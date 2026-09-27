@@ -64,18 +64,34 @@ def test_new_cutoff_requires_explicit_reviews_with_original_sources(method):
     assert result['model']['calendar']['value'] == seed['plan']['model']['calendar']['value']
 
 
-@pytest.mark.parametrize('fault', ['generation', 'ticker', 'method', 'plan', 'hash', 'artifact'])
-def test_invalid_published_basis_fails_before_any_provider(fault):
+@pytest.mark.parametrize('fault', ['generation', 'ticker', 'method', 'plan', 'hash'])
+@pytest.mark.parametrize('artifact_available', [True, False])
+def test_invalid_published_basis_fails_before_any_provider(fault, artifact_available):
     from bellomberg.valuation.preparation_basis import capture_prior_basis
     _, _, _, _, current = _prior()
+    current['artifact']['available'] = artifact_available
     payload = current['current']; basis = payload['preparation']['review_basis']
     if fault == 'generation': payload['generation_id'] = 'different'
     elif fault == 'ticker': payload['ticker'] = 'UNRELATED'
     elif fault == 'method': payload['valuation_decision'] = {'method_id': 'unrelated'}
     elif fault == 'plan': payload['preparation']['proposal']['plan']['model']['opening_nwc']['value'] += 1
     elif fault == 'hash': basis['seed']['plan_sha256'] = '0' * 64
-    elif fault == 'artifact': current['artifact']['available'] = False
     with pytest.raises(ValueError): capture_prior_basis(current)
+
+
+def test_unavailable_artifact_requires_fresh_sources_without_inheriting_prior_documents():
+    from bellomberg.valuation.preparation_basis import capture_prior_basis, retain_prior_documents
+    _, _, _, _, current = _prior()
+    current['artifact'] = {'available': False, 'reason': 'synthetic edited workbook'}
+    prior = capture_prior_basis(current)
+    assert prior == {'status': 'fresh_required', 'reason': 'prior_artifact_unavailable',
+        'source_generation_id': 'synthetic-generation', 'source_snapshot_id': 'synthetic-snapshot',
+        'artifact_reason': 'synthetic edited workbook'}
+    report = {'documents': [], 'status': 'incomplete', 'issues': ['new source missing']}
+    assert retain_prior_documents(report, prior) == report
+    prior.pop('source_generation_id')
+    with pytest.raises(ValueError, match='pinned generation'):
+        retain_prior_documents(report, prior)
 
 
 def test_legacy_basis_absence_is_an_explicit_fresh_preparation_reason():

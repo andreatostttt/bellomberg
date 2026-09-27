@@ -3,7 +3,7 @@ from copy import deepcopy
 
 
 def prepare_and_generate(bundle, *, documents, propose, output_dir=None, source_report=None,
-                         prior_preparation=None):
+                         prior_preparation=None, reuse_prepared=None):
     from .input_preparation import prepare_method_inputs
     from .dcf_engine import generate_valuation, _write_payload_sidecar
     if prior_preparation is not None:
@@ -31,6 +31,12 @@ def prepare_and_generate(bundle, *, documents, propose, output_dir=None, source_
                 raise ValueError('refresh lineage differs from compiled plan')
             prepared['provenance']['refresh_review'] = deepcopy(lineage)
     candidate = prepared["bundle"]
+    if (prepared['status'] == 'prepared' and not prepared['issues'] and reuse_prepared is not None
+            and (selection or {}).get('mode') == 'unchanged_context'
+            and candidate['snapshot_id'] == prior_preparation.get('source_snapshot_id')):
+        reused = reuse_prepared(candidate)
+        if reused is not None:
+            return reused  # Keep the verified generation and its original preparation receipt.
     if prepared["issues"]:
         from uuid import uuid4
         from .dcf_quality import normalize_valuation_payload
@@ -61,7 +67,8 @@ def prepare_and_generate(bundle, *, documents, propose, output_dir=None, source_
 
 
 def collect_and_prepare(bundle, *, archive_root, propose, filing_results=(), output_dir=None,
-                        catalog=None, download=None, source_report=None, prior_preparation=None):
+                        catalog=None, download=None, source_report=None, prior_preparation=None,
+                        reuse_prepared=None):
     """Explicit preparation entry point; callers own paid-work authorization."""
     from .input_preparation import has_approved_inputs
     from .sector_analysis import validate_bundle
@@ -75,4 +82,5 @@ def collect_and_prepare(bundle, *, archive_root, propose, filing_results=(), out
         financial_currency=(bundle['case'].get('info') or {}).get('financialCurrency'),
         method_id=bundle['decision'].get('method_id'))
     return prepare_and_generate(bundle, documents=report["documents"], propose=propose,
-                                source_report=report, output_dir=output_dir, prior_preparation=prior_preparation)
+                                source_report=report, output_dir=output_dir, prior_preparation=prior_preparation,
+                                reuse_prepared=reuse_prepared)

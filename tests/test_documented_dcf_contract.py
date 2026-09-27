@@ -71,7 +71,7 @@ def test_committee_dispatch_prepares_empty_records_and_tracks_exact_revised_snap
     original = _bundle()
     calls = []
 
-    def authorized_prepare(bundle):
+    def authorized_prepare(bundle, *, prior_preparation=None, reuse_prepared=None):
         calls.append(bundle["snapshot_id"])
         return prepare_and_generate(bundle, documents=_documents(), propose=_propose_operating,
                                     output_dir=tmp_path)

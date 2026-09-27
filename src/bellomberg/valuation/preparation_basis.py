@@ -12,19 +12,26 @@ def capture_prior_basis(current):
     identity = {'source_generation_id': current['current_generation'],
                 'source_snapshot_id': payload.get('snapshot_id')}
     if (payload.get('generation_id') != current['current_generation']
-            or not identity['source_snapshot_id'] or not current.get('artifact', {}).get('available')):
-        raise ValueError('previous generation or workbook cannot be verified')
+            or not identity['source_snapshot_id']):
+        raise ValueError('previous generation identity cannot be verified')
     preparation = payload.get('preparation') or {}
     basis = preparation.get('review_basis')
-    if basis is None:
-        return {**identity, 'status': 'fresh_required', 'reason': 'prior_review_basis_absent'}
-    _verify_basis(basis)
-    if (preparation.get('status') != 'prepared'
+    if basis is not None:
+        _verify_basis(basis)
+    if basis is not None and (preparation.get('status') != 'prepared'
             or basis['dossier']['ticker'] != payload.get('ticker')
             or basis['dossier']['method_id'] != payload.get('valuation_decision', {}).get('method_id')
             or basis['dossier']['as_of'] != payload.get('valuation_decision', {}).get('as_of')
             or _digest((preparation.get('proposal') or {}).get('plan')) != basis['seed']['plan_sha256']):
         raise ValueError('prior preparation differs from the published generation')
+    if not current.get('artifact', {}).get('available'):
+        # The immutable DB generation still pins publication/CAS. A missing or
+        # edited file cannot supply prior research, but must not prevent a new
+        # model from independently acquired evidence. Preserve the old artifact.
+        return {**identity, 'status': 'fresh_required', 'reason': 'prior_artifact_unavailable',
+                'artifact_reason': current.get('artifact', {}).get('reason')}
+    if basis is None:
+        return {**identity, 'status': 'fresh_required', 'reason': 'prior_review_basis_absent'}
     return {**identity, 'status': 'available', 'basis_sha256': _digest(basis), 'basis': deepcopy(basis)}
 
 
@@ -42,8 +49,12 @@ def _verified_prior(prior):
     if not isinstance(prior, dict) or prior.get('status') not in ('available', 'fresh_required'):
         raise ValueError('invalid pinned preparation selection')
     if prior['status'] == 'fresh_required':
-        if prior.get('reason') not in ('no_previous_generation', 'prior_review_basis_absent'):
+        if prior.get('reason') not in ('no_previous_generation', 'prior_review_basis_absent',
+                                       'prior_artifact_unavailable'):
             raise ValueError('unknown fresh preparation reason')
+        if prior['reason'] == 'prior_artifact_unavailable' and (
+                not prior.get('source_generation_id') or not prior.get('source_snapshot_id')):
+            raise ValueError('unavailable prior artifact requires pinned generation identity')
         return None
     basis = prior.get('basis')
     if (not prior.get('source_generation_id') or not prior.get('source_snapshot_id')

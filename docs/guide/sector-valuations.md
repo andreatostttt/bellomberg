@@ -352,8 +352,13 @@ This option retains the same paid journal, budget and model limits.
 Before paid preparation, the event queue pins the verified current generation
 and its recompilable research basis in the acquired-source checkpoint. Recovery
 uses that exact basis even if another generation becomes current; publication
-still checks the captured head and cannot replace a concurrent version. Missing
+still checks the captured head and cannot replace a concurrent version. The
+committee supplies the same prior-basis selection from the generation captured
+by its dispatcher, before preparation. Missing
 legacy research is an explicit fresh-preparation reason, not an inferred plan.
+An unavailable or altered previous workbook likewise requires fresh preparation
+from acquired sources, without inheriting that generation's research basis.
+Its history and files remain intact; identical paid requests can still be reused.
 Historical documents keep their original dates and hashes; retaining them does
 not clear current acquisition failures or claim a new download.
 
@@ -365,6 +370,11 @@ calendar, perimeter or legal structure, that validated opening starts fresh
 scenario preparation without paying for the opening twice. Old scenario paths
 are not carried into the new structure. The selection, original generation and
 actual review evidence remain recorded; none of these paths grants PM approval.
+After collection and recompilation, an unchanged committee candidate also reuses
+the existing workbook when its snapshot, current generation, sidecar, file hash
+and storage link still pass verification. It creates no duplicate thesis or
+publication. Changed source documents are checked even when the raw profile is
+unchanged; a concurrent publication cannot be adopted as the captured generation.
 Existing checkpoints without a prior basis retain their original preparation
 path and paid request identities. The real pilot's larger authorized output
 limit does not certify completion under ordinary application limits.
@@ -1487,6 +1497,16 @@ The Python suite also runs React contract tests and therefore needs Node plus
 the app's development dependencies. These checks need no personal database,
 private model registry, keys or live model calls. Live source checks are separate
 from the repeatable synthetic suite.
+
+`tests/test_public_model_lifecycle.py` exercises an empty profile through the
+committee coverage hook, raw synthetic documents, metered provider simulation,
+workbook, authenticated download and byte-verified MIME attachment. It also
+checks legacy reconstruction, damaged files, missing sources and locked history.
+`tests/test_committee_preparation_refresh.py` compares successive generations
+through the committee and queue, measuring the explicit reviews and journal.
+Automatic preparation remains limited to operating FCFF, bank residual income
+and fund NAV contracts; the adapter table does not promise automatic preparation
+for every family or sufficient sources for every issuer.
 
 Existing databases require the separate additive metadata procedure
 `tools/migrations/migra_valuation_metadata.py`. Its default dry-run preserves

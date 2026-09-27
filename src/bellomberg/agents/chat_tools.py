@@ -1656,10 +1656,52 @@ def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
                     r = generate_valuation(tool_input["ticker"], prepared_bundle=bundle)
                     r["preparation"] = {"status": "blocked", "reason": publication_state["reason"]}
                 else:
-                    r = valuation_preparer(bundle)
+                    from bellomberg.valuation.preparation_basis import capture_prior_basis
+                    def reuse_prepared(candidate):
+                        nonlocal cache_note
+                        try:
+                            current = model_versions.current(tool_input['ticker']) if model_versions else None
+                            generation = (publication_head or {}).get('current_generation')
+                            if (not generation or not current or current['current_generation'] != generation
+                                    or not current['artifact']['available']):
+                                return None
+                            payload = current['current']
+                            expected = {**candidate['decision'], 'snapshot_id': candidate['snapshot_id'],
+                                        'generation_id': generation}
+                            check = assess_valuation_usability(payload, expected_decision=expected,
+                                as_of=candidate['case']['as_of'])
+                            with open(os.path.splitext(payload['path'])[0] + '.payload.json', encoding='utf-8') as stream:
+                                sidecar = json.load(stream)
+                            side_check = assess_valuation_usability(sidecar, expected_decision=expected,
+                                as_of=candidate['case']['as_of'])
+                            if not check['usable'] or not side_check['usable']:
+                                cache_note = 'Cache ricompilata non riutilizzabile: ' + '; '.join(check['reasons'] + side_check['reasons'])
+                                return None
+                            from hashlib import sha256
+                            with open(payload['path'], 'rb') as workbook:
+                                digest = sha256(workbook.read()).hexdigest()
+                            if payload.get('workbook_sha256') != digest or sidecar.get('workbook_sha256') != digest:
+                                cache_note = 'Workbook modificato durante la verifica: cache non riutilizzabile'
+                                return None
+                            with valuation_db._conn() as conn:
+                                link = conn.execute('SELECT thesis_id FROM valuation_snapshot_links WHERE snapshot_id=? AND generation_id=? AND thesis_id IS NOT NULL',
+                                    (payload['snapshot_id'], generation)).fetchone()
+                            if not link:
+                                return None
+                            return {**payload, 'reused': True,
+                                'cache_note': 'Fonti ricompilate, snapshot e integrita della generazione corrente verificati',
+                                '_thesis_saved': {'thesis_id': link[0], 'snapshot_id': payload['snapshot_id']},
+                                'model_publication': {'status': 'current', 'reason': 'Versione corrente verificata nel registro'}}
+                        except Exception as exc:
+                            cache_note = 'Verifica cache ricompilata fallita: ' + type(exc).__name__ + ': ' + str(exc)
+                            return None
+                    r = valuation_preparer(bundle, prior_preparation=capture_prior_basis(publication_head),
+                                           reuse_prepared=reuse_prepared)
                     bundle = validate_bundle(r["acquisition_snapshot"], tool_input["ticker"])
                     if bundle["case"]["as_of"] != prepared_bundle["case"]["as_of"]:
                         raise ValueError("Il preparatore ha cambiato il cutoff acquisito")
+                    if r.get('reused'):
+                        return _stamp(r, f"valuation riusata({tool_input['ticker']})")
             else:
                 r = generate_valuation(tool_input["ticker"], prepared_bundle=bundle)
             r = normalize_valuation_payload(r, expected_decision=bundle["decision"],
