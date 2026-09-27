@@ -1,5 +1,6 @@
 """A complete numeric balance cannot silently become a narrow working-capital sum."""
 from copy import deepcopy
+from decimal import Decimal
 from hashlib import sha256
 import json
 
@@ -14,8 +15,8 @@ from test_balance_sheet_evidence import balance_raw, primary
 from test_input_preparation import _bundle, _documents, _operating_plan
 
 
-def case():
-    origin = primary(balance_raw().replace(b'iso4217:USD', b'iso4217:EUR'))
+def case(raw=None):
+    origin = primary((balance_raw() if raw is None else raw).replace(b'iso4217:USD', b'iso4217:EUR'))
     ledger = normalize_balance_sheet(origin)['documents'][0]
     body = json.loads(ledger['text'])
     classifications = []
@@ -51,6 +52,33 @@ def test_full_classification_reconciles_selected_amount_and_keeps_judgments_sepa
                        expected_entity='Synthetic Industrial Issuer') is None
     assert (origin, ledger, item) == before
     assert _fact_proof('shares', item, [origin, ledger], 'EUR million', '2025-12-31') is not None
+
+
+@pytest.mark.parametrize('original,combined,treatment', [
+    ('PropertyPlantAndEquipmentNet',
+     'PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization',
+     'fixed_or_intangible_asset'),
+    ('LongTermDebtNoncurrent', 'LongTermDebtAndCapitalLeaseObligations', 'financing'),
+    ('PropertyPlantAndEquipmentNet', 'OperatingLeaseRightOfUseAsset', 'fixed_or_intangible_asset'),
+    ('LongTermDebtNoncurrent', 'OperatingLeaseLiabilityNoncurrent', 'other_operating'),
+])
+def test_fixed_assets_debt_and_lease_concepts_cannot_enter_nwc(original, combined, treatment):
+    origin, ledger, item = case(balance_raw().replace(original.encode(), combined.encode()))
+    rows = item['calculation']['classifications']
+    selected = next(row for row in rows if row['component_tag'] == 'us-gaap:' + combined)
+    selected['treatment'] = treatment
+    assert prove(item, [origin, ledger]) is None
+
+    selected['treatment'] = 'operating_nwc'
+    components = {c['reported_tag']: c for c in json.loads(ledger['text'])['components']}
+    # Reconcile the wrong economic perimeter exactly, so arithmetic cannot hide
+    # a missing guard for the combined reported concept.
+    total = sum((Decimal(components[row['component_tag']]['value_exact']) *
+                 (1 if components[row['component_tag']]['accounting_side'] == 'asset' else -1)
+                 for row in rows if row['treatment'] == 'operating_nwc'), Decimal(0))
+    item['value'] = float(total / Decimal(1_000_000))
+    problem = prove(item, [origin, ledger])
+    assert problem is not None and 'operating NWC' in problem
 
 
 @pytest.mark.parametrize('mutation', ['omitted', 'duplicate', 'unknown', 'unresolved', 'blank_reason',

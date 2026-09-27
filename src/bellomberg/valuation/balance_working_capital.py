@@ -17,6 +17,9 @@ _NON_NWC = frozenset('us-gaap:'+tag for tag in (
     'AvailableForSaleSecuritiesDebtSecuritiesCurrent', 'AvailableForSaleSecuritiesDebtSecuritiesNoncurrent',
     'DebtSecuritiesAvailableForSaleRestricted', 'ShortTermBorrowings', 'LongTermDebtCurrent',
     'LongTermDebtNoncurrent', 'DebtCurrent', 'LongTermDebt', 'PropertyPlantAndEquipmentNet',
+    'LongTermDebtAndCapitalLeaseObligations',
+    'PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization',
+    'OperatingLeaseRightOfUseAsset', 'OperatingLeaseLiabilityNoncurrent',
     'Goodwill', 'IntangibleAssetsNetExcludingGoodwill', 'DeferredIncomeTaxAssetsNet',
     'DeferredIncomeTaxLiabilitiesNet', 'AccruedIncomeTaxesCurrent'))
 DISCLOSURE = ('ANALYST CLASSIFICATION: reported amounts and the selected sum are verified; '
