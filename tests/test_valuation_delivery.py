@@ -65,6 +65,110 @@ def test_different_failure_stages_remain_explicit(tmp_path, fault, expected):
     assert row["email_included"] is False
 
 
+def test_malformed_sidecar_keeps_other_valid_attachment(tmp_path):
+    bad = artifact(tmp_path, "SYNTH.A", "bad.xlsx")
+    good = artifact(tmp_path, "SYNTH.B", "good.xlsx")
+    sidecar_path = Path(bad["path"]).with_suffix(".payload.json")
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar["valuation_usability"] = ["invalid-shape"]
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+
+    receipt = manifest({"SYNTH.A": bad, "SYNTH.B": good}, tmp_path)
+    rows = {row["ticker"]: row for row in receipt["valuations"]}
+    assert receipt["attachments"] == [good["path"]]
+    assert rows["SYNTH.A"]["status"] == "metadata_mismatch"
+    assert rows["SYNTH.A"]["reason"]
+    assert rows["SYNTH.A"]["email_included"] is False
+    assert rows["SYNTH.B"]["status"] == "ready"
+
+
+@pytest.mark.parametrize("field, malformed", [
+    ("valuation_usability", ["invalid-shape"]),
+    ("valuation_usability", []),
+    ("_thesis_saved", ["invalid-shape"]),
+    ("_thesis_saved", []),
+    ("model_publication", ["invalid-shape"]),
+    ("model_publication", []),
+    ("valuation_decision", ["invalid-shape"]),
+])
+def test_malformed_result_metadata_is_incomplete_without_losing_other_attachment(tmp_path, field, malformed):
+    bad = artifact(tmp_path, "SYNTH.A", "bad.xlsx")
+    good = artifact(tmp_path, "SYNTH.B", "good.xlsx")
+    bad[field] = malformed
+
+    receipt = manifest({"SYNTH.A": bad, "SYNTH.B": good}, tmp_path)
+    rows = {row["ticker"]: row for row in receipt["valuations"]}
+    assert receipt["attachments"] == [good["path"]]
+    assert rows["SYNTH.A"]["status"] == "incomplete"
+    assert field in rows["SYNTH.A"]["reason"]
+    assert rows["SYNTH.A"]["email_included"] is False
+    assert rows["SYNTH.B"]["status"] == "ready"
+
+
+@pytest.mark.parametrize("malformed", ["not-a-list", 7, ["missing", 7]])
+def test_malformed_usability_reasons_keeps_other_valid_attachment(tmp_path, malformed):
+    bad = artifact(tmp_path, "SYNTH.A", "bad.xlsx")
+    good = artifact(tmp_path, "SYNTH.B", "good.xlsx")
+    bad["valuation_usability"] = {"usable": False, "reasons": malformed}
+
+    receipt = manifest({"SYNTH.A": bad, "SYNTH.B": good}, tmp_path)
+    rows = {row["ticker"]: row for row in receipt["valuations"]}
+    assert receipt["attachments"] == [good["path"]]
+    assert rows["SYNTH.A"]["status"] == "incomplete"
+    assert "valuation_usability.reasons" in rows["SYNTH.A"]["reason"]
+    assert rows["SYNTH.A"]["email_included"] is False
+    assert rows["SYNTH.B"]["status"] == "ready"
+
+
+def test_mixed_manifest_sends_only_verified_generation_and_preserves_attempts(tmp_path, monkeypatch):
+    from bellomberg.reporting.valuation_delivery import build_manifest, record_email_outcome
+    good = artifact(tmp_path, "SYNTH.A", "good.xlsx")
+    economic_ko = {"valuation_usability": {"usable": False, "reasons": ["Input economici incompleti"]}}
+    malformed = artifact(tmp_path, "SYNTH.C", "bad.xlsx")
+    sidecar_path = Path(malformed["path"]).with_suffix(".payload.json")
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar["valuation_usability"] = ["invalid-shape"]
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    attempts = [{"ticker": "SYNTH.B", "reason": "Input economici incompleti"},
+                {"ticker": "SYNTH.C", "reason": "Metadati workbook malformati"}]
+
+    receipt = build_manifest({"SYNTH.A": good, "SYNTH.B": economic_ko, "SYNTH.C": malformed},
+                             roots=[tmp_path], attempts=attempts)
+    rows = {row["ticker"]: row for row in receipt["valuations"]}
+    assert receipt["schema_version"] == 1
+    assert receipt["attempts"] == attempts
+    assert receipt["attachments"] == [good["path"]]
+    assert [rows[ticker]["status"] for ticker in ("SYNTH.A", "SYNTH.B", "SYNTH.C")] == [
+        "ready", "incomplete", "metadata_mismatch"]
+    assert all(rows[ticker]["reason"] for ticker in rows)
+
+    messages = []
+    class CaptureSMTP:
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def login(self, *args): pass
+        def send_message(self, message): messages.append(message)
+
+    monkeypatch.setattr(email_sender, "email_configurata", lambda: True)
+    monkeypatch.setattr(email_sender, "EMAIL_FROM", "fixture@example.org")
+    monkeypatch.setattr(email_sender, "EMAIL_TO", "fixture@example.org")
+    monkeypatch.setattr(email_sender, "EMAIL_PASSWORD", "synthetic-unused", raising=False)
+    monkeypatch.setattr(email_sender.smtplib, "SMTP_SSL", CaptureSMTP)
+    raw = Path(good["path"]).read_bytes()
+    sent = email_sender.invia_email_multi_allegati(receipt["attachments"],
+        expected_hashes=receipt["expected_hashes"], delivery_receipt=receipt)
+    assert sent is True and len(messages) == 1
+    parts = [part for part in messages[0].walk() if part.get_filename()]
+    assert len(parts) == 1 and parts[0].get_payload(decode=True) == raw
+    assert receipt["expected_hashes"][good["path"]] == sha256(raw).hexdigest()
+    assert rows["SYNTH.A"]["generation_id"] == good["generation_id"]
+    record_email_outcome(receipt, sent)
+    assert receipt["email_status"] == "sent"
+    assert [rows[ticker]["email_included"] for ticker in ("SYNTH.A", "SYNTH.B", "SYNTH.C")] == [
+        True, False, False]
+
+
 def test_missing_input_is_distinct_from_calculated_unpublished(tmp_path):
     results = {"SYNTH.A": {"error": "Provider rate limit", "valuation_usability": {"usable": False}},
                "SYNTH.B": {"valuation_usability": {"usable": True}, "snapshot_id": "b" * 64,

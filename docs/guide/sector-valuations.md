@@ -17,6 +17,11 @@ labelled as such; they are not a PM approval. Approved and user-locked versions
 retain precedence. An incomplete case is recorded with its reason, without a
 promised workbook or an old attachment labelled as new.
 
+Malformed result or workbook metadata is rejected for that artifact, with an
+explicit reason; other verified workbooks remain eligible for the run package.
+If a selected workbook changes or becomes unavailable after the manifest is
+assembled, sending the promised package fails instead of silently omitting it.
+
 For selected SEC annual filings, the collector also follows explicitly linked
 EX-13 financial statements and EX-21 subsidiary lists. Same-accession attachments
 retain the parent filing date. An explicit incorporation reference to another

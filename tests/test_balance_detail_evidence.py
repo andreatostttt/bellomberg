@@ -71,6 +71,53 @@ def test_components_are_dated_scaled_and_reconciled_without_economic_classificat
     assert 'complete working capital' in document['metadata']['limitation']
 
 
+@pytest.mark.parametrize('tag', [
+    b'us-gaap:ReceivablesNetCurrent',
+    b'us-gaap:AccountsPayableAndAccruedLiabilitiesCurrent',
+])
+def test_reported_receivable_payable_subtotals_are_reconciled(tag):
+    raw = raw_source().replace(b'us-gaap:OtherAssetsCurrent', tag)
+    result = normalize_balance_details(source(raw))
+    assert result['status'] == 'ready', result
+    body = json.loads(result['documents'][0]['text'])
+    assert len(body['groups']) == 1
+    group = body['groups'][0]
+    assert group['parent']['reported_tag'] == tag.decode()
+    assert group['parent']['value_exact'] == '10000'
+    assert group['parent']['unit'] == 'USD'
+    assert group['parent']['end'] == '2025-12-31'
+    assert [part['value_exact'] for part in group['components']] == ['7500', '2500', '0']
+    assert body['economic_classification_approved'] is False
+
+
+@pytest.mark.parametrize('tag', [
+    b'us-gaap:ReceivablesNetCurrent',
+    b'us-gaap:AccountsPayableAndAccruedLiabilitiesCurrent',
+])
+@pytest.mark.parametrize('mutation', [
+    'amount', 'missing_component', 'currency', 'period', 'cik', 'duplicate',
+])
+def test_new_subtotals_reject_unreconciled_or_unqualified_components(tag, mutation):
+    raw = raw_source().replace(b'us-gaap:OtherAssetsCurrent', tag)
+    if mutation == 'amount':
+        raw = raw.replace(b'>7.5<', b'>7.6<', 1)
+    elif mutation == 'missing_component':
+        import re
+        raw = re.sub(rb'<tr><td>Supplies.*?</tr>', b'', raw, count=1, flags=re.S)
+    elif mutation == 'currency':
+        raw = raw.replace(b'<table>', b'<xbrli:unit id="eur"><xbrli:measure>iso4217:EUR</xbrli:measure></xbrli:unit><table>', 1)
+        raw = raw.replace(b'unitref="usd"', b'unitref="eur"', 1)
+    elif mutation == 'period':
+        raw = raw.replace(b'contextref="now" unitref="usd" format="ixt:num-dot-decimal" scale="3">7.5',
+                          b'contextref="prior" unitref="usd" format="ixt:num-dot-decimal" scale="3">7.5', 1)
+    elif mutation == 'cik':
+        raw = raw.replace(b'>123<', b'>456<', 1)
+    else:
+        raw = raw.replace(b'us-gaap:PrepaidExpenseCurrent', b'ex:Supplies')
+    result = normalize_balance_details(source(raw))
+    assert result['status'] == 'incomplete' and result['issues'] and not result['documents']
+
+
 @pytest.mark.parametrize('before,after', [
     ('>7.5<', '>7.6<'), ('>123<', '>456<'), ('>2025-12-31<', '>2025-12-30<'),
     ('name="ex:Supplies"', 'xsi:nil="true" name="ex:Supplies"'),

@@ -29,6 +29,22 @@ def balance_raw():
     return raw_source().replace(b'<table>', ('<table>'+''.join(rows)+'</table><table>').encode(), 1)
 
 
+def balance_with_note_root(tag):
+    raw = balance_raw()
+    if tag == b'us-gaap:OtherAssetsCurrent':
+        return raw
+    balance, note = raw.split(b'</table>', 1)
+    if tag == b'us-gaap:ReceivablesNetCurrent':
+        balance = balance.replace(b'us-gaap:OtherAssetsCurrent', tag)
+    else:
+        balance = balance.replace(b'us-gaap:AccountsPayableCurrent', tag)
+        note = note.replace(b'>7.5<', b'>9.5<', 1).replace(b'>10<', b'>12<', 1)
+        note = note.replace(b'ex:Supplies', b'ex:TradePayables')
+        note = note.replace(b'us-gaap:PrepaidExpenseCurrent', b'ex:OtherAccruals')
+    note = note.replace(b'us-gaap:OtherAssetsCurrent', tag)
+    return balance+b'</table>'+note
+
+
 def primary(raw=None):
     raw = balance_raw() if raw is None else raw
     doc = source(raw)
@@ -36,8 +52,13 @@ def primary(raw=None):
     return doc
 
 
-def test_full_balance_and_note_leaves_reconcile_without_approving_economics():
-    doc = primary(); before = deepcopy(doc)
+@pytest.mark.parametrize('tag,side', [
+    (b'us-gaap:OtherAssetsCurrent', 'asset'),
+    (b'us-gaap:ReceivablesNetCurrent', 'asset'),
+    (b'us-gaap:AccountsPayableAndAccruedLiabilitiesCurrent', 'liability'),
+])
+def test_full_balance_and_note_leaves_reconcile_without_approving_economics(tag, side):
+    doc = primary(balance_with_note_root(tag)); before = deepcopy(doc)
     result = normalize_balance_sheet(doc)
     assert result['status'] == 'ready', result
     assert doc == before
@@ -46,6 +67,8 @@ def test_full_balance_and_note_leaves_reconcile_without_approving_economics():
     assert len(leaves) == len({leaf['reported_tag'] for leaf in leaves}) == 7
     assert sum(Decimal(f['value_exact']) for f in leaves if f['accounting_side'] == 'asset') == 80000
     assert sum(Decimal(f['value_exact']) for f in leaves if f['accounting_side'] == 'liability') == 20000
+    assert tag.decode() not in {f['reported_tag'] for f in leaves}
+    assert sum(tag.decode() in f['reported_ancestors'] and f['accounting_side'] == side for f in leaves) == 3
     assert all(f['economic_classification'] == 'unreviewed' and f['model_treatment'] is None for f in leaves)
     assert body['economic_classification_approved'] is False
     assert body['nonmonetary_disclosures'][0]['value_exact'] is None
@@ -84,10 +107,19 @@ def test_duplicate_balance_and_unsupported_layout_fail():
     assert normalize_balance_sheet(primary(raw))['status'] == 'incomplete'
 
 
-def test_note_parent_must_match_balance_even_when_both_tables_reconcile():
-    raw = balance_raw().replace(b'>7.5<', b'>8.5<').replace(b'>10<', b'>11<')
-    # Keep the balance at 10, while the internally reconciled note now totals 11.
-    raw = raw.replace(b'scale="3">11<', b'scale="3">10<', 1)
+@pytest.mark.parametrize('tag', [
+    b'us-gaap:OtherAssetsCurrent',
+    b'us-gaap:ReceivablesNetCurrent',
+    b'us-gaap:AccountsPayableAndAccruedLiabilitiesCurrent',
+])
+def test_note_parent_must_match_balance_even_when_both_tables_reconcile(tag):
+    balance, note = balance_with_note_root(tag).split(b'</table>', 1)
+    if tag == b'us-gaap:AccountsPayableAndAccruedLiabilitiesCurrent':
+        note = note.replace(b'>9.5<', b'>10.5<', 1).replace(b'>12<', b'>13<', 1)
+    else:
+        note = note.replace(b'>7.5<', b'>8.5<', 1).replace(b'>10<', b'>11<', 1)
+    # Both tables reconcile internally; the note parent differs from the balance parent.
+    raw = balance+b'</table>'+note
     result = normalize_balance_sheet(primary(raw))
     assert result['status'] == 'incomplete' and 'parent' in str(result['issues'])
 

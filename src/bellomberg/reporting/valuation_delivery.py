@@ -9,17 +9,27 @@ from uuid import uuid4
 
 def describe_result(ticker, result):
     result = result if isinstance(result, dict) else {}
-    usability = result.get("valuation_usability") or {}
-    usable = usability.get("usable") is True
-    publication = result.get("model_publication") or {}
+    malformed = next((key for key in ("valuation_usability", "_thesis_saved",
+                                      "model_publication", "valuation_decision")
+                      if key in result and not isinstance(result[key], dict)), None)
+    usability = result.get("valuation_usability") if isinstance(result.get("valuation_usability"), dict) else {}
+    thesis = result.get("_thesis_saved") if isinstance(result.get("_thesis_saved"), dict) else {}
+    publication = result.get("model_publication") if isinstance(result.get("model_publication"), dict) else {}
+    decision = result.get("valuation_decision") if isinstance(result.get("valuation_decision"), dict) else {}
+    reasons = usability.get("reasons")
+    if malformed is None and "reasons" in usability and (
+            not isinstance(reasons, list) or any(not isinstance(reason, str) for reason in reasons)):
+        malformed = "valuation_usability.reasons"
+    usable = malformed is None and usability.get("usable") is True
     return {"ticker": ticker, "snapshot_id": result.get("snapshot_id"),
             "generation_id": result.get("generation_id"), "path": result.get("path"),
-            "thesis_id": (result.get("_thesis_saved") or {}).get("thesis_id"),
-            "method": (result.get("valuation_decision") or {}).get("method_id"),
+            "thesis_id": thesis.get("thesis_id"),
+            "method": decision.get("method_id"),
             "revision_origin": "reused" if result.get("reused") else "generated" if result.get("path") else "not_created",
             "valuation_date": result.get("valuation_date"),
             "status": "calculated" if usable else "incomplete",
-            "reason": "" if usable else (result.get("error") or "; ".join(usability.get("reasons") or [])
+            "reason": "" if usable else ("Metadati risultato non validi: " + malformed if malformed else
+                                          result.get("error") or "; ".join(reasons or [])
                                           or "Valutazione incompleta; motivo non disponibile"),
             "model_publication": {"status": publication.get("status", "not_verified"),
                                   "reason": publication.get("reason", "Stato della versione corrente non verificato")},
@@ -58,9 +68,13 @@ def build_manifest(results, *, roots, attempts=()):
         except (OSError, ValueError) as exc:
             reject("metadata_missing", "Metadati workbook non leggibili: " + type(exc).__name__)
             continue
-        if (not isinstance(sidecar, dict) or not row["snapshot_id"] or not row["generation_id"]
+        sidecar_usability = sidecar.get("valuation_usability") if isinstance(sidecar, dict) else None
+        if not isinstance(sidecar_usability, dict):
+            reject("metadata_mismatch", "Metadati utilizzabilita workbook non validi")
+            continue
+        if (not row["snapshot_id"] or not row["generation_id"]
                 or any(sidecar.get(key) != row[key] for key in ("ticker", "snapshot_id", "generation_id"))
-                or (sidecar.get("valuation_usability") or {}).get("usable") is not True):
+                or sidecar_usability.get("usable") is not True):
             reject("metadata_mismatch", "Ticker, snapshot, generazione o utilizzabilita discordanti")
             continue
         try:

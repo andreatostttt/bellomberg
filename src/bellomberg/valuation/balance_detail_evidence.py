@@ -10,7 +10,8 @@ NORMALIZER = 'balance_details_v1'
 PREFIX = 'balance-details-'
 ROOTS = frozenset('us-gaap:' + name for name in (
     'OtherAssetsCurrent', 'OtherAssetsNoncurrent', 'AccruedLiabilitiesCurrent',
-    'OtherLiabilitiesCurrent', 'OtherLiabilitiesNoncurrent'))
+    'OtherLiabilitiesCurrent', 'OtherLiabilitiesNoncurrent',
+    'ReceivablesNetCurrent', 'AccountsPayableAndAccruedLiabilitiesCurrent'))
 
 
 def extract_balance_detail_packet(source, raw):
