@@ -95,6 +95,16 @@ def main(argv=None):
     sys.path.append(dependency_site)
     if any(name == "bellomberg" or name.startswith("bellomberg.") for name in sys.modules):
         raise RuntimeError("application imported before offline isolation")
+    # matplotlib discovers system fonts on first use (fc-list on Linux/macOS). Build that
+    # cache once, inside the sandbox (MPLCONFIGDIR above), before subprocesses are denied:
+    # a local font query, never network, and no application module is imported here.
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.font_manager  # noqa: F401
+    except Exception as exc:  # declared, the suite then reports its own failures
+        print("matplotlib font cache not prepared: " + type(exc).__name__ + ": " + str(exc)[:200],
+              file=sys.stderr)
     counters = collections.Counter()
     blocked = []
     local = threading.local()
