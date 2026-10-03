@@ -164,7 +164,7 @@ def _trade_analysis(row, *, detail):
 
 
 def _weekly_analyses(row, *, detail):
-    from bellomberg.core.research_analysis import research_digest, RESEARCH_ANALYSIS_MODE
+    from bellomberg.core.research_analysis import research_digest, RESEARCH_ANALYSIS_MODE, _thesis_identity
     context, snapshot = _json(row.get("context_json")), _json(row.get("snapshot_json"))
     if _map(context.get("contract")).get("analysis_mode") != RESEARCH_ANALYSIS_MODE:
         return {}
@@ -177,7 +177,7 @@ def _weekly_analyses(row, *, detail):
     valid = (snapshot.get("sha256") == research_digest(payload)
              and seal.get("analysis_mode") == RESEARCH_ANALYSIS_MODE and seal.get("version") == 1
              and seal.get("dossier_sha256") == research_digest({"dossiers": dossiers, "tool_receipts": seal.get("tool_receipts")})
-             and seal.get("thesis_sha256") == research_digest({"reports": reports, "dossier_sha256": seal.get("dossier_sha256")}))
+             and seal.get("thesis_sha256") == research_digest(_thesis_identity(seal)))
     desk = _map(data.get("fundamentals"))
     valid = valid and _text(reports.get("fundamentals")) and desk.get("1") == reports.get("fundamentals")
     final = _text(desk.get("2"))

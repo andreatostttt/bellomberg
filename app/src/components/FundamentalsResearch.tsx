@@ -219,6 +219,8 @@ export default function FundamentalsResearch() {
         {' · '}{tr('fundamentals.researchNextRetry')}: {dateText(list.market_refresh.next_retry_at, tr)}</>}
       {list.market_refresh.last_completed_at && <> · {tr('fundamentals.researchLastCycle')}: {dateText(list.market_refresh.last_completed_at, tr)}</>}
       {list.market_refresh.error && !/^market_update_[a-z_]+$/.test(list.market_refresh.error) && <> · {list.market_refresh.error}</>}
+      {!!list.market_refresh.notices?.length && <span title={list.market_refresh.notices.join(' | ')}>
+        {' · '}{tr('fundamentals.researchRefreshNotices')}: {list.market_refresh.notices.length}</span>}
     </p>}
     {error && <div role="alert" className="panel text-red-400 text-xs">{error}</div>}
     {!list && !error && <p className="text-muted text-xs">{tr('fundamentals.researchLoading')}</p>}

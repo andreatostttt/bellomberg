@@ -67,6 +67,8 @@ class FundMarketWorker:
                         self._state.update(status='waiting' if waiting else 'error' if error else 'idle',
                             last_completed_at=datetime.now(timezone.utc).isoformat(),
                             last_result=result, error=None if waiting else error,
+                            # Notices are not failures, but they stay visible (no silent gaps).
+                            notices=list(result.get('notices') or [])[:50],
                             next_retry_at=result.get('retry_after') if waiting else None)
                 except Exception as exc:
                     message = type(exc).__name__ + ': ' + str(exc)[:300]

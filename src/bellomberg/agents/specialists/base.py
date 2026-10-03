@@ -2354,8 +2354,11 @@ class Specialist:
                 and getattr(self.blackboard, "run_scope", "weekly") != "trade_idea"):
             try:
                 from bellomberg.core.current_facts import research_block
-                _rb = research_block(sector_bundles=self._sector_bundles,
-                                     decision_links=self._research_decision_links)
+                # Research mode reads filings in its own dossier: no valuation-engine
+                # sector acquisition (provider calls, archived-method text) here.
+                _research = is_research_mode(self.blackboard)
+                _rb = research_block(sector_bundles=None if _research else self._sector_bundles,
+                                     decision_links=None if _research else self._research_decision_links)
                 if _rb:
                     _ctx = _rb.strip() + "\n\n" + _ctx
             except Exception as e:

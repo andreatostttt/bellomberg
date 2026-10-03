@@ -10,7 +10,7 @@ import tempfile
 from threading import Event
 
 from .consensus_estimates import (
-    _identity, _stamp, consensus_observation, persist_market_observation,
+    _identity, _stamp, consensus_observation, provider_symbol, persist_market_observation,
     quote_observation, read_market_observation, refresh_receipt)
 
 QUOTE_REFRESH_SECONDS = 15 * 60
@@ -51,7 +51,7 @@ def _universe(db_path):
                 except (ValueError, TypeError):
                     notices.append('research_run_request_unreadable:' + str(ticker))
         if 'weekly_runs' in tables:
-            from bellomberg.core.research_analysis import research_digest, RESEARCH_ANALYSIS_MODE
+            from bellomberg.core.research_analysis import research_digest, RESEARCH_ANALYSIS_MODE, _thesis_identity
             for context_json, snapshot_json in conn.execute('SELECT context_json,snapshot_json FROM weekly_runs'):
                 try:
                     context, snapshot = json.loads(context_json), json.loads(snapshot_json)
@@ -63,7 +63,7 @@ def _universe(db_path):
                     if (snapshot['sha256'] != research_digest(payload)
                             or seal.get('analysis_mode') != RESEARCH_ANALYSIS_MODE or seal.get('version') != 1
                             or seal['dossier_sha256'] != research_digest({'dossiers': dossiers, 'tool_receipts': seal['tool_receipts']})
-                            or seal['thesis_sha256'] != research_digest({'reports': reports, 'dossier_sha256': seal['dossier_sha256']})):
+                            or seal['thesis_sha256'] != research_digest(_thesis_identity(seal))):
                         raise ValueError('Research seal integrity differs')
                     for ticker, dossier in dossiers.items():
                         if not isinstance(dossier, dict) or dossier.get('ticker') != ticker:
@@ -171,9 +171,10 @@ def refresh_followed_market_data(db_path, *, cache_dir, now=None, stop_event=Non
         rate_limit_error = None
         acquired_at = now if explicit_clock else datetime.now(timezone.utc)
         try:
-            provider = _ticker_factory(ticker)
+            symbol = provider_symbol(ticker)
+            provider = _ticker_factory(symbol)
             info = provider.info
-            _identity(ticker, info)
+            _identity(ticker, info, symbol)
         except Exception as exc:
             message = type(exc).__name__ + ': ' + str(exc)[:200]
             if _rate_limited(exc):
@@ -186,7 +187,7 @@ def refresh_followed_market_data(db_path, *, cache_dir, now=None, stop_event=Non
             acquired_at = now if explicit_clock else datetime.now(timezone.utc)
             if quote_due:
                 try:
-                    quote = quote_observation(ticker, info, acquired_at)
+                    quote = quote_observation(ticker, info, acquired_at, symbol)
                 except (ValueError, TypeError, OSError, OverflowError) as exc:
                     quote_error = type(exc).__name__ + ': ' + str(exc)[:200]
             if consensus_due:
@@ -194,7 +195,7 @@ def refresh_followed_market_data(db_path, *, cache_dir, now=None, stop_event=Non
                     targets = ({} if info.get('quoteType') in ('ETF', 'MUTUALFUND', 'INDEX', 'CURRENCY', 'CRYPTOCURRENCY', 'FUTURE')
                                else provider.analyst_price_targets or {})
                     acquired_at = now if explicit_clock else datetime.now(timezone.utc)
-                    consensus = consensus_observation(ticker, info, targets, acquired_at)
+                    consensus = consensus_observation(ticker, info, targets, acquired_at, symbol)
                 except Exception as exc:
                     consensus_error = type(exc).__name__ + ': ' + str(exc)[:200]
                     if _rate_limited(exc):
@@ -230,7 +231,9 @@ def refresh_followed_market_data(db_path, *, cache_dir, now=None, stop_event=Non
         if index < len(tickers) - 1 and stop.wait(TICKER_PAUSE_SECONDS):
             result['status'] = 'stopped'
             break
-    if result['status'] != 'stopped' and (result['errors'] or result['notices']):
+    # Notices (e.g. an unsealed research run, a skipped malformed symbol) stay visible in
+    # the result but are not acquisition failures: only errors make the batch partial.
+    if result['status'] != 'stopped' and result['errors']:
         result['status'] = 'partial'
     counts['not_attempted'] = len(tickers) - counts['processed'] - counts['skipped']
     return result

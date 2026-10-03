@@ -36,7 +36,7 @@ def _current_dossiers(blackboard, tickers):
     return dossiers
 
 
-def seal_research_thesis(blackboard, *, desks=None):
+def seal_research_thesis(blackboard, *, desks=None, missing=None):
     if not is_research_mode(blackboard):
         raise ValueError('Research seal requires its explicit analysis mode')
     if blackboard.data.get('_research_thesis') is not None:
@@ -61,12 +61,22 @@ def seal_research_thesis(blackboard, *, desks=None):
     payload = {'analysis_mode': RESEARCH_ANALYSIS_MODE, 'version': 1,
         'scope_status': 'companies_in_scope' if tickers else 'no_company_in_scope',
         'dossiers': dossiers, 'reports': reports, 'tool_receipts': evidence}
+    # A desk the caller declares missing is sealed as an explicit gap (with its reason),
+    # never as a report; seals without gaps keep their historical hash.
+    if missing:
+        payload['missing_reports'] = {str(desk): str(reason) for desk, reason in dict(missing).items()}
     payload['dossier_sha256'] = research_digest({'dossiers': dossiers, 'tool_receipts': evidence})
-    payload['thesis_sha256'] = research_digest({'reports': reports,
-        'dossier_sha256': payload['dossier_sha256']})
+    payload['thesis_sha256'] = research_digest(_thesis_identity(payload))
     with blackboard._lock:
         blackboard.data['_research_thesis'] = deepcopy(payload)
     return deepcopy(payload)
+
+
+def _thesis_identity(sealed):
+    identity = {'reports': sealed.get('reports'), 'dossier_sha256': sealed.get('dossier_sha256')}
+    if 'missing_reports' in sealed:
+        identity['missing_reports'] = sealed['missing_reports']
+    return identity
 
 
 def research_reference(blackboard):
@@ -82,8 +92,7 @@ def research_reference(blackboard):
         raise ValueError('Research seal integrity differs')
     if (sealed.get('dossier_sha256') != research_digest({'dossiers': dossiers,
             'tool_receipts': sealed.get('tool_receipts')})
-            or sealed.get('thesis_sha256') != research_digest({'reports': reports,
-                'dossier_sha256': sealed.get('dossier_sha256')})):
+            or sealed.get('thesis_sha256') != research_digest(_thesis_identity(sealed))):
         raise ValueError('Research seal integrity differs')
     if any(blackboard.read(desk, 1) != report for desk, report in reports.items()):
         raise ValueError('Research thesis changed after the committee seal')

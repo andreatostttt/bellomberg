@@ -25,6 +25,7 @@ export const fundamentals = {
   "researchRefreshStopped": "Automatic data refresh stopped",
   "researchRefreshRunning": "Data refresh in progress",
   "researchRefreshActive": "Automatic data refresh active",
+  "researchRefreshNotices": "Notices from the latest cycle (hover for detail)",
   "researchRefreshWaiting": "Temporary provider limit: waiting to refresh",
   "researchNextRetry": "Next retry",
   "researchLastCycle": "Last service check",

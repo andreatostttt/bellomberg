@@ -180,3 +180,65 @@ def test_preview_artifact_and_source_chart_are_explicitly_synthetic():
     assert "118" in text and "archivio_demo" in text
     first = PdfReader(path).pages[0].extract_text()
     assert run["id"] not in first and "simulated" not in first
+
+
+@pytest.mark.parametrize("broken", ["inline_todo", "risk_todo", "catalyst_nd", "scenario_marker", "cut", "recycled"])
+def test_placeholders_cuts_and_recycling_anywhere_block_delivery(tmp_path, broken):
+    run, result = editorial_fixture()
+    if broken == "inline_todo":
+        result["dossier"][2]["paragraphs"][0] += " TODO: aggiungere i multipli dei peer."
+    elif broken == "risk_todo":
+        result["risks"] = ["TODO"]
+    elif broken == "catalyst_nd":
+        result["catalysts"] = ["n.d."]
+    elif broken == "scenario_marker":
+        result["scenarios"][0]["analysis"] = "[inserire analisi dello scenario]"
+    elif broken == "cut":
+        result["dossier"][3]["paragraphs"][0] = "Il multiplo resta inferiore ai peer, ma il"
+    else:
+        sentence = ("La domanda finale resta stabile e il portafoglio ordini copre i prossimi trimestri "
+                    "secondo la documentazione societaria disponibile.")
+        for section in result["dossier"][:4]:
+            section["paragraphs"].append(sentence)
+    artifact = build_trade_idea_report(run, result, output_path=tmp_path / (broken + ".pdf"))
+    assert artifact["status"] == "partial", broken
+    assert artifact["quality"]["reasons"], broken
+
+
+def test_markdown_renders_as_typography_and_symbols_print(tmp_path):
+    from bellomberg.reporting.pdf_institutional import _register_fonts
+    from bellomberg.reporting.trade_idea_report import _symbol_font
+    _register_fonts()
+    if _symbol_font() is None:
+        pytest.skip("no symbol fallback font on this machine: the check mark is then reported as unprintable")
+    run, result = editorial_fixture()
+    result["dossier"][1]["paragraphs"][0] = (
+        "### Punto chiave\n**Margine** in tenuta \u2713 rispetto ai peer.\n- primo fattore\n|---|---|\n"
+        + result["dossier"][1]["paragraphs"][0])
+    result["dossier"][2]["paragraphs"].append("La quota della clientela di Serie A resta concentrata in Italia.")
+    artifact = build_trade_idea_report(run, result, output_path=tmp_path / "md.pdf")
+    assert artifact["status"] == "ready", artifact["reason"]
+    text = extract(artifact["path"])
+    assert "**" not in text and "###" not in text and "|---" not in text
+    assert "Margine" in text and "\u2022 primo fattore" in text
+    assert artifact["quality"]["content_integrity"] == "complete"
+
+
+def test_unprintable_character_is_printed_as_a_declared_code_without_blocking(tmp_path):
+    run, result = editorial_fixture()
+    result["dossier"][2]["paragraphs"][0] += " \U0001F680 ⚠️"
+    artifact = build_trade_idea_report(run, result, output_path=tmp_path / "emoji.pdf")
+    assert artifact["status"] == "ready", artifact["reason"]
+    assert "[U+1F680]" in extract(artifact["path"])
+    assert any("U+1F680" in notice for notice in artifact["quality"]["notices"])
+
+
+def test_legitimate_prose_is_not_blocked_and_negative_figures_keep_their_sign(tmp_path):
+    run, result = editorial_fixture()
+    result["catalysts"] = ["Capital Markets Day 2027 (data TBD dalla societa')."]
+    result["dossier"][3]["paragraphs"].append("Il confronto principale e' con Shopify, quotata anche come SHOP.TO")
+    result["dossier"][4]["paragraphs"].append("Variazioni trimestrali:\n- 3,2% a/a nel trimestre.\n- volumi stabili.")
+    artifact = build_trade_idea_report(run, result, output_path=tmp_path / "legit.pdf")
+    assert artifact["status"] == "ready", artifact["reason"]
+    text = extract(artifact["path"])
+    assert "- 3,2% a/a" in text and "• volumi stabili" in text

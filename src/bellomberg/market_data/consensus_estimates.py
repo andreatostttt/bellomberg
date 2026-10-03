@@ -125,15 +125,21 @@ def refresh_receipt(previous, now, error=None):
         'error': error, 'consecutive_failures': failures}
 
 
-def _identity(ticker, info):
-    if not isinstance(info, dict) or info.get('symbol') != ticker:
+def provider_symbol(ticker):
+    """Yahoo symbol for a book ticker: same aliases as the price updater, never guessed."""
+    from bellomberg.cli.price_updater import data_ticker
+    return data_ticker(ticker)
+
+
+def _identity(ticker, info, provider=None):
+    if not isinstance(info, dict) or info.get('symbol') != (provider or ticker):
         raise ValueError('Exact provider identity missing or mismatched')
     if not isinstance(info.get('currency'), str) or not info['currency'].strip():
         raise ValueError('Provider currency unavailable')
 
 
-def quote_observation(ticker, info, now):
-    _identity(ticker, info)
+def quote_observation(ticker, info, now, provider=None):
+    _identity(ticker, info, provider)
     value = _finite(info.get('regularMarketPrice'), positive=True)
     timestamp = _finite(info.get('regularMarketTime'))
     if value is None or timestamp is None:
@@ -142,12 +148,12 @@ def quote_observation(ticker, info, now):
     if observed > now:
         raise ValueError('Provider quote timestamp is in the future')
     return {'value': value, 'currency': info['currency'], 'identity_symbol': ticker,
-        'observed_at': observed.isoformat(), 'acquired_at': now.isoformat(),
+        'provider_symbol': provider or ticker, 'observed_at': observed.isoformat(), 'acquired_at': now.isoformat(),
         'source': 'yfinance info.regularMarketPrice', 'exchange': info.get('exchange')}
 
 
-def consensus_observation(ticker, info, targets, now):
-    _identity(ticker, info)
+def consensus_observation(ticker, info, targets, now, provider=None):
+    _identity(ticker, info, provider)
     if not isinstance(targets, dict):
         raise ValueError('Provider targets response is not an object')
     not_applicable = info.get('quoteType') in ('ETF', 'MUTUALFUND', 'INDEX', 'CURRENCY', 'CRYPTOCURRENCY', 'FUTURE')
@@ -163,7 +169,8 @@ def consensus_observation(ticker, info, targets, now):
     reason = ('Analyst company price targets do not apply to provider quoteType ' + info['quoteType']
         if not_applicable else 'Analyst target coverage unavailable' if target['mean'] is None
         else 'Provider does not supply a consensus observation date; missing fields remain null')
-    return {'identity_symbol': ticker, 'currency': info['currency'], 'currency_source': 'yfinance info.currency',
+    return {'identity_symbol': ticker, 'provider_symbol': provider or ticker,
+        'currency': info['currency'], 'currency_source': 'yfinance info.currency',
         'source': 'yfinance (consensus Yahoo Finance)', 'acquired_at': now.isoformat(), 'data_as_of': None,
         'price_targets': target, 'consensus_status': status, 'consensus_reason': reason}
 
@@ -285,25 +292,30 @@ def get_consensus(ticker: str) -> dict:
         import yfinance as yf
     except ImportError:
         return {"error": "yfinance non disponibile"}
-    tk = yf.Ticker(tkr)
     out = _empty_observation(tkr)
+    try:
+        provider = provider_symbol(tkr)
+    except Exception as e:
+        out["error"] = f"alias yfinance non risolvibile ({type(e).__name__}: {str(e)[:80]})"
+        return out
+    tk = yf.Ticker(provider)
     # Currency and exact provider identity are observations, never guessed from
     # an exchange, the requested suffix or the portfolio's accounting currency.
     info = {}
     try:
         info = tk.info or {}
-        _identity(tkr, info)
+        _identity(tkr, info, provider)
         out['details_identity_symbol'] = tkr
         out['details_source'] = 'yfinance analyst estimates/revisions/recommendations'
-        out['quote'] = quote_observation(tkr, info, datetime.fromtimestamp(time.time(), timezone.utc))
+        out['quote'] = quote_observation(tkr, info, datetime.fromtimestamp(time.time(), timezone.utc), provider)
     except Exception as e:
         out["identity_warning"] = f"n.d. ({type(e).__name__}: {str(e)[:80]})"
 
     # --- target price + upside implicito ---
     try:
-        _identity(tkr, info)
+        _identity(tkr, info, provider)
         pt = {} if info.get('quoteType') in ('ETF', 'MUTUALFUND', 'INDEX', 'CURRENCY', 'CRYPTOCURRENCY', 'FUTURE') else tk.analyst_price_targets or {}
-        out.update(consensus_observation(tkr, info, pt, datetime.fromtimestamp(time.time(), timezone.utc)))
+        out.update(consensus_observation(tkr, info, pt, datetime.fromtimestamp(time.time(), timezone.utc), provider))
     except Exception as e:
         out['consensus_reason'] = f"n.d. ({type(e).__name__}: {str(e)[:80]})"
 

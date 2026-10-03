@@ -42,7 +42,7 @@ export interface FundResearchList {
   status: string; count: number | null; items: FundResearchCompany[]; notices: string[];
   read_at?: string;
   market_refresh?: {status: string; last_completed_at?: string | null; last_result?: Record<string, unknown> | null;
-    error?: string | null; next_retry_at?: string | null};
+    error?: string | null; next_retry_at?: string | null; notices?: string[]};
 }
 export interface FundArchiveItem {
   id: string; file: string; ticker: string | null; as_of: string | null; file_modified_at?: string;

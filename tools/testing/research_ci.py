@@ -34,12 +34,32 @@ SUITE = (
     "tests/test_trade_idea_pm_sources.py",
     "tests/test_trade_idea_pm_sources_independent_review.py",
     "tests/test_trade_idea_v2_no_workbook_e2e.py",
+    "tests/test_trade_idea_quality_contract.py",
+    "tests/test_research_ci_excel_guard.py",
+    "tests/test_trade_idea_durable_settlement.py",
+    "tests/test_trade_idea_v2_finalization_cap.py",
+    "tests/test_trade_idea_policy_v3.py",
+    "tests/test_trade_idea_desk_annex.py",
+    "tests/test_trade_idea_desk_gap.py",
+    "tests/test_trade_idea_salvage_never_promotes.py",
+    "tests/test_trade_idea_catalog_resilience.py",
+    "tests/test_trade_idea_unbilled_retry.py",
+    "tests/test_trade_idea_mutation_guards.py",
+    "tests/test_trade_idea_mutation_guards_e2e.py",
+    # Weekly Consigliere research path and Fund market data: no workbook writes.
+    "tests/test_weekly_research_without_workbook.py",
+    "tests/test_fund_market_refresh.py",
+    "tests/test_fund_market_independent.py",
+    "tests/test_fund_market_worker.py",
+    "tests/test_fundamentals_research_view.py",
 )
 # Legacy paths also prepare or write workbook fixtures. Keep them out of CI.
 SELECTION = (
     "not actual_http_preflight and not mismatch_blocks_worker "
     "and not active_html_and_document_instructions_are_passive_evidence "
-    "and not email_ambiguous_restart_requires_explicit_retry"
+    "and not email_ambiguous_restart_requires_explicit_retry "
+    # Copies a frozen historical .xlsx fixture to test the archive download hash check.
+    "and not archive_download_returns_only_unchanged_frozen_workbook"
 )
 
 
@@ -47,14 +67,20 @@ class ExcelGenerationForbidden(BaseException):
     """A spreadsheet write is a hard failure, including inside application code."""
 
 
+_EXCEL_SUFFIXES = {".xls", ".xlsx", ".xlsm", ".xlsb", ".xlt", ".xltx", ".xltm"}
+
+
 def forbid_excel_write(event, args):
+    # A temporary file renamed/replaced onto a spreadsheet name is a write too.
+    if event == "os.rename" and isinstance(args[1], (str, bytes, os.PathLike)):
+        if Path(os.fsdecode(args[1])).suffix.lower() in _EXCEL_SUFFIXES:
+            raise ExcelGenerationForbidden("Excel generation is forbidden in research CI: " + os.fsdecode(args[1]))
+        return
     if event != "open" or not isinstance(args[0], (str, bytes)):
         return
     path, mode, flags = args
     writing = bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
-    if writing and Path(os.fsdecode(path)).suffix.lower() in {
-        ".xls", ".xlsx", ".xlsm", ".xlsb", ".xlt", ".xltx", ".xltm",
-    }:
+    if writing and Path(os.fsdecode(path)).suffix.lower() in _EXCEL_SUFFIXES:
         raise ExcelGenerationForbidden("Excel generation is forbidden in research CI: " + os.fsdecode(path))
 
 

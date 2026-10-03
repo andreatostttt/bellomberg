@@ -6,6 +6,18 @@ import sqlite3
 from threading import Event, Lock
 from types import SimpleNamespace
 
+import pytest
+
+@pytest.fixture(autouse=True)
+def _alias_store_present(tmp_path, monkeypatch):
+    # The Fund refresher resolves Yahoo symbols like the price updater; an absent
+    # private alias store is a declared failure, so tests provide an empty valid one.
+    import bellomberg.storage.negozi_privati as stores
+    path = tmp_path / "alias_fonti.json"
+    path.write_text('{"yfinance": {}}', encoding="utf-8")
+    monkeypatch.setattr(stores, "PERCORSO_ALIAS", str(path))
+
+
 
 def worker_module():
     return importlib.import_module('bellomberg.market_data.fund_market_worker')

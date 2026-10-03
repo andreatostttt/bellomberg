@@ -1334,11 +1334,18 @@ def tool_get_fundamentals(ticker):
     if not YFINANCE_AVAILABLE:
         return {"error": "yfinance non disponibile"}
     try:
-        tk = yf.Ticker(ticker)
+        # Same Yahoo symbol as prices and consensus (aliases), never a raw namesake.
+        from bellomberg.market_data.consensus_estimates import provider_symbol
+        symbol = provider_symbol(ticker)
+        tk = yf.Ticker(symbol)
         info = tk.info or {}
+        if info.get("symbol") not in (None, symbol):
+            return {"error": "Fundamentals identity mismatch for " + ticker + ": provider returned "
+                    + str(info.get("symbol")) + " instead of " + symbol}
 
         result = {
             "ticker": ticker,
+            "provider_symbol": symbol,
             "name": info.get("longName") or info.get("shortName", ""),
             "sector": info.get("sector", ""),
             "industry": info.get("industry", ""),
@@ -1371,12 +1378,19 @@ def tool_get_fundamentals(ticker):
             # Dividends
             "dividend_yield": info.get("dividendYield"),
             "payout_ratio": info.get("payoutRatio"),
-            # Analyst
-            "target_mean_price": info.get("targetMeanPrice"),
-            "target_high_price": info.get("targetHighPrice"),
-            "target_low_price": info.get("targetLowPrice"),
-            "recommendation": info.get("recommendationKey"),
-            "num_analysts": info.get("numberOfAnalystOpinions"),
+            # Analyst: unverified snapshot (no identity, date or target currency check).
+            # The attested market consensus is get_consensus_estimates; never cite these as it.
+            "analyst_snapshot_unverified": {k: v for k, v in {
+                "note": "NON consensus attestato: identita', data e valuta dei target non verificate; "
+                        "per il consensus usa get_consensus_estimates",
+                "target_mean_price": info.get("targetMeanPrice"),
+                "target_high_price": info.get("targetHighPrice"),
+                "target_low_price": info.get("targetLowPrice"),
+                "recommendation": info.get("recommendationKey"),
+                "num_analysts": info.get("numberOfAnalystOpinions"),
+                "quote_currency_assumed": info.get("currency"),
+            }.items() if v is not None} if any(info.get(k) is not None for k in (
+                "targetMeanPrice", "recommendationKey", "numberOfAnalystOpinions")) else None,
             # Short interest
             "short_ratio": info.get("shortRatio"),
             "short_pct_float": info.get("shortPercentOfFloat"),

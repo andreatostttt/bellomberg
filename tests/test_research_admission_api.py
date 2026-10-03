@@ -76,9 +76,10 @@ def test_normal_http_admission_start_retry_is_research_only(migrated, tmp_path, 
         assert workers == [rid] and modes == [RESEARCH_ANALYSIS_MODE] * 2
         detail = current.get_run(rid)
         assert detail['run']['analysis_mode'] == RESEARCH_ANALYSIS_MODE
-        assert detail['run']['execution_policy'] == 'trade-idea-research/2'
+        # PM 03/10/2026: new runs accept /3 (Capo MEDIUM, 128000 output tokens).
+        assert detail['run']['execution_policy'] == 'trade-idea-research/3'
         assert {role: row['reasoning_effort'] for role, row in detail['run']['models'].items()} == {
-            'specialist': 'medium', 'red_team': 'medium', 'capo': 'low', 'aux': 'medium'}
+            'specialist': 'medium', 'red_team': 'medium', 'capo': 'medium', 'aux': 'medium'}
         assert detail['run']['authorization'] == start['authorization']
         assert detail['cost']['requests'] == 0
         assert len([row for row in source_calls if row[0] == 'request']) == int(partial)

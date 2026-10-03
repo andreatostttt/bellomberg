@@ -6,12 +6,30 @@ bilanci, assunzioni e fonti, confronta il consensus di mercato quando disponibil
 e produce un giudizio indipendente; le vecchie stime Excel non sono consensus.
 
 Il comitato comprende sei desk, Red Team, confronto sulle obiezioni e Capo.
-La nuova policy `trade-idea-research/2`, salvata all'accettazione, usa MEDIUM per
-specialisti/Red Team e LOW per il Capo, con spazio massimo di output Capo di
-32768 token. Gli identificativi modello e il tetto USD scelto dal PM restano
-invariati. L'effort non garantisce un costo o una durata: ogni richiesta richiede
-la prenotazione nel budget disponibile. Le run precedenti conservano il contratto
-accettato originariamente; questa policy non riapre REY.
+Dal 03/10/2026 sera (decisione PM) le nuove run accettano la policy
+`trade-idea-research/3`: MEDIUM per specialisti, Red Team e Capo, con spazio di
+output del Capo di 128000 token (come il Capo del Consigliere) e una griglia per
+sezione nel prompt del Capo (decide, nomina i conflitti fra desk, risponde a ogni
+obiezione per ID). Il preflight verifica il tetto del Capo contro il catalogo prima
+di qualsiasi spesa. La policy `/2` (Capo LOW, 32768) resta valida per le run gia'
+accettate con essa; il contratto storico resta invariato. Gli identificativi
+modello e il tetto USD scelto dal PM sono invariati. L'effort non garantisce costo
+o durata: ogni richiesta richiede la prenotazione nel budget disponibile.
+
+Il PDF contiene, dopo la sintesi del Capo, l'appendice "Analisi integrale dei desk
+e del Red Team": i report finali di ogni analista, il Red Team e il registro
+obiezioni/risposte, senza tagli e coperti dal controllo d'integrita' del testo.
+
+Robustezza (run di ricerca): un desk che tronca, rifiuta o scrive un report
+inutilizzabile diventa una lacuna dichiarata e il comitato prosegue, purche'
+restino Fundamentals e almeno 4 desk su 6; sotto il quorum la run chiude con un
+pacchetto parziale etichettato. Le obiezioni senza risposta restano aperte e
+dichiarate. Con lacune o obiezioni aperte nessuna proposta diventa operativa.
+Un solo nuovo tentativo e' ammesso solo dopo un errore dimostrabilmente non
+fatturato (connessione mai stabilita, rifiuto 402 di ammissione OpenRouter senza
+provider); ogni altro errore resta a costo incerto e blocca la spesa. Il catalogo
+modelli e' letto al massimo una volta al minuto; se non e' raggiungibile vale lo
+snapshot accettato, dichiarato nel progresso.
 
 Il memo adotta la grafica del Consigliere: copertina con tesi e rischi, corpo
 analitico continuo, tabelle/grafici solo con dati citati, fonti in appendice.

@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections import Counter
 from hashlib import sha256
 from html import escape
+import json
 import math
 from pathlib import Path
 import re
@@ -25,7 +26,7 @@ from reportlab.platypus import (BaseDocTemplate, Frame, PageTemplate, Paragraph,
     Spacer, Table, TableStyle, PageBreak, NextPageTemplate, Flowable, KeepTogether)
 
 from bellomberg.core.trade_idea_contract import DOSSIER_KEYS
-from bellomberg.core.trade_idea_policy import EXECUTION_POLICY_V2
+from bellomberg.core.trade_idea_policy import EXECUTION_POLICY_V2, RESEARCH_POLICIES
 from bellomberg.reporting.pdf_institutional import (_register_fonts, _draw_lockup,
     OBSIDIAN, AMBER, AMBER_DEEP)
 
@@ -86,8 +87,91 @@ def _label(key, language):
     return LABELS[key][0 if language == "it" else 1]
 
 
+_SYMBOL_FONT = []
+
+
+def _symbol_font():
+    """Fallback face for symbols Arial lacks (check marks, arrows); registered once."""
+    if not _SYMBOL_FONT:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        face = None
+        for path in ("C:/Windows/Fonts/seguisym.ttf", "C:/Windows/Fonts/DejaVuSans.ttf",
+                     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                     "/Library/Fonts/Arial Unicode.ttf",
+                     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"):
+            if Path(path).is_file():
+                try:
+                    pdfmetrics.registerFont(TTFont("BBSYM", path))
+                    face = "BBSYM"
+                    break
+                except Exception:
+                    continue
+        _SYMBOL_FONT.append(face)
+    return _SYMBOL_FONT[0]
+
+
+def _missing_glyphs(value, font="LS"):
+    """Characters a registered face cannot draw (boxes in print, lost from PDF text)."""
+    from reportlab.pdfbase import pdfmetrics
+    try:
+        cmap = pdfmetrics.getFont(font).face.charToGlyph
+    except Exception:
+        return set()
+    # Astral characters (emoji) draw but do not survive PDF text extraction: never printable.
+    return {ch for ch in str(value) if ord(ch) > 0x7E and ch != "\u00ad"
+            and (ord(ch) not in cmap or ord(ch) > 0xFFFF)}
+
+
+_MD_RULE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)*\|?\s*$")
+# A list marker is "- " or "* " not followed by a number: "- 3,2%" is a negative figure.
+_MD_BULLET = re.compile(r"^\s*[-*]\s+(?![\d.,]+\s*%)(.*)$")
+_INVISIBLE = dict.fromkeys(map(ord, "\ufe0f\ufe0e\u200d"), None)
+
+
+def _printable(value):
+    """Characters no registered face can draw become a declared code, never a box."""
+    value = str(value).translate(_INVISIBLE)
+    symbol = _SYMBOL_FONT[0] if _SYMBOL_FONT else None
+    missing = _missing_glyphs(value) & (_missing_glyphs(value, symbol) if symbol else set(value))
+    for ch in missing:
+        value = value.replace(ch, f"[U+{ord(ch):04X}]")
+    return value
+
+
+def _bold_face():
+    from bellomberg.reporting.pdf_institutional import _register_fonts
+    return _register_fonts()[1]
+
+
+def _md_rules_apply(value):
+    """Separator rows belong to a multi-line pipe table; a lone "---" cell is content."""
+    value = str(value)
+    return "\n" in value and "|" in value
+
+
 def _text(value):
-    return escape(str(value)).replace("\n", "<br/>")
+    """Escape for reportlab and render the light markdown models actually emit."""
+    lines = []
+    symbol = _symbol_font()
+    value = _printable(value)
+    rules = _md_rules_apply(value)
+    bold = _bold_face()
+    for line in str(value).split("\n"):
+        if rules and _MD_RULE.match(line):
+            continue
+        heading = re.match(r"^\s*#{1,6}\s+(.*)$", line)
+        bullet = _MD_BULLET.match(line)
+        body = heading.group(1) if heading else bullet.group(1) if bullet else line
+        parts = re.split(r"\*\*(.+?)\*\*", body)
+        # The body family has no registered bold variant: name the bold face explicitly.
+        out = "".join(escape(part) if i % 2 == 0 else f'<font name="{bold}">' + escape(part) + "</font>"
+                      for i, part in enumerate(parts))
+        if symbol:
+            for ch in _missing_glyphs(out) - _missing_glyphs(out, symbol):
+                out = out.replace(ch, f'<font name="{symbol}">{ch}</font>')
+        lines.append(f'<font name="{bold}">' + out + "</font>" if heading else "\u2022 " + out if bullet else out)
+    return "<br/>".join(lines)
 
 
 def _excerpt(value, limit, language):
@@ -259,6 +343,8 @@ def _chart(section, chart, width, font):
         values = []
         for row in rows:
             raw = row[column].strip()
+            if re.fullmatch(r"[+-]?\d+,\d+", raw):  # "1250,2": one comma, no dot = decimal comma
+                raw = raw.replace(",", ".")
             if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", raw):
                 raise ValueError("Chart cells require unambiguous dot-decimal numeric values")
             value = float(raw)
@@ -1092,7 +1178,7 @@ def _render_company_memo(path, run, result, language, partial_reasons):
                           p(result.get("pm_view") or run.get("pm_view") or _label("no_view", language)),
                           p(label("Risposta del comitato", "Committee response"), "h2"), p(result.get("pm_view_response", ""))])
         for paragraph in section.get("paragraphs", []):
-            story.append(p(paragraph))
+            story.extend(_rich_flowables(paragraph, styles, width))
         if key == "executive":
             group(label("Elementi a favore", "Supporting evidence"), result.get("pros"))
             group(label("Elementi contrari", "Counterarguments"), result.get("cons"))
@@ -1147,6 +1233,17 @@ def _render_company_memo(path, run, result, language, partial_reasons):
                     else:
                         story.append(KeepTogether([drawing, p(f"{table['title']} | {table['unit']} | {table['period']} | {table['source']}", "small")]))
 
+    annex = _annex_blocks(run.get("desk_annex"), language)
+    if annex:
+        title = ("Complete desk and Red Team analysis" if language != "it" else
+                 "Analisi integrale dei desk e del Red Team")
+        story.extend([PageBreak(), _Section("annex", title), _SectionTitle(title, styles["h1"], width),
+            p(("Full final reports the Capo deliberated on; nothing is cut." if language != "it" else
+               "Testo integrale dei report finali su cui ha deliberato il Capo; nessun taglio."), "small")])
+        for _, heading, block in annex:
+            if heading:
+                story.append(p(heading, "h2"))
+            story.extend(_rich_flowables(block, styles, width))
     story.extend([PageBreak(), _Section("sources", _label("sources", language)),
         _SectionTitle(_label("sources", language), styles["h1"], width), p(_label("scope", language), "small")])
     for evidence in result.get("evidence", []):
@@ -1178,6 +1275,139 @@ def _render_company_memo(path, run, result, language, partial_reasons):
     return doc.section_pages
 
 
+def _rich_flowables(text, styles, width):
+    """Paragraphs for prose, a real table for a run of markdown pipe rows."""
+    lines, out, prose, rows = str(text).split("\n"), [], [], []
+
+    def flush_prose():
+        if prose and "\n".join(prose).strip():
+            out.append(Paragraph(_text("\n".join(prose)), styles["body"]))
+        prose.clear()
+
+    def flush_rows():
+        cells = [[cell.strip() for cell in row.strip().strip("|").split("|")] for row in rows
+                 if not _MD_RULE.match(row)]
+        if len(cells) >= 2:
+            count = max(len(row) for row in cells)
+            cells = [row + [""] * (count - len(row)) for row in cells]
+            data = [[Paragraph(_text(cell), styles["headcell" if index == 0 else "cell"]) for cell in row]
+                    for index, row in enumerate(cells)]
+            table = Table(data, colWidths=[width / count] * count, repeatRows=1, splitByRow=1, hAlign="LEFT")
+            table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), OBSIDIAN),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [PAPER, PALE]), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5), ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("LINEBELOW", (0, 0), (-1, 0), .8, AMBER)]))
+            out.extend([table, Spacer(1, 4)])
+        elif rows:
+            prose.extend(row for row in rows if not _MD_RULE.match(row))  # a lone separator is markup
+            flush_prose()
+        rows.clear()
+
+    for line in lines:
+        if line.strip().startswith("|") and line.strip().count("|") >= 2:
+            flush_prose()
+            rows.append(line)
+        else:
+            if rows:
+                flush_rows()
+            prose.append(line)
+    if rows:
+        flush_rows()
+    flush_prose()
+    return out
+
+
+def _integrity_pieces(text):
+    """Prose runs and individual table cells: wrapped cells interleave in extracted text."""
+    pieces, prose = [], []
+    for line in str(text).split("\n"):
+        if line.strip().startswith("|") and line.strip().count("|") >= 2:
+            if prose and "\n".join(prose).strip():
+                pieces.append("\n".join(prose))
+            prose = []
+            if not _MD_RULE.match(line):
+                pieces.extend(cell.strip() for cell in line.strip().strip("|").split("|") if cell.strip())
+        else:
+            prose.append(line)
+    if prose and "\n".join(prose).strip():
+        pieces.append("\n".join(prose))
+    return pieces or [str(text)]
+
+
+def _annex_blocks(annex, language):
+    """(fragment name, heading or None, text) in print order; the same list feeds the
+    renderer and the integrity check, so every printed annex block is verified."""
+    if not isinstance(annex, dict):
+        return []
+    english = language != "it"
+    if annex.get("unavailable"):
+        return [("annex.unavailable", "Annex" if english else "Appendice",
+                 ("[KO] Desk annex not available: " if english else "[KO] Appendice dei desk non disponibile: ")
+                 + str(annex["unavailable"]))]
+    names = {"macro": "Macro", "eventdesk": "Event desk", "crypto": "Crypto", "fundamentals": "Fundamentals",
+             "quant": "Quant", "options": "Options" if english else "Opzioni"}
+    states = {"answered": "answered" if english else "risposta", "conceded": "conceded" if english else "concessa",
+              "open": "open" if english else "aperta"}
+    out = []
+    for desk in annex.get("desks") or []:
+        name = str(desk.get("desk"))
+        if desk.get("status") != "ready":
+            out.append((f"annex.{name}.missing", "Desk " + names.get(name, name),
+                        ("[KO] Final report not available for this desk." if english else
+                         "[KO] Report finale non disponibile per questo desk.")))
+            continue
+        heading = "Desk " + names.get(name, name) + " — " + (
+            ("final round" if english else "round finale") if str(desk.get("round")) == "2"
+            else ("round " + str(desk.get("round"))))
+        blocks = [block.strip() for block in re.split(r"\n\s*\n", str(desk.get("text") or "")) if block.strip()]
+        for index, block in enumerate(blocks):
+            out.append((f"annex.{name}.{index}", heading if index == 0 else None, block))
+    red = str(annex.get("red_team") or "").strip()
+    red_lines = []
+    if red:
+        try:
+            parsed = json.loads(red)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            # Objections and decisive questions are printed once, in the ledger and question
+            # list below; the remaining review fields are printed as readable labelled prose.
+            def walk(value, label=""):
+                if isinstance(value, dict):
+                    for key, item in value.items():
+                        if not label and key in ("objections", "decisive_questions"):
+                            continue
+                        walk(item, f"{label} / {key}" if label else str(key))
+                elif isinstance(value, list):
+                    for item in value:
+                        walk(item, label)
+                elif value not in (None, "") and not isinstance(value, bool):
+                    red_lines.append(f"{label.replace('_', ' ').capitalize()}: {value}")
+            walk(parsed)
+            if isinstance(parsed, dict) and not annex.get("ledger") and parsed.get("objections"):
+                walk({"objection": parsed["objections"]})
+        else:
+            red_lines = [block.strip() for block in re.split(r"\n\s*\n", red) if block.strip()]
+    for index, line in enumerate(red_lines):
+        out.append((f"annex.red_team.{index}", "Red Team" if index == 0 else None, line))
+    for index, row in enumerate(annex.get("ledger") or []):
+        head = " · ".join([*(str(row.get(key)) for key in ("id", "desk", "category") if row.get(key)),
+                           *((("material" if english else "materiale"),) if row.get("material") else ())])
+        text = (head + ("\n" if head else "") + str(row.get("objection") or "")
+                + (("\nRequested change: " if english else "\nModifica richiesta: ") + row["requested_change"]
+                   if row.get("requested_change") else "")
+                + ("\n" + ("Desk reply" if english else "Risposta del desk")
+                   + f" ({states.get(row.get('state'), row.get('state') or 'n.d.')}): "
+                   + (row.get("response") or "n.d.")))
+        out.append((f"annex.ledger.{index}",
+                    ("Objection ledger" if english else "Registro obiezioni e risposte") if index == 0 else None, text))
+    for index, question in enumerate(annex.get("decisive_questions") or []):
+        out.append((f"annex.question.{index}",
+                    ("Decisive questions" if english else "Domande decisive") if index == 0 else None, question))
+    return out
+
+
 def _content_fragments(result):
     """Original analytic claims and citations which must survive PDF pagination."""
     for name in ("summary", "pm_view_response", "pm_view"):
@@ -1188,7 +1418,10 @@ def _content_fragments(result):
             yield f"{name}.{index}", value
     for section in result.get("dossier", []):
         for index, value in enumerate(section.get("paragraphs", [])):
-            yield f"{section['key']}.{index}", value
+            pieces = _integrity_pieces(value)
+            for piece_index, piece in enumerate(pieces):
+                yield (f"{section['key']}.{index}" if len(pieces) == 1
+                       else f"{section['key']}.{index}.{piece_index}"), piece
         for index, table in enumerate(section.get("tables", [])):
             for value in [table["title"], table["source"], table["unit"], table["period"], *table["columns"],
                           *(cell for row in table["rows"] for cell in row)]:
@@ -1206,11 +1439,23 @@ def _content_fragments(result):
             yield "proposal."+field, result["proposal"][field]
 
 
-def _normalized_text(value):
+def _normalized_text(value, rendered=False):
+    # Markdown markers in the ORIGINAL become typography (bold, headings, bullets, tables).
+    # The extracted PDF text only loses the drawn bullet: a prose dash that wraps to the
+    # start of a printed line is content, not a marker. Pipes never carry meaning here.
+    value = _printable(value)
+    if rendered:
+        value = re.sub(r"(?m)^\s*\u2022\s+", "", value)
+    else:
+        rules = _md_rules_apply(value)
+        value = "\n".join(line for line in value.split("\n") if not (rules and _MD_RULE.match(line)))
+        value = re.sub(r"(?m)^\s*(?:#{1,6}\s+|[-*\u2022]\s+(?![\d.,]+\s*%))", "", value).replace("**", "")
+    value = value.replace("|", "")
     return re.sub(r"\s+", "", unicodedata.normalize("NFKC", value).replace("\u00ad", "")).casefold()
 
 
-def _inspect_company_memo(path, result, section_pages, language):
+def _inspect_company_memo(path, result, section_pages, language, execution_policy=EXECUTION_POLICY_V2,
+                          annex=None):
     reader = PdfReader(str(path))
     pages = [page.extract_text() or "" for page in reader.pages]
     # Page furniture and repeated table headings can interrupt a split paragraph/cell.
@@ -1221,8 +1466,11 @@ def _inspect_company_memo(path, result, section_pages, language):
         if line.strip() not in furniture | table_heads and not re.fullmatch(r"(?:Pagina|Page) \d+", line.strip())
         and not line.startswith("TRADE IDEA | "))
     # Headers themselves are also verified against the unfiltered document.
-    normalized, raw = _normalized_text(body), _normalized_text("\n".join(pages))
-    lost = sorted({name for name, value in _content_fragments(result)
+    normalized, raw = _normalized_text(body, rendered=True), _normalized_text("\n".join(pages), rendered=True)
+    annex_fragments = [(name if len(pieces) == 1 else f"{name}.{index}", piece)
+                       for name, _, text in _annex_blocks(annex, language)
+                       for pieces in [_integrity_pieces(text)] for index, piece in enumerate(pieces)]
+    lost = sorted({name for name, value in [*_content_fragments(result), *annex_fragments]
                    if _normalized_text(value) not in normalized and _normalized_text(value) not in raw})
     sections = result.get("dossier", [])
     keys = [section["key"] for section in sections]
@@ -1231,14 +1479,52 @@ def _inspect_company_memo(path, result, section_pages, language):
     placeholder = re.compile(r"\s*(?:\[?todo\]?|tbd|n\.?\s?d\.?|da completare|analisi da completare|"
         r"dato non disponibile|dati non disponibili|analisi non disponibile|to be completed|analysis pending|"
         r"not available|placeholder|\.\.\.|…)[.!\s]*", re.I)
+    # Authoring markers are never analysis, wherever they appear in a sentence.
+    # ("da completare" alone stays a full-paragraph placeholder: "lavori da completare" is business prose.)
+    # Only unambiguous authoring forms: "data TBD dalla societa'" is legitimate prose.
+    marker = re.compile(r"\bTODO\b|\bFIXME\b|(?i:lorem ipsum)|(?i:\[(?:todo|tbd|inserire|insert)[^\]]*\])"
+        r"|(?i:<(?:inserire|insert)[^>]*>)|(?im:^\s*(?:todo|tbd)\s*:)")
+    # An unpunctuated paragraph ending on a conjunction/article/preposition is a cut.
+    # Single letters are excluded: "Serie A", "classe E" are legitimate endings.
+    # Lower-case and not after a dot: "SHOP.TO", "MA" or "LE" tickers are not cut words.
+    dangling = re.compile(r"(?<![.\w])(?:ed|ma|il|lo|la|gli|le|un|una|di|del|della|che|per|con|tra|fra|"
+        r"and|or|but|the|an|of|to|for|with|which)\s*$")
     def unfinished_text(value):
         value = re.sub(r"\[src:[^\]]*\]", "", str(value), flags=re.I).strip()
-        return not value or bool(placeholder.fullmatch(value))
+        return not value or bool(placeholder.fullmatch(value)) or bool(marker.search(value))
+    def cut_text(value):
+        return bool(dangling.search(re.sub(r"\[src:[^\]]*\]", "", str(value), flags=re.I).strip()))
     unfinished = [s["key"] for s in sections if any(unfinished_text(p) for p in s.get("paragraphs", []))]
     unfinished.extend(field for field in ("summary", "pm_view_response") if unfinished_text(result.get(field, "")))
     for index, objection in enumerate(result.get("objections", [])):
         if unfinished_text(objection.get("objection", "")) or unfinished_text(objection.get("response", "")):
             unfinished.append(f"objections.{index}")
+    # Lists, scenarios and proposal are printed (cover included): same rule as the prose.
+    prose = {"summary", "pm_view_response", "pm_view", "destination.reason", "proposal.rationale"}
+    seen_fields = set(unfinished)
+    for name, value in _content_fragments(result):
+        root = name.split(".")[0]
+        # Dossier paragraphs were checked above; "catalysts"/"scenarios" are also list fields.
+        if root in {"evidence", "objections"} or ".table." in name:
+            continue
+        if name not in prose and not re.fullmatch(r"(?:pros|cons|risks|catalysts|invalidation|data_gaps|"
+                r"review_conditions|decisive_questions)\.\d+|scenarios\.\d+\.analysis|"
+                r"history_review\.\d+\.response|proposal\.timing", name):
+            continue
+        if unfinished_text(value) and name not in seen_fields:
+            unfinished.append(name)
+            seen_fields.add(name)
+    truncated = [f"{s['key']}.{i}" for s in sections for i, p in enumerate(s.get("paragraphs", [])) if cut_text(p)]
+    truncated.extend(field for field in ("summary",) if cut_text(result.get(field, "")))
+    sentences = Counter(
+        _normalized_text(sentence) for p in [*(p for s in sections for p in s.get("paragraphs", [])),
+                                              str(result.get("summary") or "")]
+        for sentence in re.split(r"(?<=[.!?])\s+", re.sub(r"\[src:[^\]]*\]", "", p, flags=re.I))
+        if len(_normalized_text(sentence)) >= 80)
+    recycled = sum(count - 1 for count in sentences.values() if count > 2)
+    unprintable = sorted({f"U+{ord(ch):04X}" for _, value in [*_content_fragments(result), *annex_fragments]
+                          for ch in _missing_glyphs(value) & (_missing_glyphs(value, _symbol_font())
+                                                               if _symbol_font() else set(str(value)))})
     paragraphs = [p for s in sections for p in s.get("paragraphs", [])]
     same_sections = Counter(_normalized_text("\n".join(s.get("paragraphs", []))) for s in sections)
     repeated = any(text and count > 1 for text, count in same_sections.items())
@@ -1248,27 +1534,35 @@ def _inspect_company_memo(path, result, section_pages, language):
     for values, it, en in ((missing, "Sezioni mancanti", "Missing sections"),
                            (empty, "Sezioni vuote", "Empty sections"),
                            (unfinished, "Sezioni da completare", "Unfinished sections"),
+                           (truncated, "Testo interrotto a meta' frase", "Text cut mid-sentence"),
                            (lost, "Testo originale non integro nel PDF", "Original text missing from PDF")):
         if values:
             reasons.append((it if language == "it" else en) + ": " + ", ".join(values))
+    if recycled:
+        reasons.append(f"Frasi lunghe ripetute piu' di due volte: {recycled}" if language == "it" else
+                       f"Long sentences repeated more than twice: {recycled}")
     if repeated or len(keys) != len(set(keys)):
         reasons.append("Sezioni ripetute non costituiscono copertura analitica" if language == "it" else
                        "Repeated sections do not constitute analytical coverage")
-    source_page = section_pages.get("sources", len(pages)+1)
+    # The verbatim annex is desk material, not the Capo's analytical pages.
+    source_page = min(section_pages.get("annex", len(pages)+1), section_pages.get("sources", len(pages)+1))
     first = min((section_pages[k] for k in DOSSIER_KEYS if k in section_pages), default=source_page)
     counts = [{"page": i, "words": len(re.findall(r"\b\w+\b", text)), "analytical": first <= i < source_page}
               for i, text in enumerate(pages, 1)]
-    return {"status": "partial" if reasons else "ready", "execution_policy": EXECUTION_POLICY_V2,
+    return {"status": "partial" if reasons else "ready", "execution_policy": execution_policy,
         "total_pages": len(pages), "analytical_pages": sum(page["analytical"] for page in counts),
         "analytical_words": sum(len(re.findall(r"\b\w+\b", p)) for p in paragraphs),
         "pages": counts, "section_pages": section_pages, "reasons": reasons,
-        "content_integrity": "incomplete" if lost else "complete", "integrity_missing": lost}
+        "content_integrity": "incomplete" if lost else "complete", "integrity_missing": lost,
+        "notices": ([("Caratteri non stampabili resi come codice: " if language == "it" else
+                      "Unprintable characters printed as code points: ") + ", ".join(unprintable)]
+                    if unprintable else [])}
 
 
-def inspect_research_pdf(path, result, section_pages, *, language="it", execution_policy=None):
+def inspect_research_pdf(path, result, section_pages, *, language="it", execution_policy=None, annex=None):
     """Measure actual selectable text; cover/bibliography/PM quotes do not qualify."""
-    if execution_policy == EXECUTION_POLICY_V2:
-        return _inspect_company_memo(path, result, section_pages, language)
+    if execution_policy in RESEARCH_POLICIES:
+        return _inspect_company_memo(path, result, section_pages, language, execution_policy, annex)
     if execution_policy is not None:
         raise ValueError("Unknown Trade Idea report execution policy")
     reader = PdfReader(str(path))
@@ -1311,13 +1605,15 @@ def build_trade_idea_report(run, result, *, output_path, valuations=(), language
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     policy = run.get("execution_policy")
-    render = (lambda reasons: _render_company_memo(path, run, result, language, reasons)) if policy == EXECUTION_POLICY_V2 else (
+    render = (lambda reasons: _render_company_memo(path, run, result, language, reasons)) if policy in RESEARCH_POLICIES else (
         lambda reasons: _render(path, run, result, valuations, language, reasons))
     sections = render([])
-    quality = inspect_research_pdf(path, result, sections, language=language, execution_policy=policy)
+    quality = inspect_research_pdf(path, result, sections, language=language, execution_policy=policy,
+                                   annex=run.get("desk_annex"))
     if quality["status"] != "ready":
         sections = render(quality["reasons"])
-        quality = inspect_research_pdf(path, result, sections, language=language, execution_policy=policy)
+        quality = inspect_research_pdf(path, result, sections, language=language, execution_policy=policy,
+                                   annex=run.get("desk_annex"))
     return {"path": str(path.resolve()), "sha256": sha256(path.read_bytes()).hexdigest(),
             "quality": quality, "status": quality["status"], "reason": "; ".join(quality["reasons"])}
 

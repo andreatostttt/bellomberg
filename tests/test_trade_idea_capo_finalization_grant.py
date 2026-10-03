@@ -10,15 +10,20 @@ from test_trade_idea_store import db_path, migrated, request, store
 from test_trade_idea_run_controls_api import admission
 
 
-def parent_case(path, fault=None):
+def parent_case(path, fault=None, v2=False):
     current, payload = store(path), request()
     payload['budget_limit_usd'] = '15'
+    if v2:
+        payload['execution_policy'] = 'trade-idea-research/2'
+        for role, selected in payload['models'].items():
+            selected['reasoning_effort'] = 'low' if role == 'capo' else 'medium'
     payload['analysis_mode'] = payload['source_qualification']['analysis_mode'] = RESEARCH_ANALYSIS_MODE
     payload['authorization'].update(activities=['committee'], max_revision_rounds=0)
     parent = current.create_run(payload, idempotency_key='capo-source')['run']['id']
     token = current.claim_run(parent)
     model = payload['models']['capo']['model']
-    contract = {key: payload[key] for key in ('ticker', 'language', 'view_text', 'models', 'analysis_mode')}
+    contract = {key: payload[key] for key in ('ticker', 'language', 'view_text', 'models', 'analysis_mode')
+                + (('execution_policy',) if v2 else ())}
     contract.update(version=1, source_fingerprint=payload['source_qualification']['fingerprint'])
     checkpoint = {'version': 1, 'contract': contract, 'data': {'macro': {'2': 'Original report'}},
                   'specialist_checkpoints': {}}
@@ -184,3 +189,15 @@ def test_api_requires_explicit_cost_consent_and_passes_only_the_selected_request
             'authorize_new_requests': True, 'recover_truncated_request_id': None,
             'capo_finalization_request_id': 'failed-capo'})]
         assert workers == ['final-only-child']
+
+
+
+def test_v2_finalization_grant_never_has_less_room_than_the_accepted_capo_cap(migrated):
+    from test_trade_idea_paid_capo_checkpoint import case as v2_case
+    current, parent, _, body, _ = v2_case(migrated, public=' ', stop_reason='max_tokens')
+    assert body['max_tokens'] == 32768
+    child = current.create_continuation(parent, idempotency_key='v2-grant', authorize_new_requests=True,
+                                        capo_finalization_request_id='original-paid-capo')
+    accepted = current.accepted_capo_finalization(child['run']['id'])
+    assert accepted['max_tokens'] == 32768
+    assert accepted['thinking'] == {'type': 'effort', 'effort': 'low'}

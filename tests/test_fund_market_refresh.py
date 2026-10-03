@@ -12,6 +12,17 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _alias_store_present(tmp_path, monkeypatch):
+    # The Fund refresher resolves Yahoo symbols like the price updater; an absent
+    # private alias store is a declared failure, so tests provide an empty valid one.
+    import bellomberg.storage.negozi_privati as stores
+    path = tmp_path / "alias_fonti.json"
+    path.write_text('{"yfinance": {}}', encoding="utf-8")
+    monkeypatch.setattr(stores, "PERCORSO_ALIAS", str(path))
+
+
+
 NOW = datetime(2026, 10, 3, 12, tzinfo=timezone.utc)
 MODE = 'fundamentals_research_v1'
 
@@ -334,3 +345,44 @@ def test_new_full_details_do_not_regress_newer_periodic_targets(market):
     saved = persist_market_observation('ALPHA.X', cache_dir=market.cache, consensus=full)
     assert saved['price_targets']['mean'] == 20. and saved['acquired_at'] == newer['acquired_at']
     assert saved['eps_estimates'] == full['eps_estimates'] and saved['details_acquired_at'] == full['details_acquired_at']
+
+
+def test_provider_symbol_uses_price_updater_aliases_and_rejects_raw_namesake(market, monkeypatch, tmp_path):
+    import bellomberg.storage.negozi_privati as stores
+    alias = tmp_path / "alias_with_fra.json"
+    alias.write_text('{"yfinance": {"ZETA.FRA": "ZETA.DE"}}', encoding="utf-8")
+    monkeypatch.setattr(stores, "PERCORSO_ALIAS", str(alias))
+    with sqlite3.connect(market.db) as conn:
+        conn.execute('DELETE FROM positions'); conn.execute('DELETE FROM favorite_companies')
+        conn.execute('DELETE FROM trade_idea_runs')
+        conn.executemany('INSERT INTO positions VALUES(?,?,?)', [('BTC', 1, 1), ('ZETA.FRA', 1, 3)])
+    result = market.module.refresh_followed_market_data(market.db, cache_dir=market.cache, now=NOW)
+    asked = {ticker for ticker, endpoint in market.calls if endpoint == 'info'}
+    assert asked == {'BTC-USD', 'ZETA.DE'}, asked
+    for book, provider in (('BTC', 'BTC-USD'), ('ZETA.FRA', 'ZETA.DE')):
+        saved = _read(market.cache, book)
+        assert saved['identity_symbol'] == book and saved['provider_symbol'] == provider
+        assert saved['quote']['provider_symbol'] == provider
+    # A provider answering with the raw book symbol (e.g. an ETF named BTC) is not BTC-USD.
+    market.calls.clear(); market.faults['symbol'] = 'BTC'
+    later = market.module.refresh_followed_market_data(
+        market.db, cache_dir=market.cache, now=NOW + timedelta(days=2))
+    assert any(row.get('ticker') == 'BTC' for row in later['errors'])
+    assert _read(market.cache, 'BTC')['quote']['provider_symbol'] == 'BTC-USD'
+
+
+def test_missing_alias_store_is_a_declared_failure_not_the_raw_symbol(market, monkeypatch, tmp_path):
+    import bellomberg.storage.negozi_privati as stores
+    monkeypatch.setattr(stores, "PERCORSO_ALIAS", str(tmp_path / "absent.json"))
+    result = market.module.refresh_followed_market_data(market.db, cache_dir=market.cache, now=NOW)
+    assert not market.calls
+    assert result['counts']['failures'] == result['universe_count'] == 4
+    assert all('alias' in (row.get('error') or '').lower() for row in result['errors'] if row.get('ticker'))
+
+
+def test_notices_alone_do_not_turn_a_successful_batch_into_a_failure(market):
+    with sqlite3.connect(market.db) as conn:
+        conn.execute("INSERT INTO favorite_companies VALUES('Europe Defense basket')")
+    result = market.module.refresh_followed_market_data(market.db, cache_dir=market.cache, now=NOW)
+    assert any(notice.startswith('invalid_exact_ticker:') for notice in result['notices'])
+    assert not result['errors'] and result['status'] == 'completed'

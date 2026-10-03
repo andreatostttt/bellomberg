@@ -25,6 +25,7 @@ export const fundamentals = {
   "researchRefreshStopped": "Aggiornamento automatico fermo",
   "researchRefreshRunning": "Aggiornamento dati in corso",
   "researchRefreshActive": "Aggiornamento automatico attivo",
+  "researchRefreshNotices": "Avvisi dell'ultimo ciclo (dettaglio al passaggio del mouse)",
   "researchRefreshWaiting": "Limite temporaneo del fornitore: aggiornamento in attesa",
   "researchNextRetry": "Prossimo tentativo",
   "researchLastCycle": "Ultimo controllo del servizio",

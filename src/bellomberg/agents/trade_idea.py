@@ -17,8 +17,9 @@ from urllib.request import Request, urlopen
 from bellomberg.core.llm_client import OpenRouterClient, costruisci_corpo
 from bellomberg.core.research_analysis import (RESEARCH_ANALYSIS_MODE, is_research_mode,
     seal_research_thesis, research_reference, research_context)
-from bellomberg.core.trade_idea_policy import (EXECUTION_POLICY_V2, execution_policy,
-    role_effort, role_thinking, output_cap as policy_output_cap)
+from bellomberg.core.trade_idea_policy import (RESEARCH_POLICIES, EXECUTION_POLICY_V3, execution_policy,
+    role_effort, role_thinking, output_cap as policy_output_cap,
+    report_quality_sufficient as _quality_sufficient)
 
 
 MODEL_IDS = {
@@ -249,8 +250,10 @@ def fetch_model_catalog(*, opener=urlopen, use_cache=True) -> dict:
         params = row.get("supported_parameters") or []
         efforts = (row.get("reasoning") or {}).get("supported_efforts") or []
         required = ("reasoning", "reasoning_effort", "max_tokens")
-        if "max" not in efforts or any(item not in params for item in required):
-            raise ValueError("ragionamento max non confermato nel catalogo: " + slug)
+        # Each accepted policy checks its own effort against supported_efforts; "max" is
+        # required only by the historical contract (see reasoning_effort below).
+        if not efforts or any(item not in params for item in required):
+            raise ValueError("ragionamento non confermato nel catalogo: " + slug)
         if role in ("specialist", "red_team") and any(item not in params for item in ("tools", "tool_choice")):
             raise ValueError("tool calling non confermato nel catalogo: " + slug)
         if role in ("capo", "red_team", "aux") and "response_format" not in params:
@@ -270,7 +273,8 @@ def fetch_model_catalog(*, opener=urlopen, use_cache=True) -> dict:
             prices[key] = str(val)
         selected[role] = {"id": slug, "context_length": context,
                           "max_completion_tokens": max_completion, "pricing": prices,
-                          "reasoning_effort": "max", "tools": role in ("specialist", "red_team"),
+                          "reasoning_effort": "max" if "max" in efforts else None,
+                          "tools": role in ("specialist", "red_team"),
                           "supported_efforts": list(efforts),
                           "structured_output": "response_format" in params}
     snapshot = {"checked_at": datetime.now(timezone.utc).isoformat(), "models": selected,
@@ -347,6 +351,15 @@ def preflight_trade_idea(ticker, pm_view="", view_source="manual", budget_limit_
             for row in models:
                 if row['reasoning_effort'] not in catalog['models'][row['role']].get('supported_efforts', []):
                     raise ValueError('Effort richiesto non confermato dal catalogo: ' + row['role'])
+            # Checked before any spending: a Capo cap above the provider maximum would
+            # otherwise surface only at the Capo call, after desks and Red Team are paid.
+            capo_cap = policy_output_cap(policy, 'capo', 0)
+            capo_row = catalog['models']['capo']
+            if (not isinstance(capo_row.get('max_completion_tokens'), int)
+                    or capo_cap > capo_row['max_completion_tokens']
+                    or capo_cap >= int(capo_row.get('context_length') or 0)):
+                raise ValueError('Tetto di output del Capo non supportato dal catalogo: '
+                                 + str(capo_cap) + ' > ' + str(capo_row.get('max_completion_tokens')))
         prices = {role: catalog["models"][role]["pricing"] for role in MODEL_IDS}
     except Exception as exc:
         catalog, models, prices = None, [], {}
@@ -466,7 +479,9 @@ class TradeIdeaBudgetGate:
         self.run_id = run_id
         self.worker_token = worker_token
         self.catalog_snapshot = catalog_snapshot
-        self.catalog_fetcher = catalog_fetcher or (lambda: fetch_model_catalog(use_cache=False))
+        # One live catalog read per minute at most; the accepted snapshot prices every reservation.
+        self.catalog_fetcher = catalog_fetcher or (lambda: fetch_model_catalog(use_cache=True))
+        self.catalog_notices = []
         self._requests = {}
 
     def wrap_client(self, client, *, role):
@@ -613,7 +628,19 @@ class TradeIdeaBudgetGate:
         expected = model_for_role(expected_role)
         if model != expected:
             raise ValueError("modello fuori mapping Trade Idea: " + str(model))
-        live = self.catalog_fetcher()
+        try:
+            live = self.catalog_fetcher()
+        except OSError as exc:
+            from urllib.error import HTTPError
+            if isinstance(exc, HTTPError):
+                raise  # the catalog answered: a withdrawn or changed model must be visible
+            # A network blip on the free catalog must not end a paid run: the accepted
+            # snapshot is the binding contract (price, effort, caps) and is declared here.
+            # A changed catalog content (ValueError) still blocks.
+            live = self.catalog_snapshot
+            self.catalog_notices.append({"at": datetime.now(timezone.utc).isoformat(), "role": role,
+                "notice": "catalogo live non raggiungibile, usato lo snapshot accettato: "
+                          + type(exc).__name__ + ": " + str(exc)[:200]})
         quoted = self.catalog_snapshot["models"][expected_role]
         live_model = live["models"][expected_role]
         if live_model["id"] != model:
@@ -630,7 +657,11 @@ class TradeIdeaBudgetGate:
         pricing = quoted["pricing"]
         context = quoted["context_length"]
         cap = kwargs.get("max_tokens")
-        if (execution_policy(accepted_run) == EXECUTION_POLICY_V2 and expected_role == 'capo'
+        if finalization is not None:
+            # An explicit finalization grant carries its own authorized cap.
+            if cap != finalization.get("max_tokens"):
+                raise ValueError('Capo output cap differs from its explicit finalization grant')
+        elif (execution_policy(accepted_run) in RESEARCH_POLICIES and expected_role == 'capo'
                 and cap != policy_output_cap(accepted_run, 'capo', 128000)):
             raise ValueError('Capo output cap differs from the accepted execution policy')
         if (type(cap) is not int or cap <= 0
@@ -672,7 +703,7 @@ class TradeIdeaBudgetGate:
         accepted = self.store.reserve_cost(self.run_id, request_id, recorded_role, model, str(reserve),
             request_sha256=fingerprint, worker_token=self.worker_token,
             **({'capo_request_body': body} if recorded_role == 'capo'
-               and execution_policy(accepted_run) == EXECUTION_POLICY_V2 else {}))
+               and execution_policy(accepted_run) in RESEARCH_POLICIES else {}))
         if accepted is not True:
             raise RuntimeError("prenotazione LLM duplicata o rifiutata: nessuna richiesta inviata")
         self._requests[request_id] = {"role": role, "request_sha256": fingerprint,
@@ -715,6 +746,23 @@ class TradeIdeaBudgetGate:
                 return _restore_provider_message(payload)
         return None
 
+    def _durable(self, write, *args, **kwargs):
+        """Persist a settlement of an already-paid response; retry the WRITE, never the call.
+
+        A busy SQLite (parallel desks) must not turn a received paid response into
+        an unrecoverable unknown. Only lock/busy errors are retried.
+        """
+        import sqlite3
+        import time
+        for attempt in range(6):
+            try:
+                return write(*args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                text = str(exc).lower()
+                if attempt == 5 or not ("locked" in text or "busy" in text):
+                    raise
+                time.sleep(0.5 * 2 ** attempt)
+
     def _reconcile(self, request_id, response, expected_model):
         response.request_id = request_id
         usage = getattr(response, "usage", None)
@@ -727,26 +775,26 @@ class TradeIdeaBudgetGate:
                    "response": payload, "response_sha256": _plan_digest(payload)}
         if (not isinstance(getattr(response, "id", None), str)
                 or not response.id.strip() or getattr(response, "model", None) != expected_model):
-            self.store.mark_cost_unknown(self.run_id, request_id,
+            self._durable(self.store.mark_cost_unknown, self.run_id, request_id,
                 reason="identita' risposta provider assente o modello diverso da quello accettato", receipt=receipt)
             raise RuntimeError("identita' modello/risposta provider non attestabile")
         actual = getattr(usage, "cost_usd", None)
         if isinstance(actual, bool) or actual is None:
-            self.store.mark_cost_unknown(self.run_id, request_id,
+            self._durable(self.store.mark_cost_unknown, self.run_id, request_id,
                                          reason="provider usage.cost_usd assente", receipt=receipt)
             raise RuntimeError("costo provider non disponibile; nuove richieste Trade Idea bloccate")
         try:
             amount = Decimal(str(actual))
         except InvalidOperation as exc:
-            self.store.mark_cost_unknown(self.run_id, request_id,
+            self._durable(self.store.mark_cost_unknown, self.run_id, request_id,
                                          reason="provider usage.cost_usd invalido", receipt=receipt)
             raise RuntimeError("costo provider invalido") from exc
         if not amount.is_finite() or amount < 0:
-            self.store.mark_cost_unknown(self.run_id, request_id,
+            self._durable(self.store.mark_cost_unknown, self.run_id, request_id,
                                          reason="provider usage.cost_usd non finito o negativo", receipt=receipt)
             raise RuntimeError("costo provider invalido")
         details = usage.to_dict() if hasattr(usage, "to_dict") else {"cost_usd": str(amount)}
-        self.store.reconcile_cost(self.run_id, request_id, charged_usd=str(amount),
+        self._durable(self.store.reconcile_cost, self.run_id, request_id, charged_usd=str(amount),
                                   usage=details, receipt=receipt)
 
     def _unknown(self, request_id, exc):
@@ -756,7 +804,7 @@ class TradeIdeaBudgetGate:
                    "partial_response_sha256": _plan_digest(partial),
                    "response_id": partial.get("id"), "model": partial.get("model"),
                    "status_code": getattr(exc, "status_code", None)}
-        self.store.mark_cost_unknown(self.run_id, request_id,
+        self._durable(self.store.mark_cost_unknown, self.run_id, request_id,
                                      reason=type(exc).__name__ + ": " + str(exc)[:250], receipt=receipt)
         request = self._requests.get(request_id, {})
         failure = {"message": type(exc).__name__ + ": " + str(exc)[:2800],
@@ -862,6 +910,42 @@ def _restore_provider_message(payload):
     return response
 
 
+def _provably_unbilled(exc):
+    """Seconds to wait before ONE retry when the failure provably never reached a model, else None.
+
+    Only (a) a connection that was never established and (b) OpenRouter's documented
+    pre-provider admission rejection (HTTP 402 in_flight_budget_exhausted, provider_name
+    null). Timeouts after sending, 5xx, 429 and mid-stream errors may be billed and stay
+    unknown (run blocked until reconciled).
+    """
+    if getattr(exc, "partial_response", None):
+        return None  # something was generated: possibly billed
+    if getattr(exc, "transport_phase", None) == "connect":
+        return 5
+    try:
+        from bellomberg.core.preprovider_receipt import _failure_metadata
+        metadata = _failure_metadata({"exception_type": type(exc).__name__,
+                                      "message": type(exc).__name__ + ": " + str(exc)})
+    except Exception:
+        return None
+    retry_after = (metadata.get("headers") or {}).get("Retry-After")
+    return min(int(retry_after), 120) if retry_after else 30
+
+
+def _settle_unbilled_or_unknown(gate, request_id, exc):
+    """True when the reservation was released as provably unbilled (caller may retry once)."""
+    wait = _provably_unbilled(exc)
+    if wait is None:
+        gate._unknown(request_id, exc)
+        return None
+    gate._durable(gate.store.release_cost, gate.run_id, request_id,
+                  reason="provably unbilled pre-provider failure: " + type(exc).__name__ + ": " + str(exc)[:300],
+                  receipt={"request_sha256": gate._requests.get(request_id, {}).get("request_sha256"),
+                           "billable": False, "unbilled_evidence": type(exc).__name__ + ": " + str(exc)[:600],
+                           "transport_phase": getattr(exc, "transport_phase", None)})
+    return wait
+
+
 class _BudgetedClient:
     def __init__(self, inner, gate, role):
         self.messages = _BudgetedMessages(inner.messages, gate, role)
@@ -882,11 +966,20 @@ class _BudgetedMessages:
             if recovered is not None:
                 return recovered
         request_id, kw = self.gate._reserve(kwargs, self.role)
-        try:
-            result = self.inner.create(**kw)
-        except Exception as exc:
-            self.gate._unknown(request_id, exc)
-            raise
+        retried = False
+        while True:
+            try:
+                result = self.inner.create(**kw)
+                break
+            except Exception as exc:
+                # One new reservation and retry only after a provably unbilled failure.
+                wait = _settle_unbilled_or_unknown(self.gate, request_id, exc)
+                if wait is None or retried:
+                    raise
+                retried = True
+                import time
+                time.sleep(wait)
+                request_id, kw = self.gate._reserve(kwargs, self.role)
         try:
             self.gate._reconcile(request_id, result, kwargs["model"])
         except Exception as exc:
@@ -911,13 +1004,22 @@ class _BudgetedStream:
             self.reconciled = True
             return self
         self.request_id, kw = self.gate._reserve(self.kwargs, self.role)
-        try:
-            self.context = self.inner.stream(**kw)
-            self.stream = self.context.__enter__()
-        except Exception as exc:
-            self.gate._unknown(self.request_id, exc)
-            self.unknown_marked = True
-            raise
+        retried = False
+        while True:
+            try:
+                self.context = self.inner.stream(**kw)
+                self.stream = self.context.__enter__()
+                break
+            except Exception as exc:
+                wait = _settle_unbilled_or_unknown(self.gate, self.request_id, exc)
+                if wait is None or retried:
+                    self.unknown_marked = wait is None
+                    self.reconciled = wait is not None  # released: nothing left to settle on exit
+                    raise
+                retried = True
+                import time
+                time.sleep(wait)
+                self.request_id, kw = self.gate._reserve(self.kwargs, self.role)
         return self
 
     def get_final_message(self):
@@ -1048,7 +1150,7 @@ def run_trade_idea_capo(blackboard, *, portfolio, mandate, decision_context=None
     """One structured Capo judgment, using the existing selected desk reports."""
     from bellomberg.agents.capo import scegli_report_specialisti
     from bellomberg.core.trade_idea_contract import (
-        CAPO_TRADE_IDEA_INSTRUCTIONS, CAPO_RESEARCH_INSTRUCTIONS, CAPO_RESEARCH_INSTRUCTIONS_V2,
+        CAPO_TRADE_IDEA_INSTRUCTIONS, CAPO_RESEARCH_INSTRUCTIONS, CAPO_RESEARCH_INSTRUCTIONS_V2, CAPO_RESEARCH_INSTRUCTIONS_V3,
         TRADE_IDEA_RESULT_SCHEMA, validate_result)
     from bellomberg.valuation.sector_analysis import valuation_results_block
     from bellomberg.core.language import output_language_instruction
@@ -1057,7 +1159,15 @@ def run_trade_idea_capo(blackboard, *, portfolio, mandate, decision_context=None
     chosen = scegli_report_specialisti(
         blackboard.data, orari=getattr(blackboard, "orari_report", None))
     # Final Trade Idea decisions cannot silently select an older round.
+    gaps = (blackboard.data.get("_desk_gaps") or {}) if is_research_mode(blackboard) else {}
     for name in TRADE_IDEA_DESKS:
+        if name in gaps:
+            sealed_r1 = ((blackboard.data.get("_research_thesis") or {}).get("reports") or {}).get(name)
+            chosen[name] = {"round": 1 if sealed_r1 else None, "no_report": False, "report":
+                ("[DECLARED GAP] Final desk report unavailable: " + str(gaps[name].get("message"))[:600]
+                 + ("\nSealed round-1 report follows; it was not revised after the Red Team.\n\n" + sealed_r1
+                    if sealed_r1 else "\nNo sealed report exists for this desk."))}
+            continue
         chosen[name] = {**chosen.get(name, {}), "report": blackboard.read(name, 2), "round": 2}
     missing = [name for name in ("macro", "eventdesk", "crypto", "fundamentals", "quant", "options")
                if name not in chosen or chosen[name].get("no_report")]
@@ -1073,7 +1183,7 @@ def run_trade_idea_capo(blackboard, *, portfolio, mandate, decision_context=None
     gate = getattr(blackboard, "budget_gate", None)
     if gate is None:
         raise ValueError("Trade Idea Capo senza budget gate")
-    if execution_policy(blackboard) == EXECUTION_POLICY_V2:
+    if execution_policy(blackboard) in RESEARCH_POLICIES:
         # This runs before rebuilding history, book text or any dynamic prompt.
         # The store verifies the saved wire request, paid receipt and economics.
         response = gate.reuse_capo_response()
@@ -1091,8 +1201,9 @@ def run_trade_idea_capo(blackboard, *, portfolio, mandate, decision_context=None
     from bellomberg.core import mandato_pm
     research = is_research_mode(blackboard)
     finalization = _capo_finalization_policy(blackboard)
-    policy_v2 = execution_policy(blackboard) == EXECUTION_POLICY_V2
-    research_prompt = CAPO_RESEARCH_INSTRUCTIONS_V2 if policy_v2 else CAPO_RESEARCH_INSTRUCTIONS
+    policy_v2 = execution_policy(blackboard) in RESEARCH_POLICIES
+    research_prompt = (CAPO_RESEARCH_INSTRUCTIONS_V3 if execution_policy(blackboard) == EXECUTION_POLICY_V3
+                       else CAPO_RESEARCH_INSTRUCTIONS_V2 if policy_v2 else CAPO_RESEARCH_INSTRUCTIONS)
     system = ((research_prompt if research else CAPO_TRADE_IDEA_INSTRUCTIONS)
               + "\n\n" + output_language_instruction(blackboard.language)
               + "\n\nPer ogni Evidence.source usa il formato esatto '[src: nome_tool] fonte'. "
@@ -1322,6 +1433,74 @@ def _candidate_history(store, ticker, current_id):
             "omitted": max(0, total_prior - len(history)), "runs": history}
 
 
+_DESK_LOCAL_MESSAGES = ("specialist response truncated", "specialist response failed",
+                        " response incomplete: ", "Desk final report did not discuss the supplied sealed research")
+
+
+def _desk_local_failure(error):
+    """Explicit allow-list of failures confined to one desk's own answer.
+
+    Truncation, refusal or an unusable final report, and provider errors on that
+    desk's request (their cost state stays guarded by the store: unknown blocks all
+    spending, released is provably unbilled). Everything else is run-level.
+    """
+    from bellomberg.core.llm_client import APIError
+    if isinstance(error, APIError):
+        return True
+    text = str(error)
+    return isinstance(error, RuntimeError) and any(marker in text for marker in _DESK_LOCAL_MESSAGES)
+
+
+def _desk_annex(data):
+    """Complete final desk reports, Red Team review and objection ledger for the memo annex.
+
+    Built from the same checkpoint data the Capo read (blackboard.data or the persisted
+    checkpoint), so a recovered package renders the identical annex. Nothing is cut;
+    a missing report is declared, never replaced by an earlier round in silence.
+    """
+    from bellomberg.agents.capo import scegli_report_specialisti
+    if not isinstance(data, dict) or not data:
+        return {"version": 1, "unavailable": "checkpoint della run assente o illeggibile"}
+    selected = scegli_report_specialisti(data)
+    desks = []
+    gaps = data.get("_desk_gaps") or {}
+    sealed = ((data.get("_research_thesis") or {}).get("reports") or {}) if isinstance(
+        data.get("_research_thesis"), dict) else {}
+    for name in TRADE_IDEA_DESKS:
+        if name in gaps:
+            note = ("[LACUNA DICHIARATA] Report finale non disponibile: "
+                    + str(gaps[name].get("message") or "")[:600])
+            if sealed.get(name):
+                desks.append({"desk": name, "round": 1, "status": "ready",
+                              "text": note + "\n\nSegue il round 1 sigillato, non rivisto dopo il Red Team.\n\n"
+                              + str(sealed[name])})
+            else:
+                desks.append({"desk": name, "round": None, "status": "missing", "text": ""})
+            continue
+        row = selected.get(name) or {}
+        text = str(row.get("report") or "")
+        if not row or row.get("no_report") or not text.strip():
+            desks.append({"desk": name, "round": None, "status": "missing", "text": ""})
+        else:
+            desks.append({"desk": name, "round": row.get("round"), "status": "ready", "text": text})
+    red_rounds = data.get("_red_team") or data.get("red_team") or {}
+    red = ""
+    if isinstance(red_rounds, dict) and red_rounds:
+        latest = max(red_rounds, key=lambda key: int(key) if str(key).lstrip("-").isdigit() else -1)
+        red = str(red_rounds[latest] or "")
+    ledger = []
+    for row in data.get("_objections") or []:
+        objection = row.get("objection") if isinstance(row, dict) else None
+        if not isinstance(objection, dict):
+            continue
+        ledger.append({key: objection.get(key) for key in ("id", "desk", "category", "material")}
+                      | {"objection": str(objection.get("objection") or objection.get("text") or ""),
+                         "requested_change": str(objection.get("requested_change") or ""),
+                         "state": row.get("state"), "response": str(row.get("response") or "")})
+    return {"version": 1, "desks": desks, "red_team": red, "ledger": ledger,
+            "decisive_questions": [str(item) for item in data.get("_decisive_questions") or []]}
+
+
 def _reports(blackboard):
     from bellomberg.agents.capo import scegli_report_specialisti
     selected = scegli_report_specialisti(blackboard.data, orari=blackboard.orari_report)
@@ -1339,6 +1518,8 @@ def _progress(blackboard, phase, *, events=()):
                if is_research_mode(blackboard) else {}),
             "checkpoint": checkpoint, "checkpoint_sha256": _plan_digest(checkpoint),
             "primary_failure": blackboard.data.get("_primary_failure"),
+            "desk_gaps": deepcopy(blackboard.data.get("_desk_gaps") or {}),
+            "catalog_notices": list(getattr(getattr(blackboard, "budget_gate", None), "catalog_notices", None) or [])[-20:],
             "remaining_work": _remaining_work(blackboard),
             "specialists": [{"name": name, "round": blackboard.current_round,
                              "status": status} for name, status in blackboard.specialist_status.items()],
@@ -1392,7 +1573,7 @@ def _capo_input_fingerprint(blackboard, audit, mandate):
         "red": blackboard.get_latest("red_team"), "model_review": audit,
         **({'research_review': blackboard.data.get('_research_review')} if is_research_mode(blackboard) else {}),
         "contract": _checkpoint_contract(blackboard)}
-    if execution_policy(blackboard) == EXECUTION_POLICY_V2:
+    if execution_policy(blackboard) in RESEARCH_POLICIES:
         # Completed public JSON is reusable only on the same economic basis.
         # Dynamic candidate history and technical failures are deliberately absent.
         inputs['economic_inputs'] = {key: blackboard.data.get(key) for key in (
@@ -1551,6 +1732,8 @@ def _configure_native_recovery(blackboard, store, token, *, inherited=None):
         historical_failure = saved.pop("_primary_failure", None)
         if historical_failure:
             saved.setdefault("_historical_failures", []).append(historical_failure)
+        if saved.get("_desk_gaps") and saved.get("_research_thesis") is None:
+            saved.setdefault("_historical_desk_gaps", []).append(saved.pop("_desk_gaps"))
         blackboard.data = {**saved, **current_context}
         blackboard.orari_report = {name: {int(key): value for key, value in rows.items()}
                                    for name, rows in checkpoint["orari_report"].items()}
@@ -1581,6 +1764,18 @@ def _configure_native_recovery(blackboard, store, token, *, inherited=None):
             "exception_type": type(error).__name__, "desk": desk, "round": round_n,
             "request_id": request_id or getattr(error, "request_id", None),
             "phase": getattr(blackboard, "model_phase", "committee")}
+        if (is_research_mode(blackboard) and desk is not None
+                and desk == getattr(blackboard, "reply_completion_desk", None) and _desk_local_failure(error)):
+            persist("reply_completion_failure:" + desk)  # its objections are flagged unanswered
+            return
+        if is_research_mode(blackboard) and desk in TRADE_IDEA_DESKS and _desk_local_failure(error):
+            # PM 03/10/2026: one desk that truncates, refuses or writes an unusable report
+            # is a declared gap, not the end of an already paid committee. Money, budget,
+            # integrity and PM stops below stay run-blocking.
+            with blackboard._lock:
+                blackboard.data.setdefault("_desk_gaps", {})[desk] = item
+            persist("desk_gap:" + desk)
+            return
         with blackboard._lock:
             first = store.record_failure(blackboard.run_id, token, item)
             if not blackboard.data.get("_primary_failure"):
@@ -1598,6 +1793,8 @@ def _configure_native_recovery(blackboard, store, token, *, inherited=None):
             raise RuntimeError("Provider cost unresolved; no new request permitted")
 
     def should_run(name, round_n):
+        if is_research_mode(blackboard) and name in (blackboard.data.get("_desk_gaps") or {}):
+            return False
         row = blackboard.data.get("_completed_stages", {}).get(f"{name}:{round_n}")
         if not row:
             return True
@@ -1688,6 +1885,17 @@ def _model_authoring_progress(blackboard, *, remaining_turns=None, messages=None
     return ledger
 
 
+def _declared_excerpt(text, english, limit=42000, chunk=14000):
+    """Partial-package excerpt; a cut is stated with both lengths, never silent."""
+    parts = [text[i:i + chunk] for i in range(0, min(len(text), limit), chunk)]
+    if len(text) > limit:
+        parts.append((f"[Excerpt: first {limit} of {len(text)} characters; the complete report "
+                      "remains in the run's saved desk reports.]") if english else
+                     (f"[Estratto: primi {limit} di {len(text)} caratteri; il report integrale "
+                      "resta nei report desk salvati della run.]"))
+    return parts
+
+
 def _incomplete_capo_result(run, blackboard, reason):
     """Preserve actual desk material when the Capo has no valid economic verdict."""
     from bellomberg.core.trade_idea_contract import validate_result
@@ -1708,14 +1916,13 @@ def _incomplete_capo_result(run, blackboard, reason):
         dossier.append({"key": "desk_" + report["specialist"],
             "title": ("Unreviewed desk material: " if english else
                       "Materiale desk non sintetizzato: ") + report["specialist"],
-            "paragraphs": [text[i:i + 14000] for i in range(0, min(len(text), 42000), 14000)],
+            "paragraphs": _declared_excerpt(text, english),
             "evidence_ids": [], "tables": [], "charts": []})
     red = blackboard.get_latest("red_team")
     if red and str(red.get("report") or "").strip():
         text = str(red["report"])
         dossier.append({"key": "red_team", "title": "Unreviewed Red Team" if english else
-                        "Red Team non sintetizzato", "paragraphs": [text[i:i + 14000]
-                        for i in range(0, min(len(text), 42000), 14000)],
+                        "Red Team non sintetizzato", "paragraphs": _declared_excerpt(text, english),
                         "evidence_ids": [], "tables": [], "charts": []})
     gap = (("Capo output invalid or unavailable: " if english else
             "Output Capo non valido o non disponibile: ") + cause)
@@ -2936,7 +3143,15 @@ def _require_final_research(blackboard):
     if blackboard.valuation_results or blackboard.valuation_generations or blackboard.valuation_attempts:
         raise RuntimeError('Research-only run contains unexpected workbook generations')
     reference = research_reference(blackboard)
+    sealed = blackboard.data['_research_thesis']
+    gaps = blackboard.data.get('_desk_gaps') or {}
     for desk in TRADE_IDEA_DESKS:
+        if desk not in sealed['reports']:
+            if desk not in (sealed.get('missing_reports') or {}):
+                raise RuntimeError('Desk neither sealed nor declared missing: ' + desk)
+            continue
+        if desk in gaps:  # final round failed after the seal: declared, its sealed R1 remains
+            continue
         row = (blackboard.data.get('_desk_research_reviews') or {}).get(desk) or {}
         report = blackboard.read(desk, 2)
         if (row.get('round') != 2 or row.get('research_ref') != reference
@@ -2953,7 +3168,7 @@ def _require_final_research(blackboard):
 
 def _missing_research_replies(blackboard):
     return [row for row in blackboard.data.get('_objections', [])
-            if row['objection']['material'] and not row.get('response')]
+            if row['objection']['material'] and not row.get('response') and not row.get('unanswered')]
 
 
 def _complete_research_objection_replies(blackboard):
@@ -2968,6 +3183,12 @@ def _complete_research_objection_replies(blackboard):
         desk = actor_type.name
         missing = [row for row in _missing_research_replies(blackboard) if row['objection']['desk'] == desk]
         descriptor = tasks.get(desk)
+        if desk in (blackboard.data.get('_desk_gaps') or {}):
+            _flag_unanswered(blackboard, missing, "addressed desk unavailable (declared gap)")
+            continue
+        if descriptor is not None and descriptor.get('unanswered'):
+            _flag_unanswered(blackboard, missing, "desk reply completion did not complete")
+            continue
         if not missing and descriptor is None:
             continue
         blackboard.raise_if_run_blocked()
@@ -3002,14 +3223,22 @@ def _complete_research_objection_replies(blackboard):
             continue
         blackboard.current_round = 2
         actor = actor_type(blackboard)
-        actor.run(2, task_context=deepcopy(task), publish_report=False)
+        blackboard.reply_completion_desk = desk
+        try:
+            actor.run(2, task_context=deepcopy(task), publish_report=False)
+        finally:
+            blackboard.reply_completion_desk = None
         blackboard.raise_if_run_blocked()
         if getattr(actor, 'run_result_status', None) != 'complete':
-            raise RuntimeError('Research reply completion is incomplete: ' + desk)
-        remaining = [row['objection']['id'] for row in _missing_research_replies(blackboard)
-                     if row['objection']['desk'] == desk]
-        if remaining:
-            raise RuntimeError('material objections without addressed desk reply: ' + ', '.join(remaining))
+            _flag_unanswered(blackboard, [row for row in _missing_research_replies(blackboard)
+                                          if row['objection']['desk'] == desk],
+                             "desk reply completion did not complete")
+            descriptor.update(complete=False, unanswered=True)
+            blackboard.persist_run_checkpoint('research_objection_completion_unanswered')
+            continue
+        _flag_unanswered(blackboard, [row for row in _missing_research_replies(blackboard)
+                                      if row['objection']['desk'] == desk],
+                         "no desk reply after the completion turn")
         saved = deepcopy(blackboard.specialist_checkpoints.get(key) or {})
         seal = saved.pop('sha256', None)
         if (seal != _checkpoint_digest(saved) or saved.get('status') != 'complete'
@@ -3020,9 +3249,41 @@ def _complete_research_objection_replies(blackboard):
         blackboard.persist_run_checkpoint('research_objection_completion_complete')
 
 
+def _committee_quorum(blackboard):
+    """Present desks and declared gaps; Fundamentals plus four of six desks are required."""
+    gaps = blackboard.data.get("_desk_gaps") or {}
+    missing = {}
+    for desk in TRADE_IDEA_DESKS:
+        report = blackboard.read(desk, 1)
+        if desk in gaps:
+            missing[desk] = gaps[desk].get("message") or "desk failure"
+        elif not isinstance(report, str) or not report.strip() or report.startswith("[ERROR"):
+            missing[desk] = "R1 report unavailable"
+    present = [desk for desk in TRADE_IDEA_DESKS if desk not in missing]
+    if "fundamentals" in missing or len(present) < 4:
+        raise RuntimeError("Committee below quorum (Fundamentals and at least 4 of 6 desks required); "
+                           "missing: " + ", ".join(f"{desk} ({reason[:160]})" for desk, reason in missing.items()))
+    return present, missing
+
+
+def _quorum_still_reachable(blackboard):
+    """Stop before paying further rounds when the committee can no longer reach quorum."""
+    gaps = blackboard.data.get("_desk_gaps") or {}
+    if "fundamentals" in gaps or len(TRADE_IDEA_DESKS) - len(gaps) < 4:
+        raise RuntimeError("Committee below quorum (Fundamentals and at least 4 of 6 desks required); "
+                           "declared gaps: " + ", ".join(sorted(gaps)))
+
+
+def _flag_unanswered(blackboard, rows, reason):
+    for row in rows:
+        row["state"] = "open"
+        row["unanswered"] = reason
+
+
 def _run_research_committee(blackboard, portfolio, runner, red_runner, check_stop, persist):
     from bellomberg.core.trade_idea_contract import validate_committee_review
-    seal_research_thesis(blackboard, desks=TRADE_IDEA_DESKS)
+    present, missing = _committee_quorum(blackboard) if blackboard.data.get("_research_thesis") is None else (None, None)
+    seal_research_thesis(blackboard, desks=present or TRADE_IDEA_DESKS, missing=missing)
     blackboard.model_phase = 'review'
     persist('research_dossier')
     check_stop()
@@ -3046,15 +3307,14 @@ def _run_research_committee(blackboard, portfolio, runner, red_runner, check_sto
     check_stop()
     _complete_research_objection_replies(blackboard)
     check_stop()
-    missing = [row['objection']['id'] for row in blackboard.data['_objections']
-        if row['objection']['material'] and not row.get('response')]
-    if missing:
-        raise RuntimeError('material objections without addressed desk reply: ' + ', '.join(missing))
+    _flag_unanswered(blackboard, _missing_research_replies(blackboard),
+                     "no desk reply after the completion turn")
     _require_final_research(blackboard)
     blackboard.data['_research_review'] = {'research_ref': reference,
         'red_team': deepcopy(blackboard.data['_red_research_review']),
-        'desks': deepcopy(blackboard.data['_desk_research_reviews']),
-        'objections': deepcopy(blackboard.data['_objections'])}
+        'desks': deepcopy(blackboard.data.get('_desk_research_reviews') or {}),
+        'objections': deepcopy(blackboard.data['_objections']),
+        **({'desk_gaps': deepcopy(blackboard.data['_desk_gaps'])} if blackboard.data.get('_desk_gaps') else {})}
     persist('research_review')
 
 
@@ -3929,7 +4189,8 @@ def _preview_quality(run, result, directory, blackboard):
     report_run = {**run, "identity": {"ticker": run["ticker"],
         "name": run.get("company_name"), "exchange": run.get("exchange"),
         "currency": run.get("currency")},
-        "cutoff": blackboard.data.get("_data_cutoff") or run.get("started_at")}
+        "cutoff": blackboard.data.get("_data_cutoff") or run.get("started_at"),
+        "desk_annex": _desk_annex(blackboard.data) if is_research_mode(blackboard) else None}
     checked = {'valuations': []} if is_research_mode(blackboard) else _candidate_workbooks(run["ticker"], blackboard.valuation_generations,
         blackboard.valuation_attempts, [MODELS_DIR, REPORT_DIR, *getattr(blackboard, "model_roots", ())],
         result.get("valuation_refs") or ())
@@ -4133,8 +4394,10 @@ def _operational_checks(run, result, blackboard, sizing, portfolio, mandate,
         mandate_valid = False
     return {
         "identity_verified": bool(run.get("company_name") and run.get("exchange") and run["ticker"] == result["ticker"]),
-        "evidence_sufficient": (report_quality.get("status") == "ready"
-            and report_quality.get("analytical_pages", 0) >= 10
+        "evidence_sufficient": (_quality_sufficient(report_quality)
+            and not blackboard.data.get("_desk_gaps")
+            and not any(row.get("unanswered") and row["objection"].get("material")
+                        for row in blackboard.data.get("_objections") or [])
             and {section["key"] for section in result.get("dossier", [])} >= set(DOSSIER_KEYS)
             and not blackboard.data.get("_numeric_claim_gaps")
             and _candidate_quote_matches(blackboard.data.get("_candidate_quote_initial"),
@@ -4200,7 +4463,9 @@ def _deliver_trade_idea(store, run_id, *, valuation_results=None, valuation_atte
     run_for_report = {**run, "identity": {"ticker": run["ticker"],
         "name": run.get("company_name"), "exchange": run.get("exchange"),
         "currency": run.get("currency")},
-        "cutoff": (detail.get("progress") or {}).get("data_cutoff") or run.get("started_at")}
+        "cutoff": (detail.get("progress") or {}).get("data_cutoff") or run.get("started_at"),
+        "desk_annex": (_desk_annex((((detail.get("progress") or {}).get("checkpoint") or {}).get("data")))
+                       if run.get("analysis_mode") == RESEARCH_ANALYSIS_MODE else None)}
     persisted_manifest = detail.get("artifacts") is not None
     if valuation_results is None:
         progress = detail.get("progress") or {}
@@ -4357,6 +4622,7 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
     token = None
     blackboard = None
     source_validation = None
+    result = None
     try:
         from contextlib import nullcontext
         source_scope = (nullcontext() if default_risk_db_matches else
@@ -4504,6 +4770,8 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                     check_stop()
                     runner(blackboard, round_n)
                     check_stop()
+                    if is_research_mode(blackboard):
+                        _quorum_still_reachable(blackboard)
                     store.update_progress(run_id, token, phase,
                                           _progress(blackboard, phase, events=(f"R{round_n} concluso",)))
                 if is_research_mode(blackboard):
@@ -4620,7 +4888,10 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                     blackboard, run["ticker"]))
                 blackboard.data.setdefault("_data_cutoff", datetime.now(timezone.utc).isoformat())
                 failures = []
+                declared_gaps = (blackboard.data.get("_desk_gaps") or {}) if is_research_mode(blackboard) else {}
                 for name in ("macro", "eventdesk", "crypto", "fundamentals", "quant", "options"):
+                    if name in declared_gaps:
+                        continue  # sealed as a declared gap: context for the Capo, not a hidden failure
                     for round_n in ((0, 1, 2) if name in blackboard.r2_specialists else (0, 1)):
                         report = blackboard.read(name, round_n)
                         if not isinstance(report, str) or not report.strip() or report.startswith("[ERROR"):
@@ -4750,7 +5021,7 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                 if token and store.get_run(run_id)["run"]["technical_status"] == "running":
                     reason = type(exc).__name__ + ": " + str(exc)[:3800]
                     if blackboard is not None and hasattr(blackboard, "record_run_failure"):
-                        blackboard.record_run_failure(exc, desk=blackboard.current_specialist,
+                        blackboard.record_run_failure(exc, desk=None,
                                                      round_n=blackboard.current_round)
                     progress = (_progress(blackboard, "incomplete", events=(reason,))
                                 if blackboard else {"phase": "failed", "events": [{"message": reason}]})
@@ -4758,9 +5029,49 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                         progress['source_validation'] = source_validation
                     store.update_progress(run_id, token, progress["phase"], progress)
                     stopped = store.get_run(run_id)["run"]["stop_requested"]
-                    store.finish_run(run_id, token, None,
-                                     "cancelled" if stopped else "incomplete" if blackboard else "failed",
-                                     reason=reason)
+                    # Paid material must not vanish with the exception: a validated Capo
+                    # result, or the desk/Red Team reports, close the run as a labelled
+                    # partial package routed to research (never an operational proposal).
+                    candidates = []
+                    if not stopped and blackboard is not None:
+                        # A Capo verdict whose post-checks crashed is never delivered as a
+                        # judgment: it keeps its analysis but becomes incomplete, without a
+                        # proposal, with the cause as a data gap (email stays blocked).
+                        if isinstance(result, dict):
+                            unchecked = deepcopy(result)
+                            unchecked.update(judgment="incomplete", proposal=None)
+                            gap = ("Controlli successivi al Capo non completati: " + reason)[:1500]
+                            unchecked["data_gaps"] = [gap, *(unchecked.get("data_gaps") or [])][:80]
+                            candidates.append(unchecked)
+                        try:
+                            if any(report.get("status") == "ready" for report in _reports(blackboard)):
+                                candidates.append(lambda: _incomplete_capo_result(run, blackboard, reason))
+                        except Exception as salvage_exc:
+                            reason += ("; materiale parziale non ricostruibile: "
+                                       + type(salvage_exc).__name__)[:3990 - len(reason)]
+                    status = "cancelled" if stopped else "incomplete" if blackboard else "failed"
+                    salvage = None
+                    for candidate in candidates:
+                        try:
+                            salvage = candidate() if callable(candidate) else candidate
+                            store.finish_run(run_id, token, salvage, status, reason=reason)
+                            break
+                        except Exception:
+                            salvage = None
+                            if store.get_run(run_id)["run"]["technical_status"] != "running":
+                                break
+                    if store.get_run(run_id)["run"]["technical_status"] == "running":
+                        store.finish_run(run_id, token, None, status, reason=reason)
+                    if salvage is not None:
+                        try:
+                            store.route_result(run_id, {})
+                        except Exception as route_exc:
+                            route_reason = ("Routing parziale KO: " + type(route_exc).__name__ + ": "
+                                            + str(route_exc)[:3000])
+                            try:
+                                store.mark_routing_failure(run_id, route_reason)
+                            finally:
+                                store.block_delivery(run_id, reason=route_reason)
             finally:
                 if blackboard is not None:
                     terminal = store.get_run(run_id)["run"]

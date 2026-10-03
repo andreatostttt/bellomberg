@@ -17,7 +17,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE, is_research_mode
-from bellomberg.core.trade_idea_policy import EXECUTION_POLICY_V2, execution_policy, role_effort
+from bellomberg.core.trade_idea_policy import (EXECUTION_POLICY_V3, RESEARCH_POLICIES, execution_policy,
+    role_effort, output_cap)
 
 
 SCHEMA = (
@@ -179,7 +180,7 @@ def _native_checkpoint_contract(row, accepted):
 def _capo_request_bindings(row):
     """Bind paid research to its economic inputs, not subsequent run history."""
     accepted = json.loads(row["request_json"])
-    if execution_policy(accepted) != EXECUTION_POLICY_V2:
+    if execution_policy(accepted) not in RESEARCH_POLICIES:
         raise RunConflict("Exact Capo request storage requires the accepted research execution policy")
     progress = json.loads(row["progress_json"])
     checkpoint = progress.get("checkpoint")
@@ -189,9 +190,19 @@ def _capo_request_bindings(row):
         raise RunConflict("Capo request checkpoint integrity or accepted contract differs")
     data = checkpoint.get("data")
     desks = ("macro", "eventdesk", "crypto", "fundamentals", "quant", "options")
-    if (not isinstance(data, dict) or any(not isinstance(data.get(desk), dict)
-            or any(not isinstance(data[desk].get(str(round_n)), str)
-                   or not data[desk][str(round_n)].strip() for round_n in (1, 2)) for desk in desks)
+    thesis = data.get("_research_thesis") if isinstance(data, dict) else None
+    sealed_missing = set((thesis.get("missing_reports") or {}) if isinstance(thesis, dict) else ())
+    declared_gaps = set((data.get("_desk_gaps") or {}) if isinstance(data, dict) else ())
+
+    def desk_complete(desk):
+        # A desk sealed as missing has no report; a gap declared after the seal keeps its R1.
+        if desk in sealed_missing:
+            return True
+        rounds = (1,) if desk in declared_gaps else (1, 2)
+        return isinstance(data.get(desk), dict) and all(
+            isinstance(data[desk].get(str(round_n)), str) and data[desk][str(round_n)].strip()
+            for round_n in rounds)
+    if (not isinstance(data, dict) or not all(desk_complete(desk) for desk in desks)
             or any(not isinstance(data.get(key), dict) for key in
                    ("_research_thesis", "_research_review", "_sizing", "_decision_context",
                     "_candidate_quote_initial"))):
@@ -199,7 +210,7 @@ def _capo_request_bindings(row):
     fields = ("_research_thesis", "_research_review", "_desk_research_reviews", "_red_research_review",
               "_red_team", "_objections", "_objection_history", "_decisive_questions",
               "_research_reply_completions", "_sizing", "_decision_context", "_candidate_quote_initial",
-              "_data_cutoff", "_identity")
+              "_data_cutoff", "_identity", "_desk_gaps")
     times = checkpoint.get("orari_report") or {}
     bindings = {"contract": checkpoint["contract"], "accepted_context_sha256": _digest(json.loads(row["context_json"])),
         "reports": {desk: _digest(data[desk]) for desk in desks},
@@ -276,7 +287,11 @@ def _checkpoint_resume_block(checkpoint):
                and row.get("status") == "complete"
                for key, row in (checkpoint.get("specialist_checkpoints") or {}).items()):
             return "model_authoring_review_required"
-    for row in (checkpoint.get("specialist_checkpoints") or {}).values():
+    sealed_missing = set(((data.get("_research_thesis") or {}).get("missing_reports") or {})
+                         if isinstance(data.get("_research_thesis"), dict) else ())
+    for key, row in (checkpoint.get("specialist_checkpoints") or {}).items():
+        if str(key).split(":", 1)[0] in sealed_missing:
+            continue  # declared gap sealed into the thesis: no recovery rewrites it
         if isinstance(row, dict) and row.get("inflight_tools"):
             # These three run-bound public-document tools have their own
             # durable dispatch/receipt journal. Re-entry only reads that
@@ -311,9 +326,8 @@ def trade_idea_pdf_ready(manifest_json, manifest_sha256, *, run_id, ticker):
         verify_trade_idea_manifest(manifest, require_complete=True)
     except (ValueError, OSError, KeyError, TypeError):
         return False
-    quality = manifest.get("pdf_quality") or {}
-    if (quality.get("status") != "ready" or quality.get("analytical_pages", 0) < 10
-            or quality.get("analytical_words", 0) < 4000):
+    from bellomberg.core.trade_idea_policy import report_quality_sufficient
+    if not report_quality_sufficient(manifest.get("pdf_quality") or {}):
         return False
     pdfs = [artifact for artifact in manifest.get("artifacts") or []
             if isinstance(artifact, dict) and artifact.get("kind") == "pdf"]
@@ -914,7 +928,12 @@ class TradeIdeaStore:
             "source_run_id": source["id"], "source_request_sha256": source["request_sha256"],
             "source_checkpoint_sha256": progress["checkpoint_sha256"],
             "source_fingerprint": contract["source_fingerprint"], "model": model,
-            "thinking": {"type": "effort", "effort": "low"}, "max_tokens": 20000,
+            # Never below the accepted Capo cap: a finalization with less room than the
+            # truncated original would truncate again. /3 keeps its accepted MEDIUM effort;
+            # earlier contracts keep LOW so their already-accepted grants stay identical.
+            "thinking": {"type": "effort", "effort": (role_effort(accepted, 'capo')
+                         if execution_policy(accepted) == EXECUTION_POLICY_V3 else "low")},
+            "max_tokens": max(20000, output_cap(accepted, 'capo', 20000)),
             "context_projection": "sealed_all_rounds_red_team_dedup_v1",
             "request_sha256": fingerprint, "response_sha256": receipt["response_sha256"]}
 
@@ -1686,7 +1705,7 @@ class TradeIdeaStore:
                     raise BudgetBlocked("run is not active or stop was requested")
                 policy = execution_policy(json.loads(row["request_json"]))
                 saved_capo = None
-                if role == "capo" and policy == EXECUTION_POLICY_V2:
+                if role == "capo" and policy in RESEARCH_POLICIES:
                     if (not isinstance(capo_request_body, dict)
                             or _digest(capo_request_body) != request_sha256
                             or capo_request_body.get("model") != model
@@ -1708,7 +1727,8 @@ class TradeIdeaStore:
                     granted_ids = [item["id"] for item in chain if
                         "capo_finalization" in (json.loads(item["request_json"]).get("continuation") or {})]
                     if conn.execute("SELECT 1 FROM trade_idea_costs WHERE run_id IN ("
-                            + ",".join("?" for _ in granted_ids) + ") LIMIT 1", granted_ids).fetchone():
+                            + ",".join("?" for _ in granted_ids) + ") AND NOT (status='released' "
+                            "AND json_extract(receipt_json,'$.billable')=0) LIMIT 1", granted_ids).fetchone():
                         raise BudgetBlocked("Capo finalization authorizes only one new request; authorization consumed")
                 role_key = ("specialist" if role.startswith("specialist:") else
                             "aux" if role.startswith("aux:") else role)
@@ -1755,7 +1775,7 @@ class TradeIdeaStore:
                 if row["technical_status"] != "running" or row["worker_token"] != worker_token:
                     raise RunConflict("worker claim lost")
                 accepted = json.loads(row["request_json"])
-                if execution_policy(accepted) != EXECUTION_POLICY_V2:
+                if execution_policy(accepted) not in RESEARCH_POLICIES:
                     conn.execute("COMMIT")
                     return None
                 chain = self._ancestry(conn, run_id)
@@ -1766,6 +1786,13 @@ class TradeIdeaStore:
                 events = conn.execute("SELECT * FROM trade_idea_events WHERE run_id IN ("
                     + ",".join("?" for _ in ancestors) + ") AND kind='capo_request_saved' ORDER BY id DESC",
                     list(ancestors)).fetchall()
+                def unbilled(event):
+                    request_id = json.loads(event["payload_json"]).get("request_id")
+                    row_cost = conn.execute("SELECT status, receipt_json FROM trade_idea_costs "
+                        "WHERE request_id=? AND run_id=?", (request_id, event["run_id"])).fetchone()
+                    return bool(row_cost and row_cost["status"] == "released"
+                                and json.loads(row_cost["receipt_json"] or "{}").get("billable") is False)
+                events = [event for event in events if not unbilled(event)]
                 if not events:
                     conn.execute("COMMIT")
                     return None

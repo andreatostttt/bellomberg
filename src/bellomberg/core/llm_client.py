@@ -1110,8 +1110,12 @@ class OpenRouterClient:
                 resp = self._http.send(req, stream=stream)
             except httpx.TimeoutException as e:
                 ultimo = APITimeoutError("timeout dopo " + str(self.timeout) + " s: " + str(e))
+                if isinstance(e, httpx.ConnectTimeout):
+                    ultimo.transport_phase = "connect"  # no request bytes reached the provider
             except httpx.HTTPError as e:
                 ultimo = APIConnectionError(type(e).__name__ + ": " + str(e))
+                if isinstance(e, httpx.ConnectError):
+                    ultimo.transport_phase = "connect"
             else:
                 if resp.status_code < 400:
                     return resp
@@ -1286,8 +1290,12 @@ class AsyncOpenRouterClient:
                 resp = await self._http.send(req, stream=stream)
             except httpx.TimeoutException as e:
                 ultimo = APITimeoutError("timeout dopo " + str(self.timeout) + " s: " + str(e))
+                if isinstance(e, httpx.ConnectTimeout):
+                    ultimo.transport_phase = "connect"  # no request bytes reached the provider
             except httpx.HTTPError as e:
                 ultimo = APIConnectionError(type(e).__name__ + ": " + str(e))
+                if isinstance(e, httpx.ConnectError):
+                    ultimo.transport_phase = "connect"
             else:
                 if resp.status_code < 400:
                     return resp

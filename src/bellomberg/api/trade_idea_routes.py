@@ -25,7 +25,7 @@ from bellomberg.agents.trade_idea import (
     source_qualification_summary)
 from bellomberg.agents.trade_idea_sources import PMDocumentSource, normalize_sources
 from bellomberg.core.language import capture_language
-from bellomberg.core.trade_idea_policy import EXECUTION_POLICY_V2
+from bellomberg.core.trade_idea_policy import CURRENT_EXECUTION_POLICY
 from bellomberg.core.paths import DATA_DIR, MODELS_DIR, REPORT_DIR
 from bellomberg.storage.memory_db import SQLITE_PATH
 from bellomberg.storage.trade_idea_store import (
@@ -373,12 +373,17 @@ def _revalidate_orphan_route(current, detail, *, quote_sampler=None, portfolio_l
     progress = detail.get("progress") or {}
     checks = progress.get("routing_checks")
     quality = progress.get("report_quality") or {}
+    from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE
+    from bellomberg.core.trade_idea_policy import report_quality_sufficient
+    # Research runs attest the sealed research, not a workbook valuation.
+    research = run.get("analysis_mode") == RESEARCH_ANALYSIS_MODE
     required = ("identity_verified", "evidence_sufficient", "red_team_complete",
-                "capo_valid", "mandate_valid", "sizing_valid", "valuation_checked",
+                "capo_valid", "mandate_valid", "sizing_valid",
+                "research_reviewed" if research else "valuation_checked",
                 "history_context_sent", "candidate_price_revalidated", "fx_revalidated")
     if not isinstance(checks, dict) or any(checks.get(key) is not True for key in required):
         return None, "Attestazioni operative persistite assenti o incomplete"
-    if quality.get("status") != "ready" or quality.get("analytical_pages", 0) < 10:
+    if not report_quality_sufficient(quality):
         return None, "Qualita' del dossier non attestata prima del crash"
     quotes = progress.get("candidate_quote_receipts") or {}
     initial, final = quotes.get("initial"), quotes.get("final")
@@ -411,6 +416,10 @@ def _revalidate_orphan_route(current, detail, *, quote_sampler=None, portfolio_l
         return None, "FX/book cambiato o non verificabile al riavvio"
 
     refs = result.get("valuation_refs") or []
+    if research:
+        if refs:
+            return None, "Riferimenti di valutazione inattesi in una run di ricerca"
+        return checks, None
     generations = progress.get("valuation_generations") or []
     try:
         checked = _candidate_workbooks(run["ticker"], generations,
@@ -530,7 +539,7 @@ def install_trade_idea_routes(app, require_session, *, db_path=SQLITE_PATH,
         checked = preflight_trade_idea(body.ticker, body.pm_view, body.view_source,
                                       body.budget_limit_usd, active_checker=checker,
                                       analysis_mode=RESEARCH_ANALYSIS_MODE,
-                                      execution_policy=EXECUTION_POLICY_V2,
+                                      execution_policy=CURRENT_EXECUTION_POLICY,
                                       archive_root=root,
                                       **({"document_sources": body.document_sources} if body.document_sources else {}))
         if checked.get('ok'):
@@ -598,7 +607,7 @@ def install_trade_idea_routes(app, require_session, *, db_path=SQLITE_PATH,
         checked = preflight_trade_idea(body.ticker, body.pm_view, body.view_source,
                                        body.budget_limit_usd, active_checker=checker,
                                        analysis_mode=RESEARCH_ANALYSIS_MODE,
-                                       execution_policy=EXECUTION_POLICY_V2,
+                                       execution_policy=CURRENT_EXECUTION_POLICY,
                                        identity_resolver=lambda _ticker: deepcopy(cached['identity']),
                                        source_qualifier=recheck, archive_root=root,
                                        **({"document_sources": body.document_sources} if body.document_sources else {}))
@@ -608,8 +617,8 @@ def install_trade_idea_routes(app, require_session, *, db_path=SQLITE_PATH,
             raise HTTPException(code, "; ".join(checked["reasons"]))
         if not source_verified:
             raise HTTPException(428, "Controverifica delle fonti del preflight non eseguita")
-        if (checked.get('execution_policy') != EXECUTION_POLICY_V2 or
-                cached.get('execution_policy') != EXECUTION_POLICY_V2 or
+        if (checked.get('execution_policy') != CURRENT_EXECUTION_POLICY or
+                cached.get('execution_policy') != CURRENT_EXECUTION_POLICY or
                 checked['models'] != cached['models'] or
                 (checked.get('catalog_snapshot') or {}).get('models') !=
                 (cached.get('catalog_snapshot') or {}).get('models')):
@@ -627,7 +636,7 @@ def install_trade_idea_routes(app, require_session, *, db_path=SQLITE_PATH,
         identity = checked["identity"]
         request = {"ticker": identity["ticker"], "company_name": identity["name"],
                    "analysis_mode": RESEARCH_ANALYSIS_MODE,
-                   "execution_policy": EXECUTION_POLICY_V2,
+                   "execution_policy": CURRENT_EXECUTION_POLICY,
                    "exchange": identity["exchange"], "currency": identity.get("currency"),
                    "view_text": body.pm_view, "view_origin": body.view_source,
                    "language": language,

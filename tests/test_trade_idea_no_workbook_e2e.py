@@ -182,7 +182,8 @@ def no_workbook_case(migrated, tmp_path, monkeypatch, smtp):
     monkeypatch.setattr(mandato_pm, 'carica', lambda: mandate)
     monkeypatch.setattr(llm_pricing, '_fx_usd_to_eur', lambda: (0.9, 'frozen_test_fx'))
     monkeypatch.setattr(chat_tools, '_compatta_portfolio_live', lambda value: deepcopy(value))
-    state = {'judgment': 'rejected', 'stop_after': None, 'source_gaps': True, 'capo_calls': 0}
+    state = {'judgment': 'rejected', 'stop_after': None, 'source_gaps': True, 'capo_calls': 0,
+             'truncate': None, 'no_reply': None}
 
     def dossier_payload():
         result = research_result(state['judgment'])
@@ -315,7 +316,7 @@ def no_workbook_case(migrated, tmp_path, monkeypatch, smtp):
                 if desk == 'fundamentals' and round_n == 1:
                     steps.extend([('get_filing_changes', {'ticker': IDENTITY['ticker']}),
                                   ('get_fundamentals', {'ticker': IDENTITY['ticker']})])
-                if round_n == 2:
+                if round_n == 2 and desk != state['no_reply']:
                     steps.append(('respond_trade_idea_objection', {
                         'objection_id': 'challenge-' + desk,
                         'response': 'The shared dated annual statement supports this limited inference; unavailable consensus and remaining economic uncertainty are explicit.',
@@ -335,6 +336,9 @@ def no_workbook_case(migrated, tmp_path, monkeypatch, smtp):
                  'Consensus is unavailable and the undated commentary is not financial evidence. '
                  'Renewal economics, cash conversion, reinvestment and downside conditions remain uncertain. '
                  'No workbook or mandatory fair value is required [src: read_company_dossier]. ' * 5)))
+            if state['truncate'] == (desk, round_n):
+                # Known-cost truncation of one desk's answer (no visible end of turn).
+                return response(kwargs, [SimpleNamespace(type='text', text=text[:200])], serial, 'max_tokens')
             return response(kwargs, [SimpleNamespace(type='text', text=text)], serial)
 
         def stream(self, **kwargs):

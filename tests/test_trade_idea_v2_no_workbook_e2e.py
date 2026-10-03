@@ -99,6 +99,10 @@ def test_v2_research_four_resumes_paid_capo_crash_and_exact_delivery_recovery(no
         detail = case.execute(ident, 'v2-round-' + str(round_n))
         assert detail['run']['technical_status'] == 'incomplete', detail['run']['reason']
         assert 'native R' + str(round_n) in detail['run']['reason']
+        if round_n:
+            # Paid desk material survives the failure as a labelled partial result.
+            assert detail['result']['judgment'] == 'incomplete' and detail['result']['proposal'] is None
+            assert any(section['key'].startswith('desk_') for section in detail['result']['dossier'])
         assert all(_provider_round(call) not in range(round_n) for call in case.providers[before:])
         assert not case.smtp[0] and not case.prohibited
         source_count = source_count if source_count is not None else len(case.transport.requests)
@@ -113,6 +117,7 @@ def test_v2_research_four_resumes_paid_capo_crash_and_exact_delivery_recovery(no
     assert failed['run']['technical_status'] == 'incomplete'
     assert 'Intentional offline crash after paid validated Capo' in failed['run']['reason']
     assert crash['triggered'] == 1 and case.state['capo_calls'] == 1
+    assert failed['result']['judgment'] == 'incomplete' and failed['result']['proposal'] is None
     assert failed['email']['status'] == 'blocked' and not case.smtp[0]
     assert len(case.providers) == before_capo + 1
     assert case.providers[-1]['max_tokens'] == 32768
@@ -166,6 +171,10 @@ def test_v2_research_four_resumes_paid_capo_crash_and_exact_delivery_recovery(no
     assert attachment.get_payload(decode=True) == pdf.read_bytes()
     text = '\n'.join(page.extract_text() or '' for page in PdfReader(pdf).pages)
     assert 'immunita' in text and 'consensus' in text.lower()
+    # The delivered memo carries the complete desk annex, measured on the same PDF as routing.
+    assert 'Analisi integrale dei desk e del Red Team' in text
+    assert 'annex' in manifest['pdf_quality']['section_pages']
+    assert 'annex' in final['progress']['report_quality']['section_pages']
     assert case.smtp[0][0]['Message-ID'] == manifest['message_id']
     assert final['cost']['requests'] == paid_count
     assert Decimal(final['cost']['charged_usd']) == Decimal('0.001') * paid_count
