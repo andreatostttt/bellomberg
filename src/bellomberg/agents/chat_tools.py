@@ -251,7 +251,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     },
     {
         "name": "get_valuation",
-        "description": "Valutazione settoriale da uno snapshot acquisito: segui valuation_decision, acquisition_tasks e lo schema driver in method_records; non scegliere un motore alternativo. Per i metodi DOCUMENTATI correnti (operating FCFF, banche, managed care, assicurazioni, RAB, NAV e altri adapter a record) invia SOLO ticker, method_records e analysis_context.scenario_rationale. La variant view e le fonti stanno nel rationale dei record, con entita, periodo, unita, base contabile, URL, data e scadenza. I set di record APPROVATI dal PM arrivano da soli dall'archivio, con le motivazioni di scenario del set (method_inputs_origin nel riepilogo RESEARCH e nel blocco VALUTAZIONI): per un titolo con set approvato valido chiama get_valuation col SOLO ticker, senza method_records e senza scenario_rationale. Un set passato dal desk e' una PROPOSTA NON approvata: sostituisce l'archivio senza sommarsi (origine 'esplicito NON approvato' e un task che dichiara lo stato dell'archivio sostituito) e sostituisce anche il set esplicito precedente conservandone la storia; il bundle RESEARCH si revisiona senza riacquisire i provider. I parametri top-level diversi da questi tre sono LEGACY: NON inviarli ai metodi documentati (anche variant_view/growth_path/scenarios/peers/nav_target/rab); producono FV n.d. per input non consumati. Nessun CAGR/default economico colma record assenti. Prima studia filing, guidance, consensus, catalyst e management. ETF, fondi aperti, indici, crypto e panieri restano esposizioni, non DCF aziendali; NAV per veicoli solo nel perimetro registrato e dichiarato dal servizio, fuori copertura = FV n.d. con motivo, mai un veicolo sostitutivo. Cita FV/upside solo con valuation_usability.usable=true, insieme a metodo, snapshot e cutoff; DOCUMENTATA non certifica la correttezza economica o delle fonti e non supera sanity BLOCK.",
+        "description": "Valutazione settoriale da uno snapshot acquisito: segui valuation_decision, acquisition_tasks e lo schema driver in method_records; non scegliere un motore alternativo. Per i metodi DOCUMENTATI correnti (operating FCFF, banche, managed care, assicurazioni, RAB, NAV e altri adapter a record) invia SOLO ticker, method_records e analysis_context.scenario_rationale. La variant view e le fonti stanno nel rationale dei record, con entita, periodo, unita, base contabile, URL, data e scadenza. I set di record APPROVATI dal PM arrivano da soli dall'archivio, con le motivazioni di scenario del set (method_inputs_origin nel riepilogo RESEARCH e nel blocco VALUTAZIONI): per un titolo con set approvato valido chiama get_valuation col SOLO ticker, senza method_records e senza scenario_rationale. Un set passato dal desk e' una PROPOSTA NON approvata: sostituisce l'archivio senza sommarsi (origine 'esplicito NON approvato' e un task che dichiara lo stato dell'archivio sostituito) e sostituisce anche il set esplicito precedente conservandone la storia; il bundle RESEARCH si revisiona senza riacquisire i provider. I parametri top-level diversi da questi tre sono LEGACY: NON inviarli ai metodi documentati (anche variant_view/growth_path/scenarios/peers/nav_target/rab); producono FV n.d. per input non consumati. Nessun CAGR/default economico colma record assenti. Prima studia filing, guidance, consensus, catalyst e management. ETF, fondi aperti, indici, crypto e panieri restano esposizioni, non DCF aziendali; NAV per veicoli solo nel perimetro registrato e dichiarato dal servizio, fuori copertura = FV n.d. con motivo, mai un veicolo sostitutivo. Cita FV/upside solo con valuation_usability.usable=true, insieme a metodo, snapshot e cutoff; DOCUMENTATA non certifica la correttezza economica o delle fonti e non annulla blocchi per dati, fonti, unita, identita, integrita o matematica. Qualunque scarto positivo o negativo fra fair value e prezzo e' informativo in tutti gli scenari (bear, base e bull), senza soglie di esclusione: non calibrare i driver per avvicinare il FV al prezzo. Un BLOCK storico dovuto alla sola distanza dimostrata non e' un vincolo vigente; usa il modello validato corrente e mantieni irrisolti i blocchi ambigui o indipendenti. Rischio e sizing restano controlli separati.",
         "input_schema": {"type": "object", "properties": {
             "ticker": {"type": "string"},
             "method_records": method_records_schema(),
@@ -1336,6 +1336,9 @@ def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
     caller (V6 Lotto 3, review B4): chi sta chiamando ("chat:fundamentals",
     "specialista-run:fundamentals", "red-team") — oggi usato per l'attribuzione
     fine di entered_by nel registro guidance; opzionale e retrocompatibile."""
+    if tool_name == 'get_valuation':
+        return {'ok': False, 'status': 'archived', 'code': 'excel_archived',
+            'error': 'Generazione Excel archiviata. Usa analisi societaria, bilanci, guidance e consensus; i modelli storici sono consultabili in Archivio Excel.'}
     try:
         if tool_name == "get_filing_changes":
             from bellomberg.agents.filing_context import get_filing_changes
@@ -1688,7 +1691,8 @@ def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
                                     (payload['snapshot_id'], generation)).fetchone()
                             if not link:
                                 return None
-                            return {**payload, 'reused': True,
+                            return {**normalize_valuation_payload(payload, expected_decision=expected,
+                                        as_of=candidate['case']['as_of']), 'reused': True,
                                 'cache_note': 'Fonti ricompilate, snapshot e integrita della generazione corrente verificati',
                                 '_thesis_saved': {'thesis_id': link[0], 'snapshot_id': payload['snapshot_id']},
                                 'model_publication': {'status': 'current', 'reason': 'Versione corrente verificata nel registro'}}
@@ -1802,9 +1806,11 @@ def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
                         publication_state = {"status": "failed", "reason": type(exc).__name__ + ": " + str(exc)}
             r["model_publication"] = publication_state
             if isinstance(r, dict) and r.get("valuation_flagged"):
-                # 204b-FIX: la sanity ha marcato la VAL (divergenza estrema fair value/prezzo).
-                # L'agente DEVE riportarlo e NON proporre il nome in ACTION TABLE su questo modello.
-                _hl = r.get("sanity_headline") or "Fair value molto distante dal prezzo: verificare growth/margini/WACC/shares."
+                # Preserve actual validation failures; price distance alone is informational.
+                _hl = (r.get("error")
+                       or "; ".join(str(reason) for reason in (r.get("valuation_usability") or {}).get("reasons", []))
+                       or r.get("sanity_headline") or (r.get("sanity") or {}).get("headline")
+                       or "Valutazione non utilizzabile: causa specifica non disponibile; verificare stato e prove del modello.")
                 r["_analyst_note"] = ("[VAL FLAGGED] " + _hl + " " + (r.get("_analyst_note") or "")).strip()
             return _stamp(r, f"dcf_engine valuation({tool_input['ticker']})")
 
@@ -2036,7 +2042,7 @@ def get_tools_for_agent(agent_id: str) -> List[Dict[str, Any]]:
     """Subset di tools per ogni agente.
     Capo ha accesso a TUTTO. Ogni specialist ha i SUOI tool primari + shared.
     """
-    ALL = TOOL_DEFINITIONS
+    ALL = [tool for tool in TOOL_DEFINITIONS if tool['name'] != 'get_valuation']
     if agent_id == "capo":
         return ALL  # full access
 

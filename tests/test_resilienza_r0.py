@@ -30,6 +30,7 @@ class _Usage:
     output_tokens = 50
     cache_read_input_tokens = 0
     cache_creation_input_tokens = 0
+    cost_usd = 0.03  # Simulated provider receipt for the successful branches.
 
 
 class _ToolUseBlock:
@@ -133,9 +134,8 @@ def bb(tmp_path, monkeypatch):
 # ============================================================
 # (a) retry sul 529
 # ============================================================
-def test_529_transiente_si_riprende_col_retry(bb, capsys):
-    """Il caso V7: 529 alla prima chiamata. Con la cura il round SOPRAVVIVE
-    e il desk ripreso lavora normalmente (giro tool + report)."""
+def test_529_ambiguo_conserva_causa_e_non_rispende(bb, capsys):
+    """An overloaded status alone does not attest nonbillable rejection."""
     def script(n, kwargs):
         if n == 1:
             raise _Err529("Error code: 529 - overloaded_error")
@@ -144,15 +144,11 @@ def test_529_transiente_si_riprende_col_retry(bb, capsys):
     client = _FakeClient(script)
     out = _MockSpecialist(bb, client=client).run(1)
 
-    assert out == REPORT_VERO
-    assert "[ERROR" not in out and "[COLLASSO" not in out
-    # 1 fallita (529) + 1 tool + 1 report
-    assert len(client.calls) == 3
-    # il retry e' DICHIARATO a log (mai un recupero zitto)
+    assert "[ERROR quant round 1]" in out and "529" in out
+    assert len(client.calls) == 1
     assert "529" in capsys.readouterr().out
-    # e le chiamate extra sono CONTATE nell'usage (misura, non stima):
-    # 2 iterazioni riuscite + 1 tentativo 529
-    assert bb.usage_log[-1]["api_calls"] == 3
+    assert bb.usage_log[-1]["api_calls"] == 1
+    assert bb.usage_log[-1]["cost_usd"] is None
 
 
 def test_529_esauriti_resta_errore_dichiarato(bb):
@@ -164,8 +160,7 @@ def test_529_esauriti_resta_errore_dichiarato(bb):
     out = _MockSpecialist(bb, client=client).run(1)
 
     assert out.startswith("[ERROR quant round 1]")
-    # 1 chiamata + i soli tentativi del backoff (2 nel collaudo)
-    assert len(client.calls) == 1 + len(base_mod.RETRY_529_BACKOFF_S)
+    assert len(client.calls) == 1  # Neither an outer nor an inner blind retry.
 
 
 def test_errore_non_529_resta_immediato(bb):

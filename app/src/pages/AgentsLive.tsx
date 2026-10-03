@@ -36,13 +36,14 @@ import { leggiDetail } from '@/lib/quota';
 import { useNavigate } from 'react-router-dom';
 import { Bellomberg, AgentInfo, AgentsLiveState, EnginesInfo, UsageBySpecialist, UsageTotal } from '@/lib/api';
 import RunConfirmDialog from '@/components/RunConfirmDialog';
+import WeeklyRecoveryPanel from '@/components/WeeklyRecoveryPanel';
 import Quadrante from '@/components/Quadrante';
 import SkyCanvas from '@/components/SkyCanvas';
 import { Sigil } from '@/lib/Sigil';
 import { useBox } from '@/lib/useBox';
 import { derivePlancia, engineShort, fmtDurShort, fmtClock, type Plancia, type Desk } from '@/lib/plancia-data';
 import { conservaDettaglioRun, dettaglioLeggibile, statusHttp } from '@/lib/mandato';
-import { Play, Square, Radio, AlertCircle } from 'lucide-react';
+import { Play, Square, Radio, AlertCircle, Lightbulb } from 'lucide-react';
 import './agents-plancia.css';
 
 const ACTIVE_RUN_KEY = 'bellomberg_active_run';
@@ -532,6 +533,7 @@ export default function AgentsLive() {
         )}
 
         <div className="grow" />
+        <button className="go" onClick={() => navigate('/agents/trade-idea')}><Lightbulb size={11} /> {tr('tradeidea.openTradeIdea')}</button>
         {isRunning ? (
           <button className="go stop" onClick={stopRun} disabled={stopping}
             title={activeTaskId ? tr('activity.stopTask', {a: activeTaskId}) : tr('activity.noTrackedTask')}>
@@ -546,6 +548,12 @@ export default function AgentsLive() {
       </div>
 
       {/* ══ I BUCHI IN VETRINA, non nei tooltip (regola PM 14/07) ═════ */}
+      <WeeklyRecoveryPanel disabled={isRunning} onStarted={tid => {
+        try { localStorage.setItem(ACTIVE_RUN_KEY, tid); } catch {}
+        setActiveTaskId(tid); setTriggerMsg({ kind: 'active', id: tid }); setStopNotice(null);
+        setState(prev => ({ ...(prev || {}), running: true, start_time: new Date().toISOString(),
+          message: tr('tradeidea.recoveryBusy') } as AgentsLiveState));
+      }} />
       {triggerMsg && <div className="warn"><span>{triggerMsg.kind === 'starting' ? tr('activity.starting')
         : tr('activity.runActiveEstimate', { a: triggerMsg.id ?? tr('activity.unavailable') })}</span></div>}
       {stopNotice && <div className="warn" role="status">

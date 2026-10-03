@@ -10,30 +10,34 @@ from datetime import timedelta
 from pathlib import Path
 import re
 
-from .dcf_quality import SCENARIOS, _date, _finite, _text, _evidence_issues, _portable
-from .method_registry import get_method_requirements
+from .dcf_quality import (SCENARIOS, DOCUMENTED_OPERATING_SANITY_POLICY,
+                          _date, _finite, _text, _evidence_issues, _portable,
+                          _documented_operating_scenario_valid)
+from .method_registry import get_method_requirements, requirements_for_records
 from .record_semantics import is_opening_equity_bridge
 
 
-def bind_inputs(bundle, schema, *, entities=None, horizon='forecast', forward_period=None):
+def bind_inputs(bundle, schema, *, entities=None, horizon='forecast', forward_period=None, scenario_names=SCENARIOS):
     """schema: driver -> (field, unit, basis, timing, shape, scope).
 
 timing is opening/future/terminal; shape is number/path/text/contract. Scope model
 or scenario is explicit. The caller validates each contract's exact keys.
 """
     case=bundle['case']; rows=case['records']; issues=[]; consumed=[]; evidence=[]
-    values={'model':{}, **{s:{} for s in SCENARIOS}}
+    values={'model':{}, **{s:{} for s in scenario_names}}
     def problem(driver, reason):
         issues.append({'field':schema[driver][0] if driver in schema else str(driver),
                        'status':'data_missing','reason':str(driver)+': '+reason})
     if case['assumptions']:
         problem('assumptions','Parametri legacy non consumati: '+', '.join(sorted(case['assumptions']))+'; usare i driver documentati del metodo')
     context=bundle['analysis_context']
-    if set(context)-{'scenario_rationale','revisions'}:
+    if set(context)-({'scenario_rationale','revisions'} if scenario_names else {'analysis_rationale'}):
         problem('analysis_context','Campi non consumati nel contratto documentato')
     rationale=context.get('scenario_rationale')
-    if not isinstance(rationale,dict) or set(rationale)!=set(SCENARIOS) or any(not _text(v) for v in rationale.values()):
+    if scenario_names and (not isinstance(rationale,dict) or set(rationale)!=set(scenario_names) or any(not _text(v) for v in rationale.values())):
         problem('scenario_rationale','Motivazioni esplicite bear/base/bull richieste')
+    elif not scenario_names and not _text(context.get('analysis_rationale')):
+        problem('analysis_rationale', 'Motivazione osservazionale esplicita richiesta')
     if context.get('revisions'):
         problem('revisions','Revisioni non riconciliate: fornire nuovo caso documentato; storia acquisizioni conservata')
     def structure(name):
@@ -56,6 +60,9 @@ or scenario is explicit. The caller validates each contract's exact keys.
     if horizon=='snapshot':
         if periods!=[] or calendar.get('discount_convention')!='snapshot':
             problem('calendar','NAV richiede fotografia datata senza orizzonte/sconto fittizio')
+        from .property_nav_requirements import reported_policy_selected
+        if bundle['decision'].get('method_id') == 'property_nav' and reported_policy_selected(rows):
+            span = calendar.get('valuation_date')
         if forward_period is not None:
             if (not isinstance(forward_period,dict) or set(forward_period)!={'start','end'} or
                     not _date(forward_period.get('start')) or not _date(forward_period.get('end')) or not opening):
@@ -83,8 +90,8 @@ or scenario is explicit. The caller validates each contract's exact keys.
             previous=end
         span='|'.join(p['start']+'/'+p['end'] for p in periods)
     quote_keys={'financial_currency','quote_currency','quote_unit','quote_units_per_currency',
-                'financial_to_quote_rate','shares_per_quote','share_class','price','price_as_of'}
-    if set(quotation)!=quote_keys:
+                 'financial_to_quote_rate','shares_per_quote','share_class','price','price_as_of'}
+    if set(quotation) not in (quote_keys, quote_keys | {'price_date_basis'}):
         problem('quotation','Quotazione, conversione e share class esplicite richieste')
     else:
         for key in ('price','financial_to_quote_rate','quote_units_per_currency','shares_per_quote'):
@@ -96,8 +103,11 @@ or scenario is explicit. The caller validates each contract's exact keys.
         if not isinstance(qc,str) or not re.fullmatch('[A-Z]{3}',qc): problem('quotation','Valuta quotazione ISO richiesta')
         if quotation['financial_currency']!=currency or quotation['share_class']!=perimeter.get('share_class'):
             problem('quotation','Valuta/classe non coerente col perimetro')
-        if quotation['price_as_of']!=calendar.get('valuation_date'):
-            problem('quotation','Prezzo e saldi devono avere stessa data valore; nessun rollforward implicito')
+        from .quotation_evidence import validate_quote_date_basis
+        try:
+            validate_quote_date_basis(quotation, calendar.get('valuation_date'))
+        except ValueError as exc:
+            problem('quotation', str(exc))
         if qc==currency and quotation['financial_to_quote_rate']!=1: problem('quotation','Cambio stessa valuta diverso da uno')
         if not ((qu==qc and quotation['quote_units_per_currency']==1) or
                 (qc=='GBP' and qu in ('GBX','GBp') and quotation['quote_units_per_currency']==100)):
@@ -140,13 +150,13 @@ or scenario is explicit. The caller validates each contract's exact keys.
         consumed.append({'record_index':index,**{key:row[key] for key in ('field','scenario','driver','entity','period','source_id')}})
         evidence.append({'scenario':scenario,'driver':driver,'values':deepcopy(value),'evidence':proof,'issues':[]})
     for driver,definition in schema.items():
-        for scenario in ('model',) if definition[-1]=='model' else SCENARIOS:
+        for scenario in ('model',) if definition[-1]=='model' else scenario_names:
             if driver not in values[scenario]: problem(driver,scenario+': input documentato mancante/non consumato')
     return {'values':values,'issues':issues,'consumed':consumed,'evidence':evidence,'times':times,
             'perimeter':perimeter,'calendar':calendar,'quotation':quotation,'problem':problem}
 
 
-def finish_documented(bundle, bound, scenarios, *, metadata, output_dir, engine):
+def finish_documented(bundle, bound, scenarios, *, metadata, output_dir, engine, valuation_basis=None):
     """One common quality/sanity/Excel/sidecar result for the new record adapters."""
     from .dcf_engine import sanity_check, _write_payload_sidecar, REPORT_DIR
     from .dcf_quality import normalize_valuation_payload
@@ -158,14 +168,14 @@ def finish_documented(bundle, bound, scenarios, *, metadata, output_dir, engine)
     if nonfinite(scenarios):
         bound['problem']('calculation','Risultato aritmetico non finito: acquisire driver validi; nessun valore di ripiego')
         scenarios=_portable(scenarios)
-    required=[f['field'] for f in get_method_requirements(method)['fields']]
+    required=[f['field'] for f in requirements_for_records(method,bundle['case']['records'])['fields']]
     consumed_fields=sorted({r['field'] for r in bound['consumed']})
     missing=sorted((set(required)-set(consumed_fields)) | set(bundle['case']['assumptions']))
     complete=not issues and not missing and len(bound['consumed'])==len(bundle['case']['records'])
     result={**metadata,'ticker':bundle['case']['ticker'],'engine':engine,'method':method,'ok':complete,
         'currency':quote.get('quote_unit'),'financial_currency':bound['perimeter'].get('currency'),'price':quote.get('price'),
         'valuation_date':bound['calendar'].get('valuation_date'),
-        'valuation_basis':'Documented scenario valuation at opening balances/quotation cutoff; regenerate to change assumptions.',
+        'valuation_basis':valuation_basis or 'Documented scenario valuation at opening balances/quotation cutoff; regenerate to change assumptions.',
         'analytical_quality':{'method_id':method,'status':'DOCUMENTATA' if complete else 'INCOMPLETA',
             'record_adapter':True,'snapshot':{'forecast_years':[p['end'] for p in bound['calendar'].get('periods',[]) if isinstance(p,dict) and 'end' in p]},
             'issues':[p['reason'] for p in issues], 'rows':bound['evidence']},
@@ -175,21 +185,34 @@ def finish_documented(bundle, bound, scenarios, *, metadata, output_dir, engine)
         'fair_value_weighted':None, 'calculation_details':{'scenarios':scenarios}}
     if complete:
         factor=quote['financial_to_quote_rate']*quote['quote_units_per_currency']*quote['shares_per_quote']
+        base_policy=method=='operating_fcff'
         checks={}
         for scenario in SCENARIOS:
-            value=scenarios.get(scenario,{}).get('fair_value_per_share')
+            calculated=scenarios.get(scenario)
+            value=calculated.get('fair_value_per_share') if isinstance(calculated,dict) else None
             result['fair_value_'+scenario]=round(value*factor,2) if _finite(value) else None
             check=sanity_check(result['fair_value_'+scenario],quote['price'])
-            if not _finite(value) or value<=0:
+            if (not _finite(value) or value<=0 or not _finite(result['fair_value_'+scenario])
+                    or result['fair_value_'+scenario]<=0
+                    or base_policy and not _documented_operating_scenario_valid(calculated)):
                 check.update(status='incomplete',severity='BLOCK',exclude_from_action_table=True)
             checks[scenario]=check
-        severity=max((c['severity'] for c in checks.values()),key={'OK':0,'WARN':1,'BLOCK':2}.get)
+        invalid=set(scenarios)!=set(SCENARIOS) or any(check['status']!='ok' for check in checks.values())
+        if base_policy:
+            for scenario in ('bear','bull'):
+                checks[scenario]['divergence_informational']=checks[scenario]['status']=='ok'
+        severity=('BLOCK' if invalid else checks['base']['severity']) if base_policy else max(
+            (c['severity'] for c in checks.values()),key={'OK':0,'WARN':1,'BLOCK':2}.get)
         result['sanity']={**checks['base'],'severity':severity,'method_id':method,
             'exclude_from_action_table':severity=='BLOCK','scenario_checks':checks}
+        if base_policy:
+            result['sanity']['policy']=DOCUMENTED_OPERATING_SANITY_POLICY
         result['upside_pct']=checks['base'].get('upside_pct')
     else:
         result['sanity']={'status':'incomplete','severity':'BLOCK','method_id':method,'exclude_from_action_table':True,
                           'headline':'Dati o riconciliazioni incompleti: FV n.d.'}
+        if method=='operating_fcff':
+            result['sanity']['policy']=DOCUMENTED_OPERATING_SANITY_POLICY
     from .market_quote import build_market_quote
     result['market_quote']=build_market_quote(bundle,quote,{s:result.get('fair_value_'+s) for s in SCENARIOS})
     result=normalize_valuation_payload(result,expected_decision=bundle['decision'],as_of=bundle['case']['as_of'])
@@ -272,5 +295,7 @@ def build_documented_workbook(payload, output_dir):
         present_sourcebook(wb, payload)
         from .documented_analysis import present_analysis
         present_analysis(wb, payload)
+    from .preparation_workbook_packet import capture_bindings
+    capture_bindings(wb, payload)
     wb.save(path); wb.close()
     return str(path)

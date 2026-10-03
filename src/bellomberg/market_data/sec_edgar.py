@@ -258,18 +258,50 @@ def _filing_metadata(righe, indice, cik, issuer):
         return valori[indice] if indice < len(valori) else None
     return {"emittente_id": f"CIK:{str(cik).zfill(10)}", "issuer": issuer,
             "report_date": campo("reportDate"),
+            **({'accepted_at': campo('acceptanceDateTime')} if campo('acceptanceDateTime') else {}),
             "items": [x.strip() for x in (campo("items") or "").split(",") if x.strip()],
             "fonte": "SEC EDGAR"}
 
 
-def get_filing_catalog(ticker: str, days: int = 1100, max_pages: int = 20) -> dict:
+def _issuer_name_key(name):
+    # Punctuation/case/spacing only: no fuzzy matching, suffix removal or aliases.
+    return re.sub(r'[\W_]+', '', name, flags=re.UNICODE).casefold() if isinstance(name, str) else ''
+
+
+def _cik_from_exact_issuer_name(ticker, issuer_name):
+    """Resolve documents for a confirmed foreign issuer, never its market quote."""
+    key = _issuer_name_key(issuer_name)
+    if not key:
+        raise ValueError('Nome legale esatto richiesto per la ricerca documentale SEC')
+    url = 'https://www.sec.gov/files/company_tickers.json'
+    response = requests.get(url, headers=_headers(), timeout=10)
+    response.raise_for_status()
+    companies = response.json()
+    if not isinstance(companies, dict):
+        raise ValueError('Elenco emittenti SEC non valido')
+    matches = [row for row in companies.values() if isinstance(row, dict)
+               and _issuer_name_key(row.get('title')) == key]
+    identifiers = {str(int(row['cik_str'])).zfill(10) for row in matches}
+    if len(identifiers) != 1:
+        raise ValueError('Nome legale SEC assente o associato a piu emittenti; nessun omonimo di ticker utilizzato')
+    cik = identifiers.pop()
+    if not re.fullmatch(r'\d{10}', cik) or int(cik) <= 0:
+        raise ValueError('CIK non valido nel catalogo emittenti SEC')
+    return cik, {'basis': 'exact_issuer_name_unique_cik', 'source_url': url,
+        'requested_ticker': ticker, 'requested_issuer_name': issuer_name,
+        'emittente_id': 'CIK:' + cik,
+        'sec_tickers': sorted({row['ticker'] for row in matches}),
+        'limitation': 'SEC symbols identify issuer filings only; requested listing and quotation remain unchanged.'}
+
+
+def get_filing_catalog(ticker: str, days: int = 1100, max_pages: int = 20, *, issuer_name=None) -> dict:
     """I-20: indice annuali/intermedi inclusi 20-F/6-K e archivi submissions.
 
     Non assume che un 6-K sia un bilancio: periodo/sezioni vanno verificati sul
     documento. Limiti, errori e assenze viaggiano insieme ai risultati parziali.
     Nessuna cache su disco. Il percorso storico degli altri consumer resta invariato.
     """
-    return _publication_catalog(ticker, days, max_pages, earnings=False)
+    return _publication_catalog(ticker, days, max_pages, earnings=False, issuer_name=issuer_name)
 
 
 def get_publication_catalog(ticker: str, days: int = 400, max_pages: int = 2) -> dict:
@@ -281,15 +313,19 @@ def get_publication_catalog(ticker: str, days: int = 400, max_pages: int = 2) ->
     return _publication_catalog(ticker, days, max_pages, earnings=True)
 
 
-def _publication_catalog(ticker, days, max_pages, *, earnings):
+def _publication_catalog(ticker, days, max_pages, *, earnings, issuer_name=None):
     out = {"stato": "ok", "documenti": [], "motivi": [], "fonte": "SEC EDGAR"}
     try:
         if days <= 0 or max_pages < 1:
             raise ValueError("days e max_pages devono essere positivi")
         ambiguo = ticker_ambiguo_per_cik(ticker)
         if ambiguo:
-            raise ValueError(ambiguo)
-        cik = lookup_cik(ticker, motivo=out["motivi"])
+            if issuer_name is None:
+                raise ValueError(ambiguo)
+            cik, binding = _cik_from_exact_issuer_name(ticker, issuer_name)
+            out['identity_resolution'] = binding
+        else:
+            cik = lookup_cik(ticker, motivo=out["motivi"])
         if not cik:
             raise ValueError("CIK non disponibile")
         cik = str(int(cik)).zfill(10)
@@ -299,6 +335,8 @@ def _publication_catalog(ticker, days, max_pages, *, earnings):
         data = response.json()
         if str(int(data["cik"])).zfill(10) != cik:
             raise ValueError("CIK della risposta diverso dall'emittente richiesto")
+        if issuer_name is not None and _issuer_name_key(data.get('name')) != _issuer_name_key(issuer_name):
+            raise ValueError('Nome legale submissions diverso dall\'emittente confermato')
         if earnings:
             out["emittente_id"] = "CIK:" + cik
         filings = data["filings"]

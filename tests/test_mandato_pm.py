@@ -596,13 +596,16 @@ def test_il_consigliere_chiama_il_controllo_prima_di_costruire_il_blackboard():
             if isinstance(sotto, ast.Call):
                 f = sotto.func
                 nome = f.id if isinstance(f, ast.Name) else getattr(f, "attr", "")
-                if nome in ("mandato_o_esci", "Blackboard"):
+                if nome in ("mandato_o_esci", "_run_multi_agent"):
                     chiamate.append((nome, i))
     idx = {}
     for nome, i in chiamate:
         idx.setdefault(nome, i)
     assert "mandato_o_esci" in idx, "run_multi_agent non chiama mandato_o_esci"
-    assert "Blackboard" in idx and idx["mandato_o_esci"] < idx["Blackboard"], idx
+    assert "_run_multi_agent" in idx and idx["mandato_o_esci"] < idx["_run_multi_agent"], idx
+    inner = next(n for n in albero.body if isinstance(n, ast.FunctionDef) and n.name == "_run_multi_agent")
+    assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "Blackboard"
+               for node in ast.walk(inner))
 
 
 # --------------------------------------------------------------------------- le tesi del PM portano il profilo VIVO
@@ -841,6 +844,6 @@ def test_regenerate_memo_controlla_il_mandato_prima_del_blackboard():
             if isinstance(sotto, ast.Call):
                 f = sotto.func
                 nome = f.id if isinstance(f, ast.Name) else getattr(f, "attr", "")
-                if nome in ("carica", "Blackboard"):
+                if nome in ("run_multi_agent", "Blackboard", "run_capo"):
                     idx.setdefault(nome, i)
-    assert "carica" in idx and "Blackboard" in idx and idx["carica"] < idx["Blackboard"], idx
+    assert "run_multi_agent" in idx and "Blackboard" not in idx and "run_capo" not in idx, idx

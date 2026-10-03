@@ -291,7 +291,8 @@ def test_T3_il_registro_usage_distingue_il_ritentativo_dal_retry_529(bb_fund, mo
     client = _ClientCheRispettaIlContratto(_copione_529_poi_report)
     _MockFundamentals(bb_fund, client=client).run(1)
     riga529 = [u for u in bb_fund.usage_log if u["agent"] == "fundamentals" and u["round"] == 1][-1]
-    assert riga529["api_calls"] == 2, riga529
+    assert riga529["api_calls"] == 1, riga529
+    assert riga529["cost_usd"] is None, riga529
     assert riga529.get("retry_vuoto") == 0, riga529
 
     with open(Blackboard.HEARTBEAT_PATH, encoding="utf-8") as f:

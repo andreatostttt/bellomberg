@@ -107,6 +107,108 @@ def test_duplicate_balance_and_unsupported_layout_fail():
     assert normalize_balance_sheet(primary(raw))['status'] == 'incomplete'
 
 
+def _with_dimensional_asset_note(raw, *, note_first=False):
+    """A reported segment exposure is not another consolidated balance sheet."""
+    raw = raw.replace(b'<html ', b'<html xmlns:xbrldi="http://xbrl.org/2006/xbrldi" ', 1)
+    contexts = ''.join(
+        f'<xbrli:context id="segment-{key}"><xbrli:entity>'
+        '<xbrli:identifier scheme="http://www.sec.gov/CIK">123</xbrli:identifier>'
+        '<xbrli:segment><xbrldi:explicitmember dimension="ex:BusinessSegmentsAxis">'
+        'ex:WidgetsMember</xbrldi:explicitmember></xbrli:segment></xbrli:entity>'
+        f'<xbrli:period><xbrli:instant>{on}</xbrli:instant></xbrli:period></xbrli:context>'
+        for key, on in [('now', '2025-12-31'), ('prior', '2024-12-31')])
+    note = '<table><tr><th>Segment exposure</th><th>2025</th><th>2024</th></tr>'
+    for index, tag in enumerate(('us-gaap:Assets', 'ex:MaximumExposureToLoss')):
+        note += '<tr><td>'+tag+'</td>'+''.join(
+            f'<td><ix:nonfraction id="segment-{index}-{key}" name="{tag}" '
+            f'contextref="segment-{key}" unitref="usd" scale="3">{amount}'
+            '</ix:nonfraction></td>' for key, amount in [('now', 7+index), ('prior', 5+index)])+'</tr>'
+    note += '</table>'
+    raw = raw.replace(b'<table>', contexts.encode()+b'<table>', 1)
+    return (raw.replace(b'<table>', note.encode()+b'<table>', 1) if note_first
+            else raw.replace(b'</html>', note.encode()+b'</html>'))
+
+
+@pytest.mark.parametrize('note_first', [False, True])
+@pytest.mark.parametrize('exposure_consolidated', [False, True])
+def test_dimensional_asset_note_does_not_make_consolidated_balance_ambiguous(note_first, exposure_consolidated):
+    raw = _with_dimensional_asset_note(balance_raw(), note_first=note_first)
+    if exposure_consolidated:
+        # A company-wide risk disclosure can accompany dimensional asset facts.
+        for key in ('now', 'prior'):
+            raw = raw.replace(f'name="ex:MaximumExposureToLoss" contextref="segment-{key}"'.encode(),
+                              f'name="ex:MaximumExposureToLoss" contextref="{key}"'.encode())
+    doc = primary(raw)
+    before = deepcopy(doc)
+    result = normalize_balance_sheet(doc)
+    assert result['status'] == 'ready', result
+    assert doc == before
+    packet = doc['balance_sheet_fields']
+    assert len(packet['tables']) == len(packet['excluded_tables']) == 1
+    assert packet['excluded_tables'][0]['reason'] == 'explicit_dimensional_note'
+    assert {'segment-now', 'segment-prior'} <= set(packet['excluded_tables'][0]['context_refs'])
+    body = json.loads(result['documents'][0]['text'])
+    assert sum(Decimal(x['value_exact']) for x in body['components']
+               if x['accounting_side'] == 'asset') == 80000
+    assert not any(x['reported_tag'] == 'ex:MaximumExposureToLoss' for x in body['components'])
+
+
+@pytest.mark.parametrize('mutation', [
+    'issuer', 'dimension_missing', 'namespace', 'future_period', 'mixed_scope',
+    'partial_consolidated_balance',
+])
+def test_dimensional_note_selection_preserves_ambiguous_or_incomplete_balances(mutation):
+    raw = _with_dimensional_asset_note(balance_raw())
+    if mutation == 'issuer':
+        raw = raw.replace(b'<xbrli:identifier scheme="http://www.sec.gov/CIK">123</xbrli:identifier>'
+                          b'<xbrli:segment>',
+                          b'<xbrli:identifier scheme="http://www.sec.gov/CIK">321</xbrli:identifier>'
+                          b'<xbrli:segment>')
+    elif mutation == 'dimension_missing':
+        raw = raw.replace(b' dimension="ex:BusinessSegmentsAxis"', b'')
+    elif mutation == 'namespace':
+        raw = raw.replace(b'http://xbrl.org/2006/xbrldi', b'https://example.com/not-xbrldi')
+    elif mutation == 'future_period':
+        raw = raw.replace(b'<xbrli:instant>2025-12-31</xbrli:instant></xbrli:period>'
+                          b'</xbrli:context><xbrli:context id="segment-prior">',
+                          b'<xbrli:instant>2026-12-31</xbrli:instant></xbrli:period>'
+                          b'</xbrli:context><xbrli:context id="segment-prior">')
+    elif mutation == 'mixed_scope':
+        raw = raw.replace(b'name="us-gaap:Assets" contextref="segment-now"',
+                          b'name="us-gaap:Assets" contextref="now"')
+    else:
+        raw = raw.replace(b'us-gaap:LiabilitiesAndStockholdersEquity', b'ex:UnknownClosingTotal')
+    result = normalize_balance_sheet(primary(raw))
+    assert result['status'] == 'incomplete' and not result['documents'], result
+
+
+def test_only_dimensional_asset_note_does_not_establish_consolidated_coverage():
+    result = normalize_balance_sheet(primary(_with_dimensional_asset_note(raw_source())))
+    assert result['status'] == 'incomplete' and not result['documents'], result
+
+
+@pytest.mark.parametrize('mutation', ['consolidated_context', 'source_text', 'refs', 'duplicate_index', 'second_balance'])
+def test_catalog_recompilation_rechecks_why_a_table_was_excluded(mutation):
+    from bellomberg.valuation.statement_table_evidence import _json
+    doc = primary(_with_dimensional_asset_note(balance_raw()))
+    packet = doc['balance_sheet_fields']
+    excluded = packet['excluded_tables'][0]
+    if mutation == 'consolidated_context':
+        excluded['html'] = excluded['html'].replace('contextref="segment-now"', 'contextref="now"')
+    elif mutation == 'source_text':
+        excluded['html'] = excluded['html'].replace('>7</ix:nonfraction>', '>99</ix:nonfraction>')
+    elif mutation == 'refs':
+        excluded['context_refs'] = []
+    elif mutation == 'duplicate_index':
+        excluded['index'] = packet['tables'][0]['index']
+    else:
+        excluded['html'] = packet['tables'][0]['html']
+        excluded['context_refs'] = ['now']
+    packet['sha256'] = sha256(_json({k: v for k, v in packet.items() if k != 'sha256'}).encode()).hexdigest()
+    result = normalize_balance_sheet(doc)
+    assert result['status'] == 'incomplete' and not result['documents'], result
+
+
 @pytest.mark.parametrize('tag', [
     b'us-gaap:OtherAssetsCurrent',
     b'us-gaap:ReceivablesNetCurrent',

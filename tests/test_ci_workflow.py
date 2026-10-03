@@ -10,7 +10,9 @@ uvicorn[standard] (requirements.txt): se manca, il test cade con la causa, non s
 """
 import os
 import re
+import sys
 
+import pytest
 import yaml
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -82,7 +84,10 @@ def test_il_job_macos_installa_il_pacchetto_e_ne_verifica_la_coerenza():
 def test_il_job_macos_compila_e_lancia_la_suite_offline():
     run = _run_di(_job("macos-source"))
     assert "compileall" in run and "src/bellomberg" in run
-    assert re.search(r"pytest tests/? -q", run), run
+    for nome in ("test", "macos-source"):
+        run = _run_di(_job(nome))
+        assert "python -I tools/testing/research_ci.py" in run, run
+        assert not re.search(r"pytest tests/?(?:\s|$)", run), run
 
 
 def test_il_job_macos_costruisce_i_bundle_e_prova_electron():
@@ -126,3 +131,16 @@ def test_il_job_macos_non_spende_minuti_sul_repo_privato_senza_ordine():
 
 def test_i_job_linux_e_windows_restano_senza_condizione_di_costo():
     assert "if" not in _job("test") and "if" not in _job("desktop-windows")
+
+
+def test_research_ci_rifiuta_la_creazione_excel_prima_di_scrivere(tmp_path):
+    from tools.testing import research_ci
+
+    sys.addaudithook(research_ci.forbid_excel_write)
+    target = tmp_path / "forbidden.XLSX"
+    with pytest.raises(research_ci.ExcelGenerationForbidden, match="forbidden"):
+        target.write_bytes(b"must never be written")
+    assert not target.exists()
+    pdf = tmp_path / "research.pdf"
+    pdf.write_bytes(b"synthetic PDF fixture")
+    assert pdf.read_bytes() == b"synthetic PDF fixture"

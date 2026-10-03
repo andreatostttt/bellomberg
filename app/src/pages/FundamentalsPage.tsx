@@ -10,6 +10,11 @@ import { prepareValuationModel, valuationBadge } from '@/lib/sector-valuation';
 import FilingDiffPanel from '@/components/FilingDiffPanel';
 import { currentWorkbook, historicalWorkbook, requestModelRefresh, lockModel, createPersonalVariant, personalVariants, personalWorkbook } from '@/lib/valuation-download';
 import type { PersonalValuation } from '@/lib/valuation-download';
+import FundamentalsResearch from '@/components/FundamentalsResearch';
+
+// The research view is the ordinary Fund page. The former workspace remains
+// preserved below as source history, never mounted by the application router.
+export default FundamentalsResearch;
 
 // F17 Fundamentals — OPZIONE B scelta dal PM (17/07, mockup renderizzato, regola
 // 15/07): master-detail stile terminal. Sinistra: tabella densa (un modello canonico
@@ -113,7 +118,7 @@ function MnavBar({ now, target }: { now: number | null; target?: number | null }
   );
 }
 
-export default function FundamentalsPage() {
+export function ArchivedValuationWorkspace() {
   const tr = useT();
   const [models, setModels] = useState<ValuationModel[]>([]);
   const [nota, setNota] = useState<string | undefined>();

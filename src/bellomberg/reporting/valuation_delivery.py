@@ -5,23 +5,30 @@ import json
 import os
 from pathlib import Path
 from uuid import uuid4
+from zipfile import BadZipFile
 
 
 def describe_result(ticker, result):
     result = result if isinstance(result, dict) else {}
-    malformed = next((key for key in ("valuation_usability", "_thesis_saved",
+    exposure = result.get("method") == "exposure_analysis"
+    usability_key = "analysis_usability" if exposure else "valuation_usability"
+    malformed = next((key for key in ("valuation_usability", usability_key, "_thesis_saved",
                                       "model_publication", "valuation_decision")
                       if key in result and not isinstance(result[key], dict)), None)
-    usability = result.get("valuation_usability") if isinstance(result.get("valuation_usability"), dict) else {}
+    usability = result.get(usability_key) if isinstance(result.get(usability_key), dict) else {}
     thesis = result.get("_thesis_saved") if isinstance(result.get("_thesis_saved"), dict) else {}
     publication = result.get("model_publication") if isinstance(result.get("model_publication"), dict) else {}
     decision = result.get("valuation_decision") if isinstance(result.get("valuation_decision"), dict) else {}
     reasons = usability.get("reasons")
     if malformed is None and "reasons" in usability and (
             not isinstance(reasons, list) or any(not isinstance(reason, str) for reason in reasons)):
-        malformed = "valuation_usability.reasons"
+        malformed = usability_key + ".reasons"
     usable = malformed is None and usability.get("usable") is True
-    return {"ticker": ticker, "snapshot_id": result.get("snapshot_id"),
+    if exposure and malformed is None:
+        from bellomberg.valuation.trade_idea_model import candidate_model_usability
+        checked = candidate_model_usability(result)
+        usable, reasons = checked["usable"], checked["reasons"]
+    row = {"ticker": ticker, "snapshot_id": result.get("snapshot_id"),
             "generation_id": result.get("generation_id"), "path": result.get("path"),
             "thesis_id": thesis.get("thesis_id"),
             "method": decision.get("method_id"),
@@ -36,6 +43,17 @@ def describe_result(ticker, result):
             # publication_status is the v1 artifact field, retained for old receipts.
             "artifact_status": "not_verified", "publication_status": "not_verified", "email_included": False,
             "recorded_at": datetime.now(timezone.utc).isoformat()}
+    if exposure:
+        row.update(model_kind="exposure", objective="observed_exposure_analysis", intrinsic_value_applicable=False)
+    return row
+
+
+def _exposure_payload_digest(payload):
+    """Bind the observational receipt to its exact acquired records and results."""
+    keys = ("ticker", "method", "snapshot_id", "generation_id", "valuation_date", "currency", "price",
+            "acquisition_snapshot", "valuation_decision", "analysis_usability", "exposure_analysis", "input_consumption")
+    return sha256(json.dumps({key: payload.get(key) for key in keys}, sort_keys=True,
+                            ensure_ascii=False, allow_nan=False).encode()).hexdigest()
 
 
 def build_manifest(results, *, roots, attempts=()):
@@ -68,7 +86,8 @@ def build_manifest(results, *, roots, attempts=()):
         except (OSError, ValueError) as exc:
             reject("metadata_missing", "Metadati workbook non leggibili: " + type(exc).__name__)
             continue
-        sidecar_usability = sidecar.get("valuation_usability") if isinstance(sidecar, dict) else None
+        exposure = result.get("method") == "exposure_analysis"
+        sidecar_usability = sidecar.get("analysis_usability" if exposure else "valuation_usability") if isinstance(sidecar, dict) else None
         if not isinstance(sidecar_usability, dict):
             reject("metadata_mismatch", "Metadati utilizzabilita workbook non validi")
             continue
@@ -85,6 +104,24 @@ def build_manifest(results, *, roots, attempts=()):
         if digest != result.get("workbook_sha256") or digest != sidecar.get("workbook_sha256"):
             reject("file_modified", "Workbook modificato rispetto alla generazione; copia conservata")
             continue
+        if exposure:
+            from bellomberg.valuation.trade_idea_model import candidate_model_usability, model_exhibits
+            checked = candidate_model_usability(sidecar)
+            if (checked.get("kind") != "exposure" or not checked.get("usable")
+                    or not row["valuation_date"] or sidecar.get("valuation_date") != row["valuation_date"]
+                    or _exposure_payload_digest(result) != _exposure_payload_digest(sidecar)):
+                reject("metadata_mismatch", "Identita, data o osservazioni del modello exposure discordanti")
+                continue
+            try:
+                from openpyxl.utils.exceptions import InvalidFileException
+                exhibits = model_exhibits(sidecar, workbook_path=path)
+            except (OSError, ValueError, TypeError, KeyError, BadZipFile, InvalidFileException) as exc:
+                reject("model_dossier_unbound", "Workbook exposure non leggibile: " + type(exc).__name__)
+                continue
+            if exhibits.get("status") != "complete":
+                reject("model_dossier_unbound", "Prospetti exposure non verificati: " + "; ".join(exhibits.get("reasons") or []))
+                continue
+            row["analysis_payload_sha256"] = _exposure_payload_digest(sidecar)
         file = str(path)
         row.update(status="ready", reason="Generazione registrata e contenuto verificato",
                    artifact_status="available", publication_status="available", workbook_sha256=digest, path=file)
@@ -148,7 +185,7 @@ def recover_manifest(memo_id, *, receipts_dir, roots, memo_sha256):
                 or type(row.get("thesis_id")) is not int or row["thesis_id"] < 1):
             issues.append("Receipt incompleto o discordante per " + str(ticker))
             continue
-        results[ticker] = {"path": file, "snapshot_id": row["snapshot_id"],
+        recovered = {"path": file, "snapshot_id": row["snapshot_id"],
                            "generation_id": row["generation_id"],
                            "workbook_sha256": digest,
                            "valuation_usability": {"usable": True},
@@ -156,6 +193,22 @@ def recover_manifest(memo_id, *, receipts_dir, roots, memo_sha256):
                            "model_publication": {"status": "historical_receipt",
                                "reason": "Copia datata del pacchetto originale; versione corrente non riverificata"},
                            "reused": row.get("revision_origin") == "reused"}
+        if row.get("method") == "exposure_analysis" or row.get("model_kind") == "exposure":
+            try:
+                sidecar = json.loads(Path(file).with_suffix(".payload.json").read_text(encoding="utf-8"))
+                if (not isinstance(sidecar, dict) or not row.get("analysis_payload_sha256")
+                        or _exposure_payload_digest(sidecar) != row["analysis_payload_sha256"]
+                        or sidecar.get("valuation_date") != row.get("valuation_date")):
+                    raise ValueError("Observational receipt differs from its exact model payload")
+                recovered = {**sidecar, **recovered, "method": "exposure_analysis",
+                             "valuation_usability": sidecar.get("valuation_usability")}
+            except (OSError, ValueError, TypeError) as exc:
+                issues.append("Receipt exposure non verificabile per " + ticker + ": " + type(exc).__name__)
+                skipped.append({**row, "status": "metadata_mismatch", "artifact_status": "unavailable",
+                                "publication_status": "unavailable", "email_included": False,
+                                "reason": "Osservazioni originali non piu verificabili"})
+                continue
+        results[ticker] = recovered
     attempts = source.get("attempts")
     if not isinstance(attempts, list):
         issues.append("Tentativi originali non leggibili")
@@ -169,6 +222,7 @@ def recover_manifest(memo_id, *, receipts_dir, roots, memo_sha256):
 def record_email_outcome(receipt, sent):
     """An assembled MIME is not evidence that SMTP delivered the message."""
     receipt["email_status"] = ("sent" if sent is True else
+                               "uncertain" if receipt.get("email_status") == "uncertain" else
                                "package_failed" if receipt.get("email_status") == "package_failed"
                                else "not_sent")
     included = (set(receipt.get("mime_attachments") or []) & set(receipt.get("attachments") or [])

@@ -51,6 +51,43 @@ def test_sec_ambiguous_european_symbol_never_contacts_us_namesake(monkeypatch):
     assert r["stato"] == "errore" and r["motivi"]
 
 
+@pytest.mark.parametrize('fault', [None, 'no_exact_name', 'two_issuers', 'submissions_name', 'submissions_cik'])
+def test_foreign_catalog_uses_exact_issuer_name_without_replacing_requested_listing(monkeypatch, fault):
+    monkeypatch.setattr(sec_edgar, '_alias_sec', lambda: {})
+    monkeypatch.setattr(sec_edgar, '_headers', lambda: {'User-Agent': 'synthetic-test'})
+    monkeypatch.setattr(sec_edgar, 'lookup_cik', lambda *_a, **_k: pytest.fail('Foreign ticker stripped'))
+    companies = {'0': {'cik_str': 1234, 'title': 'EXAMPLE SA', 'ticker': 'USADR'},
+                 '1': {'cik_str': 1234, 'title': 'EXAMPLE SA', 'ticker': 'USORDINARY'},
+                 '2': {'cik_str': 9999, 'title': 'Unrelated Company Inc.', 'ticker': 'EXAMPLE'}}
+    if fault == 'no_exact_name':
+        companies['0']['title'] = companies['1']['title'] = 'Example Holdings SA'
+    elif fault == 'two_issuers':
+        companies['1']['cik_str'] = 5678
+    calls = []
+    def get(url, **kw):
+        calls.append(url)
+        if url.endswith('company_tickers.json'):
+            return Risposta(companies)
+        assert url == 'https://data.sec.gov/submissions/CIK0000001234.json'
+        return Risposta({'cik': '4321' if fault == 'submissions_cik' else '1234',
+            'name': 'Another Issuer SA' if fault == 'submissions_name' else 'EXAMPLE SA',
+            'filings': {'recent': righe('20-F', '0000001234-26-000001', '2025-12-31'), 'files': []}})
+    monkeypatch.setattr(sec_edgar.requests, 'get', get)
+    result = sec_edgar.get_filing_catalog('EXAMPLE.MI', issuer_name='Example S.A.', days=5000)
+    if fault:
+        assert result['stato'] == 'errore' and result['documenti'] == []
+        assert result['motivi']
+        if fault in ('no_exact_name', 'two_issuers'):
+            assert len(calls) == 1
+    else:
+        assert result['stato'] == 'ok', result['motivi']
+        assert result['documenti'][0]['ticker'] == 'EXAMPLE.MI'
+        assert result['documenti'][0]['emittente_id'] == 'CIK:0000001234'
+        assert result['identity_resolution']['sec_tickers'] == ['USADR', 'USORDINARY']
+        assert result['identity_resolution']['requested_ticker'] == 'EXAMPLE.MI'
+        assert result['identity_resolution']['basis'] == 'exact_issuer_name_unique_cik'
+
+
 @pytest.mark.parametrize("name", ["https://evil.example/submissions.json", "../other.json"])
 def test_sec_archive_path_must_belong_to_requested_cik(monkeypatch, name):
     monkeypatch.setattr(sec_edgar, "lookup_cik", lambda *a, **k: "0000001234")

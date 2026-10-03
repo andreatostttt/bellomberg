@@ -180,7 +180,11 @@ def create_valuation_automation_router(require_session, *, db_provider, roots,
         return {key: row[key] for key in ("id", "ticker", "source_generation", "label", "created_at",
             "status", "error", "available", "modified", "current_sha256", "read_error") if key in row}
 
-    @router.post("/{ticker}/refresh", status_code=202)
+    def archive_only():
+        raise HTTPException(409, {"code": "excel_archived",
+            "message": "Archivio Excel in sola lettura. La generazione richiede un incarico separato."})
+
+    @router.post("/{ticker}/refresh", status_code=202, dependencies=[Depends(archive_only)])
     def refresh(ticker: str, body: dict):
         ticker = _ticker(ticker)
         fields(body, ("request_id",))
@@ -198,7 +202,7 @@ def create_valuation_automation_router(require_session, *, db_provider, roots,
         except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as exc:
             raise _unavailable(exc) from exc
 
-    @router.post("/{ticker}/lock")
+    @router.post("/{ticker}/lock", dependencies=[Depends(archive_only)])
     def lock(ticker: str, body: dict):
         ticker = _ticker(ticker)
         fields(body, ("locked", "generation_id"))
@@ -213,7 +217,7 @@ def create_valuation_automation_router(require_session, *, db_provider, roots,
             raise _unavailable(exc) from exc
         return {"ticker": ticker, "generation_id": generation, "locked": body["locked"]}
 
-    @router.post("/{ticker}/variants", status_code=201)
+    @router.post("/{ticker}/variants", status_code=201, dependencies=[Depends(archive_only)])
     def create_variant(ticker: str, body: dict):
         ticker = _ticker(ticker)
         fields(body, ("request_id", "generation_id", "label"))

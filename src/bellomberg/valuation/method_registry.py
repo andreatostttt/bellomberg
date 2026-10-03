@@ -305,6 +305,24 @@ def get_method_requirements(method_id: str) -> dict[str, Any]:
             **deepcopy(_METHODS[method_id]["requirements"]), "analysis_standard": forecast_standard(method_id)}
 
 
+def requirements_for_records(method_id, records):
+    """Select only the closed reported NAV contract; preserve every legacy schema."""
+    result = get_method_requirements(method_id)
+    if method_id == 'property_nav':
+        from .property_nav_requirements import REPORTED_FIELDS, reported_policy_selected
+        if reported_policy_selected(records):
+            result['fields'] = [{'field': field, 'required': True, 'description': description}
+                                for field, description in REPORTED_FIELDS]
+            result['record_contract'] = 'reported_property_nav_snapshot/1'
+            result['periods'] = ['Dated reported balance-sheet snapshot; no forecast horizon or invented cash bridge.']
+            result['drivers'] = ['reported_property_values', 'reported_equity_method_participations',
+                                 'reported_liabilities', 'EPRA_NTA_adjustments', 'explicit_asset_sensitivity']
+            result['reconciliations'] = ['Complete assets less liabilities and minorities reconcile to reported parent equity.',
+                'IFRS to EPRA NTA and diluted shares reconcile within reported rounding precision.',
+                'Joint venture property memorandum and development commitments are not added twice to NAV.']
+    return result
+
+
 def is_record_method(decision):
     """Current documented adapter contract, shared by provenance consumers."""
     if not isinstance(decision, dict):

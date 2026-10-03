@@ -126,7 +126,11 @@ def test_api_spawns_the_packaged_committee_module(tmp_path, monkeypatch):
     assert tasks.callback is not None
     tasks.callback()
 
-    assert calls == [[sys.executable, "-u", "-m", "bellomberg.agents.consigliere_multi"]]
+    assert len(calls) == 1
+    assert calls[0][:4] == [sys.executable, "-u", "-m", "bellomberg.agents.consigliere_multi"]
+    assert calls[0][4] == '--outcome'
+    assert Path(calls[0][5]).parent == tmp_path / 'weekly_outcomes'
+    assert calls[0][6] == '--task-id' and calls[0][7]
 
 
 def test_api_console_entrypoint_uses_the_packaged_app(monkeypatch):

@@ -5,6 +5,7 @@ memo prodotti su Opus 5 (id 48 del 28/07 e id 49 del 30/07) sono usciti a
 capo_tokens_out = 32000 ESATTI col marker [NOTA AUTOMATICA]; i memo su
 Opus 4.8 (46, 47) chiudevano a 22.342/20.379. Decisione PM 01/08: streaming +
 tetto a 64000 (l'SDK rifiuta le non-streaming che stima sopra ~10 minuti).
+Decisione PM 02/10: tetto nuovo 128000, mantenendo lo streaming.
 
 Voce 5 (P3): capo.py stampava "Opus 4.8" in testa mentre il modello vero e'
 claude-opus-5 — l'etichetta ora deriva da CAPO_MODEL e non puo' piu' invecchiare.
@@ -85,12 +86,12 @@ def _blackboard_finto():
     return SimpleNamespace(data={"macro": {2: "report macro finto"}})
 
 
-def test_capo_chiama_in_streaming_col_tetto_64k(monkeypatch):
+def test_capo_chiama_in_streaming_col_tetto_128k(monkeypatch):
     chiamate = _prepara(monkeypatch, _messaggio_finto())
     final, usage = capo.run_capo(_blackboard_finto())
     assert len(chiamate) == 1
     kw = chiamate[0]
-    assert kw["max_tokens"] == 64000, kw["max_tokens"]
+    assert kw["max_tokens"] == 128000, kw["max_tokens"]
     assert kw["model"] == llm_client.modello("capo")
     # il thinking del comitato resta ADAPTIVE (regola CLAUDE.md: com'era)
     assert kw["thinking"] == {"type": "adaptive"}

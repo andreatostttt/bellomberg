@@ -8,6 +8,7 @@ from datetime import date
 from decimal import Decimal
 from fractions import Fraction
 from hashlib import sha256
+from pathlib import Path
 import calendar
 import json
 import re
@@ -58,7 +59,7 @@ def extract_statement_packet(source, raw):
     from bellomberg.market_data.lettore_trimestrali import estrai_testo
     if estrai_testo('statement.html', contenuto=raw).get('testo') != source['text']:
         raise ValueError('statement text differs from original HTML extraction')
-    soup = BeautifulSoup(raw, 'html.parser'); tables = []
+    soup = BeautifulSoup(raw, 'html.parser'); tables, share_tables = [], []
     for index, table in enumerate(soup.find_all('table')):
         if table.find_parent('table'):
             continue
@@ -69,7 +70,9 @@ def extract_statement_packet(source, raw):
                 if length > 2400:
                     break
         context = ' '.join(' '.join(reversed(preceding)).split())
-        if not _HEADING.search(context):
+        heading = _HEADING.search(context)
+        share_candidate = 'Number of shares outstanding' in table.get_text(' ', strip=True)
+        if not heading and not share_candidate:
             continue
         rows = []
         for tr in table.find_all('tr'):
@@ -77,9 +80,13 @@ def extract_statement_packet(source, raw):
                 rows.append([{'text': ' '.join(cell.get_text(' ', strip=True).split()),
                               'colspan': cell.get('colspan', '1'), 'rowspan': cell.get('rowspan', '1')}
                              for cell in tr.find_all(['td', 'th'], recursive=False)])
-        tables.append({'index': index, 'context': context, 'rows': rows})
+        if share_candidate:
+            share_tables.append({'index': index, 'rows': rows})
+        if heading:
+            tables.append({'index': index, 'context': context, 'rows': rows})
     packet = {'format': NORMALIZER, 'source_document_sha256': source['id'],
-              'source_text_sha256': source['sha256'], 'tables': tables}
+              'source_text_sha256': source['sha256'], 'tables': tables,
+              'share_tables': share_tables}
     packet['sha256'] = sha256(_json(packet).encode()).hexdigest()
     return packet
 
@@ -178,7 +185,7 @@ def _section_subtotals(rows, columns):
         for left, right, _ in columns:
             if any(c['text'] for c in heading if left <= c['column'] < right):
                 continue
-            terms, pairs = [], []
+            terms, pairs, reported_dashes = [], [], []
             for index in block:
                 row = rows[index]
                 if row[0]['column'] != 0 or not row[0]['text'] or _NONMONETARY.search(row[0]['text']):
@@ -188,6 +195,18 @@ def _section_subtotals(rows, columns):
                     break
                 values = [(c, _number(c, row, exact=True)) for c in cells]
                 numbers = [(c, n) for c, n in values if n is not None]
+                # A printed dash is a disclosure, never a numeric zero. It may
+                # appear inside a reconciled section only at the established
+                # measure column, with no other opening-period cell populated.
+                dashes = [c for c, n in values if c['text'] == '-' and n is None]
+                if (index != block[-1] and not numbers and len(dashes) == 1 and pairs
+                        and dashes[0]['column'] == pairs[0][0]['column']
+                        and all(not c['text'] or c is dashes[0] for c, _ in values)):
+                    c = dashes[0]
+                    reported_dashes.append({'row_index': index, 'cell_index': c['cell_index'],
+                                            'column': c['column'], 'cell_text': c['text'],
+                                            'label': row[0]['text']})
+                    continue
                 # Only an adjacent closing parenthesis may accompany a number.
                 if any(c['text'] and n is None and not (c['text'] == ')' and any(
                         p['end_column'] == c['column'] and p['text'].startswith('(')
@@ -207,7 +226,8 @@ def _section_subtotals(rows, columns):
                         or sum(Fraction(n) for _, n in pairs) != Fraction(total)):
                     continue
                 proof = {'section': section, 'heading_row_index': start, 'boundary_row_index': boundary,
-                         'terms': terms, 'subtotal': {'row_index': block[-1], 'cell_index': subtotal['cell_index'],
+                          'terms': terms, 'reported_dashes': reported_dashes,
+                          'subtotal': {'row_index': block[-1], 'cell_index': subtotal['cell_index'],
                          'column': subtotal['column'], 'cell_text': subtotal['text'],
                          'value': _number(subtotal, rows[block[-1]])}}
                 resolved[block[-1], left] = (cell, _number(cell, rows[block[-1]]), proof)
@@ -224,6 +244,75 @@ def _concept(label, role, section):
     return current.get(section, {}).get(label, 'label:' + label) if role == 'balance' else 'label:' + label
 
 
+def _opening_share_facts(source, packet, packet_sha256, meta, cik, accession):
+    """Only the unscaled, dated outstanding-share row of one SEC summary table."""
+    candidates = packet.get('share_tables', [])
+    if not candidates:
+        return []
+    if len(candidates) != 1 or meta['form'] not in ('6-K', '6-K/A', '20-F', '20-F/A'):
+        raise ValueError('unique foreign primary summary share table required')
+    if extract_statement_packet(source, Path(source['archive_path']).read_bytes()) != source['statement_table_fields']:
+        raise ValueError('share table layout differs from verified source bytes')
+    table = candidates[0]
+    compact = lambda value: re.sub(r'\s+', '', value)
+    literal = compact(' '.join(c['text'] for row in table['rows'] for c in row))
+    if not literal or literal not in compact(source['text']):
+        raise ValueError('share table cells differ from the original source')
+    rows = _grid(table['rows'])
+    if len(rows) < 3 or not rows[0] or not re.fullmatch(
+            r'\(?all amounts in (?:thousands|millions) of '
+            r'(?:U\.S\. dollars|euros|pounds sterling), except number of shares\)?',
+            rows[0][0]['text'], re.I):
+        raise ValueError('explicit unscaled share-count unit exception required')
+    dates = []
+    for heading in rows[0][1:]:
+        match = re.fullmatch(_DAY + r'\s*', heading['text'], re.I)
+        if not match:
+            continue
+        years = [cell for cell in rows[1] if cell['column'] == heading['column']
+                 and cell['end_column'] == heading['end_column']
+                 and re.fullmatch(r'20\d{2}', cell['text'])]
+        if len(years) != 1:
+            raise ValueError('share count header lacks an aligned reporting year')
+        period = _period(match[1], match[2], years[0]['text'])['end']
+        dates.append((heading, years[0], period))
+    if (len(dates) != 2 or dates[0][2] != meta['report_date']
+            or dates[1][2] >= dates[0][2]
+            or dates[0][0]['end_column'] > dates[1][0]['column']):
+        raise ValueError('ordered opening/comparative share dates required')
+    labels = [row[0]['text'] for row in rows[2:] if row]
+    if (labels.count('Number of shares outstanding') != 1
+            or not {'Total assets', 'Total liabilities', 'Equity',
+                    'Total liabilities and equity'} <= set(labels)):
+        raise ValueError('single outstanding-share row in complete summary required')
+    row_index = next(i for i, row in enumerate(rows)
+                     if row and row[0]['text'] == 'Number of shares outstanding')
+    row = rows[row_index]; facts = []
+    for heading, year, period in dates:
+        cells = [cell for cell in row if heading['column'] <= cell['column'] < heading['end_column']]
+        numeric = [(cell, _number(cell, row, exact=True)) for cell in cells if cell['text']]
+        if (len(numeric) != 1 or numeric[0][0]['end_column'] > heading['end_column']
+                or numeric[0][1] is None or numeric[0][1] <= 0
+                or numeric[0][1] != numeric[0][1].to_integral_value()):
+            raise ValueError('one positive unscaled share count per reported date required')
+        cell, value = numeric[0]
+        facts.append({'taxonomy': TAXONOMY, 'concept': 'CommonStockSharesOutstanding',
+                      'label': row[0]['text'], 'value': int(value), 'unit': 'shares',
+                      'end': period, 'entity': meta['issuer'], 'scope': 'consolidated',
+                      'statement': 'shares', 'section': None,
+                      'proof': {'source_document_id': source['id'],
+                                'packet_sha256': packet_sha256,
+                                'table_index': table['index'], 'row_index': row_index,
+                                'cell_index': cell['cell_index'], 'column': cell['column'],
+                                'cell_text': cell['text'], 'header_row_index': 0,
+                                'header_cell_index': heading['cell_index'],
+                                'header_text': heading['text'],
+                                'year_row_index': 1, 'year_cell_index': year['cell_index'],
+                                'year_text': year['text'], 'unit_exception': rows[0][0]['text'],
+                                'issuer_cik': cik, 'accession': accession}})
+    return facts
+
+
 def normalize_statement_tables(source):
     if source.get('filing_verification') is not None:
         from .pdf_statement_evidence import normalize_pdf_statements
@@ -236,7 +325,8 @@ def normalize_statement_tables(source):
             raise ValueError('statement layout packet changed')
         facts, roles = [], set()
         coverage = {'missing_cells': 0, 'ambiguous_cells': 0, 'excluded_nonmonetary_rows': 0,
-                    'excluded_reconciliation_rows': 0, 'resolved_subtotal_cells': 0}
+                    'excluded_reconciliation_rows': 0, 'resolved_subtotal_cells': 0,
+                    'share_observation': 'absent'}
         for table in packet['tables']:
             compact = lambda text: re.sub(r'\s+', '', text)
             literal = compact(' '.join(c['text'] for row in table['rows'] for c in row))
@@ -304,6 +394,13 @@ def normalize_statement_tables(source):
                                   **subtotal_proof}})
         if roles != {'income', 'balance', 'cash_flow'} or not any(f['concept'] == 'Revenue' for f in facts):
             raise ValueError('income, balance sheet, cash flow and reported revenue required')
+        if packet.get('share_tables'):
+            try:
+                facts.extend(_opening_share_facts(source, packet, supplied, meta, cik, accession))
+                coverage['share_observation'] = 'ready'
+            except (ValueError, KeyError, TypeError, IndexError, ArithmeticError, OSError) as exc:
+                coverage['share_observation'] = 'incomplete'
+                coverage['share_issue'] = str(exc)
         text = _json({'issuer': meta['issuer'], 'facts': facts})
         doc = {'id': PREFIX + source['id'], 'url': source['url'], 'published_at': source['published_at'],
                'document_sha256': source['id'], 'text': text, 'sha256': sha256(text.encode()).hexdigest(),

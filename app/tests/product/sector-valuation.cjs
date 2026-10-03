@@ -32,7 +32,7 @@ function render(model, language = 'it') {
     react: hooks, '@/lib/api': { Bellomberg: {}, API_BASE: 'http://synthetic.invalid' },
   } });
   carica('i18n/lingua.ts').impostaLinguaCorrente(language);
-  const Page = carica('pages/FundamentalsPage.tsx').default;
+  const Page = carica('pages/FundamentalsPage.tsx').ArchivedValuationWorkspace;
   return renderToStaticMarkup(React.createElement(Page));
 }
 

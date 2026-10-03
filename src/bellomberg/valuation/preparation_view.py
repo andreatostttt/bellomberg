@@ -322,3 +322,113 @@ def select_stage_view(dossier, stage, *, excerpt_manifest=None):
             'when issuer, concept, unit and periods reconcile. Do not mix source families or '
             'treat omitted cells as zero. Selected current operating components do not certify complete NWC.')
     return view
+
+
+def compact_structured_evidence(source_dossier, context):
+    """Optional prompt copy: retain every fact, omit declared technical metadata.
+
+    This does not authenticate a source. Normalizers and the compiler still
+    reprove the original catalog; visible citations must match original values.
+    Existing stage views stay byte-identical unless this helper is requested.
+    """
+    view = deepcopy(context)
+    reports = {row['id']: row for row in view.get('stage_view', {}).get('documents', [])}
+    originals = {doc['id']: doc for doc in source_dossier['documents']}
+    for document in view['documents']:
+        ident = document['id']
+        original = originals.get(ident)
+        row = reports.get(ident)
+        if original is None or row is None or not isinstance(original.get('text'), str):
+            continue
+        text = original['text']
+        digest = sha256(text.encode('utf-8')).hexdigest()
+        if original.get('sha256') != digest:
+            raise ValueError('structured source text SHA-256 mismatch: ' + ident)
+        if document.get('text') != text:
+            continue  # A previously projected document cannot be reinterpreted.
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            continue
+        kind = _structured_kind(original, parsed, source_dossier.get('ticker'))
+        metadata = original.get('metadata') or {}
+        normalizer = metadata.get('normalizer')
+        bound = metadata.get('source_document_id') in originals
+        balance = (normalizer == 'balance_sheet_v1' and bound
+                   and ident == 'balance-sheet-' + str(metadata.get('source_document_id'))
+                   and isinstance(parsed, dict)
+                   and isinstance(parsed.get('groups'), list)
+                   and isinstance(parsed.get('components'), list))
+        if not (kind == 'xbrl' or kind == 'printed_statement' and bound or balance):
+            continue
+        projected = deepcopy(parsed)
+        omitted_fields = []
+        proof_count = 0
+
+        def omit_proof(node):
+            nonlocal proof_count
+            if isinstance(node, dict):
+                # Subtotal arithmetic, explicit dashes, unit exceptions and
+                # unknown disclosures can affect interpretation: retain their
+                # whole proof. Only known locator/geometry dictionaries shrink.
+                geometry = {'source_document_id', 'packet_sha256', 'table_index',
+                            'row_index', 'cell_index', 'column', 'cell_text'}
+                if isinstance(node.get('proof'), dict) and set(node['proof']) <= geometry:
+                    del node['proof']
+                    proof_count += 1
+                for key, child in node.items():
+                    if key != 'proof':
+                        omit_proof(child)
+            elif isinstance(node, list):
+                for child in node:
+                    omit_proof(child)
+
+        if kind == 'printed_statement' or balance:
+            omit_proof(projected)
+            if proof_count:
+                omitted_fields.append('geometry-only proof dictionaries (recursive; retained in original catalog)')
+        shared_observation = {}
+        if kind == 'xbrl':
+            keys = ('accn', 'fy', 'fp', 'form', 'filed', 'frame')
+            for key in keys:
+                observations = [fact['observation'] for fact in projected['facts']]
+                if (all(key in observation for observation in observations)
+                        and len({_canonical(observation[key]) for observation in observations}) == 1):
+                    shared_observation[key] = deepcopy(observations[0][key])
+                    omitted_fields.append('/facts/*/observation/' + key)
+                    for fact in projected['facts']:
+                        fact['observation'].pop(key, None)
+        facts = projected.get('facts', [])
+        shared = {}
+        for key in ('taxonomy', 'entity', 'scope', 'section'):
+            if facts and all(isinstance(fact, dict) and key in fact for fact in facts):
+                value = facts[0][key]
+                if all(_canonical(fact[key]) == _canonical(value) for fact in facts):
+                    shared[key] = deepcopy(value)
+                    for fact in facts:
+                        del fact[key]
+                    omitted_fields.append('/facts/*/' + key)
+        if not omitted_fields:
+            continue
+        body = _canonical(projected)
+        document['text'] = body
+        projection = {
+            'policy': 'structured_proof_metadata_compaction_v1', 'source_id': ident,
+            'original_text_sha256': digest,
+            'projected_text_sha256': sha256(body.encode('utf-8')).hexdigest(),
+            'original_text_utf8_bytes': len(text.encode('utf-8')),
+            'projected_text_utf8_bytes': len(body.encode('utf-8')),
+            'retained_facts': len(facts), 'omitted_facts': 0,
+            'omitted_proof_dictionaries': proof_count, 'omitted_fields': omitted_fields,
+            'shared_fact_metadata': shared,
+            'shared_observation_metadata': shared_observation,
+            'coverage_limitations': 'All values, labels, concepts, units, dates and array indices remain. '
+                'Shared metadata applies to every fact and is shown here once. Subtotal, dash, unit-exception '
+                'and unknown proof disclosures remain. Omitted proof geometry '
+                'and filing metadata remain in the original catalog. Cite visible leaf pointers; '
+                'whole projected records and omitted fields are not valid evidence pointers. '
+                'This projection does not certify economic coverage.'}
+        row.update(view='verified_structured_projection', structured_projection=projection)
+        if 'excerpt_projection' in view['stage_view']:
+            view['stage_view']['excerpt_projection']['full_json_documents'] -= 1
+    return view

@@ -8,6 +8,10 @@ from .real_estate_adapter import INCOME, CAPEX
 def apply_property_formulas(wb, payload):
     if not ready(payload, {'property_nav'}):
         return False
+    from .property_nav_requirements import reported_policy_selected
+    if reported_policy_selected(payload.get('acquisition_snapshot',{}).get('case',{}).get('records',())):
+        from .property_reported_formulas import apply_reported_property_formulas
+        return apply_reported_property_formulas(wb,payload)
     m = LinkedModel(wb, payload); m.quotation_checks()
     shares = m.ref('model', 'shares')
     comps = {k: m.ref('model', 'components', k) for k in m.value('model', 'components')}

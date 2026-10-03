@@ -23,3 +23,4 @@ pdfplumber>=0.11.10,<0.12  # AUTO299: original PDF word coordinates for dated st
 beautifulsoup4>=4.14.3  # valuation source HTML parser; explicit dependency tested locally
 pydantic>=2.0  # 02/09 (B7): importato direttamente (modelli degli endpoint); arrivava solo come dipendenza transitiva di fastapi
 httpx>=0.27  # 05/09: llm_client.py (OpenRouter) lo importa direttamente; prima arrivava solo come dipendenza transitiva di anthropic (stessa classe di pypdf/pydantic del 02/09)
+PyMuPDF==1.28.2  # Trade Idea property primary PDF page proofs; exact verified extraction version

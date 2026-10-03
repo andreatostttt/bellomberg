@@ -88,6 +88,89 @@ def _norm_currency(c) -> str:
     return c
 
 
+def historical_eur_returns(prices: "pd.DataFrame", cur_of: Dict[str, str], *, fx_fetch=None):
+    """Dated close-to-close EUR returns, without filling missing observations.
+
+    Convert price levels first so every return uses the FX rates of the same
+    two closes, including the first return and non-trading-day intervals.
+    GBX's constant price scale cancels in returns; its FX currency is GBP.
+    A missing currency/rate/price leaves NaN and an explicit failed qualification.
+    This strict path is opt-in; historical consumers retain their old contract.
+    """
+    def daily_index(frame):
+        result = frame.copy()
+        index = pd.DatetimeIndex(result.index)
+        if index.tz is not None:
+            index = index.tz_localize(None)
+        result.index = index.normalize()
+        if result.index.has_duplicates or not result.index.is_monotonic_increasing:
+            raise ValueError("historical observations require unique increasing dates")
+        return result
+
+    local = daily_index(prices).astype(float)
+    meta = {"qualified": False, "base_currency": "EUR", "converted": [],
+            "local_declared": [], "missing_currency": [], "missing_fx": {},
+            "missing_prices": {}, "series": {}, "method": "dated_price_ratio",
+            "formula": "(P_t / FX_t) / (P_previous / FX_previous) - 1"}
+    if len(local) < 2 or not len(local.columns):
+        meta["error"] = "insufficient historical price observations"
+        return local.iloc[0:0], meta
+    currencies = {str(s): _norm_currency(cur_of.get(s)) for s in local.columns}
+    pairs = sorted({"EUR" + c + "=X" for c in currencies.values() if c and c != "EUR"})
+    fx = pd.DataFrame(index=local.index)
+    if pairs:
+        start = local.index.min().strftime("%Y-%m-%d")
+        end = (local.index.max() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        try:
+            raw = (fx_fetch or yf.download)(pairs, start=start, end=end,
+                progress=False, auto_adjust=True, threads=True)
+            fx = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
+            if isinstance(fx, pd.Series):
+                fx = fx.to_frame(pairs[0])
+            # yfinance's one-symbol, single-level OHLC form is also supported.
+            if len(pairs) == 1 and pairs[0] not in fx.columns and "Close" in fx.columns:
+                fx = fx[["Close"]].rename(columns={"Close": pairs[0]})
+            fx = daily_index(fx).astype(float)
+        except Exception as exc:
+            meta["fx_error"] = type(exc).__name__ + ": " + str(exc)[:200]
+            fx = pd.DataFrame(index=local.index)
+    euro = local.copy()
+    for symbol in local.columns:
+        cur = currencies[str(symbol)]
+        price = local[symbol]
+        invalid_price = ~np.isfinite(price) | (price <= 0)
+        if invalid_price.any():
+            meta["missing_prices"][str(symbol)] = [d.date().isoformat() for d in local.index[invalid_price]]
+        price = price.mask(invalid_price)
+        if not cur:
+            meta["missing_currency"].append(str(symbol))
+            euro[symbol] = np.nan
+            continue
+        if cur == "EUR":
+            euro[symbol] = price
+            meta["series"][str(symbol)] = {"currency": "EUR", "fx_required": False}
+            continue
+        pair = "EUR" + cur + "=X"
+        rate = fx[pair].reindex(local.index) if pair in fx.columns else pd.Series(np.nan, index=local.index)
+        invalid_fx = ~np.isfinite(rate) | (rate <= 0)
+        if invalid_fx.any():
+            meta["missing_fx"][str(symbol)] = [d.date().isoformat() for d in local.index[invalid_fx]]
+            meta["local_declared"].append(str(symbol) + ": historical FX missing; EUR returns unavailable")
+        rate = rate.mask(invalid_fx)
+        euro[symbol] = price / rate
+        if not invalid_fx.any():
+            meta["converted"].append(str(symbol))
+        meta["series"][str(symbol)] = {"currency": cur, "pair": pair,
+            "source": "Yahoo Finance historical daily Close", "quote_convention": "local_currency_per_EUR",
+            "first_close": local.index[0].date().isoformat(), "last_close": local.index[-1].date().isoformat(),
+            "observations": int(rate.notna().sum()), "required_observations": len(local)}
+    result = euro.pct_change(fill_method=None).iloc[1:]
+    meta["qualified"] = not any(meta[k] for k in ("missing_currency", "missing_fx", "missing_prices"))
+    meta["return_observations"] = {str(c): int(result[c].notna().sum()) for c in result.columns}
+    result.attrs["fx_conversion"] = meta
+    return result, meta
+
+
 def _convert_returns_to_eur(returns: "pd.DataFrame", cur_of: Dict[str, str],
                               period: str = "1y"):
     """Converte i rendimenti in EUR: r_eur = (1+r_local)/(1+r_fx) - 1, con
@@ -215,7 +298,7 @@ def _ledoit_wolf_cc(returns_matrix: "np.ndarray"):
     return sigma, float(average_cor), float(shrink)
 
 
-def compute_portfolio_risk(force: bool = False) -> Dict[str, Any]:
+def compute_portfolio_risk(force: bool = False, *, strict_eur: bool = False) -> Dict[str, Any]:
     """Returns dict con risk metrics correnti. Cached 5 min."""
     # Il negozio PRIMA della cache (review 05/09): la chiave di cache non lo contiene, quindi
     # un risultato calcolato col negozio a posto verrebbe servito per altri 5 minuti dopo che
@@ -240,7 +323,7 @@ def compute_portfolio_risk(force: bool = False) -> Dict[str, Any]:
     if snap.get("fx_incomplete"):
         return {"error": _message("FX incompleto: pesi rischio EUR n.d. ({currencies})", "Incomplete FX: EUR risk weights unavailable ({currencies})", currencies=", ".join(snap["fx_incomplete"])),
                 "timestamp": datetime.now().isoformat()}
-    if not force and _CACHE["data"] and (time.time() - _CACHE["ts"] < CACHE_TTL_SEC):
+    if not strict_eur and not force and _CACHE["data"] and (time.time() - _CACHE["ts"] < CACHE_TTL_SEC):
         return render_payload(_CACHE["data"])
 
     positions = snap.get("positions", [])
@@ -260,7 +343,7 @@ def compute_portfolio_risk(force: bool = False) -> Dict[str, Any]:
             continue
         yf_map[p["ticker"]] = sym
         weights_eur[p["ticker"]] = float(p.get("valore_mercato", 0) or 0)
-        cur_of[sym] = (p.get("valuta") or "EUR")
+        cur_of[sym] = (p.get("valuta") if strict_eur else (p.get("valuta") or "EUR"))
 
     if not yf_map:
         return {"error": _message('no analyzable tickers', 'No analyzable tickers'), "timestamp": datetime.now().isoformat()}
@@ -307,7 +390,19 @@ def compute_portfolio_risk(force: bool = False) -> Dict[str, Any]:
     # fix review 22/07 (E4): anche SPY va in EUR — il beta era cov(port EUR,
     # SPY USD): numeratore con la componente FX, benchmark senza.
     cur_of.setdefault("SPY", "USD")
-    returns, fx_meta = _convert_returns_to_eur(returns, cur_of, period="1y")
+    if strict_eur:
+        missing = [symbol for symbol in dict.fromkeys([*yf_symbols,"SPY"]) if symbol not in prices.columns]
+        unmapped = [p["ticker"] for p in positions if p["ticker"] not in yf_map]
+        if missing or unmapped:
+            return {"error": _message("Serie storiche mancanti nel book EUR", "Historical series missing from the EUR book"),
+                    "fx_conversion":{"qualified":False,"base_currency":"EUR","missing_tickers":missing,"unmapped_tickers":unmapped},
+                    "skipped_tickers":sorted(set(missing+unmapped)),"timestamp":datetime.now().isoformat()}
+        returns, fx_meta = historical_eur_returns(prices, cur_of)
+        if not fx_meta["qualified"]:
+            return {"error": _message("Rendimenti storici EUR non qualificati", "Historical EUR returns not qualified"),
+                    "fx_conversion": fx_meta, "timestamp": datetime.now().isoformat()}
+    else:
+        returns, fx_meta = _convert_returns_to_eur(returns, cur_of, period="1y")
     if fx_meta.get("local_declared"):
         _log("FX: rendimenti in valuta LOCALE dichiarati per " + ", ".join(fx_meta["local_declared"]))
 
@@ -338,6 +433,12 @@ def compute_portfolio_risk(force: bool = False) -> Dict[str, Any]:
 
     if not valid_internal_tickers:
         return {"error": _message('no valid return series', 'No valid return series'), "timestamp": datetime.now().isoformat()}
+
+    if strict_eur and len(valid_internal_tickers)!=len(yf_map):
+        missing = sorted(set(yf_map)-set(valid_internal_tickers))
+        return {"error": _message("Storia insufficiente nel book EUR", "Insufficient history in the EUR book"),
+                "fx_conversion":{**fx_meta,"qualified":False,"insufficient_history":missing},
+                "skipped_tickers":missing,"timestamp":datetime.now().isoformat()}
 
     # Portfolio metrics: weighted returns
     valid_yf = [yf_map[t] for t in valid_internal_tickers]
@@ -488,8 +589,9 @@ def compute_portfolio_risk(force: bool = False) -> Dict[str, Any]:
         "cached_for_sec": CACHE_TTL_SEC,
     }
 
-    _CACHE["ts"] = time.time()
-    _CACHE["data"] = result
+    if not strict_eur:
+        _CACHE["ts"] = time.time()
+        _CACHE["data"] = result
     _log(f"computed risk: VaR95={port_var95_pct:.2f}% Sharpe={port_sharpe:.2f} Beta={beta_spy:.2f} DD={max_dd_port:.1f}% alerts={len(alerts)}")
     return render_payload(result)
 

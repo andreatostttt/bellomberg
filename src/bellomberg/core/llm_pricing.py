@@ -114,6 +114,10 @@ def preparation_price_ceiling(metadata, *, model, max_tokens):
     context = metadata.get("context_length")
     if type(context) is not int or type(max_tokens) is not int or not 0 < max_tokens < context:
         raise ValueError("model context or completion cap unavailable")
+    provider_cap = (metadata.get("top_provider") or {}).get("max_completion_tokens")
+    if provider_cap is not None and (type(provider_cap) is not int or provider_cap <= 0
+                                     or max_tokens > provider_cap):
+        raise ValueError("requested completion cap exceeds or cannot verify provider output limit")
     rates = {}
     for key in ("prompt", "completion"):
         raw = metadata.get("pricing", {}).get(key)

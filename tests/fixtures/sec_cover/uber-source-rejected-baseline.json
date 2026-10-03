@@ -1,0 +1,37 @@
+{
+  "request_fingerprint": "b89928e416bf36df07226354b943b2c215fd1b7ea40197461dae6c5c46d9590d",
+  "reason": "One or more PM documentary sources require verification before any spending grant",
+  "receipt": {
+    "as_of": "2026-10-02",
+    "contract": "trade-idea-pm-documents/1",
+    "documents": [
+      {
+        "bytes": 2419544,
+        "reason": "Reporting period requires a unique explicit dated primary-text disclosure; optional claims must be verified",
+        "request": {
+          "issuer_quote": null,
+          "publication_quote": null,
+          "published_at": null,
+          "report_date": null,
+          "report_date_quote": null,
+          "title": null,
+          "url": "https://www.sec.gov/Archives/edgar/data/1543151/000154315126000032/uber-20260630.htm"
+        },
+        "sha256": "1b96b259139fbe986b1ca12a12e13f9e8ca8c6d393a40d9e581c574856861279",
+        "status": "needs_verification",
+        "url": "https://www.sec.gov/Archives/edgar/data/1543151/000154315126000032/uber-20260630.htm"
+      }
+    ],
+    "fingerprint": "5fd9614084cd05451bfb8f960d7097bbbb2d907dfcb359af1359364e2cba8cb0",
+    "ticker": "UBER"
+  },
+  "source": {
+    "issuer_quote": null,
+    "publication_quote": null,
+    "published_at": null,
+    "report_date": null,
+    "report_date_quote": null,
+    "title": null,
+    "url": "https://www.sec.gov/Archives/edgar/data/1543151/000154315126000032/uber-20260630.htm"
+  }
+}

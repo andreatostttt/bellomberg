@@ -30,3 +30,20 @@ Market data is fetched at runtime from third-party services (Yahoo Finance via
 yfinance, SEC EDGAR, filings.xbrl.org, FRED, Finnhub, NewsAPI and others) under
 their own terms of use; no third-party data series is redistributed in this
 repository.
+
+Python backend dependency: PyMuPDF 1.28.2
+---------------------------------------
+The Python backend uses PyMuPDF to extract and verify source-page evidence from
+PDF documents. Upstream project: https://github.com/pymupdf/PyMuPDF
+
+Upstream licensing: GNU Affero General Public License, version 3.0, or an
+Artifex commercial license. Official terms and licensing information:
+https://pymupdf.io/licensing
+
+Review the applicable upstream terms before redistributing the Python backend
+or making it available as a network service. This notice is not a substitute
+for those terms and does not attest ownership of a commercial license or
+overall license compatibility. Bellomberg's existing project LICENSE is retained.
+
+The current Electron packaging configuration includes the desktop interface;
+it does not bundle the external Python backend or PyMuPDF.

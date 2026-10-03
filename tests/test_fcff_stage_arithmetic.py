@@ -128,3 +128,148 @@ def test_revenue_check_preserves_engine_tolerance_and_rejects_a_saved_mismatch()
     with pytest.raises(ValueError, match='base.*revenue_build'):
         forecast_arithmetic(plan)
     assert plan == before
+
+
+def _accounting_bridge_case():
+    """Independent synthetic operating judgments, not inferred from engine EBIT."""
+    plan = _operating_plan(years=4)
+    plan['model']['capdev_amortization_years']['value'] = 2
+    revenue = [100., 120., 108., 129.6]
+    depreciation = [10., 12., 9., 13.]
+    capitalization = [4., 6., 9., 6.]
+    opening_amortization = [2., 1., 0., 0.]
+    # Two-year life includes the current cohort; opening runoff is separate.
+    amortization = [4., 6., 7.5, 7.5]
+    targets = {}
+    for scope, starting_margin in (('bear', .40), ('base', .45), ('bull', .50)):
+        reported_margin = [starting_margin + .01 * index for index in range(4)]
+        operating_profit = [sales * (margin - .10 - .10)
+                            for sales, margin in zip(revenue, reported_margin)]
+        scenario = plan['scenarios'][scope]
+        paths = {
+            'revenue_growth': [0., .20, -.10, .20],
+            'gross_margin': [margin + dep / sales
+                             for margin, dep, sales in zip(reported_margin, depreciation, revenue)],
+            'rnd_pct': [.10] * 4, 'sga_pct': [.10] * 4,
+            'capdev_pct': [cap / sales for cap, sales in zip(capitalization, revenue)],
+            'da_tan_pct': [dep / sales for dep, sales in zip(depreciation, revenue)],
+            'tax_rate': [.25] * 4, 'capex_pct': [.08] * 4, 'nwc_pct': [.05] * 4,
+            'opening_intangible_amortization': opening_amortization,
+        }
+        for driver, values in paths.items():
+            scenario[driver]['value'] = deepcopy(values)
+        scenario['revenue_build']['value']['unit_price'] = [sales / 10. for sales in revenue]
+        scenario['terminal_bridge']['value'].update(
+            normalized_ebit=operating_profit[-1], capitalized_research_adjustment=1.5)
+        targets[scope] = {
+            'revenue': revenue, 'operating_profit': operating_profit,
+            'depreciation': depreciation, 'capitalization': capitalization,
+            'amortization': amortization, 'opening_amortization': opening_amortization,
+            'working_capital_change': [5., 1., -.6, 1.08],
+        }
+    return plan, targets
+
+
+def _accounting_numbers(plan, scope):
+    from bellomberg.valuation.dcf_buyside_v3 import _scenario_numbers
+    scenario = {name: item['value'] for name, item in plan['scenarios'][scope].items()}
+    return _scenario_numbers(
+        {'documented_inputs': True,
+         'capdev_amortization_years': plan['model']['capdev_amortization_years']['value']},
+        scenario, plan['model']['historical_revenue']['value'],
+        nwc0=plan['model']['opening_nwc']['value'])
+
+
+def test_aggregate_da_bridge_preserves_independent_operating_profit_in_every_period():
+    from bellomberg.valuation.fcff_stage_arithmetic import forecast_arithmetic
+    plan, targets = _accounting_bridge_case()
+    before = deepcopy(plan)
+    forecasts = forecast_arithmetic(plan)
+    for scope, target in targets.items():
+        numbers = _accounting_numbers(plan, scope)
+        expected_ebitda = [op + dep + cap for op, dep, cap in zip(
+            target['operating_profit'], target['depreciation'], target['capitalization'])]
+        expected_ebit = [op + cap - amort for op, cap, amort in zip(
+            target['operating_profit'], target['capitalization'], target['amortization'])]
+        expected_tax = [max(ebit, 0.) * .25 for ebit in expected_ebit]
+        expected_fcff = [op + dep - tax - sales * .08 - delta
+                         for op, dep, tax, sales, delta in zip(
+                             target['operating_profit'], target['depreciation'], expected_tax,
+                             target['revenue'], target['working_capital_change'])]
+        assert numbers['revenue'] == pytest.approx(target['revenue'])
+        assert numbers['capitalized_development'] == pytest.approx(target['capitalization'])
+        assert numbers['tangible_depreciation'] == pytest.approx(target['depreciation'])
+        assert numbers['research_amortization'] == pytest.approx(target['amortization'])
+        assert numbers['ebitda'] == pytest.approx(expected_ebitda)
+        assert numbers['ebit'] == pytest.approx(expected_ebit)
+        assert numbers['cash_tax'] == pytest.approx(expected_tax)
+        assert numbers['ufcf'] == pytest.approx(expected_fcff)
+        assert forecasts[scope]['final_year']['ebit'] == pytest.approx(expected_ebit[-1])
+        assert forecasts[scope]['research_normalization_adjustment'] == pytest.approx(1.5)
+        assert (forecasts[scope]['final_year']['ebit'] + 1.5
+                == pytest.approx(target['operating_profit'][-1]))
+
+        partial = deepcopy(plan)
+        partial['scenarios'][scope]['gross_margin']['value'] = [
+            margin - .10 * dep / sales for margin, dep, sales in zip(
+                plan['scenarios'][scope]['gross_margin']['value'],
+                target['depreciation'], target['revenue'])]
+        wrong = _accounting_numbers(partial, scope)
+        residual = [.10 * dep for dep in target['depreciation']]
+        assert wrong['ebitda'] == pytest.approx([value - gap
+                                               for value, gap in zip(expected_ebitda, residual)])
+        assert wrong['ebit'] == pytest.approx([value - gap
+                                             for value, gap in zip(expected_ebit, residual)])
+        assert wrong['ufcf'] == pytest.approx([value - gap * .75
+                                             for value, gap in zip(expected_fcff, residual)])
+    assert plan == before
+
+
+@pytest.mark.parametrize('scope', ['bear', 'base', 'bull'])
+def test_terminal_self_consistency_cannot_prove_the_independent_operating_profit(scope):
+    from bellomberg.valuation.fcff_stage_arithmetic import forecast_arithmetic
+    plan, targets = _accounting_bridge_case()
+    target = targets[scope]
+    scenario = plan['scenarios'][scope]
+    scenario['gross_margin']['value'] = [margin - .10 * dep / sales
+                                         for margin, dep, sales in zip(
+                                             scenario['gross_margin']['value'],
+                                             target['depreciation'], target['revenue'])]
+    before = deepcopy(plan)
+    with pytest.raises(ValueError, match=scope + '.*EBIT normalizzato'):
+        forecast_arithmetic(plan)
+    assert plan == before
+
+    numbers = _accounting_numbers(plan, scope)
+    # Rebuilding the terminal from the same erroneous EBIT passes local checks;
+    # it still fails the independent economic identity. No production fix here.
+    scenario['terminal_bridge']['value']['normalized_ebit'] = (
+        numbers['ebit'][-1] + target['amortization'][-1] - target['capitalization'][-1])
+    before = deepcopy(plan)
+    accepted = forecast_arithmetic(plan)[scope]
+    normalized = accepted['final_year']['ebit'] + accepted['research_normalization_adjustment']
+    assert normalized == pytest.approx(target['operating_profit'][-1] - 1.3)
+    assert normalized != pytest.approx(target['operating_profit'][-1])
+    assert plan == before
+
+
+@pytest.mark.parametrize('error', ['already_net_of_capitalization', 'opening_amortization_in_costs'])
+def test_gross_research_and_separate_opening_amortization_prevent_double_counting(error):
+    plan, targets = _accounting_bridge_case()
+    before = deepcopy(plan)
+    wrong_plan = deepcopy(plan)
+    for scope, target in targets.items():
+        correct = _accounting_numbers(plan, scope)
+        shift = (target['capitalization'] if error == 'already_net_of_capitalization'
+                 else [-value for value in target['opening_amortization']])
+        wrong_plan['scenarios'][scope]['rnd_pct']['value'] = [
+            .10 - delta / sales for delta, sales in zip(shift, target['revenue'])]
+        wrong = _accounting_numbers(wrong_plan, scope)
+        assert wrong['research_amortization'] == pytest.approx(target['amortization'])
+        assert wrong['ebitda'] == pytest.approx([value + delta
+                                               for value, delta in zip(correct['ebitda'], shift)])
+        assert wrong['ebit'] == pytest.approx([value + delta
+                                             for value, delta in zip(correct['ebit'], shift)])
+        assert wrong['ufcf'] == pytest.approx([value + delta * .75
+                                             for value, delta in zip(correct['ufcf'], shift)])
+    assert plan == before

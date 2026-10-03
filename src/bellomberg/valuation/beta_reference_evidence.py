@@ -23,6 +23,11 @@ _FX_LIMITATION = (' EUR stock prices are converted with same-date Yahoo EURUSD C
     'Stock, FX and index may have different closing times; dates are provider session labels, '
     'not synchronized timestamps. This is not an intraday hedge return or FX-neutral beta. '
     'A blank FX bar at the requested exclusive endpoint is retained but never used.')
+_FX_ENDPOINT_LIMITATION = (' EUR stock prices are converted with same-date Yahoo EURUSD Close, without fill. '
+    'Stock, FX and index may have different closing times; dates are provider session labels, '
+    'not synchronized timestamps. This is not an intraday hedge return or FX-neutral beta. '
+    'An FX bar at the requested exclusive endpoint, blank or observed, is retained in the '
+    'hashed snapshot and declared separately, but never used in the regression.')
 _LIMITATION = ('Historical regression reference, not a chosen forward beta or WACC. '
     'Daily Yahoo Adj Close includes stock distribution/split adjustments; S&P 500 is a price index, '
     'not a total-return market benchmark. No equivalence to the provider five-year monthly beta. '
@@ -51,18 +56,22 @@ def _series(raw, symbol, start, cutoff, *, currency='USD', price_field='Adj Clos
     rows = raw.get('observations')
     if not isinstance(rows, list) or len(rows) < 253:
         raise ValueError('insufficient five-year observation coverage')
-    values, missing, seen = {}, [], set()
+    values, missing, seen, excluded_endpoint = {}, [], set(), []
     for row in rows:
         day = date.fromisoformat(row['date']); price = row[value_key]
-        endpoint_blank = symbol == _FX and day == cutoff and price is None
-        if row['date'] != day.isoformat() or not (start <= day < cutoff or endpoint_blank) or day in seen:
+        endpoint_fx = symbol == _FX and day == cutoff
+        if row['date'] != day.isoformat() or not (start <= day < cutoff or endpoint_fx) or day in seen:
             raise ValueError('duplicate or out-of-window history date')
         seen.add(day)
+        if price is not None and (type(price) not in (int, float) or not isfinite(price) or price <= 0):
+            raise ValueError('missing/nonfinite/nonpositive adjusted price')
+        if endpoint_fx:
+            excluded_endpoint.append({'date': day.isoformat(),
+                                      'value_state': 'blank' if price is None else 'observed'})
+            continue
         if price is None:
             missing.append(day.isoformat())
             continue
-        if type(price) not in (int, float) or not isfinite(price) or price <= 0:
-            raise ValueError('missing/nonfinite/nonpositive adjusted price')
         values[day] = price
     days = sorted(values)
     if len(days) < 253:
@@ -71,7 +80,7 @@ def _series(raw, symbol, start, cutoff, *, currency='USD', price_field='Adj Clos
         raise ValueError('short or stale history window')
     if any(_bdays_between(a, b) > 5 for a, b in zip(days, days[1:])):
         raise ValueError('unqualified long gap in history')
-    return values, sorted(missing)
+    return values, sorted(missing), excluded_endpoint
 
 
 def normalize_beta_reference(raw, *, as_of, retrieval):
@@ -94,18 +103,21 @@ def normalize_beta_reference(raw, *, as_of, retrieval):
     if (set(legs) != ({ticker, _BENCHMARK, _FX} if converted else {ticker, _BENCHMARK})
             or snapshot.get('currency_conversion') != (_CONVERSION if converted else None)):
         raise ValueError('exact issuer and benchmark histories required')
-    stock, missing_stock = _series(legs[ticker], ticker, start, cutoff, currency='EUR' if converted else 'USD')
-    market, missing_market = _series(legs[_BENCHMARK], _BENCHMARK, start, cutoff)
+    stock, missing_stock, _ = _series(legs[ticker], ticker, start, cutoff, currency='EUR' if converted else 'USD')
+    market, missing_market, _ = _series(legs[_BENCHMARK], _BENCHMARK, start, cutoff)
     fx_coverage = {}; missing = {ticker: missing_stock, _BENCHMARK: missing_market}
+    excluded_endpoint = {}
     limitation = _LIMITATION
     if converted:
-        fx, missing[_FX] = _series(legs[_FX], _FX, start, cutoff, price_field='Close', value_key='close')
+        fx, missing[_FX], endpoint = _series(legs[_FX], _FX, start, cutoff, price_field='Close', value_key='close')
+        if endpoint:
+            excluded_endpoint[_FX] = endpoint
         fx_coverage = {'fx_unmatched_stock_dates': len(stock.keys()-fx.keys()),
                        'fx_dates_without_stock': len(fx.keys()-stock.keys())}
         stock = {day: price*fx[day] for day, price in stock.items() if day in fx}
         if any(not isfinite(price) or price <= 0 for price in stock.values()):
             raise ValueError('converted stock price nonfinite/nonpositive')
-        limitation += _FX_LIMITATION
+        limitation += _FX_ENDPOINT_LIMITATION if endpoint else _FX_LIMITATION
     days = sorted(stock.keys() & market.keys())
     if len(days) < 253:
         raise ValueError('insufficient common observations')
@@ -122,7 +134,8 @@ def normalize_beta_reference(raw, *, as_of, retrieval):
         method='covariance(asset,benchmark)/variance(benchmark), same sample denominator',
         sampling='daily available common dates, adjacent simple returns, no fill/interpolation')
     coverage = {'unpaired_dates': len(stock.keys() ^ market.keys()),
-        'missing_observations': missing, **fx_coverage,
+        'missing_observations': missing,
+        **({'excluded_endpoint_observations': excluded_endpoint} if excluded_endpoint else {}), **fx_coverage,
         'series': {name: {'url': _url(name), 'observations': len(leg['observations']),
             'normalized_observations_sha256': sha256(_json(leg['observations']).encode('utf-8')).hexdigest()}
             for name, leg in legs.items()}}

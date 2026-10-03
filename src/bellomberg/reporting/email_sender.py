@@ -315,7 +315,8 @@ def corpo_valutazioni(valuation_results, allegati, delivery=None):
 
 @localized
 def invia_email_multi_allegati(pdf_paths, oggetto=None, body_extra="", *,
-                             expected_hashes=None, delivery_receipt=None):
+                             expected_hashes=None, delivery_receipt=None,
+                             message_title=None, message_id=None, require_all_hashes=False):
     """Invia email con N allegati (PDF memo + PDF appendice + N Excel DCF).
 
     pdf_paths: list of file paths (PDF + XLSX mixed). I file vengono inferiti via estensione.
@@ -327,6 +328,9 @@ def invia_email_multi_allegati(pdf_paths, oggetto=None, body_extra="", *,
     from email import encoders
 
     if not email_configurata():
+        if delivery_receipt is not None:
+            delivery_receipt.update(email_status="failed", smtp_state="not_started",
+                                    email_error="Email configuration missing")
         return False
     pdf_paths = list(pdf_paths)
     missing = [p for p in pdf_paths if not p or not _os.path.isfile(p)]
@@ -346,6 +350,8 @@ def invia_email_multi_allegati(pdf_paths, oggetto=None, body_extra="", *,
     msg["Subject"] = oggetto
     msg["From"] = EMAIL_FROM
     msg["To"] = EMAIL_TO
+    if message_id:
+        msg["Message-ID"] = message_id
 
     # Lista allegati nel body
     n_files = len(pdf_paths)
@@ -368,7 +374,8 @@ def invia_email_multi_allegati(pdf_paths, oggetto=None, body_extra="", *,
 <hr>
 <p style="color:#888;font-size:12px;">{piede}</p>
 </body></html>""".format(
-        title=_t("Weekly Research Note"), attached=_t("email.attached_count", count=n_files),
+        title=__import__("html").escape(message_title) if message_title else _t("Weekly Research Note"),
+        attached=_t("email.attached_count", count=n_files),
         files_list=files_list_html,
         extra=body_extra or "",
         piede=piede,
@@ -376,7 +383,8 @@ def invia_email_multi_allegati(pdf_paths, oggetto=None, body_extra="", *,
     testo_extra = _re.sub(r"<[^>]+>", " ", body_extra or "")
     testo_extra = _re.sub(r"[ \t]+", " ", testo_extra).strip()
     body = MIMEMultipart("alternative")
-    body.attach(MIMEText(_t("Weekly Research Note - ") + _t("email.attached_count", count=n_files) + "."
+    body.attach(MIMEText((message_title + " - " if message_title else _t("Weekly Research Note - "))
+                         + _t("email.attached_count", count=n_files) + "."
                          + ("\n\n" + testo_extra if testo_extra else ""), "plain", "utf-8"))
     body.attach(MIMEText(body_html, "html", "utf-8"))
     msg.attach(body)
@@ -393,10 +401,12 @@ def invia_email_multi_allegati(pdf_paths, oggetto=None, body_extra="", *,
                 part = MIMEBase("application", "octet-stream")
             with open(path, "rb") as f:
                 contents = f.read()
+            if require_all_hashes and (not expected_hashes or str(path) not in expected_hashes):
+                raise ValueError("Attachment hash missing from validated manifest")
             if expected_hashes and str(path) in expected_hashes:
                 from hashlib import sha256
                 if sha256(contents).hexdigest() != expected_hashes[str(path)]:
-                    raise ValueError("Workbook modificato dopo la verifica della generazione")
+                    raise ValueError("Allegato modificato dopo la verifica della generazione")
             part.set_payload(contents)
             encoders.encode_base64(part)
             filename = _os.path.basename(path)
@@ -411,14 +421,34 @@ def invia_email_multi_allegati(pdf_paths, oggetto=None, body_extra="", *,
             return False
 
     if delivery_receipt is not None:
-        delivery_receipt.update(email_status="package_built", mime_attachments=[str(p) for p in pdf_paths])
+        delivery_receipt.update(email_status="package_built", smtp_state="not_started",
+                                mime_attachments=[str(p) for p in pdf_paths])
+    smtp_state = "connecting"
     try:
         context = ssl.create_default_context()
         with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context, timeout=30) as server:
             server.login(EMAIL_FROM, EMAIL_PASSWORD)
-            server.send_message(msg)
+            smtp_state = "sending"
+            if delivery_receipt is not None:
+                delivery_receipt["smtp_state"] = smtp_state
+            refused = server.send_message(msg)
+            if refused:
+                if delivery_receipt is not None:
+                    delivery_receipt.update(email_status="uncertain", email_error="Some recipients were refused")
+                return False
+            smtp_state = "accepted"
+            if delivery_receipt is not None:
+                delivery_receipt.update(smtp_state=smtp_state, email_status="accepted", email_error=None)
         print("  [OK] Email con " + str(n_files) + " allegati inviata a " + EMAIL_TO)
         return True
     except Exception as e:
+        # A lost QUIT response cannot revoke an observed successful DATA response.
+        if smtp_state == "accepted":
+            return True
+        known_rejection = isinstance(e, (smtplib.SMTPAuthenticationError, smtplib.SMTPRecipientsRefused,
+                                        smtplib.SMTPSenderRefused, smtplib.SMTPDataError))
+        if delivery_receipt is not None:
+            delivery_receipt.update(email_status="uncertain" if smtp_state == "sending" and not known_rejection else "failed",
+                                    smtp_state=smtp_state, email_error=type(e).__name__)
         print("  [!] SMTP error: " + str(e))
         return False

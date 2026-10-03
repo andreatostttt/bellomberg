@@ -225,7 +225,11 @@ class ValuationWorker:
                 guard=publication_guard)
             usable = assess_valuation_usability(result)["usable"]
             status = "succeeded" if usable and publication["status"] == "published" else "incomplete"
-            return self.jobs.finish(*identity, status=status, reason=publication["reason"],
+            reason = publication["reason"]
+            if isinstance(reason, str) and len(reason) > 1000:
+                suffix = " [full reason: result.publication.reason]"
+                reason = reason[:1000 - len(suffix)] + suffix
+            return self.jobs.finish(*identity, status=status, reason=reason,
                 result={"snapshot_id": result["snapshot_id"], "generation_id": result["generation_id"],
                         "thesis_id": thesis, "publication": publication})
         except LeaseLost:

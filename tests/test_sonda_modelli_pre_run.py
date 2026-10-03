@@ -60,3 +60,27 @@ def test_la_riga_di_log_nomina_ok_e_ko():
     righe = lc.righe_log_sonda(esiti)
     assert any("[OK]" in r and "a/uno" in r for r in righe), righe
     assert any("[KO]" in r and "m/bloccato" in r and "403" in r for r in righe), righe
+
+
+def test_sonda_has_real_receipts_and_is_reused_without_second_charge(tmp_path):
+    import json
+    import httpx
+    from bellomberg.core.request_journal import RequestJournal
+    calls = []
+    def send(request):
+        body = json.loads(request.content)
+        calls.append(body)
+        return httpx.Response(200, json={"id": "probe-" + str(len(calls)), "model": body["model"],
+            "choices": [{"message": {"content": "pong"}, "finish_reason": "stop"}],
+            "usage": {"cost": 0.000001}})
+    client = lc.OpenRouterClient(api_key="offline", trasporto=httpx.MockTransport(send))
+    journal = RequestJournal(tmp_path / "sonda.sqlite", run_id="probe-run",
+        authorization={"source": "test"}, authorized_usd="1", metadata=lambda model: {
+            "id": model, "context_length": 1000, "pricing": {"prompt": "0.000001", "completion": "0.000002"}})
+    for _ in range(2):
+        with lc.request_scope(journal, phase="sonda"):
+            receipts = lc.sonda_modelli(["test/one", "test/two", "test/one"], client=client)
+        assert all(row["ok"] and row["request_id"] and row["response_id"]
+                   and row["cost_usd"] == 0.000001 for row in receipts.values())
+    assert len(calls) == 2 and journal.summary()["request_count"] == 2
+    assert journal.summary()["cost_usd"] == 0.000002

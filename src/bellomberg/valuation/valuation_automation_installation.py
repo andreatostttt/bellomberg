@@ -68,7 +68,17 @@ def _error(exc):
     return {"status": "error", "reason": type(exc).__name__ + ": " + str(exc)[:500]}
 
 
+def archive_state():
+    """The ordinary installation keeps Excel history without starting new work."""
+    return {"status": "archived", "reason": "excel_generation_archived_by_research_contract"}
+
+
 def notify_tracking(db_path, ticker, trigger):
+    """Tracking changes cannot enqueue archived Excel work."""
+    return archive_state()
+
+
+def _notify_legacy_tracking(db_path, ticker, trigger):
     """Never turn an already committed trade/favorite into a retryable HTTP error."""
     try:
         runtime = installation_runtime()
@@ -209,6 +219,11 @@ class AutomationRunner:
 
 
 def start_installation(db_path):
+    """Keep the old worker dormant, including discovery and recovery threads."""
+    return {"runner": None, "state": archive_state()}
+
+
+def _start_legacy_installation(db_path):
     """Called by backend lifespan only, never by a GET or a model mention."""
     try:
         runtime = installation_runtime()

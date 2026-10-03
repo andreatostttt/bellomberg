@@ -30,6 +30,7 @@ def collect_documents(ticker, *, as_of, archive_root, filing_results=(), catalog
         raise ValueError("unknown document selection policy")
     root = Path(archive_root).resolve()
     documents, issues, archived, entries = [], [], [], []
+    supplied_references = set()
     coverage = {"downloaded": 0, "reused": 0, "deduplicated": 0,
                 "excluded": 0, "limited": 0, "max_documents": max_documents,
                 "download_attempted": 0, "accepted": 0,
@@ -65,7 +66,13 @@ def collect_documents(ticker, *, as_of, archive_root, filing_results=(), catalog
             digest = sha256(raw).hexdigest()
             if digest != candidate.get("sha256"):
                 raise ValueError("source bytes differ from archived SHA256")
-            extracted = estrai_testo(str(path), contenuto=raw)
+            accepted_metadata = candidate.get('metadati')
+            accepted_verification = (accepted_metadata.get('pm_source_verification') or {}) if isinstance(accepted_metadata, dict) else {}
+            extractor = {}
+            if accepted_verification.get('contract') == 'trade-idea-pm-documents/1':
+                from bellomberg.market_data.lettore_trimestrali import LEGACY_HTML_TEXT_EXTRACTOR
+                extractor['html_extractor'] = accepted_verification.get('text_extraction', LEGACY_HTML_TEXT_EXTRACTOR)
+            extracted = estrai_testo(str(path), contenuto=raw, **extractor)
             if extracted.get("stato") not in ("ok", "parziale") or not extracted.get("testo", "").strip():
                 raise ValueError("document text unavailable: " + str(extracted.get("motivo")))
             if extracted.get("pagine_senza_testo"):
@@ -74,7 +81,7 @@ def collect_documents(ticker, *, as_of, archive_root, filing_results=(), catalog
             metadata = candidate.get("metadati")
             if not isinstance(metadata, dict):
                 metadata = {key: candidate.get(key) for key in
-                            ("emittente_id", "issuer", "form", "report_date", "accession")}
+                            ("emittente_id", "issuer", "form", "report_date", "accession", "accepted_at")}
             else:
                 metadata = dict(metadata)
                 # Filing Diff names the verified accounting end "periodo_fine";
@@ -87,6 +94,8 @@ def collect_documents(ticker, *, as_of, archive_root, filing_results=(), catalog
                     "metadata": metadata,
                     "extraction_coverage": {key: extracted.get(key) for key in
                         ("stato", "caratteri", "pagine", "formato", "pagine_senza_testo")}}
+            if 'pagine_vuote_verificate' in extracted:
+                document['extraction_coverage']['pagine_vuote_verificate'] = extracted['pagine_vuote_verificate']
             if candidate.get('filing_verification') is not None:
                 from .filing_pdf_evidence import verify_filing_pdf, SCHEMA
                 if extracted.get('formato') != 'pdf':
@@ -122,6 +131,8 @@ def collect_documents(ticker, *, as_of, archive_root, filing_results=(), catalog
             if not isinstance(candidate, dict):
                 issue("filing_diff", "document entry must be an object", excluded=True)
                 continue
+            if isinstance(candidate.get('url'), str):
+                supplied_references.add(candidate['url'])
             if candidate.get("stato") in ("verificato", "duplicato"):
                 doc = load(candidate, origin="filing_diff")
                 if doc is not None:
@@ -144,6 +155,8 @@ def collect_documents(ticker, *, as_of, archive_root, filing_results=(), catalog
             raise TypeError("SEC catalog response must be an object")
         coverage["catalog_checked"] = True
         coverage["catalog_status"] = response.get("stato")
+        if response.get('identity_resolution'):
+            coverage['issuer_resolution'] = deepcopy(response['identity_resolution'])
         reasons = response.get("motivi") or []
         if not isinstance(reasons, list):
             issue("SEC", "catalog reasons list malformed")
@@ -172,7 +185,8 @@ def collect_documents(ticker, *, as_of, archive_root, filing_results=(), catalog
                             raise ValueError("different issuer ticker")
                         parsed = urlsplit(url)
                         if (parsed.scheme != "https" or parsed.hostname != "www.sec.gov"
-                                or parsed.username or parsed.password or parsed.port not in (None, 443)):
+                                or parsed.username or parsed.password or parsed.port not in (None, 443)
+                                or parsed.query or parsed.fragment):
                             raise ValueError("catalog document outside verified SEC HTTPS host")
                         published = published_on(entry.get("filed_date"))
                     except (TypeError, ValueError) as exc:
@@ -210,7 +224,7 @@ def collect_documents(ticker, *, as_of, archive_root, filing_results=(), catalog
         if local is not None:
             metadata = local["metadata"]
             fields = {name: entry[name] for name in
-                      ("emittente_id", "issuer", "form", "report_date", "accession") if entry.get(name)}
+                      ("emittente_id", "issuer", "form", "report_date", "accession", "accepted_at") if entry.get(name)}
             conflicts = [name for name, value in fields.items()
                          if metadata.get(name) and metadata[name] != value]
             missing_proof = needs_financial_proof and (
@@ -233,9 +247,10 @@ def collect_documents(ticker, *, as_of, archive_root, filing_results=(), catalog
                         "source": "SEC submissions", "url": url, "filed_date": published,
                         "document_sha256": local["document_sha256"], "fields": fields}
                 matched.add(id(local))
-        # A 6-K may be a press release or unrelated notice. Only an already
-        # qualified financial document can enter this pool; no catalog shortcut.
-        if needs_financial_proof and local is None:
+        # An explicitly supplied but invalid source cannot be repaired from a
+        # catalog label. A new catalog candidate must prove its financial scope
+        # from freshly downloaded bytes below, before it becomes a document.
+        if needs_financial_proof and local is None and url in supplied_references:
             continue
         pool.append((published, 1, -ordinal, url, entry, local))
     for doc in archive_unique.values():
@@ -291,8 +306,20 @@ def collect_documents(ticker, *, as_of, archive_root, filing_results=(), catalog
                 if not isinstance(fetched, dict) or fetched.get("stato") != "ok":
                     detail = fetched.get("motivo") if isinstance(fetched, dict) else fetched
                     raise ValueError("download failed: " + str(detail))
-                doc = load({**entry, "path": fetched.get("path"), "sha256": fetched.get("sha256")},
-                           origin="SEC")
+                candidate = {**entry, 'path': fetched.get('path'), 'sha256': fetched.get('sha256')}
+                if entry.get('form') in ('6-K', '6-K/A'):
+                    from .sec_interim_sources import verify_sec_interim_candidate
+                    if not Path(fetched['path']).resolve().is_relative_to(root):
+                        raise ValueError('source path outside archive root')
+                    candidate = verify_sec_interim_candidate(candidate, fetched['path'])
+                    if candidate['stato'] == 'not_financial':
+                        coverage['excluded'] += 1
+                        coverage.setdefault('nonfinancial_filings', []).append({
+                            'url': url, 'reasons': candidate['motivi']})
+                        continue
+                    if candidate['stato'] != 'verificato':
+                        raise ValueError('6-K financial proof unavailable: ' + '; '.join(candidate['motivi']))
+                doc = load(candidate, origin="SEC")
             except Exception as exc:
                 issue(url, type(exc).__name__ + ": " + str(exc), excluded=True)
                 continue
@@ -306,6 +333,23 @@ def collect_documents(ticker, *, as_of, archive_root, filing_results=(), catalog
         seen_bytes.add(doc["document_sha256"])
         documents.append(doc)
         coverage["reused" if local is not None else "downloaded"] += 1
+        if selection_policy == 'opening_annual_comparative' and len(documents) <= 2 and doc['metadata'].get('form') == '6-K':
+            # A recent notice may have preceded the real interim in the catalog.
+            # Once a financial period is proved, acquire its prior-year period
+            # before unrelated older notices consume the bounded document slots.
+            on = date.fromisoformat(doc['metadata']['report_date'])
+            remaining = pool[index + 1:]
+            comparative = []
+            for item in remaining:
+                meta = item[5]['metadata'] if item[5] is not None else item[4]
+                try:
+                    period = date.fromisoformat(meta.get('report_date', ''))
+                except (TypeError, ValueError):
+                    continue
+                if period.year == on.year - 1 and (period.month, period.day) == (on.month, on.day):
+                    comparative.append(item)
+            if comparative:
+                pool[index + 1:] = comparative + [item for item in remaining if item not in comparative]
     coverage["accepted"] = len(documents)
     if coverage["limited"]:
         issue("catalog", "document limit reached; coverage partial")

@@ -24,7 +24,7 @@ Never submit API keys, tokens, personal financial records, real mandates, absolu
 
 ## Development setup
 
-Use Python 3.10 or newer and Node.js 22.12 or newer. CI runs Python 3.12.
+Use Python 3.10 or newer and Node.js 22.12 or newer. Linux CI runs Python 3.12 and 3.14; macOS source CI runs Python 3.12.
 
 ```powershell
 python -m venv .venv
@@ -61,12 +61,13 @@ Windows is the supported desktop platform; preserve CRLF where `.gitattributes` 
 
 ## Tests
 
-Run the smallest relevant battery first, then the offline suite:
+Run the isolated research suite. It blocks network access, production writes and Excel file generation:
 
 ```powershell
-python -m pytest tests/test_<battery>.py -q
-python -m pytest tests/ -q
+python -I tools/testing/research_ci.py
 ```
+
+The full legacy test collection contains workbook-generating tests and is not the research CI entry point. Keep archived workbook workflows out of new research tests.
 
 For frontend changes:
 
@@ -81,6 +82,15 @@ npm run test:desktop
 For documentation changes, `python docs/guide/verify_docs.py` checks handbook links, the page inventory and the synthetic SVG assets.
 
 State which checks you ran and which live integrations remain untested. A passing offline suite does not validate current provider availability, account entitlements, brokerage connectivity, or email delivery.
+
+## Combining frontend work with current upstream
+
+1. Commit existing work on a feature branch in your fork before synchronizing. Keep a backup branch for a substantial redesign.
+2. Point the fork to this public repository as `upstream`; fetch upstream updates and merge `upstream/main` into the feature branch. Resolve overlapping edits explicitly.
+3. Open a pull request with the frontend diff and before/after screenshots. Check the current API contracts, authentication, research pages and desktop navigation, as well as the visual changes.
+4. The maintainer applies the reviewed changes in the private source repository, verifies them, and publishes the normal export. The public PR is then closed with a link to that sync commit; it is not merged directly into this generated history.
+
+This preserves both sets of changes without granting contributors access to private project records. Fetching or pushing alone does not combine two divergent implementations.
 
 ## Pull requests
 

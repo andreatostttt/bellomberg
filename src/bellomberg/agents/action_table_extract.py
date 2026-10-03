@@ -16,6 +16,8 @@ import re as _re
 import time as _time
 from bellomberg.core.language import prompt_for_language, scoped_language
 
+ACTION_EXTRACT_MAX_TOKENS = 16000
+
 EMIT_TOOL = {
     "name": "emit_action_table",
     "description": "Trascrivi in forma strutturata le righe DATI dell'ACTION TABLE del memo.",
@@ -91,6 +93,7 @@ def extract_rows_structured(memo_markdown: str, usage_out: dict = None) -> dict:
                        "status": "skipped"})
     try:
         from bellomberg.core.llm_client import OpenRouterClient, modello as _modello_llm, somma_usage
+        from bellomberg.agents.specialists.base import timeout_specialisti
         from bellomberg.core.llm_refusal import refusal_reason as _refusal_reason
         # 05/09 (ordine PM): modello dal .env (ACTION_EXTRACTOR_MODEL); assente = errore col nome
         MODEL_SYNTHESIZER = _modello_llm("action_extractor")
@@ -106,15 +109,11 @@ def extract_rows_structured(memo_markdown: str, usage_out: dict = None) -> dict:
         return {"error": "memo vuoto"}
     _t0 = _time.perf_counter()
     try:
-        client = OpenRouterClient(timeout=120.0, max_retries=1)
+        client = OpenRouterClient(timeout=timeout_specialisti(ACTION_EXTRACT_MAX_TOKENS), max_retries=1)
         resp = client.messages.create(
             model=MODEL_SYNTHESIZER,
-            # 26/07 pre-V6: 1500 -> 2100 (+40%, dal +37/38% MISURATO col count_tokens
-            # sui prompt di questa fascia). L'ultima run ha emesso 12 righe = 670
-            # token di output su Sonnet 4.6; gli stessi diventano ~920 su Sonnet 5.
-            # Qui il troncamento non accorcia un testo: ROMPE il JSON del tool, si
-            # cade sul fallback regex e le decisioni strutturate si perdono in parte.
-            max_tokens=2100,
+            # PM 02/10: 16k; JSON troncato resta un errore dichiarato.
+            max_tokens=ACTION_EXTRACT_MAX_TOKENS,
             # Sonnet 5 (26/07): omesso = adaptive acceso; SPENTO esplicito — qui
             # c'e' tool_choice FORZATO (estrazione meccanica), il thinking non
             # serve e col budget corto lo eroderebbe

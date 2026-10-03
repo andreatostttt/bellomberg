@@ -1,0 +1,107 @@
+{
+  "contract": "trade-idea-pm-documents/1",
+  "ticker": "UBER",
+  "as_of": "2026-10-02",
+  "documents": [
+    {
+      "stato": "verificato",
+      "url": "https://www.sec.gov/Archives/edgar/data/1543151/000154315126000032/uber-20260630.htm",
+      "path": "1b96b259139fbe986b1ca12a12e13f9e8ca8c6d393a40d9e581c574856861279.html",
+      "sha256": "1b96b259139fbe986b1ca12a12e13f9e8ca8c6d393a40d9e581c574856861279",
+      "filed_date": "2026-08-05",
+      "metadati": {
+        "issuer": "Uber Technologies, Inc",
+        "form": "10-Q",
+        "report_date": "2026-06-30",
+        "pm_source_verification": {
+          "contract": "trade-idea-pm-documents/1",
+          "ticker": "UBER",
+          "publisher": {
+            "host": "www.sec.gov",
+            "basis": "server_curated_public_authority"
+          },
+          "publication_basis": "server_sec_catalog_receipt",
+          "report_date_basis": "dated_primary_text_quote",
+          "issuer_basis": "confirmed_issuer_name_in_primary_text",
+          "claim_origins": {
+            "publication": "automatic_sec_catalog_receipt",
+            "report_date": "verified_pm_locator",
+            "issuer": "verified_pm_locator"
+          },
+          "proofs": {
+            "report_date": {
+              "quote": "For the quarterly period ended June 30, 2026",
+              "start": 30741,
+              "end": 30785,
+              "sha256": "d2fa66f2f44485a00dfb52c46585fac70c2d9ab7b48fc9b204d9422a722757e8"
+            },
+            "issuer": {
+              "quote": "UBER TECHNOLOGIES, INC.\n\n(Exact name of registrant as specified in its charter)",
+              "start": 31012,
+              "end": 31091,
+              "sha256": "92bef7821adc6e71d3b0dd7b392b12bc40cc08fbf60e34fe6f8435fcb452e01e"
+            },
+            "publication": {
+              "source_url": "https://data.sec.gov/submissions/CIK0001543151.json",
+              "sha256": "86e4fa48c1b20aa2e6f57fa3f854cf92bbf8ce7bad6ea24823dd986829ee880a",
+              "locator": "/entry/filed_date",
+              "value": "2026-08-05"
+            }
+          },
+          "security_identity_verified": false,
+          "limitation": "Document publisher, bytes and quoted metadata are checked; economic sufficiency and the selected security remain separate gates.",
+          "publication_receipt": {
+            "contract": "trade-idea-sec-publication-receipt/1",
+            "source_url": "https://data.sec.gov/submissions/CIK0001543151.json",
+            "sha256": "86e4fa48c1b20aa2e6f57fa3f854cf92bbf8ce7bad6ea24823dd986829ee880a",
+            "entry": {
+              "ticker": "UBER",
+              "url": "https://www.sec.gov/Archives/edgar/data/1543151/000154315126000032/uber-20260630.htm",
+              "issuer": "Uber Technologies, Inc",
+              "emittente_id": "CIK:0001543151",
+              "form": "10-Q",
+              "accession": "0001543151-26-000032",
+              "filed_date": "2026-08-05",
+              "report_date": "2026-06-30"
+            },
+            "catalog_status": "ok"
+          }
+        },
+        "emittente_id": "CIK:0001543151",
+        "accession": "0001543151-26-000032"
+      },
+      "publication_receipt": {
+        "contract": "trade-idea-sec-publication-receipt/1",
+        "source_url": "https://data.sec.gov/submissions/CIK0001543151.json",
+        "catalog_status": "ok",
+        "entry": {
+          "ticker": "UBER",
+          "url": "https://www.sec.gov/Archives/edgar/data/1543151/000154315126000032/uber-20260630.htm",
+          "issuer": "Uber Technologies, Inc",
+          "emittente_id": "CIK:0001543151",
+          "form": "10-Q",
+          "accession": "0001543151-26-000032",
+          "filed_date": "2026-08-05",
+          "report_date": "2026-06-30"
+        },
+        "path": "publication-receipts/86e4fa48c1b20aa2e6f57fa3f854cf92bbf8ce7bad6ea24823dd986829ee880a.json",
+        "sha256": "86e4fa48c1b20aa2e6f57fa3f854cf92bbf8ce7bad6ea24823dd986829ee880a"
+      },
+      "status": "verified",
+      "request": {
+        "url": "https://www.sec.gov/Archives/edgar/data/1543151/000154315126000032/uber-20260630.htm",
+        "published_at": null,
+        "publication_quote": null,
+        "report_date": "2026-06-30",
+        "report_date_quote": "For the quarterly period ended June 30, 2026",
+        "issuer_quote": "UBER TECHNOLOGIES, INC.\n\n(Exact name of registrant as specified in its charter)",
+        "title": null
+      },
+      "url_finale": "https://www.sec.gov/Archives/edgar/data/1543151/000154315126000032/uber-20260630.htm",
+      "bytes": 2419544,
+      "content_type": "text/html",
+      "text_sha256": "f57dbb68cead60ebfc6e7053c8cfaee2c87ea8d0565bb915daacd9dd72fa237b"
+    }
+  ],
+  "fingerprint": "b8da8e4d3aed498ec46ec1c281c5ce3221a19cd6ab6473d8387a01aa25d5d013"
+}

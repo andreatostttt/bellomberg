@@ -8,6 +8,7 @@ import MemoArchive from './pages/MemoArchive';
 import Chat from './pages/Chat';
 import Decisions from './pages/Decisions';
 import AgentsLive from './pages/AgentsLive';
+import TradeIdeaPage from './pages/TradeIdeaPage';
 import MonteCarloPage from './pages/MonteCarloPage';
 import TradeEntryPage from './pages/TradeEntryPage';
 import NewsPage from './pages/NewsPage';
@@ -56,6 +57,7 @@ export default function App() {
               const Page = PAGES[entry.id];
               return <Route key={entry.id} path={entry.to} element={<ErrorBoundary label={localizeDestination(entry, language).label}><Page /></ErrorBoundary>} />;
             })}
+            <Route path="/agents/trade-idea" element={<ErrorBoundary label={t('tradeidea.title')}><TradeIdeaPage /></ErrorBoundary>} />
             <Route path="/settings" element={<Navigate to="/dashboard" replace />} />
           </Routes>
           </Layout>

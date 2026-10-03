@@ -18,7 +18,8 @@ from .sector_analysis import revise_sector_analysis, validate_bundle
 
 SCENARIOS = ("bear", "base", "bull")
 KINDS = {"historical", "company_guidance", "analyst_estimate"}
-_RECORD_TYPES = {"operating_fcff", "bank_residual_income", "fund_nav"}
+from .preparation_methods import supported_methods
+_RECORD_TYPES = frozenset(supported_methods())
 
 
 def _issue(field, code, reason):
@@ -111,6 +112,12 @@ def _catalog(documents, cutoff):
                           "metadata": deepcopy(raw.get("metadata")),
                           "page_references": deepcopy(raw.get("page_references")),
                           "extraction_coverage": deepcopy(raw.get("extraction_coverage", raw.get("coverage")))}
+        if raw.get('retrieval') is not None:
+            catalog[ident]['retrieval'] = deepcopy(raw['retrieval'])
+        if raw.get('archive_path') is not None:
+            # A bounded raw-byte parser may need the archived primary again.
+            # The path is operational metadata, never a public source locator.
+            catalog[ident]['archive_path'] = deepcopy(raw['archive_path'])
         provenance[ident] = {"url": raw["url"], **deepcopy(dates),
                              "sha256": actual_hash if supplied_hash is not None else None,
                              "sha256_status": "verified" if supplied_hash is not None else "not_provided",
@@ -152,10 +159,26 @@ def _catalog(documents, cutoff):
         from .fund_nav_statement import NORMALIZER as NAV_NORMALIZER, PREFIX as NAV_PREFIX
         nav_statement = (ident.startswith(NAV_PREFIX) or isinstance(metadata, dict)
                          and metadata.get('normalizer') == NAV_NORMALIZER)
+        from .nav_components_evidence import NORMALIZER as NAV_COMPONENTS_NORMALIZER, PREFIX as NAV_COMPONENTS_PREFIX
+        nav_components = (ident.startswith(NAV_COMPONENTS_PREFIX) or isinstance(metadata, dict)
+                          and metadata.get('normalizer') == NAV_COMPONENTS_NORMALIZER)
+        from .fund_nav_quote_evidence import NORMALIZER as FUND_QUOTE_NORMALIZER, PREFIX as FUND_QUOTE_PREFIX
+        fund_quote = (ident.startswith(FUND_QUOTE_PREFIX) or isinstance(metadata, dict)
+                      and metadata.get('normalizer') == FUND_QUOTE_NORMALIZER)
+        from .fund_nav_publication_evidence import NORMALIZER as FUND_PUBLICATION_NORMALIZER, PREFIX as FUND_PUBLICATION_PREFIX
+        fund_publication = (ident.startswith(FUND_PUBLICATION_PREFIX) or isinstance(metadata, dict)
+                            and metadata.get('normalizer') == FUND_PUBLICATION_NORMALIZER)
+        from .property_reported_sources import NORMALIZER as REPORTED_PROPERTY_NORMALIZER
+        reported_property = (ident.startswith('reported-property-') or isinstance(metadata, dict)
+                             and metadata.get('normalizer') == REPORTED_PROPERTY_NORMALIZER)
+        commodity_trust = (ident.startswith('commodity-trust-facts-') or isinstance(metadata, dict)
+                           and metadata.get('normalizer') == 'commodity_trust_primary/1')
         from .foreign_listing_evidence import NORMALIZER as LISTING_NORMALIZER, PREFIX as LISTING_PREFIX
         foreign_listing = (ident.startswith(LISTING_PREFIX) or isinstance(metadata, dict)
                            and metadata.get('normalizer') == LISTING_NORMALIZER)
-        from .fx_evidence import NORMALIZER as FX_NORMALIZER, PREFIX as FX_PREFIX
+        from .fx_evidence import (NORMALIZER as FX_NORMALIZER, PREFIX as FX_PREFIX,
+                                 CROSS_NORMALIZER, CROSS_PREFIX)
+        cross_fx = ident.startswith(CROSS_PREFIX) or isinstance(metadata, dict) and metadata.get('normalizer') == CROSS_NORMALIZER
         fx = ident.startswith(FX_PREFIX) or isinstance(metadata, dict) and metadata.get('normalizer') == FX_NORMALIZER
         from .operating_wc_evidence import NORMALIZER as WC_NORMALIZER, PREFIX as WC_PREFIX
         working_capital = ident.startswith(WC_PREFIX) or isinstance(metadata, dict) and metadata.get('normalizer') == WC_NORMALIZER
@@ -163,14 +186,61 @@ def _catalog(documents, cutoff):
         balance_details = ident.startswith(DETAIL_PREFIX) or isinstance(metadata, dict) and metadata.get('normalizer') == DETAIL_NORMALIZER
         from .balance_sheet_evidence import NORMALIZER as BALANCE_NORMALIZER, PREFIX as BALANCE_PREFIX
         balance_sheet = ident.startswith(BALANCE_PREFIX) or isinstance(metadata, dict) and metadata.get('normalizer') == BALANCE_NORMALIZER
-        if not (fdic or inline or statement_shares or statement_tables or nav_statement or foreign_listing or fx or working_capital or balance_details or balance_sheet or ident.startswith("regulatory-facts-") or
+        if not (fdic or inline or statement_shares or statement_tables or nav_statement or nav_components or fund_quote or fund_publication or reported_property or commodity_trust or foreign_listing or cross_fx or fx or working_capital or balance_details or balance_sheet or ident.startswith("regulatory-facts-") or
                 isinstance(metadata, dict) and metadata.get("normalizer") == "regulatory_pdf_v1"):
             continue
         try:
             origin_id = metadata.get("source_document_id") if isinstance(metadata, dict) else None
-            if not isinstance(origin_id, str) or origin_id == ident or origin_id not in catalog:
+            if not (fund_quote or fund_publication) and (not isinstance(origin_id, str) or origin_id == ident or origin_id not in catalog):
                 raise ValueError("PDF originale assente dal catalogo")
-            if balance_sheet:
+            if commodity_trust:
+                from .commodity_trust_evidence import normalize_commodity_trust
+                dependencies = metadata['source_document_ids']
+                roles = ('statement', 'product', 'prospectus')
+                if not isinstance(dependencies, dict) or set(dependencies) != set(roles) or any(
+                        not isinstance(dependencies[key], str) or dependencies[key] == ident or dependencies[key] not in catalog
+                        or (catalog[dependencies[key]].get('metadata') or {}).get('normalizer') for key in roles):
+                    raise ValueError('Three original commodity-trust statement, issuer-product and prospectus sources required')
+                if len(set(dependencies.values())) != 3:
+                    raise ValueError('Distinct original commodity-trust source roles required')
+                normalized = normalize_commodity_trust(*(catalog[dependencies[key]] for key in roles),
+                    **{key: metadata[key] for key in ('ticker', 'entity', 'on', 'as_of')})
+                if date.fromisoformat(metadata['as_of']) > cutoff:
+                    raise ValueError('Commodity trust observation after information cutoff')
+            elif fund_quote:
+                from .fund_nav_quote_evidence import normalize_fund_quote
+                dependencies = metadata['source_document_ids']
+                roles = ('statement', 'price', 'unit', 'decimal')
+                if not isinstance(dependencies, dict) or set(dependencies) != set(roles) or any(
+                        not isinstance(dependencies[key], str) or dependencies[key] == ident or dependencies[key] not in catalog
+                        or (catalog[dependencies[key]].get('metadata') or {}).get('normalizer') for key in roles):
+                    raise ValueError('Four original financial, issuer-price, exchange-unit and decimal sources required')
+                expected = normalize_fund_quote(*(catalog[dependencies[key]] for key in roles),
+                    **{key: metadata[key] for key in ('ticker', 'entity', 'share_class', 'listing_symbol', 'isin',
+                                                      'exchange', 'on', 'as_of', 'quote_currency', 'quote_unit')})
+                if date.fromisoformat(metadata['as_of']) > cutoff:
+                    raise ValueError('Issuer-derived quotation evidence after information cutoff')
+                normalized = {'status': 'ready', 'documents': [expected]}
+            elif fund_publication:
+                from .fund_nav_publication_evidence import normalize_fund_publication
+                dependencies = metadata['source_document_ids']
+                roles = ('catalog', 'statement')
+                if not isinstance(dependencies, dict) or set(dependencies) != set(roles) or any(
+                        not isinstance(dependencies[key], str) or dependencies[key] == ident or dependencies[key] not in catalog
+                        or (catalog[dependencies[key]].get('metadata') or {}).get('normalizer') for key in roles):
+                    raise ValueError('Original archived publisher tool receipt and exact financial PDF required')
+                expected = normalize_fund_publication(*(catalog[dependencies[key]] for key in roles),
+                    **{key: metadata[key] for key in ('entity', 'share_class', 'on', 'as_of')})
+                if date.fromisoformat(metadata['as_of']) > cutoff:
+                    raise ValueError('Publisher catalog observation after information cutoff')
+                normalized = {'status': 'ready', 'documents': [expected]}
+            elif reported_property:
+                from .property_reported_sources import normalize_reported_property
+                normalized = normalize_reported_property(catalog[origin_id],
+                    **{key: metadata[key] for key in ('entity', 'on', 'as_of')})
+                if date.fromisoformat(metadata['as_of']) > cutoff:
+                    raise ValueError('Reported property source qualification after information cutoff')
+            elif balance_sheet:
                 from .balance_sheet_evidence import normalize_balance_sheet
                 normalized = normalize_balance_sheet(catalog[origin_id])
             elif balance_details:
@@ -182,6 +252,17 @@ def _catalog(documents, cutoff):
                     catalog[metadata['statement_document_id']], on=metadata['report_date'], as_of=metadata['as_of'])
                 if date.fromisoformat(metadata['as_of']) > cutoff:
                     raise ValueError('working-capital disclosure after information cutoff')
+            elif cross_fx:
+                from .fx_evidence import normalize_cross_fx
+                first, second = metadata['financial_document_id'], metadata['quote_document_id']
+                if first == second or first not in catalog or second not in catalog or origin_id not in (first, second):
+                    raise ValueError('Two distinct original ECB currency observations are required in the complete catalog')
+                expected = normalize_cross_fx(catalog[first], catalog[second],
+                    financial_currency=metadata['financial_currency'], quote_currency=metadata['quote_currency'],
+                    on=metadata['report_date'], as_of=metadata['as_of'])
+                if date.fromisoformat(metadata['as_of']) > cutoff:
+                    raise ValueError('Cross FX evidence after information cutoff')
+                normalized = {'status': 'ready', 'documents': [expected]}
             elif fx:
                 from .fx_evidence import normalize_fx
                 expected = normalize_fx(catalog[origin_id], financial_currency=metadata['financial_currency'],
@@ -196,6 +277,15 @@ def _catalog(documents, cutoff):
                     on=metadata['report_date'], as_of=metadata['as_of'])
                 if date.fromisoformat(metadata['as_of']) > cutoff:
                     raise ValueError('listing identity after information cutoff')
+            elif nav_components:
+                from .nav_components_evidence import normalize_nav_components
+                observed = normalize_nav_components(catalog[origin_id], classification=metadata['classification'],
+                    on=metadata['report_date'], as_of=metadata['as_of'], entity=metadata['entity'], share_class=metadata['share_class'])
+                if date.fromisoformat(metadata['as_of']) > cutoff:
+                    raise ValueError('NAV component coverage after information cutoff')
+                # This confirms the closed observed ledger only. Publication,
+                # quotation, dilution and analyst targets remain separate gates.
+                normalized = dict(observed, status='ready' if observed.get('status') == 'diagnostic_ready' else 'incomplete')
             elif nav_statement:
                 from .fund_nav_statement import normalize_fund_statement
                 normalized = normalize_fund_statement(catalog[origin_id])
@@ -235,6 +325,9 @@ def _catalog(documents, cutoff):
 
 
 def _calendar(plan, cutoff, *, method=None):
+    if method == 'managed_care_distributable_equity':
+        from .preparation_methods import managed_calendar
+        return managed_calendar(plan, cutoff)
     issues = []
     model = plan.get("model") if isinstance(plan.get("model"), dict) else {}
     perimeter = (model.get("perimeter") or {}).get("value") if isinstance(model.get("perimeter"), dict) else None
@@ -251,12 +344,29 @@ def _calendar(plan, cutoff, *, method=None):
     if opening is None or opening > cutoff:
         issues.append(_issue("calendar", "invalid_valuation_date", "Data valore non ISO o futura rispetto al cutoff"))
     periods = calendar.get("periods")
-    if method == 'fund_nav':
+    from .preparation_methods import SNAPSHOT_METHODS, FINITE_METHODS
+    if method in SNAPSHOT_METHODS:
         if periods != [] or calendar.get('discount_convention') != 'snapshot':
             issues.append(_issue('calendar', 'snapshot_required', 'NAV: fotografia datata con periods=[] e discount_convention=snapshot richiesta'))
-        return perimeter or {}, calendar, calendar.get('valuation_date'), issues
-    if not isinstance(periods, list) or len(periods) != 10:
-        issues.append(_issue("calendar", "horizon", "Nuovo candidato FCFF/banca: 10 esercizi annui espliciti richiesti"))
+        span = calendar.get('valuation_date')
+        if method == 'property_nav':
+            from .preparation_methods import _selection_records
+            from .property_nav_requirements import reported_policy_selected
+            if reported_policy_selected(_selection_records(plan)):
+                return perimeter or {}, calendar, span, issues
+            forward = (model.get('forward_year') or {}).get('value')
+            start = _day(forward.get('start')) if isinstance(forward, dict) else None
+            end = _day(forward.get('end')) if isinstance(forward, dict) else None
+            if (not isinstance(forward, dict) or set(forward) != {'start','end'} or not opening
+                    or not start or not end or start != opening + timedelta(days=1)
+                    or (end.year,end.month,end.day) != (opening.year+1,opening.month,opening.day)):
+                issues.append(_issue('forward_year', 'invalid_forward_year', 'Property NAV requires its own whole dated forward cash year'))
+            else:
+                span = forward['start'] + '/' + forward['end']
+        return perimeter or {}, calendar, span, issues
+    if (not isinstance(periods, list) or not periods or
+            method not in FINITE_METHODS and len(periods) != 10):
+        issues.append(_issue("calendar", "horizon", "Calendario esplicito richiesto: 10 esercizi per attivita continuativa, vita finita documentata per progetti"))
         return perimeter or {}, calendar, None, issues
     previous = opening
     for index, period in enumerate(periods):
@@ -344,6 +454,9 @@ def _source_scale(quoted, target):
 def _fact_proof(driver, item, evidence, unit, period=None, *, expected_entity=None, bank_context=None,
                 pointer_repairs=None):
     """A cited ID alone cannot prove a historical or management number."""
+    from .balance_component_bridge import uses_balance_components, balance_component_sum_proof
+    if uses_balance_components(item):
+        return balance_component_sum_proof(driver, item, evidence, unit, period, expected_entity, scale=_source_scale)
     from .balance_working_capital import OPERATION, balance_nwc_proof
     if isinstance(item.get('calculation'), dict) and item['calculation'].get('operation') == OPERATION:
         if driver != 'opening_nwc':
@@ -405,6 +518,9 @@ def _fact_proof(driver, item, evidence, unit, period=None, *, expected_entity=No
                                      allowed_concepts=allowed_concepts, concept_signs=concept_signs,
                                      expected_entity=expected_entity,
                                      regulatory_components=regulatory_components,
+                                     sec_share_count=driver == 'shares',
+                                     sec_opening_bridge=driver in ('net_debt', 'equity_adjustments'),
+                                     revenue_pointer_repairs=(pointer_repairs if driver == 'historical_revenue' else None),
                                      parent_cash_pointer_repairs=(pointer_repairs if driver == 'capital.parent_opening_cash' else None))
     if len(evidence) != 1:
         return "fatto storico/guidance: una fonte primaria univoca richiesta"
@@ -441,7 +557,8 @@ def _fact_proof(driver, item, evidence, unit, period=None, *, expected_entity=No
     return None
 
 
-def _quotation_proof(item, evidence):
+def _quotation_proof(item, evidence, *, expected_entity=None, expected_ticker=None,
+                     opening_date=None, sec_filings=(), sec_primary_id=None):
     value, facts = item.get("value"), item.get("facts")
     if not isinstance(value, dict) or not isinstance(facts, dict):
         return "quotazione: contratto e facts documentati richiesti"
@@ -455,6 +572,23 @@ def _quotation_proof(item, evidence):
     if set(facts) != required:
         return "prove numeriche richieste per " + ", ".join(sorted(required))
     catalog = {doc["id"]: doc for doc in evidence}
+    if 'price_date_basis' in value:
+        try:
+            from .quotation_evidence import verify_sec_us_weekend_quote_basis
+            from .input_evidence import same_entity_name
+            basis = value['price_date_basis']
+            listing = catalog[basis['listing_document_id']]
+            parent_id = listing['id'].removeprefix('listing-')
+            parents = [doc for doc in sec_filings if doc.get('id') == parent_id]
+            if (len(parents) != 1 or parent_id != sec_primary_id or not expected_ticker or not expected_entity
+                    or not same_entity_name((parents[0].get('metadata') or {}).get('issuer'), expected_entity)):
+                raise ValueError('Selected primary and exact model entity/ticker required for weekend quotation')
+            verify_sec_us_weekend_quote_basis(value, listing, parents[0],
+                ticker=expected_ticker, opening_date=opening_date)
+            if (facts.get('shares_per_quote') or {}).get('evidence_ids') != [listing['id']]:
+                raise ValueError('Weekend quotation ratio must cite the same recompiled SEC listing')
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return 'quotation weekend basis: ' + str(exc)
     for key in sorted(required):
         fact = facts[key]
         if not isinstance(fact, dict) or set(fact) - {"evidence_ids", "evidence_quote", "quoted_value", "quoted_unit", "date_quote", "evidence_pointer"}:
@@ -463,13 +597,41 @@ def _quotation_proof(item, evidence):
         if not isinstance(ids, list) or len(ids) != 1 or not isinstance(ids[0], str) or ids[0] not in catalog:
             return key + ": fonte primaria univoca richiesta fra quelle del driver"
         sources = [catalog[ids[0]]]
+        if key == 'price' and 'price_date_basis' in value:
+            from urllib.parse import quote as url_quote
+            try:
+                body = json.loads(sources[0]['text'])
+                observation = body.get('observation') or {}
+                if (sources[0]['id'] != 'price-' + expected_ticker + '-' + value['price_as_of']
+                        or sources[0].get('url') != 'https://finance.yahoo.com/quote/'
+                            + url_quote(expected_ticker, safe='') + '/history/'
+                        or body.get('symbol') != expected_ticker or observation.get('symbol') != expected_ticker
+                        or observation.get('date') != value['price_as_of']
+                        or observation.get('currency') != value['quote_unit']
+                        or observation.get('close') != value['price']):
+                    raise ValueError('Weekend close requires the exact ticker, actual date and unadjusted quote source')
+            except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                return 'quotation weekend price: ' + str(exc)
         # Listing identity is a disclosed deterministic unit conversion. A ratio
         # for another share class cannot attest this quotation's conversion.
         origin = (sources[0].get("metadata") or {})
+        from .fund_nav_quote_evidence import NORMALIZER as FUND_QUOTE_NORMALIZER
+        if origin.get('normalizer') == FUND_QUOTE_NORMALIZER:
+            from .input_evidence import same_entity_name
+            if (expected_entity is None or not same_entity_name(origin.get('entity'), expected_entity)
+                    or value.get('share_class') != origin.get('share_class')
+                    or value.get('financial_currency') != origin.get('financial_currency')
+                    or value.get('quote_currency') != origin.get('quote_currency')
+                    or value.get('quote_unit') != origin.get('quote_unit')
+                    or value.get('price_as_of') != origin.get('on')
+                    or expected_ticker is not None and expected_ticker != origin.get('ticker')):
+                return 'Issuer-derived quotation security, entity, class, date or unit differs from the exact model'
         if key == "shares_per_quote" and origin.get("basis") == "one_listed_ordinary_share_is_one_share_of_the_same_class":
             if value.get("share_class") != origin.get("share_class"):
                 return "classe quotata diversa dall'identita primaria verificata"
-        problem = _fact_proof(key, {**fact, "value": value.get(key)}, sources, units[key], value.get("price_as_of"))
+        fact_date = opening_date if key == 'shares_per_quote' and 'price_date_basis' in value else value.get('price_as_of')
+        problem = _fact_proof(key, {**fact, "value": value.get(key)}, sources, units[key], fact_date,
+                              expected_entity=expected_entity if origin.get('normalizer') == FUND_QUOTE_NORMALIZER else None)
         if problem:
             return key + ": " + problem
         if key == "price" and "evidence_pointer" not in fact:
@@ -484,23 +646,40 @@ def _quotation_proof(item, evidence):
     return None
 
 
-def _compile(plan, schema, entities, perimeter, calendar, span, catalog, cutoff, *, pointer_repairs=None, method=None):
+def _selected_sec_filings(catalog, source_report, method):
+    """Selected filings bind SEC display typography in revenue and opening shares."""
+    if method != 'operating_fcff' or not isinstance(source_report, dict):
+        return []
+    selection = source_report.get('selection')
+    selected = selection.get('selected_document_ids') if isinstance(selection, dict) else None
+    if (not isinstance(selected, list) or selection.get('selected_document_id') not in selected):
+        return []
+    return [catalog[ident] for ident in selected if isinstance(ident, str) and ident in catalog]
+
+
+def _compile(plan, schema, entities, perimeter, calendar, span, catalog, cutoff, *, pointer_repairs=None, method=None, ticker=None,
+             sec_filings=(), sec_primary_id=None):
     from .record_semantics import is_opening_equity_bridge
+    from .preparation_record_evidence import record_period, prove_reported_record
     from .fund_nav_preparation import JUDGMENTS, prove_nav
     nav = method == 'fund_nav'
+    from .trade_idea_commodity_exposure import selected as commodity_selected, record_period as commodity_period
+    commodity = method == 'exposure_analysis' and commodity_selected({key: item.get('value')
+        for key, item in (plan.get('model') or {}).items() if isinstance(item, dict)})
     records, issues, expiry_policies = [], [], {}
     model = plan.get("model")
     scenarios = plan.get("scenarios")
-    if not isinstance(model, dict) or not isinstance(scenarios, dict) or set(scenarios) != set(SCENARIOS) \
-            or any(not isinstance(scenarios[s], dict) for s in SCENARIOS):
+    scenario_names = () if method == 'exposure_analysis' else SCENARIOS
+    if not isinstance(model, dict) or not isinstance(scenarios, dict) or set(scenarios) != set(scenario_names) \
+            or any(not isinstance(scenarios[s], dict) for s in scenario_names):
         return [], [_issue("proposal", "invalid_plan", "Servono model e scenari bear/base/bull come mappe di driver")], {}
     if any(not isinstance(driver, str) for driver in model) or any(
-            not isinstance(driver, str) for scope in SCENARIOS for driver in scenarios[scope]):
+            not isinstance(driver, str) for scope in scenario_names for driver in scenarios[scope]):
         return [], [_issue("proposal", "invalid_driver_name", "I nomi dei driver devono essere stringhe")], {}
     expected_model = {key for key, value in schema.items() if value[-1] == "model"}
     expected_scenarios = {key for key, value in schema.items() if value[-1] == "scenario"}
     for scope, values, expected in [("model", model, expected_model)] + [
-            (scenario, scenarios[scenario], expected_scenarios) for scenario in SCENARIOS]:
+            (scenario, scenarios[scenario], expected_scenarios) for scenario in scenario_names]:
         for driver in sorted(set(values) - expected):
             issues.append(_issue(driver, "unconsumed_driver", f"{scope}.{driver}: driver non consumato dal metodo"))
         for driver in sorted(expected - set(values)):
@@ -513,7 +692,7 @@ def _compile(plan, schema, entities, perimeter, calendar, span, catalog, cutoff,
                 issues.append(_issue(driver, "invalid_driver", label + ": driver non strutturato"))
                 continue
             allowed = {"value", "kind", "evidence_ids", "rationale", "valid_until", "valid_until_basis",
-                       "evidence_quote", "quoted_value", "quoted_unit", "period_quote", "facts", "evidence_pointer", "calculation"}
+                       "evidence_quote", "quoted_value", "quoted_unit", "period_quote", "facts", "evidence_pointer", "calculation", "record_pointer", "dilution_estimate"}
             if set(item) - allowed:
                 issues.append(_issue(driver, "unused_proposal_field", label + ": campi non consumati " + repr(sorted(set(item)-allowed))))
                 continue
@@ -524,19 +703,28 @@ def _compile(plan, schema, entities, perimeter, calendar, span, catalog, cutoff,
                                                  "money_per_policy": " per policy"}[unit]
             kind = item.get("kind")
             ids = item.get("evidence_ids")
+            share_estimate = (method == 'operating_fcff' and driver == 'shares'
+                              and kind == 'analyst_estimate' and 'dilution_estimate' in item)
+            if 'dilution_estimate' in item and not share_estimate:
+                issues.append(_issue(driver, 'invalid_dilution_estimate', label
+                    + ': la stima della diluizione e riservata al denominatore FCFF analyst_estimate'))
+                continue
             if not isinstance(kind, str) or kind not in KINDS or not _text(item.get("rationale")):
                 issues.append(_issue(driver, "invalid_judgment", label + ": kind o rationale non valido"))
                 continue
             # The legacy capital descriptor dates Ke at opening, but it is a
             # prospective valuation judgment, not an observed balance/quotation.
-            nav_judgment = nav and driver in JUDGMENTS
+            nav_judgment = (nav and driver in JUDGMENTS or method == 'digital_asset_nav'
+                            and driver in {'perimeter', 'calendar', 'nav_target', 'target_basis'}
+                            or method == 'property_nav' and driver in {'perimeter', 'calendar', 'policy', 'forward_year'}
+                            or method == 'exposure_analysis' and (driver in {'perimeter', 'calendar'} or commodity and driver == 'policy'))
             if nav_judgment and kind != 'analyst_estimate':
                 issues.append(_issue(driver, 'nav_judgment_required', label + ': scelta analitica NAV, non un fatto storico o guidance'))
                 continue
-            if timing == "opening" and driver != "capital.ke" and not nav_judgment and kind != "historical":
+            if timing in ("opening", "actuals") and driver != "capital.ke" and not nav_judgment and not share_estimate and kind != "historical":
                 issues.append(_issue(driver, "opening_fact_required", label + ": saldo/quotazione iniziale richiede un fatto storico verificabile"))
                 continue
-            if timing in ("future", "terminal") and kind == "historical" and not opening_bridge:
+            if timing in ("future", "terminal", "annual") and kind == "historical" and not opening_bridge:
                 issues.append(_issue(driver, "historical_forecast", label + ": storico non utilizzabile come forecast"))
                 continue
             if (not isinstance(ids, list) or not ids or any(not isinstance(x, str) for x in ids)
@@ -558,6 +746,15 @@ def _compile(plan, schema, entities, perimeter, calendar, span, catalog, cutoff,
             if not (same_day or source_expiry):
                 issues.append(_issue(driver, "unverified_expiry", label + ": solo policy same_day o scadenza letterale nella fonte citata"))
                 continue
+            if share_estimate:
+                from .diluted_share_estimate import prove_diluted_share_estimate
+                proof_error = prove_diluted_share_estimate(item, catalog,
+                    entity=entities.get(driver, perimeter['entity']),
+                    opening_date=calendar['valuation_date'], sec_filings=sec_filings,
+                    share_class=perimeter['share_class'])
+                if proof_error:
+                    issues.append(_issue(driver, 'unverified_dilution_estimate', label + ': ' + proof_error))
+                    continue
             if kind in ("historical", "company_guidance"):
                 if driver == 'opening_nwc' and method == 'operating_fcff':
                     from .balance_working_capital import balance_nwc_selection_problem
@@ -567,7 +764,7 @@ def _compile(plan, schema, entities, perimeter, calendar, span, catalog, cutoff,
                         issues.append(_issue(driver, 'incomplete_balance_coverage', label + ': ' + selection_error))
                         continue
                 if driver in ('shares', 'capital.shares_m'):
-                    from .statement_shares_evidence import share_selection_problem
+                    from .statement_shares_evidence import share_selection_problem, is_statement_shares
                     selection_error = share_selection_problem(item, catalog, entities.get(driver, perimeter['entity']),
                         calendar['valuation_date'], perimeter['share_class'])
                     if selection_error:
@@ -578,22 +775,49 @@ def _compile(plan, schema, entities, perimeter, calendar, span, catalog, cutoff,
                     issues.append(_issue(driver, "unverified_fact", label
                         + ": osservazioni JSON storiche non certificano guidance futura"))
                     continue
-                proof_error = (_quotation_proof(item, evidence) if driver == "quotation"
+                period = record_period(timing, calendar, span, method=method, opening_bridge=opening_bridge)
+                if commodity:
+                    period = commodity_period(driver, item.get('value'), calendar)
+                if (driver == 'quotation' and 'record_pointer' in item
+                        and isinstance(item.get('value'), dict) and 'price_date_basis' in item['value']):
+                    issues.append(_issue(driver, 'unverified_fact', label
+                        + ': weekend quotation requires separate SEC listing and dated price facts; no record-pointer substitution'))
+                    continue
+                # Statement-share documents are already recompiled against the original
+                # filing in _catalog. Their proof consumes only the explicitly cited
+                # observation; supplemental filings must not turn it into a mixed proof.
+                proof_error = (prove_reported_record(item, evidence, driver=driver, field=field,
+                                   entity=entities.get(driver, perimeter['entity']), period=period, unit=unit, basis=basis)
+                               if 'record_pointer' in item else _quotation_proof(item, evidence,
+                                   expected_entity=perimeter['entity'], expected_ticker=ticker,
+                                   opening_date=calendar['valuation_date'], sec_filings=sec_filings,
+                                   sec_primary_id=sec_primary_id) if driver == "quotation"
                                else prove_nav(driver, item, evidence, unit, calendar['valuation_date'], perimeter, model, _fact_proof) if nav
-                               else _fact_proof(driver, item, evidence, unit,
+                               else _fact_proof(driver, item, evidence + [doc for doc in sec_filings
+                                    if doc['id'] not in ids] if driver in ('historical_revenue', 'shares')
+                                    and ('evidence_pointer' in item or 'calculation' in item)
+                                    and not (driver == 'shares' and any(is_statement_shares(doc) for doc in evidence))
+                                    else evidence, unit,
                                                 calendar["valuation_date"] if timing == "opening" or opening_bridge else None,
                                                 expected_entity=entities.get(driver, perimeter["entity"]),
                                                 bank_context=plan, pointer_repairs=driver_repairs))
                 if proof_error:
                     issues.append(_issue(driver, "unverified_fact", label + ": " + proof_error))
                     continue
-            elif any(key in item for key in ("evidence_quote", "quoted_value", "quoted_unit", "period_quote", "evidence_pointer", "calculation")) or (
+            elif any(key in item for key in ("evidence_quote", "quoted_value", "quoted_unit", "period_quote", "evidence_pointer", "calculation", "record_pointer")) or (
                     'facts' in item and driver != 'liquidity_bridge'):
                 issues.append(_issue(driver, "mixed_evidence", label + ": prove di fatto in una stima: separare osservazioni e giudizio"))
                 continue
             if "facts" in item and driver not in ('quotation', 'liquidity_bridge') and not (nav and driver == 'components'):
                 issues.append(_issue(driver, "unused_facts", label + ": facts consentiti solo per quotation/liquidity_bridge"))
                 continue
+            if nav and driver == 'policy':
+                from .fund_nav_preparation import prove_incremental_policy
+                policy_error = prove_incremental_policy(item, model, catalog, perimeter,
+                    calendar['valuation_date'], cutoff.isoformat())
+                if policy_error:
+                    issues.append(_issue(driver, 'unverified_dilution_policy', label + ': ' + policy_error))
+                    continue
             if driver == 'liquidity_bridge':
                 from .bank_liquidity_evidence import prove_opening_cash
                 cash_error = prove_opening_cash(item, evidence, calendar['valuation_date'], perimeter['currency'],
@@ -608,7 +832,8 @@ def _compile(plan, schema, entities, perimeter, calendar, span, catalog, cutoff,
             if shape == "number" and not _finite(value):
                 issues.append(_issue(driver, "invalid_number", label + ": numero finito richiesto"))
                 continue
-            if shape == "path" and (not isinstance(value, list) or len(value) != len(calendar["periods"])
+            periods = calendar.get('periods', calendar.get('fiscal_periods', []))
+            if shape == "path" and (not isinstance(value, list) or len(value) != len(periods)
                                     or any(not _finite(n) for n in value)):
                 issues.append(_issue(driver, "invalid_path", label + ": percorso numerico per ogni esercizio richiesto"))
                 continue
@@ -621,9 +846,17 @@ def _compile(plan, schema, entities, perimeter, calendar, span, catalog, cutoff,
             if driver == 'capital.distribution_policy' and value != 'full_sweep_after_buffers':
                 issues.append(_issue(driver, 'unsupported_policy', label + ': serve full_sweep_after_buffers; nessun dividendo fisso implicito'))
                 continue
-            period = calendar["valuation_date"] if timing == "opening" else calendar["periods"][-1]["end"] if timing == "terminal" else span
+            period = record_period(timing, calendar, span, method=method)
+            if commodity:
+                period = commodity_period(driver, value, calendar)
             from .bank_evidence import is_consolidation, CONSOLIDATION_DISCLOSURE
             rationale = (CONSOLIDATION_DISCLOSURE if is_consolidation(item) else '') + item["rationale"]
+            from .balance_component_bridge import uses_balance_components, DISCLOSURE as BRIDGE_DISCLOSURE
+            if uses_balance_components(item):
+                rationale = BRIDGE_DISCLOSURE + rationale
+            if share_estimate:
+                from .diluted_share_estimate import diluted_share_disclosure
+                rationale = diluted_share_disclosure(item) + rationale
             if driver == 'opening_nwc' and isinstance(item.get('calculation'), dict) and item['calculation'].get('operation') == 'balance_sheet_nwc':
                 from .balance_working_capital import balance_nwc_disclosure
                 rationale = balance_nwc_disclosure(item) + rationale
@@ -685,7 +918,7 @@ def prepare_method_inputs(bundle, *, documents, propose, source_report=None):
                 "provenance": {"origin": "archive_approved", "documents": {}}}
     if decision.get("decision_status") != "resolved" or method not in _RECORD_TYPES \
             or decision.get("support_status") != "integrated":
-        reason = "Metodo non risolto o fuori dal perimetro FCFF/banca/fund NAV del preparatore: " + str(method)
+        reason = "Metodo non risolto o senza preparazione documentata integrata: " + str(method)
         return {"bundle": original, "status": "unsupported", "issues": [_issue("method", "unsupported", reason)],
                 "proposal": None, "provenance": provenance}
     if case.get("assumptions"):
@@ -703,13 +936,17 @@ def prepare_method_inputs(bundle, *, documents, propose, source_report=None):
         return {"bundle": original, "status": "incomplete", "issues": issues,
                 "proposal": None, "provenance": provenance}
     from .operating_adapter import SCHEMA as OPERATING, REVENUE_BASES, REVENUE_ALTERNATIVE_BASES
-    from .bank_adapter import SCHEMA as BANK
-    from .nav_adapter import FUND
-    requirements = get_method_requirements(method)
+    from .preparation_methods import method_schema, method_requirements, horizon, method_guide
+    schema_seed = (source_report or {}).get('source_plan')
+    if not isinstance(schema_seed, dict):
+        schema_seed = {'model': {row['driver']: {'value': row['value']} for row in case['records']
+                                  if row.get('scenario') == 'model'}, 'scenarios': {}}
+    requirements = method_requirements(method, schema_seed)
     contract = {"method_id": method, "method_version": requirements["method_version"],
-                "schema": deepcopy({'operating_fcff': OPERATING, 'bank_residual_income': BANK, 'fund_nav': FUND}[method]),
+                "schema": method_schema(method, schema_seed if method in ('property_nav', 'exposure_analysis') else None)[0],
                 "requirements": deepcopy(requirements),
-                "scenarios": list(SCENARIOS), "standard_horizon_years": 0 if method == 'fund_nav' else 10,
+                "scenarios": [] if method == 'exposure_analysis' else list(SCENARIOS), "standard_horizon_years": horizon(method)['target_annual_periods'],
+                "horizon": horizon(method),
                 "expiry_policy": {"policy": "same_day", "as_of": case["as_of"]},
                 "bank_dynamic_capital": method == "bank_residual_income"}
     from bellomberg.core.paths import PROJECT_ROOT
@@ -720,13 +957,33 @@ def prepare_method_inputs(bundle, *, documents, propose, source_report=None):
         return {"bundle": original, "status": "incomplete",
                 "issues": [_issue("contract", "missing_contract", "Contratto del metodo non installato: " + str(guide))],
                 "proposal": None, "provenance": provenance}
-    headings = {"operating_fcff": ("## Operating FCFF", "## Bank and balance-sheet"),
-                "bank_residual_income": ("## Bank and balance-sheet", "## Regulated networks"),
-                "fund_nav": ("## Funds, investment holdings and digital-asset NAV", "## Property/casualty insurance")}
     guide_text = guide.read_text(encoding="utf-8")
-    start, end = headings[method]
     contract["common_record_contract"] = guide_text[guide_text.index("## Common record contract"):guide_text.index("## Operating FCFF")]
-    contract["method_contract"] = guide_text[guide_text.index(start):guide_text.index(end)]
+    if method == 'exposure_analysis':
+        from .trade_idea_commodity_exposure import selected_records, CONTRACT, PREPARATION_POLICY as COMMODITY_POLICY
+        from .preparation_methods import _selection_records
+        if selected_records(_selection_records(schema_seed)):
+            PREPARATION_POLICY = COMMODITY_POLICY
+            contract['method_variant'] = CONTRACT
+        else:
+            from .trade_idea_exposure import PREPARATION_POLICY
+        contract['method_contract'] = PREPARATION_POLICY
+    elif method == 'property_nav' and requirements.get('record_contract') == 'reported_property_nav_snapshot/1':
+        from .property_nav_requirements import REPORTED_POLICY
+        contract['method_variant'] = requirements['record_contract']
+        contract['method_contract'] = ('Reported property NAV snapshot /1. Exact opt-in policy: '
+            + json.dumps(REPORTED_POLICY, sort_keys=True)
+            + '. Require complete source-proved IFRS balance, property/JV/development and EPRA NTA reconciliations, '
+              'all claims and restrictions. No invented forward-year NOI, FFO, AFFO or future cash bridge. '
+              'Asset shocks and NAV targets are explicit analyst judgments, distinct from reported EPRA measures.')
+    elif method == 'managed_care_distributable_equity':
+        managed_guide = PROJECT_ROOT / 'docs' / 'managed-care-inputs.md'
+        if not managed_guide.is_file():
+            return {'bundle': original, 'status': 'incomplete', 'issues': [_issue('contract', 'missing_contract', 'Contratto managed care assente')],
+                    'proposal': None, 'provenance': provenance}
+        contract['method_contract'] = managed_guide.read_text(encoding='utf-8')
+    else:
+        contract['method_contract'] = method_guide(method, guide_text)
     contract["driver_envelope"] = {
         "value": "Exact driver value per the shared/method contract; never insert missing facts",
         "kind": "historical | company_guidance | analyst_estimate",
@@ -736,7 +993,27 @@ def prepare_method_inputs(bundle, *, documents, propose, source_report=None):
         "valid_until": case["as_of"],
         "valid_until_basis": deepcopy(contract["expiry_policy"]),
         "quotation_fact_fields": ["evidence_ids", "evidence_quote", "quoted_value", "quoted_unit", "date_quote", "evidence_pointer"],
+        "quotation_date_policy": "Same-day close by default. Preserve any source-compiled price_date_basis: a verified USD ordinary listing may carry nasdaq_weekend_previous_friday/1 or nyse_weekend_previous_friday/1 for Saturday/Sunday accounting dates, matching the exact SEC exchange. price_as_of stays the real Friday; listing facts and accounting balances stay at valuation_date. No other prior-close or holiday inference.",
         "structured_fact_policy": "Use evidence_pointer with quoted_value/quoted_unit; period_quote is not applicable to structured JSON proof. Do not add other keys to quotation facts."}
+    observation_fields = {'field', 'driver', 'value', 'entity', 'period', 'unit', 'accounting_basis'}
+    typed_observations = False
+    for document in catalog.values():
+        try:
+            body = json.loads(document['text'])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(body, dict) and isinstance(body.get('observations'), list):
+            typed_observations = any(isinstance(row, dict) and observation_fields <= set(row)
+                                     for row in body['observations'])
+            if typed_observations:
+                break
+    if (typed_observations or isinstance((source_report or {}).get('source_plan'), dict)
+            or method not in ('operating_fcff', 'bank_residual_income', 'fund_nav')):
+        contract['reported_record_policy'] = {
+            'record_pointer': 'Exact JSON pointer to one whole observation present in a visible source document; never synthesize this observation from the proposed plan.',
+            'source_fields': ['field', 'driver', 'value', 'entity', 'period', 'unit', 'accounting_basis'],
+            'requirement': 'The source itself must contain every field. Driver/field/period/entity/basis must match consumption; structured contracts match exactly including explicit zeros and rights. Numeric scalar units may use deterministic same-currency scaling.',
+            'limitation': 'An offline source reference is not source-origin authentication or economic approval. Primary statement extraction gaps remain gaps.'}
     if method == "operating_fcff":
         from .input_evidence import operating_working_capital_components
         profile = decision.get("profile_id")
@@ -838,20 +1115,33 @@ def prepare_method_inputs(bundle, *, documents, propose, source_report=None):
     perimeter, calendar, span, structural = _calendar(plan, cutoff, method=method)
     issues.extend(structural)
     rationale = plan.get("scenario_rationale")
-    if not isinstance(rationale, dict) or set(rationale) != set(SCENARIOS) \
+    if method == 'exposure_analysis':
+        if not _text(plan.get('analysis_rationale')):
+            issues.append(_issue('analysis_rationale', 'missing_rationale', 'Motivazione dell analisi osservazionale richiesta'))
+        else:
+            candidate['analysis_context'] = {'analysis_rationale': plan['analysis_rationale']}
+    elif not isinstance(rationale, dict) or set(rationale) != set(SCENARIOS) \
             or any(not _text(rationale[s]) for s in SCENARIOS):
         issues.append(_issue("scenario_rationale", "missing_rationale", "Motivazioni bear/base/bull esplicite richieste"))
     else:
         candidate["analysis_context"] = {"scenario_rationale": deepcopy(rationale)}
     schema = contract["schema"]
     entities = {}
-    if method == "bank_residual_income":
+    if method == 'bank_residual_income':
         schema, entities, bank_issues = _bank_schema(plan, perimeter)
         issues.extend(bank_issues)
+    else:
+        try:
+            schema, entities = method_schema(method, plan)
+        except ValueError as exc:
+            issues.append(_issue('legal_structure', 'invalid_method_structure', str(exc)))
     if issues:
         return {"bundle": original, "status": "incomplete", "issues": issues,
                 "proposal": candidate, "provenance": provenance}
-    records, compilation, expiry_policies = _compile(plan, schema, entities, perimeter, calendar, span, catalog, cutoff, method=method)
+    sec_filings = _selected_sec_filings(catalog, source_report, method)
+    records, compilation, expiry_policies = _compile(plan, schema, entities, perimeter, calendar, span, catalog,
+        cutoff, method=method, ticker=case['ticker'], sec_filings=sec_filings,
+        sec_primary_id=((source_report or {}).get('selection') or {}).get('selected_document_id'))
     candidate["method_records"] = records
     provenance["expiry_policies"] = expiry_policies
     nwc = plan.get('model', {}).get('opening_nwc', {})

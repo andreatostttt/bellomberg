@@ -716,6 +716,19 @@ Regeneration creates new UUID workbook/sidecar files and preserves previous file
 snapshot and value travel through cache, research, database metadata, committee,
 score and F17. A blocked value is suppressed in nested calculation details too.
 
+The difference between fair value and market price is informational, in either
+direction and at any magnitude, for **bear, base and bull** and every valuation
+method. It does not mark the valuation as suspect, suppress its values, exclude a
+proposal or require the author to change assumptions. Ratios and upside remain
+visible comparisons. Review the economic reasoning and source evidence; never
+calibrate growth, margins, rates or other drivers to make the fair value approach
+the quotation. Data, source, identity, unit, integrity and arithmetic failures
+still block use, and risk and sizing rules remain separate constraints.
+Historical reports may carry a price-distance BLOCK label. Treat it as superseded
+only when the current validated view establishes that pure distance was its cause;
+an unexplained or independent failure is not waived. Stored artifacts and earlier
+analytical decisions retain their original contents.
+
 Reading a stored snapshot uses its own information cutoff: a documented value
 does not become unavailable solely because another calendar day has passed.
 An explicit cutoff or current cache identity must still match exactly. Missing

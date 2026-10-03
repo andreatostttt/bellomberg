@@ -280,8 +280,18 @@ def test_running_initial_then_same_filing_refresh_reuses_only_equivalent_source_
     observed["on_paid"] = notify
     first = manager.run_one(owner="synthetic-worker")
     first_calls = len(observed["paid"])
+    # This source-reuse test needs room for the complete refresh evidence.
+    # Measured prompt: 76,764 bytes > the 75,808-byte allowance of the old
+    # synthetic 100k model. Real provider limits and the context guard stay intact.
+    original_factory = manager.runtime.proposer_factory
+    def review_capacity_factory(*args, **kwargs):
+        proposer = original_factory(*args, **kwargs)
+        metadata = proposer.metadata
+        proposer.metadata = lambda model: {**metadata(model), 'context_length': 200000}
+        return proposer
+    manager.runtime.proposer_factory = review_capacity_factory
     second = manager.run_one(owner="synthetic-worker")
-    assert first["status"] == second["status"] == "succeeded"
+    assert first["status"] == second["status"] == "succeeded", (first.get("reason"), second.get("reason"))
     assert queued and queued[0]["id"] != initial["id"]
     assert first_calls > 1
     # Changed economic metadata needs four explicit review scopes, not another

@@ -110,22 +110,52 @@ def test_stale_worker_cannot_adopt_replacement_lease(workflow):
     assert worker.jobs.get(queued["id"])["lease_token"] == replacement["lease_token"]
 
 
-def test_failed_refresh_retains_visible_previous_model(workflow):
+@pytest.mark.parametrize("extra_diagnostic", ["", "synthetic-long-cause: " + "detail " * 180],
+                         ids=["native-causes", "long-cause"])
+def test_failed_refresh_retains_visible_previous_model(workflow, monkeypatch, extra_diagnostic):
     from bellomberg.valuation.preparation_service import prepare_and_generate
     worker, calls, _ = workflow
     _enqueue(worker)
     first = worker.run_one(owner="worker")
+    assert first["status"] == "succeeded", first
     original = worker.versions.current("SYNTH-EXT")["current"]
     before = Path(original["path"]).read_bytes()
+    sidecar_before = Path(original["path"]).with_suffix(".payload.json").read_bytes()
+    if extra_diagnostic:
+        from bellomberg.valuation import dcf_quality
+        assess = dcf_quality.assess_valuation_usability
+
+        def assess_with_long_diagnostic(payload, **kwargs):
+            check = assess(payload, **kwargs)
+            # Add detail only to a genuine failure; preserve every financial check.
+            if not check["usable"]:
+                check = {**check, "reasons": [*check["reasons"], extra_diagnostic]}
+            return check
+
+        monkeypatch.setattr(dcf_quality, "assess_valuation_usability", assess_with_long_diagnostic)
     _enqueue(worker, "new-document", first["result"]["generation_id"])
     worker.prepare = lambda bundle, **kwargs: prepare_and_generate(bundle, documents=[],
         propose=lambda *_: pytest.fail("missing evidence must not pay"), output_dir=worker.output_dir)
     second = worker.run_one(owner="worker")
-    assert second["status"] == "incomplete"
+    assert second["status"] == "incomplete", second
     view = worker.versions.current("SYNTH-EXT")
+    publication = second["result"]["publication"]
+    assert publication == view["latest_attempt"]
+    assert worker.jobs.get(second["id"])["result"]["publication"] == publication
+    assert 0 < len(second["reason"]) <= 1000
+    if len(publication["reason"]) > 1000:
+        suffix = " [full reason: result.publication.reason]"
+        assert second["reason"] == publication["reason"][:1000 - len(suffix)] + suffix
+    else:
+        assert second["reason"] == publication["reason"]
+    if extra_diagnostic:
+        assert len(publication["reason"]) > 1000
+        assert extra_diagnostic in publication["reason"]
     assert view["current"]["generation_id"] == original["generation_id"]
     assert view["latest_attempt"]["status"] == "incomplete"
     assert Path(original["path"]).read_bytes() == before
+    assert Path(original["path"]).with_suffix(".payload.json").read_bytes() == sidecar_before
+    assert len(calls) == 1
 
 
 def test_price_only_job_preserves_model_and_never_invokes_preparation(workflow):

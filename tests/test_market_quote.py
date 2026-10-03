@@ -57,7 +57,8 @@ def test_observed_price_is_additive_and_sanity_keeps_model_price(tmp_path):
     assert result['valuation_usability']['usable'], result['valuation_usability']
     assert result['price'] == 10.
     assert result['fair_value_base'] == 14.13
-    assert result['sanity']['severity'] == 'WARN'
+    assert result['sanity']['severity'] == 'OK'
+    assert result['sanity']['exclude_from_action_table'] is False
     assert result['upside_pct'] == 41.3
     assert isinstance(result.get('market_quote'), dict)
     block = result['market_quote']
@@ -240,14 +241,32 @@ def test_malformed_view_status_is_declared_missing(status):
     assert view['status_at_read'] == 'data_missing' and view['upside_base_pct'] is None
 
 
-def test_model_sanity_blocks_even_when_observed_price_would_pass(tmp_path):
+def test_model_price_distance_is_informational_when_observed_price_is_near_fair_value(tmp_path):
     rows = operating_records()
     next(r for r in rows if r['driver'] == 'quotation')['value']['price'] = 5.
     info = quote_info()
     info['regularMarketPrice'] = 14.
     result = generate(tmp_path, records=rows, info=info)
+    assert result['valuation_usability']['usable'], result['valuation_usability']
+    assert result['sanity']['severity'] == 'OK'
+    assert result['sanity']['exclude_from_action_table'] is False
+    assert result['price'] == 5.
+    assert result['fair_value_base'] == 14.13
+    assert result['upside_pct'] == 182.6
+    assert result['market_quote']['price'] == 14.
+    assert result['market_quote']['upside_base_pct'] == .9
+
+
+def test_invalid_discount_rate_still_blocks_despite_observed_price_near_valid_fair_value(tmp_path):
+    rows = operating_records()
+    next(r for r in rows if r['driver'] == 'wacc' and r['scenario'] == 'base')['value'] = 0.
+    info = quote_info()
+    info['regularMarketPrice'] = 14.
+    result = generate(tmp_path, records=rows, info=info)
     assert not result['valuation_usability']['usable']
     assert result['sanity']['severity'] == 'BLOCK'
+    assert 'WACC e RONIC devono superare g' in result['error']
+    assert result.get('fair_value_base') is None
     assert result['market_quote']['price'] == 14.
     assert result['market_quote']['upside_base_pct'] is None
 

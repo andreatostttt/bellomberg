@@ -87,6 +87,8 @@ def _err500(e: Exception, where: str, hint: str = "") -> "HTTPException":
 
 # --- bugfix #158: pulizia __pycache__ ad ogni avvio (previene bug da pyc stale) ---
 def _cleanup_pycache() -> None:
+    if sys.dont_write_bytecode:
+        return  # Read-only/offline interpreters must not mutate the installed code tree.
     import shutil
     base = str(PACKAGE_ROOT)
     removed = 0
@@ -109,7 +111,7 @@ try:
     from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request, Body
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.middleware.trustedhost import TrustedHostMiddleware
-    from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
+    from fastapi.responses import StreamingResponse, FileResponse, JSONResponse, RedirectResponse
     from bellomberg.core.api_presentation import PresentationJSONResponse
     from pydantic import BaseModel
     import uvicorn
@@ -398,9 +400,22 @@ async def lifespan(app):
         print("!" * 60)
     from bellomberg.valuation.valuation_automation_installation import start_installation
     app.state.valuation_automation = start_installation(SQLITE_PATH)
+    from bellomberg.api.trade_idea_routes import recover_orphan_runs
+    try:
+        app.state.trade_idea_recovery = recover_orphan_runs(SQLITE_PATH)
+    except Exception as exc:
+        app.state.trade_idea_recovery = {"status": "error",
+            "reason": type(exc).__name__ + ": " + str(exc)[:350]}
+    if app.state.trade_idea_recovery.get("status") != "ready" or any(
+            app.state.trade_idea_recovery.get(key) for key in
+            ("interrupted", "recovered", "unknown_liveness", "errors")):
+        print("[trade-idea recovery] " + str(app.state.trade_idea_recovery), flush=True)
+    from bellomberg.market_data.fund_market_worker import start_market_updates
+    app.state.fund_market_worker = start_market_updates(SQLITE_PATH, os.path.join(DB_DIR, 'consensus_cache'))
     try:
         yield
     finally:
+        app.state.fund_market_worker.stop()
         runner = app.state.valuation_automation["runner"]
         if runner is not None:
             runner.stop()
@@ -678,6 +693,7 @@ if FASTAPI_OK:
     from bellomberg.api.language_routes import create_language_router
     from bellomberg.api.filing_routes import create_filing_router
     from bellomberg.api.valuation_automation_routes import create_valuation_automation_router
+    from bellomberg.api.fundamentals_routes import create_fundamentals_router
     from bellomberg.core.paths import SQLITE_PATH as valuation_db_path
 
     app.include_router(create_journal_router(get_db, require_session))
@@ -685,6 +701,14 @@ if FASTAPI_OK:
     app.include_router(create_options_router(require_session))
     app.include_router(create_language_router(require_session))
     app.include_router(create_filing_router(require_session))
+    def _fund_market_refresh_state():
+        runner = getattr(app.state, 'fund_market_worker', None)
+        return runner.status() if runner is not None else {'status': 'stopped',
+            'last_completed_at': None, 'last_result': None, 'error': 'backend_lifespan_not_started'}
+
+    app.include_router(create_fundamentals_router(require_session,
+        db_provider=lambda: SQLITE_PATH, cache_dir=os.path.join(DB_DIR, "consensus_cache"),
+        roots=(REPORT_DIR, MODELS_DIR), refresh_provider=_fund_market_refresh_state))
     def _active_valuation_automation():
         binding = getattr(app.state, "valuation_automation", None)
         runner = binding.get("runner") if binding else None
@@ -709,11 +733,8 @@ if FASTAPI_OK:
         if binding is None:
             return {"status": "not_started", "reason": "backend_lifespan_not_started"}
         runner = binding["runner"]
-        from bellomberg.valuation.preparation_runtime import installation_runtime
-        try:
-            configuration = installation_runtime().status()
-        except Exception as exc:
-            configuration = {"status": "error", "reason": type(exc).__name__ + ": " + str(exc)[:500]}
+        from bellomberg.valuation.valuation_automation_installation import archive_state
+        configuration = archive_state()
         return {"configuration": configuration, "worker": runner.status() if runner else binding["state"]}
 
     # ===== DATABASE BACKUP =====
@@ -1504,7 +1525,18 @@ if FASTAPI_OK:
         """Serve il PDF del memo (bugfix #169 — i link file:/// con path relativi non funzionavano)."""
         db = get_db()
         with db._conn() as conn:
-            row = conn.execute("SELECT pdf_path FROM memos WHERE id=?", (memo_id,)).fetchone()
+            row = conn.execute("SELECT pdf_path,notes FROM memos WHERE id=?", (memo_id,)).fetchone()
+        if row and str(row[1] or "").startswith("trade_idea:"):
+            run_id = str(row[1]).removeprefix("trade_idea:")
+            import uuid
+            try:
+                run_id = str(uuid.UUID(run_id))
+            except ValueError as exc:
+                raise HTTPException(409, "Provenienza memo Trade Idea non valida") from exc
+            # The authenticated Trade Idea route verifies the saved manifest hash
+            # and returns exactly those verified bytes.
+            return RedirectResponse(
+                url=f"/trade-ideas/runs/{run_id}/artifacts/pdf", status_code=307)
         path = _resolve_memo_path(row[0] if row else None)
         if not path or not os.path.exists(path):
             raise HTTPException(404, _api_text(f'PDF non disponibile per memo {memo_id}', f'PDF unavailable for memo {memo_id}'))
@@ -1961,8 +1993,21 @@ if FASTAPI_OK:
             if d.get("archive_override") is not None:
                 d["archived"] = bool(d["archive_override"])
         executions = db.esecuzioni_delle_decisioni(rows)
+        # Optional until migration; unreadable provenance must not hide a block.
+        with db._conn() as conn:
+            has_trade_ideas = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trade_idea_runs'"
+            ).fetchone() is not None
+        provenance = {}
+        if has_trade_ideas:
+            from bellomberg.storage.trade_idea_store import TradeIdeaStore
+            idea_store = TradeIdeaStore(db.db_path)
+            for offset in range(0, len(rows), 1000):
+                provenance.update(idea_store.lookup_decisions(
+                    [row["id"] for row in rows[offset:offset + 1000]]))
         for d in rows:
             d["esecuzione"] = executions.get(d["id"])
+            d["trade_idea"] = provenance.get(d["id"])
         return {"decisions": rows}
 
     @app.post("/decisions/{decision_id}/archive", dependencies=[Depends(require_session)])
@@ -3298,12 +3343,26 @@ if FASTAPI_OK:
 
     # Store live subprocess handles so we can cancel them (consigliere_multi runs)
     _CONSIGLIERE_PROCS: Dict[str, subprocess.Popen] = {}
+    from bellomberg.api.trade_idea_routes import install_trade_idea_routes, active_paid_reason
+    from bellomberg.storage.trade_idea_store import TradeIdeaStore
+    install_trade_idea_routes(app, require_session, db_path=valuation_db_path,
+        weekly_active=lambda: bool(_CONSIGLIERE_PROCS or any(
+            st.get("status") == "running" for st in run_state.runs.values())))
+    from bellomberg.api.trade_idea_workspace_routes import install_trade_idea_workspace_routes
+    install_trade_idea_workspace_routes(app, require_session, db_path=valuation_db_path)
+    from bellomberg.api.weekly_recovery_routes import (
+        WeeklyRunOptions, read_worker_outcome, install_weekly_recovery_routes)
+    install_weekly_recovery_routes(app, require_session, lambda: get_db())
 
     @app.post("/consigliere/run", dependencies=[Depends(require_session)])
-    def trigger_consigliere(background_tasks: BackgroundTasks, request: Request):
+    def trigger_consigliere(background_tasks: BackgroundTasks, request: Request,
+                           options: WeeklyRunOptions | None = None):
         """Lancia un run consigliere in background. Ritorna subito task_id.
         Rifiuta se ce n'e' gia' uno running (anti-duplicate-trigger guard).
         """
+        options = options or WeeklyRunOptions(send_email=True)
+        if options.resume_memo_id is not None and not options.delivery_only and not options.authorize_new_ai:
+            raise HTTPException(428, "La ripresa analitica richiede conferma esplicita delle nuove richieste AI")
         # Anti-duplicate guard: refuse if there's already a running task
         active_running = [tid for tid, st in run_state.runs.items()
                            if st.get("status") == "running"]
@@ -3313,11 +3372,29 @@ if FASTAPI_OK:
                 409,
                 _api_text(f'Una run consigliere e gia in corso (task_id={existing}). Fermala prima con POST /consigliere/cancel_all o il pulsante STOP.', f'A consigliere run is already in progress (task_id={existing}). Cancel it first via POST /consigliere/cancel_all or STOP button.')
             )
+        try:
+            trade_idea_store = TradeIdeaStore(valuation_db_path)
+        except (FileNotFoundError, RuntimeError):
+            trade_idea_store = None
+        paid_reason = active_paid_reason(trade_idea_store)
+        if paid_reason:
+            raise HTTPException(409, paid_reason)
+        if options.resume_memo_id is not None:
+            from bellomberg.storage.weekly_run_store import get_weekly_run_status, WeeklyRunBlocked
+            try:
+                selected = get_weekly_run_status(get_db(), options.resume_memo_id)
+            except WeeklyRunBlocked as exc:
+                raise HTTPException(404, str(exc)) from exc
+            available = selected.get('delivery_recovery_available' if options.delivery_only else 'resume_available')
+            if not available:
+                raise HTTPException(409, selected.get('blocked_reason') or
+                    'La run selezionata non ha fasi mancanti recuperabili in questa modalita')
         # Verifica prima del throttle: un 428/503 non penalizza il click corretto
         # successivo. Il 409 sopra conserva la precedenza storica.
-        _require_mandato_run(request)
+        if not options.delivery_only:
+            _require_mandato_run(request)
         throttle(request)
-        task_id = "run_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        task_id = "run_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + secrets.token_hex(4)
         run_state.start(task_id)
 
         def _bg_run():
@@ -3328,7 +3405,8 @@ if FASTAPI_OK:
                 # e nessun processo a pagamento viene creato.
                 import bellomberg.core.mandato_pm as _mp
                 try:
-                    _mp.carica()
+                    if not options.delivery_only:
+                        _mp.carica()
                 except _mp.MandatoMancante:
                     _refund_throttle(request)
                     raise
@@ -3343,10 +3421,23 @@ if FASTAPI_OK:
                 except Exception:
                     log_f = None  # senza log si prosegue comunque
                 # Popen (non-blocking) so we can kill it via /cancel
+                outcome_path = os.path.join(DB_DIR, 'weekly_outcomes', task_id + '.json')
+                os.makedirs(os.path.dirname(outcome_path), exist_ok=True)
+                argv = [sys.executable, "-u", "-m", "bellomberg.agents.consigliere_multi",
+                        '--outcome', outcome_path, '--task-id', task_id]
+                if options.resume_memo_id is not None:
+                    argv += ['--resume-memo-id', str(options.resume_memo_id)]
+                if options.delivery_only:
+                    argv.append('--delivery-only')
+                if options.authorize_new_ai:
+                    argv.append('--authorize-new-ai')
+                if not options.send_email:
+                    argv.append('--no-email')
                 proc = subprocess.Popen(
-                    [sys.executable, "-u", "-m", "bellomberg.agents.consigliere_multi"],
+                    argv,
                     stdout=(log_f if log_f else subprocess.DEVNULL),
                     stderr=subprocess.STDOUT, text=True,
+                    cwd=str(PROJECT_ROOT), creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
                 )
                 _CONSIGLIERE_PROCS[task_id] = proc
                 try:
@@ -3370,9 +3461,11 @@ if FASTAPI_OK:
                 cur = run_state.get(task_id) or {}
                 if cur.get("status") == "cancelled":
                     return
-                run_state.finish(task_id, success=(rc == 0),
-                                  error=("rc=" + str(rc) + " - dettagli in data/consigliere_run.log")
-                                        if rc != 0 else None)
+                outcome = read_worker_outcome(outcome_path, task_id, rc)
+                cause = outcome.get('first_error') or outcome.get('last_error') or outcome.get('error')
+                message = cause.get('message') if isinstance(cause, dict) else cause
+                run_state.finish(task_id, success=outcome['status'] == 'completed', error=message)
+                run_state.runs[task_id].update(status=outcome['status'], outcome=outcome)
             except Exception as e:
                 _CONSIGLIERE_PROCS.pop(task_id, None)
                 try:

@@ -34,6 +34,9 @@ import requests
 from bellomberg.core.paths import DATA_DIR
 
 TRIMESTRALI_DIR = str(DATA_DIR / "trimestrali")
+HTML_TEXT_EXTRACTOR = 'visible_ixbrl/2'
+LEGACY_HTML_TEXT_EXTRACTOR = 'legacy_ixbrl/1'
+COMPANY_TEXT_EXTRACTOR = 'company_primary_text/1'
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Bellomberg/1.0 "
       "(lettore trimestrali; contatto PM)")
@@ -49,8 +52,11 @@ _PAROLE_LUNGHE = ("result", "risultati", "earnings", "quarter", "trimestral",
 _RE_BREVI = re.compile(r"(?<![a-z0-9])(h1|h2|q[1-4]|1h|9m)(?![a-z0-9])")
 
 
-def estrai_testo(path: str, *, contenuto: bytes | None = None) -> dict:
+def estrai_testo(path: str, *, contenuto: bytes | None = None,
+                 html_extractor: str = HTML_TEXT_EXTRACTOR) -> dict:
     """Testo con misure; contenuto permette di citare lo stesso snapshot hashato."""
+    if html_extractor not in (HTML_TEXT_EXTRACTOR, LEGACY_HTML_TEXT_EXTRACTOR, COMPANY_TEXT_EXTRACTOR):
+        raise ValueError('Unknown primary HTML text extraction contract')
     if contenuto is None and not os.path.isfile(path):
         return {"stato": "errore", "testo": "", "caratteri": 0, "pagine": None,
                 "formato": None, "motivo": f"file non trovato: {path}"}
@@ -62,10 +68,10 @@ def estrai_testo(path: str, *, contenuto: bytes | None = None) -> dict:
 
     est = os.path.splitext(path)[1].lower()
     if est == ".pdf" or grezzo[:5] == b"%PDF-":
-        return _estrai_pdf(BytesIO(grezzo))
+        return _estrai_pdf(BytesIO(grezzo), verify_empty_pages=html_extractor == COMPANY_TEXT_EXTRACTOR)
     testa = grezzo[:2048].lower()
     if est in (".html", ".htm") or b"<html" in testa or b"<!doctype" in testa:
-        return _estrai_html(grezzo)
+        return _estrai_html(grezzo, html_extractor=html_extractor)
     try:
         testo = grezzo.decode("utf-8").strip()
     except UnicodeDecodeError:
@@ -78,11 +84,14 @@ def estrai_testo(path: str, *, contenuto: bytes | None = None) -> dict:
             "motivo": "binario non riconosciuto (ne' PDF ne' HTML ne' testo)"}
 
 
-def _estrai_pdf(path: str) -> dict:
+def _estrai_pdf(path: str, *, verify_empty_pages=False) -> dict:
     try:
         from pypdf import PdfReader
         lettore = PdfReader(path)
         pagine = [pg.extract_text() or "" for pg in lettore.pages]
+        verified_empty = ([number for number, page in enumerate(lettore.pages, 1)
+            if not pagine[number - 1].strip() and _pagina_vuota_verificata(page)]
+            if verify_empty_pages else [])
     except Exception as e:  # PDF rotto/cifrato/scansionato senza xref sano
         return {"stato": "illeggibile", "testo": "", "caratteri": 0,
                 "pagine": None, "formato": "pdf",
@@ -99,26 +108,42 @@ def _estrai_pdf(path: str) -> dict:
                 "pagine": len(pagine), "formato": "pdf",
                 "motivo": ("estrazione VUOTA su %d pagine: probabile PDF "
                            "scansionato (serve OCR)" % len(pagine))}
-    vuote = [r["pagina"] for r in riferimenti if not r["testo"].strip()]
+    vuote = [r["pagina"] for r in riferimenti if not r["testo"].strip() and r["pagina"] not in verified_empty]
     return {"stato": "ok", "testo": testo, "caratteri": len(testo),
             "pagine": len(pagine), "formato": "pdf", "riferimenti": riferimenti,
             "pagine_senza_testo": vuote,
+            **({"pagine_vuote_verificate": verified_empty} if verify_empty_pages else {}),
             "avvisi": ([f"Pagine senza testo: {vuote}; contenuto non verificabile senza OCR"]
                        if vuote else [])}
 
 
+def _pagina_vuota_verificata(page):
+    """Only absence of page content and annotations proves a blank physical page.
+
+    An image, a drawing, hidden text or an extraction failure is not a blank.
+    Keep this separate from legacy receipts, whose extraction remains exact.
+    """
+    if page.get('/Annots'):
+        return False
+    contents = page.get_contents()
+    return contents is None or not contents.get_data().strip()
+
+
 class _TestoHTML(HTMLParser):
-    _MUTI = ("script", "style", "noscript", "template", "ix:hidden")
+    # Inline-XBRL resources/contexts are machine metadata, not visible report
+    # text. Keep ordinary ix:nonNumeric/nonFraction facts outside this header.
+    _MUTI = ("script", "style", "noscript", "template", "ix:header", "ix:hidden")
     _BLOCCHI = ("p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "li",
                 "section", "article", "br", "hr")
 
-    def __init__(self):
+    def __init__(self, *, legacy_inline_resources=False):
         super().__init__()
         self.pezzi = []
         self._muto = 0
+        self._muti = tuple(tag for tag in self._MUTI if tag != 'ix:header') if legacy_inline_resources else self._MUTI
 
     def handle_starttag(self, tag, attrs):
-        if tag in self._MUTI:
+        if tag in self._muti:
             self._muto += 1
         if not self._muto and tag in self._BLOCCHI:
             self.pezzi.append("\n")
@@ -130,7 +155,7 @@ class _TestoHTML(HTMLParser):
         self.handle_endtag(tag)
 
     def handle_endtag(self, tag):
-        if tag in self._MUTI and self._muto:
+        if tag in self._muti and self._muto:
             self._muto -= 1
         if not self._muto and tag in self._BLOCCHI:
             self.pezzi.append("\n")
@@ -140,8 +165,8 @@ class _TestoHTML(HTMLParser):
             self.pezzi.append(data)
 
 
-def _estrai_html(grezzo: bytes) -> dict:
-    parser = _TestoHTML()
+def _estrai_html(grezzo: bytes, *, html_extractor=HTML_TEXT_EXTRACTOR) -> dict:
+    parser = _TestoHTML(legacy_inline_resources=html_extractor == LEGACY_HTML_TEXT_EXTRACTOR)
     dichiarata = re.search(br"(?:charset\s*=\s*[\"']?|encoding\s*=\s*[\"'])([A-Za-z0-9._-]+)",
                           grezzo[:4096], re.I)
     codifica = dichiarata[1].decode("ascii") if dichiarata else "utf-8-sig"

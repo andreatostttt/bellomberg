@@ -1544,11 +1544,40 @@ class MemoryDB:
             row = conn.execute("SELECT * FROM positions WHERE ticker=?", (ticker,)).fetchone()
             cash = conn.execute("SELECT * FROM cash_state WHERE singleton_id=1").fetchone()
             decision = conn.execute("SELECT * FROM decisions WHERE id=?", (linked_decision_id,)).fetchone()
+            trade_idea = None
+            if linked_decision_id is not None and conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trade_idea_runs'").fetchone():
+                # Absence of the additive schema means an ordinary/legacy DB.
+                # Once its run table exists, a missing delivery table or other
+                # SQLite error is a real integrity failure, never a silent bypass.
+                idea = conn.execute(
+                    "SELECT id,memo_id,ticker,technical_status,phase,destination_kind,"
+                    "destination_decision_id,destination_reason FROM trade_idea_runs "
+                    "WHERE destination_decision_id=?", (linked_decision_id,)).fetchone()
+                if idea is not None:
+                    from bellomberg.storage.trade_idea_store import trade_idea_pdf_ready
+                    delivery = conn.execute(
+                        "SELECT manifest_json,manifest_sha256 FROM trade_idea_delivery WHERE run_id=?",
+                        (idea["id"],)).fetchone()
+                    trade_idea = dict(idea)
+                    trade_idea["manifest_sha256"] = delivery["manifest_sha256"] if delivery else None
+                    trade_idea["artifacts_ready"] = bool(delivery and trade_idea_pdf_ready(
+                        delivery["manifest_json"], delivery["manifest_sha256"],
+                        run_id=idea["id"], ticker=idea["ticker"]))
+            if trade_idea is None and decision is not None and decision["memo_id"] is not None:
+                tagged = conn.execute(
+                    "SELECT 1 FROM memos WHERE id=? AND substr(COALESCE(notes,''),1,11)='trade_idea:'",
+                    (decision["memo_id"],)).fetchone()
+                if tagged:
+                    raise ValueError(_storage_text(
+                        'provenienza Trade Idea mancante per la decisione collegata',
+                        'Trade Idea provenance missing for linked decision'))
             opening = conn.execute("SELECT * FROM position_openings WHERE ticker=?", (ticker,)).fetchone()
             context = {"position": dict(row) if row else None, "cash": dict(cash) if cash else None,
-                       "opening": dict(opening) if opening else None,
-                       "decision": dict(decision) if decision else None,
-                       "trades": [dict(r) for r in conn.execute(
+                        "opening": dict(opening) if opening else None,
+                        "decision": dict(decision) if decision else None,
+                        "trade_idea": trade_idea,
+                        "trades": [dict(r) for r in conn.execute(
                            "SELECT * FROM trade_history WHERE ticker=? ORDER BY data,id", (ticker,))]}
         context["fingerprint"] = sha256(json.dumps(context, sort_keys=True, allow_nan=False,
                                                    separators=(",", ":")).encode()).hexdigest()
@@ -1570,6 +1599,23 @@ class MemoryDB:
             raise ValueError(_storage_text(f'decisione {did} inesistente', f'Decision {did} does not exist'))
         if str(decision["ticker"]).strip().upper() != trade["ticker"]:
             raise ValueError(_storage_text(f"decisione {did} riguarda {decision['ticker']}, non {trade['ticker']}", f"Decision {did} concerns {decision['ticker']}, not {trade['ticker']}"))
+        trade_idea = context.get("trade_idea")
+        if trade_idea is not None:
+            if (trade_idea["destination_decision_id"] != did
+                    or trade_idea["memo_id"] != decision["memo_id"]
+                    or trade_idea["ticker"] != decision["ticker"]):
+                raise ValueError(_storage_text(
+                    f"decisione {did}: provenienza Trade Idea incoerente",
+                    f"Decision {did}: inconsistent Trade Idea provenance"))
+            if (trade_idea["technical_status"] != "completed"
+                    or trade_idea["destination_kind"] != "dcn"):
+                raise ValueError(_storage_text(
+                    f"decisione {did}: Trade Idea non completa o non operativa",
+                    f"Decision {did}: Trade Idea incomplete or non-operational"))
+            if not trade_idea["artifacts_ready"]:
+                raise ValueError(_storage_text(
+                    f"decisione {did}: PDF finale Trade Idea non validato",
+                    f"Decision {did}: final Trade Idea PDF not validated"))
         verso = cls._VERSO.get(trade["action"])
         if verso is None or verso != cls._VERSO.get(decision["action"]):
             raise ValueError(_storage_text(f'decisione {did}: verso incompatibile con il trade', f'Decision {did}: direction incompatible with the trade'))
@@ -2456,9 +2502,10 @@ class MemoryDB:
             return []
 
     def get_recent_memos(self, n=3):
-        """Ultimi N memo."""
+        """Ultimi N memo del comitato ordinario; Trade Idea ha storico proprio."""
         with self._conn() as conn:
-            rows = conn.execute("SELECT * FROM memos ORDER BY id DESC LIMIT ?", (n,)).fetchall()
+            rows = conn.execute("SELECT * FROM memos WHERE substr(COALESCE(notes,''),1,11) <> 'trade_idea:' "
+                                "ORDER BY id DESC LIMIT ?", (n,)).fetchall()
             return [dict(r) for r in rows]
 
     def save_specialist_report(self, memo_id, specialist, round_n, content, output_language=None):
@@ -2528,7 +2575,8 @@ class MemoryDB:
     # DECISIONS (extracted from Capo memo ACTION TABLE)
     # ========================================================
 
-    def extract_and_save_decisions(self, memo_id, memo_markdown, usage_out=None):
+    def extract_and_save_decisions(self, memo_id, memo_markdown, usage_out=None, *,
+                                   _prepare_only=False, _strict=False):
         """Parse ACTION TABLE dal memo del Capo. Estrae righe e salva in decisions.
         #200c (15/07): prima via = estrazione STRUTTURATA (Sonnet, tool forzato,
         celle verbatim); la regex storica resta come FALLBACK DICHIARATO. L'EUR
@@ -2572,6 +2620,8 @@ class MemoryDB:
                 r"##\s*ACTION TABLE.*?\n(\|.*?\|.*?\n)+",
                 memo_markdown, re.IGNORECASE | re.DOTALL)
             if not action_table_match:
+                if _strict and not structured_ok:
+                    raise ValueError("Estrazione decisioni non verificata: proposte precedenti conservate")
                 return []
             table_text = action_table_match.group(0)
             for line in table_text.split("\n"):
@@ -2592,6 +2642,8 @@ class MemoryDB:
                 eur = _parse_eur_amount(eur_str)
                 rows.append((action, ticker, eur, timing, confidence))
         if not rows:
+            if _strict and not structured_ok:
+                raise ValueError("ACTION TABLE presente ma nessuna decisione verificata")
             return []
 
         # ---- GUARDIA BOOK-AWARE (#31, deterministica) ----
@@ -2614,9 +2666,12 @@ class MemoryDB:
                 if t:
                     guard_pos[t] = p
         except Exception as e:
+            if _strict:
+                raise RuntimeError("Book non verificabile: decisioni precedenti conservate") from e
             print("[MemoryDB] book-guard: portafoglio non disponibile (" + str(e) + ")")
 
         decision_ids = []
+        prepared = []
         with self._conn() as conn:
             guard_trades = {}
             try:
@@ -2629,6 +2684,8 @@ class MemoryDB:
                     if tt and tt not in guard_trades:
                         guard_trades[tt] = tr
             except Exception as e:
+                if _strict:
+                    raise RuntimeError("Storico trade non verificabile: decisioni precedenti conservate") from e
                 print("[MemoryDB] book-guard: trade_history non disponibile (" + str(e) + ")")
 
             for (action, ticker, eur, timing, confidence) in rows:
@@ -2656,13 +2713,80 @@ class MemoryDB:
                         rationale = " ".join(note_parts)
                 except Exception as e:
                     print("[MemoryDB] book-guard skip su " + str(ticker) + ": " + str(e))
+                    if _strict:
+                        raise
+                if _prepare_only:
+                    if not isinstance(action, str) or not action.strip() or not isinstance(ticker, str) or not ticker.strip():
+                        raise ValueError("Decisione priva di azione o ticker: sostituzione rifiutata")
+                    prepared.append({"action": action, "ticker": ticker, "eur_amount": eur,
+                                     "timing": timing, "confidence": confidence, "rationale": rationale})
+                    continue
                 cur = conn.execute("""INSERT INTO decisions (memo_id, timestamp, action, ticker,
                                                               eur_amount, timing, confidence,
                                                               rationale, status)
                                        VALUES (?,?,?,?,?,?,?,?,'PENDING')""",
                                     (memo_id, ts, action, ticker, eur, timing, confidence, rationale))
                 decision_ids.append(cur.lastrowid)
-        return decision_ids
+        return prepared if _prepare_only else decision_ids
+
+    def replace_memo_decisions(self, memo_id, memo_markdown, *, usage_out=None,
+                               update_memo=None, prepared_rows=None):
+        """Prepare before touching prior proposals; replace atomically and once per memo text.
+
+        PM feedback and acted-on rows survive. Superseded automatic rows are archived,
+        never deleted. The extraction receipt and optional memo update commit together.
+        """
+        import hashlib
+        memo_hash = hashlib.sha256(memo_markdown.encode("utf-8")).hexdigest()
+        with self._conn() as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS memo_decision_extractions ("
+                         "memo_id INTEGER NOT NULL, memo_sha256 TEXT NOT NULL, ids_json TEXT NOT NULL, "
+                         "created_at TEXT NOT NULL, PRIMARY KEY(memo_id,memo_sha256))")
+            previous = conn.execute("SELECT ids_json FROM memo_decision_extractions WHERE memo_id=? AND memo_sha256=?",
+                                    (memo_id, memo_hash)).fetchone()
+            if previous is not None:
+                return json.loads(previous[0])
+        rows = (prepared_rows if prepared_rows is not None else self.extract_and_save_decisions(
+            memo_id, memo_markdown, usage_out=usage_out, _prepare_only=True, _strict=True))
+        if not isinstance(rows, list) or any(not isinstance(row, dict) or not row.get("action")
+                                            or not row.get("ticker") for row in rows):
+            raise ValueError("Nuove decisioni non validate: precedenti conservate")
+        ts = datetime.now().isoformat(timespec="seconds")
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            previous = conn.execute("SELECT ids_json FROM memo_decision_extractions WHERE memo_id=? AND memo_sha256=?",
+                                    (memo_id, memo_hash)).fetchone()
+            if previous is not None:
+                return json.loads(previous[0])
+            old = [dict(row) for row in conn.execute("SELECT * FROM decisions WHERE memo_id=?", (memo_id,))]
+            protected = [row for row in old if str(row.get("pm_feedback") or "").strip()
+                         or row.get("status") not in ("PENDING", "SKIPPED")
+                         or (row.get("status") == "SKIPPED" and "AUTO-ESCLUSA" not in str(row.get("outcome_notes") or ""))]
+            protected_ids = {row["id"] for row in protected}
+            for row in old:
+                if row["id"] not in protected_ids:
+                    conn.execute("UPDATE decisions SET status='EXPIRED',closed_at=?,outcome_notes=? WHERE id=?",
+                                 (ts, (row.get("outcome_notes") or "") + "\nAUTO-SUPERSEDED: memo " + memo_hash,
+                                  row["id"]))
+            ids = []
+            for row in rows:
+                matching = next((old_row for old_row in protected
+                                 if "AUTO-SUPERSEDED:" not in str(old_row.get("outcome_notes") or "")
+                                 if all(old_row.get(key) == row.get(key) for key in
+                                        ("action", "ticker", "eur_amount", "timing", "confidence"))), None)
+                if matching:
+                    ids.append(matching["id"])
+                    continue
+                cur = conn.execute("INSERT INTO decisions (memo_id,timestamp,action,ticker,eur_amount,timing,"
+                                   "confidence,rationale,status) VALUES (?,?,?,?,?,?,?,?,'PENDING')",
+                                   (memo_id, ts, row["action"], row["ticker"], row.get("eur_amount"),
+                                    row.get("timing"), row.get("confidence"), row.get("rationale")))
+                ids.append(cur.lastrowid)
+            if update_memo is not None:
+                update_memo(conn)
+            conn.execute("INSERT INTO memo_decision_extractions VALUES (?,?,?,?)",
+                         (memo_id, memo_hash, json.dumps(ids), ts))
+        return ids
 
     @staticmethod
     def _require_valuation_snapshot_schema(conn):

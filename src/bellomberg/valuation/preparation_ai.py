@@ -97,6 +97,25 @@ supported, omit it and explain the precise source gap in rationale. Keep the
 response compact; never repeat source documents or the schema.
 """
 
+GROWTH_ANCHORS = ('revenue_build', 'revenue_growth', 'gross_margin', 'capex_pct', 'nwc_pct')
+GROWTH_THESIS_SYSTEM = """
+For preparation_stage.purpose=growth_thesis, return ONLY {"growth_thesis":{...}}
+using its schema. This stage is after the verified opening and before forecasts.
+Use only visible dated evidence and the completed immutable opening. Identify
+reported segments when sourced; otherwise describe a consolidated business
+driver without inventing a segment. Separate observed history, published
+guidance, and your forward judgment; explicitly say when guidance or consensus
+is unavailable. Do not invent their values. Explain demand, revenue build,
+margin/opex, reinvestment, capital intensity, discount and terminal economics,
+periods, scenario impacts and risks. The five numeric anchors are your actual
+forecast estimates, with the same sourced envelope and periods that must be
+returned in the later driver stages. model_links must explain each pending
+model judgment, including the capitalized-development amortization choice;
+model_anchors must fix its actual sourced estimate before it is proposed.
+If a material driver cannot be justified,
+return null growth_thesis and explain the gap; never fill it silently.
+"""
+
 
 def _json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -116,6 +135,9 @@ def response_format(contract):
     if 'preparation_refresh' in contract:
         from .preparation_refresh import refresh_response_format
         return refresh_response_format(contract)
+    if contract.get('family_preparation'):
+        from .preparation_family_stages import family_response_format
+        return family_response_format(contract)
     stage = contract.get("preparation_stage")
     if not stage:
         return {"type": "json_object"}
@@ -127,6 +149,28 @@ def response_format(contract):
     # Some providers reject uniqueItems; citation uniqueness stays enforced by
     # the deterministic compiler before any economic record can be accepted.
     ids = {"type": "array", "items": text, "minItems": 1}
+    if stage.get('purpose') == 'growth_thesis':
+        anchor = obj({'value': {'anyOf': [number, {'type': 'array', 'items': number}, {'type': 'object'}]},
+                      'kind': {'const': 'analyst_estimate'}, 'evidence_ids': ids,
+                      'rationale': text, 'valid_until': text,
+                      'valid_until_basis': {'anyOf': [obj({'policy': {'const': 'same_day'}, 'as_of': text}), text]}})
+        link = obj({'periods': {'type': 'array', 'items': text, 'minItems': 1},
+                    'mechanism': text, 'impact': text, 'risk': text, 'evidence_ids': ids})
+        scenario = obj({'periods': {'type': 'array', 'items': text, 'minItems': 1},
+                        'thesis': text, 'risk': text,
+                        'links': obj({name: link for name in stage['link_drivers']}),
+                        'anchors': obj({name: anchor for name in GROWTH_ANCHORS})})
+        thesis = obj({'historical_basis': obj({'period': text, 'summary': text, 'evidence_ids': ids}),
+                      'business_drivers': {'type': 'array', 'minItems': 1, 'items': obj({
+                          'name': text, 'basis': {'enum': ['reported_segment', 'consolidated_driver']},
+                          'historical': text, 'guidance': text, 'judgment': text, 'risk': text,
+                          'evidence_ids': ids})},
+                      'model_links': obj({name: link for name in stage['model_link_drivers']}),
+                      'model_anchors': obj({name: anchor for name in stage['model_link_drivers']}),
+                      'scenarios': obj({name: scenario for name in contract['scenarios']})})
+        return {'type': 'json_schema', 'json_schema': {
+            'name': 'valuation_growth_thesis', 'strict': False,
+            'schema': obj({'growth_thesis': {'anyOf': [thesis, {'type': 'null'}]}})}}
     pointer = obj({key: text for key in ("value", "unit", "period")})
     fact_fields = {"evidence_ids": ids, "quoted_value": number, "quoted_unit": text,
                    "evidence_pointer": pointer, "evidence_quote": text, "date_quote": text}
@@ -160,6 +204,10 @@ def response_format(contract):
         _, _, _, timing, shape, _ = contract["schema"][name]
         kinds = (["analyst_estimate"] if name in ("perimeter", "calendar", "capital.ke") else
                  ["historical"] if timing == "opening" else ["company_guidance", "analyst_estimate"])
+        diluted_estimate = (contract.get('method_id') == 'operating_fcff' and name == 'shares'
+                           and 'diluted_denominator_policy' in stage)
+        if diluted_estimate:
+            kinds = ['historical', 'analyst_estimate']
         if is_opening_equity_bridge(name, contract['schema'][name]):
             kinds = ['historical', 'company_guidance', 'analyst_estimate']
         if nav and name in JUDGMENTS:
@@ -177,7 +225,15 @@ def response_format(contract):
         for kind in kinds:
             branch, mandatory = deepcopy(fields), list(required)
             branch["kind"] = {"enum": [kind]}
-            if name == "quotation":
+            if diluted_estimate and kind == 'analyst_estimate':
+                share_fact = obj({'value': number, 'evidence_ids': ids, 'quoted_value': number,
+                                  'quoted_unit': {'const': 'shares'}, 'evidence_pointer': pointer})
+                branch['dilution_estimate'] = obj({
+                    'method': {'const': 'reported_dilution_ratio_proxy'},
+                    'facts': obj({key: share_fact for key in ('outstanding', 'weighted_basic', 'weighted_diluted')}),
+                    'applicability': text, 'limitation': text})
+                mandatory.append('dilution_estimate')
+            elif name == "quotation":
                 branch["facts"] = obj({key: fact for key in sorted(quote_numbers)}, [])
                 mandatory.append("facts")
             elif nav and name == 'components':
@@ -258,7 +314,11 @@ def _model_dossier(dossier):
 
 class BudgetedProposer:
     def __init__(self, journal, *, authorized_usd, model, max_tokens, thinking,
-                 metadata=live_metadata, call=None, automatic_sections=False):
+                 metadata=live_metadata, call=None, automatic_sections=False,
+                 provider_context_check=False):
+        if type(provider_context_check) is not bool:
+            raise ValueError('provider_context_check must be a boolean')
+        self.provider_context_check = provider_context_check
         self.path = Path(journal).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.model, self.max_tokens, self.thinking = model, max_tokens, thinking
@@ -289,17 +349,34 @@ class BudgetedProposer:
 
     def summary(self):
         with self._db() as db:
-            rows = db.execute("SELECT reserved,cost,state FROM requests").fetchall()
+            rows = db.execute("SELECT * FROM requests").fetchall()
             cap = db.execute("SELECT cap FROM authorization WHERE id=1").fetchone()[0]
+        unverifiable = []
+        for row in rows:
+            receipt = self._validate_receipt(row, require_response=False)
+            if (row["response"] is not None and row["cost"] is not None
+                    and not receipt.get("response_sha256")):
+                unverifiable.append(row["key"])
         unknown = sum(row["cost"] is None for row in rows)
-        return {"authorized_usd": cap / 1e9, "requests": len(rows), "unknown_requests": unknown,
+        result = {"authorized_usd": cap / 1e9, "requests": len(rows), "unknown_requests": unknown,
                 "spent_usd": None if unknown else sum(row["cost"] for row in rows) / 1e9,
                 "known_cost_usd": sum(row["cost"] for row in rows if row["cost"] is not None) / 1e9,
                 "reserved_usd": sum(row["reserved"] for row in rows if row["cost"] is None) / 1e9}
+        if unverifiable:
+            result.update(unverifiable_responses=unverifiable,
+                          replay_status="legacy_unverifiable; original costs and records retained")
+        return result
 
     def _request(self, dossier, contract):
         user = _json({"dossier": _model_dossier(dossier), "contract": contract})
         system = SYSTEM
+        stage = contract.get('preparation_stage') or {}
+        if 'diluted_denominator_policy' in stage or 'dilution_accounting' in stage:
+            system += ('\nExplicit FCFF shares exception to the generic opening rule above: '
+                'a supplied diluted_denominator_policy permits kind=analyst_estimate ONLY with its '
+                'complete dilution_estimate historical operand proofs, disclosed proxy method and limitations. '
+                'This estimates the denominator; it does not relabel an opening observation or period average as an instant diluted fact. '
+                'A previously completed denominator with that proof remains an estimate in later stages.\n')
         if contract.get('method_id') == 'fund_nav':
             from .fund_nav_preparation import SYSTEM as NAV_SYSTEM
             system += NAV_SYSTEM
@@ -312,14 +389,43 @@ class BudgetedProposer:
             if 'arithmetic_repair' in contract['preparation_refresh']:
                 from .preparation_refresh_repair import REPAIR_SYSTEM
                 system += REPAIR_SYSTEM
-        return {"model": self.model, "max_tokens": self.max_tokens, "thinking": self.thinking,
+        if contract.get('preparation_stage', {}).get('purpose') == 'growth_thesis':
+            system += GROWTH_THESIS_SYSTEM
+        request = {"model": self.model, "max_tokens": self.max_tokens, "thinking": self.thinking,
                 "system": system, "messages": [{"role": "user", "content": user}],
                 "response_format": response_format(contract)}
+        if dossier.get('provider_context_validation') == 'openrouter_full_context_no_compression_v1':
+            if not getattr(self, 'provider_context_check', False):
+                raise ValueError('provider context validation requires explicit proposer opt-in')
+            request['require_full_context'] = True
+        return request
+
+    def cached_response(self, dossier, contract):
+        """Read an exact paid response without reserving or buying another call."""
+        key = sha256(_json(self._request(dossier, contract)).encode('utf-8')).hexdigest()
+        with self._db() as db:
+            row = self._existing(db, key, requested_max_tokens=self.max_tokens)
+        if row is not None:
+            from bellomberg.core.request_journal import observe_external_request
+            observe_external_request(self.path, row["key"], owned=False)
+        return None if row is None else self._read(row)
 
     @staticmethod
     def _prompt_bytes(request):
         return (len(request['system'].encode('utf-8')) + len(request['messages'][0]['content'].encode('utf-8'))
                 + len(_json(request['response_format']).encode('utf-8')))
+
+    def _fits_local_context(self, request, quote):
+        if self._prompt_bytes(request) + 8192 + self.max_tokens > quote['context_length']:
+            return False
+        if getattr(self, 'provider_context_check', False):
+            # The native Trade Idea gate also checks the serialized wire body.
+            from bellomberg.core.llm_client import costruisci_corpo
+            body = costruisci_corpo(**request, provider_max_price=quote['max_price'])
+            wire_bound = max(len(json.dumps(body, ensure_ascii=ascii_only).encode('utf-8'))
+                             for ascii_only in (False, True))
+            return wire_bound + self.max_tokens <= quote['context_length']
+        return True
 
     def prepare_context(self, dossier, contract, *, source_dossier, allow_selection=True,
                         allow_cached_selection=False):
@@ -341,7 +447,8 @@ class BudgetedProposer:
         request = self._request(dossier, contract)
         def cached(value):
             with self._db() as db:
-                return self._existing(db, sha256(_json(value).encode('utf-8')).hexdigest()) is not None
+                return self._existing(db, sha256(_json(value).encode('utf-8')).hexdigest(),
+                                      requested_max_tokens=self.max_tokens) is not None
         if cached(request):
             return dossier
         if not self.automatic_sections or not (allow_selection or allow_cached_selection):
@@ -391,8 +498,10 @@ class BudgetedProposer:
                     compact.append((reduced, reduced_request))
         # Reuse the refresh omission policy. Prefer dropping raw acquisition
         # envelopes to projecting economic proofs when both new forms fit.
+        # The incoming opening view can already be smaller than a reselected
+        # narrative view. Try its lean form last, preserving older paid forms.
         lean = []
-        for candidate in (projected, sec_projected, facts_projected, *(c for c, _ in compact)):
+        for candidate in (projected, sec_projected, facts_projected, *(c for c, _ in compact), dossier):
             if candidate is not None:
                 reduced = _acquisition_payload_view(candidate)
                 if reduced != candidate and reduced['review_view_omissions']:
@@ -400,20 +509,56 @@ class BudgetedProposer:
                     if cached(reduced_request):
                         return reduced
                     lean.append((reduced, reduced_request))
+        # Additional filing views are considered only after every historical paid
+        # form above. Technical proof compaction retains all economic facts;
+        # the original catalog remains the compiler's source of truth.
+        from .preparation_sections import select_ifrs_fcff_context
+        from .sec_preparation_sections import select_sec_two_filing_context
+        from .preparation_view import compact_structured_evidence
+        additional = []
+        for selector in (select_ifrs_fcff_context, select_sec_two_filing_context):
+            alternative = selector(source_dossier, dossier, contract)
+            if alternative is None:
+                continue
+            candidate = _acquisition_payload_view(compact_structured_evidence(
+                source_dossier, with_engine_guidance(alternative, contract)))
+            reduced = _completed_plan_view(candidate, contract)
+            for proposed in (candidate, reduced) if reduced != candidate else (candidate,):
+                try:
+                    verify_visible_citations({key: proposed.get(key) for key in
+                        ('prior_plan', 'reviewed_plan', 'completed_plan')}, proposed, source_dossier)
+                except ValueError:
+                    continue  # Never hide a proof still cited by a retained plan.
+                proposed_request = self._request(proposed, contract)
+                if cached(proposed_request):
+                    return proposed
+                additional.append((proposed, proposed_request))
+        strict_view = strict_request = None
+        if getattr(self, 'provider_context_check', False):
+            # This final alternative retains the incoming source text and the
+            # complete plan. Bytes are only an upper bound, not a token count.
+            strict_view = _acquisition_payload_view(dossier)
+            strict_view['provider_context_validation'] = 'openrouter_full_context_no_compression_v1'
+            verify_visible_citations({key: strict_view.get(key) for key in
+                ('prior_plan', 'reviewed_plan', 'completed_plan')}, strict_view, source_dossier)
+            strict_request = self._request(strict_view, contract)
+            if cached(strict_request):
+                return strict_view
         if not allow_selection:
             return dossier  # A replay snapshot permits only its already paid projection.
         quote = preparation_price_ceiling(self.metadata(self.model), model=self.model, max_tokens=self.max_tokens)
-        allowance = quote['context_length'] - 8192 - self.max_tokens
-        if self._prompt_bytes(request) <= allowance:
+        if self._fits_local_context(request, quote):
             return dossier
-        if self._prompt_bytes(selected_request) > allowance:
-            if sec_request is not None and self._prompt_bytes(sec_request) <= allowance:
+        if not self._fits_local_context(selected_request, quote):
+            if sec_request is not None and self._fits_local_context(sec_request, quote):
                 return sec_projected
-            if facts_request is not None and self._prompt_bytes(facts_request) <= allowance:
+            if facts_request is not None and self._fits_local_context(facts_request, quote):
                 return facts_projected
-            for reduced, reduced_request in lean + compact:
-                if self._prompt_bytes(reduced_request) <= allowance:
+            for reduced, reduced_request in lean + compact + additional:
+                if self._fits_local_context(reduced_request, quote):
                     return reduced
+            if strict_request is not None:
+                return strict_view
             raise ValueError('dossier still exceeds conservative context after declared section selection; completed plan preserved, further source selection required')
         return projected
 
@@ -423,7 +568,8 @@ class BudgetedProposer:
         request = self._request(dossier, contract)
         def cached(value):
             with self._db() as db:
-                return self._existing(db, sha256(_json(value).encode()).hexdigest()) is not None
+                return self._existing(db, sha256(_json(value).encode()).hexdigest(),
+                                      requested_max_tokens=self.max_tokens) is not None
         if cached(request) or not self.automatic_sections or not (allow_selection or allow_cached_selection):
             return dossier
         projected = select_bank_context(source_dossier, dossier, contract)
@@ -450,31 +596,36 @@ class BudgetedProposer:
 
     def __call__(self, dossier, contract):
         from bellomberg.core.llm_pricing import preparation_price_ceiling
+        from bellomberg.core.request_journal import observe_external_request, request_scope
         from .preparation_rejections import retry_allowed, rejection_proof, record_rejection, PreparationRetryDeferred
         request = self._request(dossier, contract)
         serialized = _json(request)
         key = sha256(serialized.encode("utf-8")).hexdigest()
         with self._db() as db:
-            existing = self._existing(db, key)
+            existing = self._existing(db, key, requested_max_tokens=self.max_tokens)
             if existing and not (existing['key'] == key and existing['state'] == 'rejected'
                                  and retry_allowed(db, existing)):
+                observe_external_request(self.path, existing['key'], owned=False)
                 return self._read(existing)
         quote = preparation_price_ceiling(self.metadata(self.model), model=self.model, max_tokens=self.max_tokens)
-        # Whole-context reservation protects money; conservative byte check keeps
-        # an oversized dossier from reaching the provider without silent truncation.
-        prompt_bytes = self._prompt_bytes(request)
-        if prompt_bytes + 8192 + self.max_tokens > quote["context_length"]:
+        # Whole-context reservation protects money. The opt-in provider check
+        # requires explicit no-compression on the wire, otherwise bytes gate locally.
+        if (not self._fits_local_context(request, quote)
+                and request.get('require_full_context') is not True):
             raise ValueError("dossier exceeds conservative context allowance; select documented excerpts first")
         request["provider_max_price"] = quote["max_price"]
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            existing = self._existing(db, key)
+            existing = self._existing(db, key, requested_max_tokens=self.max_tokens)
             if existing and not (existing['key'] == key and existing['state'] == 'rejected'
                                  and retry_allowed(db, existing)):
+                observe_external_request(self.path, existing['key'], owned=False)
                 return self._read(existing)
-            rows = db.execute("SELECT cost,state FROM requests").fetchall()
+            rows = db.execute("SELECT * FROM requests").fetchall()
             if any(row["cost"] is None or row["state"] == "overrun" for row in rows):
                 raise RuntimeError("unresolved request cost; reconcile provider billing before further spending")
+            for row in rows:
+                self._validate_receipt(row)
             cap = db.execute("SELECT cap FROM authorization WHERE id=1").fetchone()[0]
             if sum(row["cost"] for row in rows) + quote["reserve_nano_usd"] > cap:
                 raise RuntimeError("authorized budget insufficient for full request ceiling")
@@ -484,17 +635,21 @@ class BudgetedProposer:
             else:
                 db.execute("INSERT INTO requests(key,state,reserved,request,receipt) VALUES(?, 'reserved', ?, ?, ?)",
                            (key, quote["reserve_nano_usd"], _json(request), _json(quote)))
+        observe_external_request(self.path, key, owned=True)
         # No automatic paid retry after an ambiguous interruption.
         try:
             if self.call is None:
                 from bellomberg.core.llm_client import OpenRouterClient
-                client = OpenRouterClient(max_retries=0)
+                from bellomberg.agents.specialists.base import timeout_specialisti
+                client = OpenRouterClient(timeout=timeout_specialisti(self.max_tokens), max_retries=0)
                 try:
-                    reply = client.messages.create(**request)
+                    with request_scope(None, phase="valuation_preparer"):
+                        reply = client.messages.create(**request)
                 finally:
                     client._http.close()
             else:
-                reply = self.call(**request)
+                with request_scope(None, phase="valuation_preparer"):
+                    reply = self.call(**request)
         except Exception as exc:
             proof = rejection_proof(exc)
             with self._db() as db:
@@ -511,8 +666,14 @@ class BudgetedProposer:
             cost = _nano(getattr(getattr(reply, "usage", None), "cost_usd", None))
         except (ValueError, ArithmeticError):
             cost = None
+        identity = (isinstance(getattr(reply, "id", None), str) and bool(reply.id.strip())
+                    and getattr(reply, "model", None) == self.model)
+        if not identity:
+            cost = None
         state = "unknown" if cost is None else "overrun" if cost > quote["reserve_nano_usd"] else "received"
-        receipt = {**quote, "response_id": reply.id, "provider": reply.provider, "model": reply.model,
+        receipt = {**quote, "response_id": getattr(reply, "id", None),
+                   "provider": getattr(reply, "provider", None), "model": getattr(reply, "model", None),
+                   "identity_verified": identity, "response_sha256": sha256(content.encode("utf-8")).hexdigest(),
                    "stop_reason": reply.stop_reason, "cost_usd": None if cost is None else cost / 1e9,
                    "usage": {name: getattr(getattr(reply, "usage", None), name, None) for name in
                              ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_input_tokens")}}
@@ -523,7 +684,7 @@ class BudgetedProposer:
         return self._read(row)
 
     @staticmethod
-    def _existing(db, key):
+    def _existing(db, key, *, requested_max_tokens=None):
         direct = db.execute("SELECT * FROM requests WHERE key=?", (key,)).fetchone()
         if direct is not None:
             return direct
@@ -544,13 +705,56 @@ class BudgetedProposer:
             request.setdefault("response_format", {"type": "json_object"})
             if sha256(_json(request).encode("utf-8")).hexdigest() == key:
                 return row
+            # PM 02/10: raising the output ceiling must not repurchase the
+            # same economic work. Validate the original key above, then permit
+            # only these two known old caps with every other field identical.
+            # Return the original row, preserving failures, cost and ownership.
+            if (requested_max_tokens == 128000
+                    and type(request.get("max_tokens")) is int
+                    and request["max_tokens"] in (16000, 65536)):
+                request["max_tokens"] = requested_max_tokens
+                if sha256(_json(request).encode("utf-8")).hexdigest() == key:
+                    return row
         return None
+
+    @staticmethod
+    def _validate_receipt(row, *, require_response=True):
+        """Verify the existing owner without rewriting or sealing legacy evidence."""
+        if (row["state"] not in ("received", "reserved", "unknown", "overrun", "rejected")
+                or type(row["reserved"]) is not int or row["reserved"] < 0
+                or row["cost"] is not None and (type(row["cost"]) is not int or row["cost"] < 0)):
+            raise ValueError("invalid preparation receipt accounting")
+        receipt = json.loads(row["receipt"])
+        if row["cost"] is None:
+            return receipt  # No outcome or bill is certified for an uncertain request.
+        request = json.loads(row["request"])
+        request.pop("provider_max_price", None)
+        if sha256(_json(request).encode("utf-8")).hexdigest() != row["key"]:
+            raise ValueError("persisted paid request identity differs from its recorded body")
+        if receipt.get("reserve_nano_usd") != row["reserved"]:
+            raise ValueError("preparation receipt reservation differs from its quote")
+        if _nano(receipt.get("cost_usd")) != row["cost"]:
+            raise ValueError("preparation cost differs from its provider receipt")
+        if row["state"] == "rejected":
+            from .preparation_rejections import validate_proof
+            validate_proof(receipt)
+            return receipt
+        if (not isinstance(receipt.get("response_id"), str) or not receipt["response_id"].strip()
+                or receipt.get("model") != request.get("model")):
+            raise ValueError("preparation provider response identity differs from request")
+        saved_hash = receipt.get("response_sha256")
+        if saved_hash is None:
+            if require_response:
+                raise ValueError("legacy response unverifiable: original receipt lacks response seal; replay blocked")
+        elif not isinstance(row["response"], str) or saved_hash != sha256(row["response"].encode("utf-8")).hexdigest():
+            raise ValueError("saved preparation response checksum differs")
+        return receipt
 
     @staticmethod
     def _read(row):
         if row["state"] in ("reserved", "unknown", "overrun"):
             raise RuntimeError("unresolved request cost or ceiling overrun; paid retry blocked")
-        receipt = json.loads(row["receipt"])
+        receipt = BudgetedProposer._validate_receipt(row)
         if receipt["stop_reason"] != "end_turn":
             raise ValueError("incomplete AI response: " + str(receipt["stop_reason"]))
         def unique(pairs):
@@ -625,12 +829,169 @@ def verify_visible_citations(values, view, original):
                             raise ValueError('projected pointer differs from original source')
                 except (ValueError, TypeError, KeyError, IndexError) as exc:
                     raise ValueError("pointer fonte non visibile nello stage") from exc
+            if 'record_pointer' in node:
+                try:
+                    if len(ids) != 1 or ids[0] not in structured:
+                        raise ValueError('fonte strutturata non univoca')
+                    pointer = node['record_pointer']
+                    if _json(_pointer(structured[ids[0]], pointer)) != _json(_pointer(original_structured[ids[0]], pointer)):
+                        raise ValueError('projected record differs from original source')
+                except (ValueError, TypeError, KeyError, IndexError) as exc:
+                    raise ValueError('record_pointer fonte non visibile nello stage') from exc
             for child in node.values():
                 visit(child, ids)
         elif isinstance(node, list):
             for child in node:
                 visit(child, inherited_ids)
     visit(values)
+
+
+def _validated_growth_thesis(answer, contract, plan, schema, view, dossier):
+    """Reject an incomplete or unsourced thesis before any forecast is purchased."""
+    from math import isfinite
+    from datetime import date
+    import re
+
+    def fail(detail):
+        raise ValueError('growth thesis: ' + detail)
+
+    def fields(value, names, label):
+        if not isinstance(value, dict) or set(value) != set(names):
+            fail(label + ' fields missing or unexpected')
+
+    def words(value, label):
+        if not isinstance(value, str) or not value.strip():
+            fail(label + ' missing')
+
+    def ids(value, label):
+        if (not isinstance(value, list) or not value
+                or any(not isinstance(ident, str) or not ident for ident in value)
+                or len(set(value)) != len(value)):
+            fail(label + ' evidence_ids invalid')
+
+    fields(answer, ('growth_thesis',), 'response')
+    thesis = answer['growth_thesis']
+    fields(thesis, ('historical_basis', 'business_drivers', 'model_links', 'model_anchors', 'scenarios'), 'body')
+    calendar = plan['model']['calendar']['value']
+    periods = [row['end'] for row in calendar['periods']]
+    period_keys = {row['start']+'|'+row['end']: row['end'] for row in calendar['periods']}
+    period_keys.update({end: end for end in periods})
+
+    def dated_periods(value):
+        if not isinstance(value, list) or any(not isinstance(day, str) for day in value):
+            return None
+        return [period_keys.get(day) for day in value]
+
+    basis = thesis['historical_basis']
+    fields(basis, ('period', 'summary', 'evidence_ids'), 'historical basis')
+    if basis['period'] != calendar['valuation_date']:
+        # Narrative history may span several reported years. Its endpoint must
+        # be the exact proved opening; retain the original range in the thesis.
+        coverage = (re.fullmatch(r'(\d{4}-\d{2}-\d{2}) to (\d{4}-\d{2}-\d{2})(?: \([^()\r\n]*\))?',
+                                basis['period']) if isinstance(basis['period'], str) else None)
+        try:
+            matches = (coverage is not None and coverage[2] == calendar['valuation_date']
+                       and date.fromisoformat(coverage[1]) < date.fromisoformat(coverage[2])
+                       and all(day == coverage[2] for day in re.findall(
+                           r'\d{4}-\d{2}-\d{2}', basis['period'])[2:]))
+        except ValueError:
+            matches = False
+        if not matches:
+            fail('historical basis does not match verified opening')
+    words(basis['summary'], 'historical basis summary')
+    ids(basis['evidence_ids'], 'historical basis')
+    drivers = thesis['business_drivers']
+    if not isinstance(drivers, list) or not drivers:
+        fail('business drivers missing')
+    for driver in drivers:
+        fields(driver, ('name', 'basis', 'historical', 'guidance', 'judgment', 'risk', 'evidence_ids'),
+               'business driver')
+        if driver['basis'] not in ('reported_segment', 'consolidated_driver'):
+            fail('business driver basis invalid')
+        for key in ('name', 'historical', 'guidance', 'judgment', 'risk'):
+            words(driver[key], 'business driver ' + key)
+        ids(driver['evidence_ids'], 'business driver')
+    def validate_link(link, label):
+        fields(link, ('periods', 'mechanism', 'impact', 'risk', 'evidence_ids'), label)
+        mentioned = dated_periods(link['periods'])
+        if (not isinstance(mentioned, list) or not mentioned
+                or any(not isinstance(day, str) for day in mentioned)
+                or len(set(mentioned)) != len(mentioned)
+                or any(day not in periods for day in mentioned)
+                or mentioned != [day for day in periods if day in mentioned]):
+            fail(label + ' periods outside verified calendar')
+        for key in ('mechanism', 'impact', 'risk'):
+            words(link[key], label + ' ' + key)
+        ids(link['evidence_ids'], label)
+
+    model_links = thesis['model_links']
+    model_names = set(contract['preparation_stage']['model_link_drivers'])
+    if model_names != {name for name, descriptor in schema.items()
+                       if descriptor[-1] == 'model' and name not in plan['model']}:
+        fail('prospective model judgment partition changed')
+    if not isinstance(model_links, dict) or set(model_links) != model_names:
+        fail('prospective model judgments not covered')
+    for name, link in model_links.items():
+        validate_link(link, 'model ' + name)
+    model_anchors = thesis['model_anchors']
+    if not isinstance(model_anchors, dict) or set(model_anchors) != model_names:
+        fail('prospective model anchors not covered')
+    for name, anchor in model_anchors.items():
+        fields(anchor, ('value', 'kind', 'evidence_ids', 'rationale', 'valid_until',
+                        'valid_until_basis'), 'model ' + name + ' anchor')
+        if anchor['kind'] != 'analyst_estimate':
+            fail('model ' + name + ' anchor is not an analyst judgment')
+        ids(anchor['evidence_ids'], 'model ' + name + ' anchor')
+        if not set(anchor['evidence_ids']) & set(model_links[name]['evidence_ids']):
+            fail('model ' + name + ' anchor is disconnected from thesis evidence')
+        words(anchor['rationale'], 'model ' + name + ' anchor rationale')
+        words(anchor['valid_until'], 'model ' + name + ' anchor expiry')
+    scenarios = thesis['scenarios']
+    if not isinstance(scenarios, dict) or set(scenarios) != set(contract['scenarios']):
+        fail('scenario coverage differs from contract')
+    link_names = set(contract['preparation_stage']['link_drivers'])
+    if link_names != {name for name, descriptor in schema.items() if descriptor[-1] == 'scenario'
+                      and any(name not in plan['scenarios'][scope] for scope in contract['scenarios'])}:
+        fail('scenario driver partition changed')
+    if not set(GROWTH_ANCHORS) <= link_names:
+        fail('operating forecast anchors absent from schema')
+    for scope, scenario in scenarios.items():
+        fields(scenario, ('periods', 'thesis', 'risk', 'links', 'anchors'), scope)
+        if dated_periods(scenario['periods']) != periods:
+            fail(scope + ' periods differ from verified calendar')
+        words(scenario['thesis'], scope + ' thesis')
+        words(scenario['risk'], scope + ' risk')
+        links, anchors = scenario['links'], scenario['anchors']
+        if not isinstance(links, dict) or set(links) != link_names:
+            fail(scope + ' material driver links incomplete')
+        if not isinstance(anchors, dict) or set(anchors) != set(GROWTH_ANCHORS):
+            fail(scope + ' numeric anchors incomplete')
+        for name, link in links.items():
+            validate_link(link, scope + ' ' + name)
+        for name, anchor in anchors.items():
+            fields(anchor, ('value', 'kind', 'evidence_ids', 'rationale', 'valid_until',
+                            'valid_until_basis'), scope + ' ' + name + ' anchor')
+            if anchor['kind'] != 'analyst_estimate':
+                fail(scope + ' ' + name + ' anchor is not an estimate')
+            ids(anchor['evidence_ids'], scope + ' ' + name + ' anchor')
+            if not set(anchor['evidence_ids']) & set(links[name]['evidence_ids']):
+                fail(scope + ' ' + name + ' anchor is disconnected from thesis evidence')
+            words(anchor['rationale'], scope + ' ' + name + ' anchor rationale')
+            words(anchor['valid_until'], scope + ' ' + name + ' anchor expiry')
+            if name == 'revenue_build':
+                if not isinstance(anchor['value'], dict) or not anchor['value']:
+                    fail(scope + ' revenue build anchor missing')
+            elif (not isinstance(anchor['value'], list) or len(anchor['value']) != len(periods)
+                  or any(type(value) not in (int, float) or not isfinite(value)
+                         for value in anchor['value'])):
+                fail(scope + ' ' + name + ' anchor path invalid')
+    try:
+        verify_visible_citations(thesis, view, dossier)
+    except (ValueError, TypeError, KeyError) as exc:
+        fail('citation outside visible sources: ' + str(exc))
+    from .growth_thesis_arithmetic import prove_growth_revenues
+    prove_growth_revenues(thesis, plan)
+    return deepcopy(thesis)
 
 
 def _bank_forecast_arithmetic(plan):
@@ -676,7 +1037,8 @@ class StagedProposer:
     """
     def __init__(self, proposer, *, drivers_per_stage=6, opening_excerpt_manifest=None,
                  forecast_excerpt_manifest=None, opening_drivers_per_stage=None, opening_dossier=None,
-                 stage_dossiers=None, seed=None):
+                 stage_dossiers=None, seed=None, historical_first=False, on_historical=None,
+                 growth_thesis_first=False):
         if not isinstance(drivers_per_stage, int) or isinstance(drivers_per_stage, bool) or drivers_per_stage < 1:
             raise ValueError("positive drivers_per_stage required")
         self.proposer, self.drivers_per_stage = proposer, drivers_per_stage
@@ -692,12 +1054,34 @@ class StagedProposer:
         self.opening_dossier = deepcopy(opening_dossier)
         self.stage_dossiers = deepcopy(stage_dossiers) if stage_dossiers is not None else []
         self.seed = deepcopy(seed)
+        if type(historical_first) is not bool or historical_first and not callable(on_historical):
+            raise ValueError('historical_first requires a callable historical checkpoint')
+        if not historical_first and on_historical is not None:
+            raise ValueError('on_historical requires historical_first')
+        if historical_first and (seed is not None or opening_dossier is not None or self.stage_dossiers):
+            raise ValueError('historical_first resumes through the exact paid journal, not a partial seed or source snapshot')
+        self.historical_first, self.on_historical = historical_first, on_historical
+        if type(growth_thesis_first) is not bool:
+            raise ValueError('growth_thesis_first must be a boolean')
+        if growth_thesis_first and seed is not None:
+            raise ValueError('growth thesis requires exact journal replay, not a partial seed')
+        self.growth_thesis_first = growth_thesis_first
+        self.growth_thesis = None
+        self.growth_correction = None
         if not isinstance(self.stage_dossiers, list) or self.stage_dossiers and opening_dossier is None:
             raise ValueError('stage snapshots require a list and an explicit opening snapshot')
 
     def __call__(self, dossier, contract):
-        from .input_preparation import _calendar, _catalog, _compile, _day
+        from .input_preparation import _calendar, _catalog, _compile, _day, _selected_sec_filings
         from .preparation_view import select_stage_view
+        if self.historical_first and (contract.get('method_id') != 'operating_fcff'
+                                      or contract.get('bank_dynamic_capital')):
+            raise ValueError('historical_first supports only operating_fcff')
+        self.growth_thesis = None
+        self.growth_correction = None
+        if self.growth_thesis_first and (contract.get('method_id') != 'operating_fcff'
+                                         or contract.get('bank_dynamic_capital')):
+            raise ValueError('growth thesis supports only operating_fcff')
         if self.opening_drivers_per_stage is not None and (
                 contract.get("method_id") != "operating_fcff" or contract.get("bank_dynamic_capital")):
             raise ValueError("split opening supports only operating_fcff; bank dependencies remain atomic")
@@ -711,6 +1095,9 @@ class StagedProposer:
         catalog, catalog_issues, _ = _catalog(dossier["documents"], cutoff)
         if catalog_issues:
             raise ValueError("invalid source catalog before staged preparation")
+        sec_filings = _selected_sec_filings(catalog, dossier.get('document_acquisition'),
+                                            contract.get('method_id'))
+        sec_primary_id = ((dossier.get('document_acquisition') or {}).get('selection') or {}).get('selected_document_id')
         entities = {}
         opening_dossier = dossier
         extension = None
@@ -768,7 +1155,9 @@ class StagedProposer:
             perimeter, calendar, span, issues = _calendar(plan, cutoff, method=contract.get('method_id'))
             if not issues:
                 _, issues, _ = _compile(plan, schema, entities, perimeter, calendar, span, catalog, cutoff,
-                                        pointer_repairs=proof_normalizations, method=contract.get('method_id'))
+                                        pointer_repairs=proof_normalizations, method=contract.get('method_id'),
+                                        ticker=dossier.get('ticker'), sec_filings=sec_filings,
+                                        sec_primary_id=sec_primary_id)
                 # Unrequested stages are the only allowable gaps. Available
                 # facts and judgments must pass the very same final compiler.
                 issues = [row for row in issues if row["code"] != "missing_driver"]
@@ -786,7 +1175,39 @@ class StagedProposer:
             narrowed["schema"] = {name: schema[name] for name in names}
             narrowed["preparation_stage"] = {"scope": scope, "drivers": names,
                 "response_shape": {"drivers": "every requested name: documented driver object or null for a source gap",
-                                   "rationale": "economic reasoning; explain every null driver and its missing source"}}
+                                    "rationale": "economic reasoning; explain every null driver and its missing source"}}
+            if contract.get('method_id') == 'operating_fcff':
+                pending_opening = ((dossier.get('document_acquisition') or {}).get('historical_preparation') or {})
+                if (scope == 'model' and 'shares' in names and sec_filings
+                        and pending_opening.get('status') == 'required'
+                        and 'shares' in pending_opening.get('missing_drivers', [])):
+                    from .diluted_share_estimate import diluted_share_policy
+                    narrowed['preparation_stage']['diluted_denominator_policy'] = diluted_share_policy()
+                elif 'dilution_estimate' in (plan.get('model', {}).get('shares') or {}):
+                    narrowed['preparation_stage']['dilution_accounting'] = (
+                        'The completed share denominator is an explicitly disclosed analyst proxy, not an observed instant diluted count. '
+                        'Preserve its limitations and historical operand proofs. Do not deduct those same equity-compensation claims '
+                        'again in equity_adjustments. Future SBC remains an operating economic cost under the model policy; '
+                        'do not add it back or assume future awards are absent. Explain all relevant distinctions in the rationale.')
+                if 'equity_adjustments' in names and (self.historical_first or self.growth_thesis_first):
+                    narrowed['preparation_stage']['equity_adjustment_policy'] = (
+                        'Value separately identified non-operating assets and non-debt claims only after reviewing the completed '
+                        'scenario cash flows and terminal bridge; when the terminal bridge is jointly requested, reconcile '
+                        'to that bridge in this same response. Exclusion from opening NWC does not establish a separately '
+                        'valuable asset or debt-like claim. Use analyst_estimate for recovery, classification, timing or valuation '
+                        'judgments, with cited sources and explicit amounts, arithmetic, assumptions and expiry. Historical '
+                        'kind requires source proof and cannot certify fair value from a book sum. For each material candidate '
+                        'explain inclusion or exclusion and where it is handled in NWC, cash taxes, cash capex, terminal cash '
+                        'flows, net_debt or dilution. Do not count PPE payables twice when capex pays them, deferred tax assets '
+                        'again when cash taxes use them, or deferred government incentives/customer deposits as debt without '
+                        'a distinct repayment obligation. Do not assign entire mixed other-assets/liabilities balances at book '
+                        'value. An explicit supported assumption is permitted; an unexplained zero or balancing plug is not. '
+                        'If material classification or overlap cannot be resolved, return value null and explain the gap.')
+            if self.growth_thesis is not None:
+                narrowed['preparation_stage']['growth_thesis_binding'] = {
+                    'requirement': 'Use the documented thesis for every requested economic driver. '
+                                   'Repeat each numeric anchor exactly where present; explain mechanism, period, impact and risk '
+                                   'in the rationale. A source gap is not a license to replace the thesis.'}
             if contract.get("bank_dynamic_capital") and scope != "model":
                 from .bank_adapter import EARNINGS
                 narrowed["preparation_stage"]["bank_ledger_semantics"] = {
@@ -855,9 +1276,61 @@ class StagedProposer:
             if (scope, tuple(names)) in history:
                 source_dossier, stage_extension, manifest = history[(scope, tuple(names))]
             context = select_stage_view(source_dossier, view_scope, excerpt_manifest=manifest)
+            shares_driver = ('shares' if contract.get('method_id') == 'operating_fcff' else
+                             'capital.shares_m' if contract.get('bank_dynamic_capital') else None)
+            if shares_driver in names and isinstance(sec_primary_id, str):
+                from .statement_shares_evidence import NORMALIZER as SHARES_NORMALIZER
+                visible = {doc.get('id') for doc in context.get('documents', [])
+                           if isinstance(doc, dict) and isinstance(doc.get('text'), str)}
+                opening = ((source_dossier.get('document_acquisition') or {}).get('selection') or {}).get('opening_date')
+                candidates = [doc for doc in catalog.values() if doc['id'] in visible
+                    and (doc.get('metadata') or {}).get('normalizer') == SHARES_NORMALIZER
+                    and doc['metadata'].get('source_document_id') == sec_primary_id
+                    and doc['metadata'].get('report_date') == opening
+                    and sec_primary_id in visible]
+                if len(candidates) == 1:
+                    source = candidates[0]
+                    share_body = json.loads(source['text'])
+                    if shares_driver == 'shares' or isinstance(share_body.get('reported_precision'), dict):
+                        comparison = share_body['tag_comparison']
+                        basis = ('primary_inline_without_same_date_tag'
+                                 if comparison['status'] == 'missing_same_date_tag' else
+                                 'primary_statement_over_conflicting_tags' if comparison['conflicts'] else
+                                 'primary_statement_consistent_with_tags')
+                        narrowed['preparation_stage']['statement_share_source'] = {
+                            'document_id': source['id'],
+                            'calculation': {'type': 'statement_shares', 'fact_index': 0,
+                                'selection_basis': basis,
+                                'acknowledged_conflicts': deepcopy(comparison['conflicts'])},
+                            'reported_precision': deepcopy(share_body.get('reported_precision')),
+                            'proof': 'Cite only this normalized document in evidence_ids; do not add pointer, quote or facts. '
+                                     'Use its current-date count scaled to millions, never a weighted average. '
+                                     'Preserve reported rounding and disclose any missing or conflicting same-date SEC tag.'}
             if stage_extension is not None and scope != "model":
                 context["source_extension"] = deepcopy(stage_extension)
             context["completed_plan"] = deepcopy(plan)
+            if self.growth_thesis is not None:
+                context['growth_thesis'] = {
+                    'historical_basis': deepcopy(self.growth_thesis['historical_basis']),
+                    'business_drivers': deepcopy(self.growth_thesis['business_drivers'])}
+                if scope == 'model':
+                    context['growth_thesis']['model_links'] = {
+                        name: deepcopy(self.growth_thesis['model_links'][name]) for name in names
+                        if name in self.growth_thesis['model_links']}
+                    context['growth_thesis']['model_anchors'] = {
+                        name: deepcopy(self.growth_thesis['model_anchors'][name]) for name in names
+                        if name in self.growth_thesis['model_anchors']}
+                    context['growth_thesis']['scenarios'] = {
+                        scenario: {'thesis': value['thesis'], 'risk': value['risk']}
+                        for scenario, value in self.growth_thesis['scenarios'].items()}
+                else:
+                    scenario_thesis = self.growth_thesis['scenarios'][scope]
+                    context['growth_thesis']['scenario'] = {
+                        'thesis': scenario_thesis['thesis'], 'risk': scenario_thesis['risk'],
+                        'links': {name: deepcopy(scenario_thesis['links'][name]) for name in names
+                                  if name in scenario_thesis['links']},
+                        'anchors': {name: deepcopy(scenario_thesis['anchors'][name]) for name in names
+                                    if name in scenario_thesis['anchors']}}
             if proof_normalizations:
                 context['completed_proof_normalizations'] = deepcopy(proof_normalizations)
             if contract.get("bank_dynamic_capital") and scope != "model":
@@ -888,52 +1361,228 @@ class StagedProposer:
             if not isinstance(rationale, str) or not rationale.strip():
                 raise ValueError("preparation stage rationale missing: " + scope)
             verify_visible_citations(values, context, dossier)
+            if self.growth_thesis is not None:
+                links = (self.growth_thesis['model_links'] if scope == 'model'
+                         else self.growth_thesis['scenarios'][scope]['links'])
+                anchors = (self.growth_thesis['model_anchors'] if scope == 'model'
+                           else self.growth_thesis['scenarios'][scope]['anchors'])
+                for name, item in values.items():
+                    link = links.get(name)
+                    if link is None:
+                        continue  # Historical equity bridges precede the thesis.
+                    if name in anchors and item != anchors[name]:
+                        raise ValueError('growth thesis anchor mismatch: ' + scope + ' ' + name)
+                    if not isinstance(item.get('evidence_ids'), list) or not (
+                            set(item['evidence_ids']) & set(link['evidence_ids'])):
+                        raise ValueError('growth thesis evidence disconnected: ' + scope + ' ' + name)
+                    item['rationale'] = (item.get('rationale', '') + '\nGrowth thesis: '
+                        + link['mechanism'] + '; periods ' + ', '.join(link['periods'])
+                        + '; impact ' + link['impact'] + '; risk ' + link['risk']).strip()
             target = plan["model"] if scope == "model" else plan["scenarios"][scope]
             target.update(deepcopy(values))
             if scope != "model":
                 previous = plan["scenario_rationale"].get(scope, "")
                 plan["scenario_rationale"][scope] = (previous + "\n" + rationale).strip()
 
+        def growth_thesis_stage(model_link_drivers):
+            verify_completed()
+            link_drivers = [name for name, descriptor in schema.items()
+                            if descriptor[-1] == 'scenario' and any(
+                                name not in plan['scenarios'][scope] for scope in contract['scenarios'])]
+            narrowed = deepcopy(contract)
+            narrowed['schema'] = {name: deepcopy(schema[name]) for name in GROWTH_ANCHORS}
+            narrowed['preparation_stage'] = {
+                'scope': 'forecast', 'purpose': 'growth_thesis', 'drivers': [],
+                'link_drivers': link_drivers,
+                'model_link_drivers': model_link_drivers,
+                'driver_timings': {name: schema[name][3] for name in link_drivers},
+                'anchor_drivers': list(GROWTH_ANCHORS),
+                'response_shape': 'one sourced historical basis, business drivers, three scenario theses, '
+                                  'a period/risk/impact link and exact anchor for every pending model judgment, '
+                                  'plus links for every forecast driver and five exact numeric forecast anchors; '
+                                  'null thesis declares an evidence gap'}
+            context = select_stage_view(dossier, 'forecast', excerpt_manifest=self.forecast_excerpt_manifest)
+            context['completed_plan'] = deepcopy(plan)
+            if proof_normalizations:
+                context['completed_proof_normalizations'] = deepcopy(proof_normalizations)
+            project_context = getattr(self.proposer, 'prepare_context', None)
+            if callable(project_context):
+                context = project_context(deepcopy(context), narrowed, source_dossier=dossier,
+                                          allow_selection=self.forecast_excerpt_manifest is None)
+            from .fcff_stage_arithmetic import SEMANTICS
+            from .growth_thesis_arithmetic import GrowthArithmeticError
+            cached = getattr(self.proposer, 'cached_response', None)
+            answer = cached(context, narrowed) if callable(cached) else None
+            if answer is None:
+                context['fcff_engine_semantics'] = deepcopy(SEMANTICS)
+                if callable(project_context):
+                    context = project_context(deepcopy(context), narrowed, source_dossier=dossier,
+                                              allow_selection=self.forecast_excerpt_manifest is None)
+                answer = self.proposer(deepcopy(context), narrowed)
+            try:
+                self.growth_thesis = _validated_growth_thesis(answer, narrowed, plan, schema, context, dossier)
+            except GrowthArithmeticError as error:
+                # One explicit AI revision, within the same durable budget. The
+                # calculator never chooses which economic estimate to change.
+                context['failed_growth_thesis'] = deepcopy(answer['growth_thesis'])
+                context['fcff_engine_semantics'] = deepcopy(SEMANTICS)
+                narrowed['preparation_stage']['growth_correction'] = {
+                    'attempt': 1, 'issues': deepcopy(error.issues),
+                    'invalid_response_sha256': sha256(_json(answer).encode()).hexdigest(),
+                    'instruction': 'Return one complete corrected thesis or null. Reconcile every revenue build to its growth path; '
+                        'calculator revenue_from_growth is an identity check, not a new source. Preserve historical inputs and calendar. '
+                        'Review engine accounting before fixing anchors: gross_margin precedes separately deducted tangible depreciation; '
+                        'do not use an after-depreciation reported gross margin and deduct D&A again. capdev_pct multiplies revenue, not R&D. '
+                        'An aggregate bridge from reported operating profit plus documented total D&A is permitted if its mapping '
+                        'to engine buckets is transparent; never pretend to know an undisclosed historical COGS/R&D allocation. '
+                        'Explain sourced reclassifications and every revised judgment. Distinguish existing opening customer deposits '
+                        'from expected future receipts; do not count expected funding as opening cash or an unexplained NWC/EV benefit. '
+                        'Preserve unaffected business reasoning. There is no further automatic correction.'}
+                if callable(project_context):
+                    context = project_context(deepcopy(context), narrowed, source_dossier=dossier,
+                                              allow_selection=self.forecast_excerpt_manifest is None)
+                corrected = self.proposer(deepcopy(context), narrowed)
+                self.growth_thesis = _validated_growth_thesis(corrected, narrowed, plan, schema, context, dossier)
+                self.growth_correction = {**deepcopy(narrowed['preparation_stage']['growth_correction']),
+                    'corrected_response_sha256': sha256(_json(corrected).encode()).hexdigest(),
+                    'method': 'one explicit AI correction; original paid response preserved'}
+
+            def consume_anchors(target, anchors, links):
+                for name, anchor in anchors.items():
+                    item, link = deepcopy(anchor), links[name]
+                    item['rationale'] += ('\nGrowth thesis: ' + link['mechanism'] + '; periods '
+                        + ', '.join(link['periods']) + '; impact ' + link['impact'] + '; risk ' + link['risk'])
+                    target[name] = item
+
+            consume_anchors(plan['model'], self.growth_thesis['model_anchors'], self.growth_thesis['model_links'])
+            for scope in contract['scenarios']:
+                scenario_thesis = self.growth_thesis['scenarios'][scope]
+                consume_anchors(plan['scenarios'][scope], scenario_thesis['anchors'], scenario_thesis['links'])
+                summary = ('Growth thesis: ' + scenario_thesis['thesis'] + '; risk '
+                           + scenario_thesis['risk'] + '; impacts '
+                           + '; '.join(name + ': ' + link['impact'] for name, link in
+                                       scenario_thesis['links'].items()))
+                prior = plan['scenario_rationale'].get(scope, '')
+                plan['scenario_rationale'][scope] = (prior + '\n' + summary).strip()
+            verify_completed()
+
         # Perimeter, calendar and quotation are one coherent opening decision.
         # FCFF may then document each balance separately without relaxing the
         # compiler or changing model/output limits. Bank legal ledgers stay atomic.
-        opening = [name for name, descriptor in schema.items() if descriptor[-1] == "model"]
-        if self.seed is not None and set(plan['model']) != set(opening):
-            raise ValueError('proposal seed requires a complete opening stage')
-        if self.opening_drivers_per_stage is None:
-            stage("model", opening)
-        else:
-            seed = ["perimeter", "calendar", "quotation"]
-            if not set(seed) <= set(opening):
-                raise ValueError("split opening requires perimeter, calendar and quotation schema")
-            stage("model", seed)
+        def historical_net_debt():
+            scopes = contract['scenarios']
+            stage(scopes[0], ['net_debt'])
             verify_completed()
-            remaining = [name for name in opening if name not in seed]
-            for offset in range(0, len(remaining), self.opening_drivers_per_stage):
-                stage("model", remaining[offset:offset + self.opening_drivers_per_stage])
+            observed = plan['scenarios'][scopes[0]]['net_debt']
+            if observed.get('kind') != 'historical':
+                raise ValueError(scopes[0] + ': opening net debt requires historical proofs')
+            # One date and issuer have one observed balance. Reuse the proved
+            # object, not a fresh paid estimate for each future scenario.
+            for scope in scopes[1:]:
+                existing = plan['scenarios'][scope].get('net_debt')
+                if existing is None:
+                    plan['scenarios'][scope]['net_debt'] = deepcopy(observed)
+                    prior = plan['scenario_rationale'].get(scope, '')
+                    plan['scenario_rationale'][scope] = (prior + '\nOpening net debt: identical dated '
+                        'observation reused from ' + scopes[0] + ', with its complete source proof. '
+                        + observed['rationale']).strip()
+                elif existing.get('kind') != 'historical' or existing.get('value') != observed['value']:
+                    raise ValueError('net_debt: opening historical balance differs across scenarios')
+            verify_completed()
+
+        opening = [name for name, descriptor in schema.items() if descriptor[-1] == "model"]
+        if self.historical_first:
+            model_historical = ('perimeter', 'calendar', 'quotation', 'historical_revenue',
+                                'opening_nwc', 'shares')
+            bridges = ('net_debt',)
+            if (not set(model_historical) <= set(opening)
+                    or any(schema[name][-1] != 'scenario' for name in bridges)
+                    or set(contract['scenarios']) != {'bear', 'base', 'bull'}):
+                raise ValueError('historical_first requires the FCFF opening and three-scenario schema')
+            stage('model', list(model_historical[:3]))
+            verify_completed()
+            for name in model_historical[3:]:
+                stage('model', [name])
                 verify_completed()
+            historical_net_debt()
+            self.on_historical(deepcopy(plan), deepcopy(dossier), deepcopy(contract))
+            future_opening = [name for name in opening if name not in model_historical]
+            if self.growth_thesis_first:
+                growth_thesis_stage(future_opening)
+                future_opening = [name for name in future_opening if name not in plan['model']]
+            size = self.opening_drivers_per_stage or len(future_opening) or 1
+            for offset in range(0, len(future_opening), size):
+                stage('model', future_opening[offset:offset + size])
+                verify_completed()
+        if not self.historical_first:
+            if self.seed is not None and set(plan['model']) != set(opening):
+                raise ValueError('proposal seed requires a complete opening stage')
+            if self.growth_thesis_first:
+                model_historical = ('perimeter', 'calendar', 'quotation', 'historical_revenue',
+                                    'opening_nwc', 'shares')
+                if not set(model_historical) <= set(opening):
+                    raise ValueError('growth thesis requires the FCFF historical opening schema')
+                stage('model', list(model_historical[:3]))
+                verify_completed()
+                for name in model_historical[3:]:
+                    stage('model', [name])
+                    verify_completed()
+                historical_net_debt()
+                future_opening = [name for name in opening if name not in model_historical]
+                growth_thesis_stage(future_opening)
+                future_opening = [name for name in future_opening if name not in plan['model']]
+                size = self.opening_drivers_per_stage or len(future_opening) or 1
+                for offset in range(0, len(future_opening), size):
+                    stage('model', future_opening[offset:offset + size])
+                    verify_completed()
+            elif self.opening_drivers_per_stage is None:
+                stage("model", opening)
+            else:
+                seed = ["perimeter", "calendar", "quotation"]
+                if not set(seed) <= set(opening):
+                    raise ValueError("split opening requires perimeter, calendar and quotation schema")
+                stage("model", seed)
+                verify_completed()
+                remaining = [name for name in opening if name not in seed]
+                for offset in range(0, len(remaining), self.opening_drivers_per_stage):
+                    stage("model", remaining[offset:offset + self.opening_drivers_per_stage])
+                    verify_completed()
         if contract.get("bank_dynamic_capital"):
             from .input_preparation import _bank_schema
             schema, entities, issues = _bank_schema(plan, plan["model"]["perimeter"]["value"])
             if issues:
                 raise ValueError("bank opening structure incomplete: " + "; ".join(row["reason"] for row in issues))
         verify_completed()
-        names = [name for name, descriptor in schema.items() if descriptor[-1] == "scenario"]
+        names = [name for name, descriptor in schema.items() if descriptor[-1] == "scenario"
+                 and not (self.growth_thesis is not None and name in GROWTH_ANCHORS)
+                 and not ((self.historical_first or self.growth_thesis_first)
+                          and name == 'net_debt')]
+        # A book balance can be observed before forecasts; its separate equity
+        # value cannot. Reconcile adjustments against the actual cash-flow plan.
+        equity_bridge = (['equity_adjustments'] if contract.get('method_id') == 'operating_fcff'
+                         and (self.historical_first or self.growth_thesis_first) else [])
+        names = [name for name in names if name not in equity_bridge]
         # Terminal bridges depend on completed operating/legal-entity forecasts.
         # The FCFF bridge retains legacy future timing; bank terminal ledgers
         # and closing capital amounts declare their terminal timing explicitly.
         terminal = [name for name in names if schema[name][3] == "terminal" or
                     (name == "terminal_bridge" and contract.get("method_id") == "operating_fcff")]
         names = [name for name in names if name not in terminal]
+        if self.growth_thesis is not None and equity_bridge:
+            # Both bridges depend on the now-complete cash forecasts. A joint
+            # final response makes their treatment coherent without another
+            # full-document request. The compiler validates both atomically.
+            terminal += equity_bridge
+            equity_bridge = []
         allowed_stages = {(scope, tuple(group[offset:offset + self.drivers_per_stage]))
-                          for scope in contract['scenarios'] for group in (names, terminal)
+                          for scope in contract['scenarios'] for group in (names, terminal, equity_bridge)
                           for offset in range(0, len(group), self.drivers_per_stage)}
         if set(history) - allowed_stages:
             raise ValueError('stage snapshot does not match the current driver partition')
         if self.seed is not None:
             from .preparation_seed import verify_prefix
             verify_prefix(plan, [(scope, group[offset:offset + self.drivers_per_stage])
-                for scope in contract['scenarios'] for group in (names, terminal)
+                for scope in contract['scenarios'] for group in (names, terminal, equity_bridge)
                 for offset in range(0, len(group), self.drivers_per_stage)])
             if contract.get('bank_dynamic_capital'):
                 from .bank_stage_arithmetic import constraint_arithmetic, forecast_arithmetic
@@ -947,15 +1596,17 @@ class StagedProposer:
             for offset in range(0, len(terminal), self.drivers_per_stage):
                 stage(scope, terminal[offset:offset + self.drivers_per_stage])
                 verify_completed()
+            if equity_bridge:
+                stage(scope, equity_bridge)
+                verify_completed()
         return plan
 
 
 def configured_proposer(journal, *, authorized_usd):
-    from bellomberg.core.llm_client import modello, thinking_consigliere, MUSE_STANDARD
-    from bellomberg.agents.specialists.base import MAX_TOKENS_SPECIALIST
+    from bellomberg.core.llm_client import modello, thinking_consigliere
     model = modello("consigliere", "fundamentals", 1)
-    # PM 25/09: this cap applies only to Muse Excel preparation.
-    output_limit = 65536 if model == MUSE_STANDARD else MAX_TOKENS_SPECIALIST
+    # PM 02/10: all existing models retain their identity and thinking policy.
+    output_limit = 128000
     return BudgetedProposer(journal, authorized_usd=authorized_usd, model=model,
                             max_tokens=output_limit, thinking=thinking_consigliere(model),
                             automatic_sections=True)

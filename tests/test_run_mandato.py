@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import bellomberg.core.mandato_pm as mp
+from test_cablaggio_consigliere_multi import run_offline
 
 
 class _Proc:
@@ -80,6 +81,83 @@ def test_run_ammette_un_profilo_di_esempio_valido(ambiente):
     r = c.post("/consigliere/run")
     assert r.status_code == 200, r.text
     assert len(chiamate) == 1
+
+
+def test_zero_exit_without_verified_outcome_never_marks_weekly_complete(ambiente):
+    c, p, _calls, api = ambiente
+    p.write_text(json.dumps(_valido()), encoding='utf-8')
+    response = c.post('/consigliere/run')
+    state = api.run_state.get(response.json()['task_id'])
+    assert state['status'] == 'failed'
+    assert 'outcome' in state['error'].lower()
+
+
+@pytest.mark.parametrize('status', ['completed', 'incomplete', 'failed'])
+def test_weekly_api_consumes_task_bound_terminal_outcome(ambiente, monkeypatch, status):
+    from pathlib import Path
+    c, p, calls, api = ambiente
+    p.write_text(json.dumps(_valido()), encoding='utf-8')
+    def spawn(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if '--outcome' in argv:
+            path = Path(argv[argv.index('--outcome') + 1])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({'task_id': argv[argv.index('--task-id') + 1],
+                'status': status, 'memo_id': 7, 'analytical_status': 'complete' if status == 'completed' else 'incomplete',
+                'artifact_status': 'available' if status == 'completed' else 'missing',
+                'delivery_status': 'pending', 'first_error': None if status == 'completed' else {'message': 'Synthetic PDF failure'}}))
+        return _Proc()
+    monkeypatch.setattr(api.subprocess, 'Popen', spawn)
+    response = c.post('/consigliere/run')
+    state = api.run_state.get(response.json()['task_id'])
+    assert state['status'] == status
+    assert state['outcome']['memo_id'] == 7
+
+
+def test_weekly_recovery_options_require_exact_run_and_paid_authorization(ambiente):
+    c, p, calls, _api = ambiente
+    p.write_text(json.dumps(_valido()), encoding='utf-8')
+    assert c.post('/consigliere/run', json={'delivery_only': True}).status_code == 422
+    assert c.post('/consigliere/run', json={'resume_memo_id': 7}).status_code == 428
+    assert calls == []
+
+
+def test_weekly_api_selects_native_run_and_only_spawns_saved_delivery(ambiente, run_offline, monkeypatch):
+    from bellomberg.agents import consigliere_multi as cm
+    from bellomberg.storage import memory_db
+    c, p, calls, api = ambiente
+    p.write_text(json.dumps(_valido()), encoding='utf-8')
+    result = cm.run_multi_agent(send_email=False)
+    p.unlink()  # Frozen delivery is independent of a fresh economic mandate.
+    database = memory_db.MemoryDB()
+    monkeypatch.setattr(api, 'get_db', lambda: database)
+    listed = c.get('/consigliere/runs')
+    assert listed.status_code == 200, listed.text
+    assert listed.json()['runs'][0]['memo_id'] == result['memo_id']
+    selected = c.get('/consigliere/runs/' + str(result['memo_id'])).json()
+    assert selected['delivery_recovery_available'] and not selected['resume_available']
+    assert c.post('/consigliere/run', json={'resume_memo_id': result['memo_id'] + 1,
+                                           'delivery_only': True}).status_code == 404
+    assert calls == []
+    response = c.post('/consigliere/run', json={'resume_memo_id': result['memo_id'], 'delivery_only': True})
+    assert response.status_code == 200, response.text
+    argv = calls[0][0][0]
+    assert argv[argv.index('--resume-memo-id') + 1] == str(result['memo_id'])
+    assert '--delivery-only' in argv and '--no-email' in argv and '--authorize-new-ai' not in argv
+
+
+@pytest.mark.parametrize('patch', [
+    {'task_id': 'different'}, {'analytical_status': 'incomplete'}, {'artifact_status': 'missing'}, {'memo_id': None},
+])
+def test_weekly_worker_outcome_rejects_wrong_identity_or_partial_completion(tmp_path, patch):
+    from bellomberg.api.weekly_recovery_routes import read_worker_outcome
+    value = {'task_id': 'expected', 'status': 'completed', 'memo_id': 1,
+             'analytical_status': 'complete', 'artifact_status': 'available'}
+    value.update(patch)
+    path = tmp_path / 'outcome.json'
+    path.write_text(json.dumps(value), encoding='utf-8')
+    with pytest.raises(ValueError):
+        read_worker_outcome(path, 'expected', 0)
 
 
 @pytest.mark.parametrize('language,detail', [('it', 'e gia in corso'), ('en', 'already in progress')])

@@ -64,6 +64,7 @@ import asyncio
 from email.utils import parsedate_to_datetime
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
+from bellomberg.core.request_journal import current_request_scope, request_scope, RequestBlocked
 
 import httpx
 from dotenv import load_dotenv
@@ -287,6 +288,10 @@ def somma_usage(precedente, usage):
     Costo consegnato e completezza dei token sono misure indipendenti.
     None come precedente indica il primo messaggio, non una misura a zero.
     """
+    request_id = getattr(usage, "request_id", None)
+    previous_ids = list((precedente or {}).get("request_ids") or [])
+    if request_id and request_id in previous_ids:
+        return dict(precedente)  # The same paid receipt is not charged twice on replay.
     campi = {"in": "input_tokens", "out": "output_tokens",
              "cache_read": "cache_read_input_tokens",
              "cache_write": "cache_creation_input_tokens"}
@@ -301,6 +306,8 @@ def somma_usage(precedente, usage):
         precedente.get("cost_usd") if precedente is not None else 0.0, usage)
     totale["tokens_missing"] = [k for k in campi if totale[k] is None]
     totale["tokens_status"] = "parziale" if totale["tokens_missing"] else "completo"
+    if request_id or previous_ids:
+        totale["request_ids"] = previous_ids + ([request_id] if request_id else [])
     return totale
 
 
@@ -364,13 +371,16 @@ class Usage:
         self.reasoning_forzato = reasoning_forzato
 
     def to_dict(self):
-        return {
+        result = {
             "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
             "cache_read_input_tokens": self.cache_read_input_tokens,
             "cache_creation_input_tokens": self.cache_creation_input_tokens,
             "reasoning_tokens": self.reasoning_tokens, "cost_usd": self.cost_usd,
             "reasoning_forzato": self.reasoning_forzato,
         }
+        if getattr(self, "request_id", None):
+            result["request_ids"] = [self.request_id]
+        return result
 
     def __repr__(self):
         return "Usage(" + json.dumps(self.to_dict()) + ")"
@@ -557,7 +567,8 @@ def _reasoning_openai(thinking, model=""):
 
 
 def costruisci_corpo(model, max_tokens, messages, system=None, tools=None, tool_choice=None,
-                     thinking=None, stream=False, provider_max_price=None, response_format=None, **ignorati):
+                     thinking=None, stream=False, provider_max_price=None, response_format=None,
+                     require_full_context=False, **ignorati):
     """Il corpo JSON per chat/completions a partire dai kwargs Anthropic dei call site.
     `extra_headers` e altri kwargs Anthropic-only finiscono in `ignorati` (non partono)."""
     conserva = _conserva_cache(model)
@@ -567,6 +578,11 @@ def costruisci_corpo(model, max_tokens, messages, system=None, tools=None, tool_
         msgs.append(s)
     msgs.extend(_messaggi_openai(messages, conserva))
     corpo = {"model": model, "messages": msgs, "max_tokens": int(max_tokens)}
+    if type(require_full_context) is not bool:
+        raise ValueError('require_full_context richiede un booleano esplicito')
+    if require_full_context:
+        # OpenRouter must reject a real token overflow, never truncate sources.
+        corpo['plugins'] = [{'id': 'context-compression', 'enabled': False}]
     if provider_max_price is not None:
         from math import isfinite
         if (not isinstance(provider_max_price, dict)
@@ -700,13 +716,27 @@ def _errore_da_corpo(status, corpo):
 
 def messaggio_da_json(data):
     """Messaggio (forma SDK) da una risposta chat/completions non in streaming."""
+    if not isinstance(data, dict):
+        error = APIConnectionError("risposta INCOMPLETA: corpo provider non oggetto")
+        error.partial_response = data
+        raise error
     if isinstance(data, dict) and data.get("error") and not data.get("choices"):
         raise _errore_da_corpo(200, data)
     scelte = data.get("choices") or []
-    if not scelte:
-        raise APIConnectionError("risposta senza choices: " + json.dumps(data, default=str)[:300])
+    if not isinstance(scelte, list) or not scelte or not isinstance(scelte[0], dict):
+        error = APIConnectionError("risposta INCOMPLETA: choices assente o malformato")
+        error.partial_response = data
+        raise error
     scelta = scelte[0]
-    msg = scelta.get("message") or {}
+    if scelta.get("finish_reason") is None:
+        error = APIConnectionError("risposta INCOMPLETA: finish_reason assente")
+        error.partial_response = data
+        raise error
+    msg = scelta.get("message")
+    if not isinstance(msg, dict):
+        error = APIConnectionError("risposta INCOMPLETA: message assente o malformato")
+        error.partial_response = data
+        raise error
     blocchi = []
     r = msg.get("reasoning")
     if r:
@@ -849,6 +879,21 @@ class _Ricomposizione:
                          stop_details=det, usage=_usage_da_json(self.usage),
                          provider=self.provider, finish_reason=self.finish)
 
+    def raw_response(self):
+        """Provider fields reconstructed without inventing absent usage/finish."""
+        message = {"content": "".join(b["text"] for b in self.blocchi if b["type"] == "text")}
+        if self.reasoning:
+            message["reasoning"] = "".join(self.reasoning)
+        if self.refusal:
+            message["refusal"] = self.refusal
+        tools = [{"id": b["id"], "type": "function", "function": {
+                    "name": b["name"], "arguments": b["args"]}}
+                 for b in self.blocchi if b["type"] == "tool_use"]
+        if tools:
+            message["tool_calls"] = tools
+        return {"id": self.id, "model": self.model, "provider": self.provider,
+                "usage": self.usage, "choices": [{"message": message, "finish_reason": self.finish}]}
+
 
 def _payload_sse(riga):
     """La riga SSE -> chunk JSON, None se da ignorare, "[DONE]" alla fine."""
@@ -897,6 +942,10 @@ class _RetryBudget:
         self.used = 0
 
     def delay(self, error, headers=None):
+        # A committee owns durable reservations. An HTTP status or absence of
+        # visible output does not prove that the provider did not charge.
+        if current_request_scope() is not None:
+            return None
         if self.used >= self.limit or not (isinstance(error, APIConnectionError)
                 or isinstance(error, APIStatusError) and _ritentabile(error.status_code)):
             return None
@@ -936,22 +985,100 @@ def _decodifica(resp):
         return None
 
 
+class _RequestAttempt:
+    """Bind the existing SDK surface to its durable accounting owner."""
+    def __init__(self, body):
+        scope = current_request_scope()
+        self.journal = scope.get("journal") if scope else None
+        self.request_id, self.body, self.saved = None, body, None
+        self.finished = False
+        if self.journal is not None:
+            self.request_id, self.body, self.saved = self.journal.prepare(body, scope)
+            self.finished = self.saved is not None
+
+    def receive(self, data):
+        if self.journal is not None and not self.finished:
+            choices = data.get("choices") if isinstance(data, dict) else None
+            complete = bool(isinstance(choices, list) and choices and isinstance(choices[0], dict)
+                            and choices[0].get("finish_reason") is not None)
+            state = self.journal.receive(self.request_id, data, complete=complete)
+            self.finished = True
+            if state in ("unknown", "overrun", "incomplete"):
+                error = RequestBlocked(("measured provider cost exceeds its reservation; further spending blocked"
+                                        if state == "overrun" else
+                                        "provider evidence is malformed or incomplete; original response preserved"
+                                        if state == "incomplete" else
+                                        "provider receipt or cost is unresolved; paid response preserved"),
+                                       self.request_id)
+                error.partial_response = data
+                raise error
+
+    def fail(self, error):
+        if self.request_id:
+            error.request_id = self.request_id
+        if self.journal is not None and not self.finished:
+            self.journal.fail(self.request_id, error, response=getattr(error, "partial_response", None))
+            self.finished = True
+
+    def checkpoint(self, chunk):
+        if self.journal is not None and not self.finished:
+            self.journal.checkpoint(self.request_id, chunk)
+
+    def message(self, message):
+        message.request_id = self.request_id
+        message.replayed = self.saved is not None
+        if message.usage is not None:
+            message.usage.request_id = self.request_id
+        return message
+
+
+def _saved_stream_response(data):
+    """Replay an attested message through the normal event composer, offline."""
+    choice = data["choices"][0]
+    delta = dict(choice["message"])
+    if delta.get("tool_calls"):
+        delta["tool_calls"] = [{**tool, "index": index} for index, tool in enumerate(delta["tool_calls"])]
+    chunk = {**data, "choices": [{"delta": delta, "finish_reason": choice["finish_reason"]}]}
+    return httpx.Response(200, content=("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode())
+
+
+def _finish_stream(stream):
+    try:
+        stream._ric.messaggio()  # validate terminal evidence before publishing it
+        stream._attempt.receive(stream._ric.raw_response())
+    except Exception as exc:
+        exc.partial_response = stream._ric.raw_response()
+        stream._attempt.fail(exc)
+        stream._error = exc
+        raise
+
+
 class _Messages:
     def __init__(self, client):
         self._c = client
 
     def create(self, **kw):
         corpo = costruisci_corpo(stream=False, **kw)
+        attempt = _RequestAttempt(corpo)
+        corpo = attempt.body
         forzato = _voleva_spento(kw) and corpo.get("reasoning") == REASONING_MINIMO
         try:
-            data = self._c._post_json(corpo)
-        except APIStatusError as e:
-            if not _e_ragionamento_obbligatorio(e, corpo):
-                raise
-            _forza_minimal(corpo)
-            forzato = True
-            data = self._c._post_json(corpo)
-        return _dichiara_forzato(messaggio_da_json(data), forzato)
+            try:
+                data = attempt.saved if attempt.saved is not None else self._c._post_json(corpo)
+            except APIStatusError as e:
+                if current_request_scope() is not None or not _e_ragionamento_obbligatorio(e, corpo):
+                    raise
+                _forza_minimal(corpo)
+                forzato = True
+                data = self._c._post_json(corpo)
+            message = messaggio_da_json(data)
+            attempt.receive(data)
+            return attempt.message(_dichiara_forzato(message, forzato))
+        except Exception as exc:
+            if "data" in locals() and not hasattr(exc, "partial_response"):
+                exc.partial_response = data
+            attempt.fail(exc)
+            raise
 
     def stream(self, **kw):
         corpo = costruisci_corpo(stream=True, **kw)
@@ -1018,21 +1145,37 @@ class _StreamSync:
         self._ric = _Ricomposizione()
         self._esaurito = False
         self._retry = _RetryBudget(client.max_retries)
+        self._attempt = None
+        self._error = None
 
     def __enter__(self):
+        if self._attempt is None:
+            self._attempt = _RequestAttempt(self._corpo)
+            self._corpo = self._attempt.body
+        if self._attempt.saved is not None:
+            self._resp = _saved_stream_response(self._attempt.saved)
+            return self
         try:
-            self._resp = self._c._invia(self._corpo, stream=True, retry=self._retry)
-        except APIStatusError as e:
-            if not _e_ragionamento_obbligatorio(e, self._corpo):
-                raise
-            _forza_minimal(self._corpo)
-            self._forzato = True
-            self._resp = self._c._invia(self._corpo, stream=True, retry=self._retry)
+            try:
+                self._resp = self._c._invia(self._corpo, stream=True, retry=self._retry)
+            except APIStatusError as e:
+                if current_request_scope() is not None or not _e_ragionamento_obbligatorio(e, self._corpo):
+                    raise
+                _forza_minimal(self._corpo)
+                self._forzato = True
+                self._resp = self._c._invia(self._corpo, stream=True, retry=self._retry)
+        except Exception as exc:
+            self._attempt.fail(exc)
+            raise
         return self
 
     def __exit__(self, *a):
         if self._resp is not None:
             self._resp.close()
+        if self._attempt is not None and not self._attempt.finished:
+            error = a[1] if len(a) > 1 and a[1] is not None else APIConnectionError("stream senza ricevuta terminale")
+            error.partial_response = self._ric.raw_response()
+            self._attempt.fail(error)
         return False
 
     def __iter__(self):
@@ -1049,6 +1192,7 @@ class _StreamSync:
                             continue
                         if chunk == "[DONE]":
                             break
+                        self._attempt.checkpoint(chunk)
                         for ev in self._ric.alimenta(chunk):
                             yield ev
                     break
@@ -1062,16 +1206,28 @@ class _StreamSync:
                     self._ric = _Ricomposizione()
                     self.__enter__()
         except httpx.HTTPError as e:
-            raise APIConnectionError("stream interrotto: " + type(e).__name__ + ": " + str(e))
+            error = APIConnectionError("stream interrotto: " + type(e).__name__ + ": " + str(e))
+            error.partial_response = self._ric.raw_response()
+            self._attempt.fail(error)
+            self._error = error
+            raise error from e
+        except Exception as exc:
+            exc.partial_response = self._ric.raw_response()
+            self._attempt.fail(exc)
+            self._error = exc
+            raise
         finally:
             self._esaurito = True
+        _finish_stream(self)
         for ev in self._ric.fine():
             yield ev
 
     def get_final_message(self):
+        if self._error is not None:
+            raise self._error
         for _ in self:
             pass
-        return _dichiara_forzato(self._ric.messaggio(), self._forzato)
+        return self._attempt.message(_dichiara_forzato(self._ric.messaggio(), self._forzato))
 
 
 class _MessagesAsync:
@@ -1080,16 +1236,26 @@ class _MessagesAsync:
 
     async def create(self, **kw):
         corpo = costruisci_corpo(stream=False, **kw)
+        attempt = _RequestAttempt(corpo)
+        corpo = attempt.body
         forzato = _voleva_spento(kw) and corpo.get("reasoning") == REASONING_MINIMO
         try:
-            data = await self._c._post_json(corpo)
-        except APIStatusError as e:
-            if not _e_ragionamento_obbligatorio(e, corpo):
-                raise
-            _forza_minimal(corpo)
-            forzato = True
-            data = await self._c._post_json(corpo)
-        return _dichiara_forzato(messaggio_da_json(data), forzato)
+            try:
+                data = attempt.saved if attempt.saved is not None else await self._c._post_json(corpo)
+            except APIStatusError as e:
+                if current_request_scope() is not None or not _e_ragionamento_obbligatorio(e, corpo):
+                    raise
+                _forza_minimal(corpo)
+                forzato = True
+                data = await self._c._post_json(corpo)
+            message = messaggio_da_json(data)
+            attempt.receive(data)
+            return attempt.message(_dichiara_forzato(message, forzato))
+        except Exception as exc:
+            if "data" in locals() and not hasattr(exc, "partial_response"):
+                exc.partial_response = data
+            attempt.fail(exc)
+            raise
 
     def stream(self, **kw):
         corpo = costruisci_corpo(stream=True, **kw)
@@ -1155,21 +1321,37 @@ class _StreamAsync:
         self._ric = _Ricomposizione()
         self._esaurito = False
         self._retry = _RetryBudget(client.max_retries)
+        self._attempt = None
+        self._error = None
 
     async def __aenter__(self):
+        if self._attempt is None:
+            self._attempt = _RequestAttempt(self._corpo)
+            self._corpo = self._attempt.body
+        if self._attempt.saved is not None:
+            self._resp = _saved_stream_response(self._attempt.saved)
+            return self
         try:
-            self._resp = await self._c._invia(self._corpo, stream=True, retry=self._retry)
-        except APIStatusError as e:
-            if not _e_ragionamento_obbligatorio(e, self._corpo):
-                raise
-            _forza_minimal(self._corpo)
-            self._forzato = True
-            self._resp = await self._c._invia(self._corpo, stream=True, retry=self._retry)
+            try:
+                self._resp = await self._c._invia(self._corpo, stream=True, retry=self._retry)
+            except APIStatusError as e:
+                if current_request_scope() is not None or not _e_ragionamento_obbligatorio(e, self._corpo):
+                    raise
+                _forza_minimal(self._corpo)
+                self._forzato = True
+                self._resp = await self._c._invia(self._corpo, stream=True, retry=self._retry)
+        except Exception as exc:
+            self._attempt.fail(exc)
+            raise
         return self
 
     async def __aexit__(self, *a):
         if self._resp is not None:
             await self._resp.aclose()
+        if self._attempt is not None and not self._attempt.finished:
+            error = a[1] if len(a) > 1 and a[1] is not None else APIConnectionError("stream senza ricevuta terminale")
+            error.partial_response = self._ric.raw_response()
+            self._attempt.fail(error)
         return False
 
     async def __aiter__(self):
@@ -1186,6 +1368,7 @@ class _StreamAsync:
                             continue
                         if chunk == "[DONE]":
                             break
+                        self._attempt.checkpoint(chunk)
                         for ev in self._ric.alimenta(chunk):
                             yield ev
                     break
@@ -1199,16 +1382,28 @@ class _StreamAsync:
                     self._ric = _Ricomposizione()
                     await self.__aenter__()
         except httpx.HTTPError as e:
-            raise APIConnectionError("stream interrotto: " + type(e).__name__ + ": " + str(e))
+            error = APIConnectionError("stream interrotto: " + type(e).__name__ + ": " + str(e))
+            error.partial_response = self._ric.raw_response()
+            self._attempt.fail(error)
+            self._error = error
+            raise error from e
+        except Exception as exc:
+            exc.partial_response = self._ric.raw_response()
+            self._attempt.fail(exc)
+            self._error = exc
+            raise
         finally:
             self._esaurito = True
+        _finish_stream(self)
         for ev in self._ric.fine():
             yield ev
 
     async def get_final_message(self):
+        if self._error is not None:
+            raise self._error
         async for _ in self:
             pass
-        return _dichiara_forzato(self._ric.messaggio(), self._forzato)
+        return self._attempt.message(_dichiara_forzato(self._ric.messaggio(), self._forzato))
 
 
 # ---------------------------------------------------------------------------
@@ -1236,12 +1431,19 @@ def sonda_modelli(slugs, client=None, max_tokens=5, timeout_s=45.0):
     for s in distinti:
         t0 = time.perf_counter()
         try:
-            client.messages.create(model=s, max_tokens=int(max_tokens),
+            response = client.messages.create(model=s, max_tokens=int(max_tokens),
                                    messages=[{"role": "user", "content": "ping"}],
                                    thinking={"type": "disabled"})
-            esiti[s] = {"ok": True, "motivo": None, "durata_s": round(time.perf_counter() - t0, 2)}
+            usage = getattr(response, "usage", None)
+            esiti[s] = {"ok": True, "motivo": None, "durata_s": round(time.perf_counter() - t0, 2),
+                "request_id": getattr(response, "request_id", None),
+                "response_id": getattr(response, "id", None),
+                "cost_usd": getattr(usage, "cost_usd", None),
+                "usage": usage.to_dict() if hasattr(usage, "to_dict") else None,
+                "stop_reason": getattr(response, "stop_reason", None)}
         except Exception as e:
             esiti[s] = {"ok": False,
+                        "request_id": getattr(e, "request_id", None), "cost_usd": None,
                         "motivo": (type(e).__name__ + ": " + str(e))[:300],
                         "durata_s": round(time.perf_counter() - t0, 2)}
     return esiti

@@ -30,7 +30,7 @@ function retained(model, extra = {}, api = {}) {
         return [values[at], value => { values[at] = typeof value === 'function' ? value(values[at]) : value; }]; } },
     '@/lib/api': { Bellomberg: api, API_BASE: 'http://synthetic.invalid' },
   } });
-  const language = load('i18n/lingua.ts'), Page = load('pages/FundamentalsPage.tsx').default;
+  const language = load('i18n/lingua.ts'), Page = load('pages/FundamentalsPage.tsx').ArchivedValuationWorkspace;
   const render = selected => { state = memoIndex = effectIndex = 0; effects.length = 0; language.impostaLinguaCorrente(selected); return renderToStaticMarkup(React.createElement(Page)); };
   render.effects = async () => { for (const effect of effects) effect(); await new Promise(resolve => setImmediate(resolve)); };
   return render;

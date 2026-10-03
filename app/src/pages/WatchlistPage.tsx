@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, Fragment } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Bellomberg, FavCompany, MktQuote } from '@/lib/api';
-import { Star, Cpu, Heart, RefreshCw, Globe } from 'lucide-react';
+import { Star, Cpu, Heart, RefreshCw, Globe, Lightbulb } from 'lucide-react';
 import { useT } from '@/i18n/provider';
 import { linguaCorrente, localeDi } from '@/i18n/lingua';
 
@@ -165,6 +165,8 @@ export default function WatchlistPage() {
                           <button disabled={savingNotes[f.ticker]} onClick={e => { e.stopPropagation(); saveNote(f.ticker); }} className="btn btn-cyan shrink-0 mt-0.5">
                             {savingNotes[f.ticker] ? tr('ui.saving') : savedNote[f.ticker] ? tr('ui.saved') : tr('ui.save')}
                           </button>
+                          <button onClick={e => { e.stopPropagation(); const draft = notesRef.current[f.ticker] ?? ''; navigate(`/agents/trade-idea?ticker=${encodeURIComponent(f.ticker)}&source=favorites`, { state: { viewDraft: draft, noteSaved: draft === (f.note || '') } }); }}
+                                  className="btn btn-amber shrink-0 mt-0.5"><Lightbulb size={11} />{tr('tradeidea.openTradeIdea')}</button>
                         </div>
                         {noteErrors[f.ticker] && <div role="alert" className="text-crimson text-2xs">{tr('ui.note_failed', { error: noteErrors[f.ticker] })}</div>}
                       </td>

@@ -18,7 +18,7 @@ generate_valuation(ticker) ->
        - operating    -> dcf_buyside_v3.build_model_v3 (DCF unlevered template-parity;
                          v3 KO = rifiuto dichiarato, NESSUN fallback v2 — audit/13 §4 n.1)
   4. COMPS omogenei: tira EV/EBITDA dei PEERS reali del sotto-settore (stesso settore, non a caso)
-  5. SANITY: confronta fair value vs prezzo; warning se ratio estremo (<0.4 o >2.5)
+  5. SANITY: confronto informativo fair value/prezzo; lo scarto non misura la validita'.
 
 Tutto guarded. Mai eccezioni propagate.
 """
@@ -635,7 +635,8 @@ def _read_previous_valuation_snapshot(output_dir, ticker):
 
 
 def generate_valuation(ticker: str, output_dir: str = None, *, prepared_bundle=None,
-                       providers=None, as_of=None, method_records=None, **kwargs) -> Dict[str, Any]:
+                       providers=None, as_of=None, method_records=None,
+                       preparation_evidence=None, **kwargs) -> Dict[str, Any]:
     """Common entry: acquire once, then pass the immutable case to the adapter."""
     from uuid import uuid4
     from bellomberg.valuation.sector_analysis import (prepare_sector_analysis,
@@ -681,6 +682,9 @@ def generate_valuation(ticker: str, output_dir: str = None, *, prepared_bundle=N
                 "input_consumption": {"status": "incomplete", "consumed_fields": [],
                     "unconsumed_fields": sorted({r.get("field") for r in bundle["case"]["records"] if r.get("field")}),
                     "reason": "Adapter legacy: schema settoriale non ancora attestato; integrazione per famiglia nei lotti successivi."}}
+    if preparation_evidence is not None:
+        from copy import deepcopy
+        metadata["preparation"] = deepcopy(preparation_evidence)
     accepted_arguments = {
         "operating": {"variant_view", "growth_override", "ebitda_margin_target", "terminal_growth",
                       "scenarios", "equity_adjustments", "stance", "diluted_shares_m", "precedents",
@@ -692,7 +696,17 @@ def generate_valuation(ticker: str, output_dir: str = None, *, prepared_bundle=N
     }
     allowed = accepted_arguments.get(bundle["case"]["route"])
     ignored = sorted(set(params) - allowed) if allowed is not None else []
-    if (bundle["decision"]["method_id"] == "managed_care_distributable_equity"
+    if (bundle["decision"]["method_id"] == "exposure_analysis"
+            and bundle['decision']['decision_status'] == 'resolved'
+            and bundle['decision']['support_status'] == 'integrated'
+            and bundle['case']['records']):
+        # A classification-only ETF/ETN response keeps its legacy contract.
+        # It has no workbook and cannot qualify as a Trade Idea model. Once
+        # observations are supplied, the common exposure compiler owns even
+        # incomplete inputs; no fallback can declare them a complete analysis.
+        from bellomberg.valuation.trade_idea_exposure import generate_exposure
+        result = generate_exposure(bundle, output_dir=output_dir, metadata=metadata)
+    elif (bundle["decision"]["method_id"] == "managed_care_distributable_equity"
             and bundle["decision"]["decision_status"] == "resolved"
             and bundle["decision"]["support_status"] == "integrated"):
         from bellomberg.valuation.managed_care_adapter import generate_managed_care
@@ -1990,46 +2004,27 @@ def _sanity_with_fx(r: Dict[str, Any], price, info: Dict[str, Any]) -> Dict[str,
 
 @scoped_language
 def sanity_check(fair_value: Optional[float], price: Optional[float]) -> Dict[str, Any]:
-    """Confronta fair value vs prezzo. 204b-FIX: ora URLA. Oltre al testo ritorna 'severity'
-    (OK/WARN/BLOCK) e 'exclude_from_action_table': se |fair/price-1| supera il 40-50% il
-    consumatore a valle (memo/Capo/ACTION TABLE) deve segnalare/escludere il nome. Prima i
-    campi c'erano ma nessuno li consumava e le soglie (0.4/2.5) erano troppo larghe.
-    Retro-compatibile: status/ratio/upside_pct/reading restano invariati."""
-    if not fair_value or not price or price <= 0:
+    """Describe distance to market without judging the model by that distance.
+
+    PM 02/10: no upper/lower divergence gate, for any scenario or method.
+    Input, provenance and calculation checks remain separate and authoritative.
+    """
+    from math import isfinite
+    try:
+        valid = all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                    and isfinite(v) and v > 0 for v in (fair_value, price))
+        ratio = fair_value / price if valid else None
+        valid = valid and isfinite(ratio) and isfinite((ratio - 1) * 100)
+    except (OverflowError, TypeError, ValueError):
+        valid = False
+    if not valid:
         return {"status": "n/d", "ratio": None, "severity": "OK",
                 "exclude_from_action_table": False, "headline": None}
-    ratio = fair_value / price
-    divergence = abs(ratio - 1.0)
-    if ratio < 0.4:
-        flag = _lt("FAIR VALUE MOLTO SOTTO il prezzo: o le assumptions sono troppo conservative, o il mercato sconta crescita non nel modello. Rivedere growth/terminal.",
-                   "FAIR VALUE FAR BELOW price: assumptions may be too conservative, or the market prices growth absent from the model. Review growth/terminal.")
-    elif ratio > 2.5:
-        flag = _lt("FAIR VALUE MOLTO SOPRA il prezzo: assumptions forse troppo ottimistiche, o vero deep value. Verificare margini/WACC.",
-                   "FAIR VALUE FAR ABOVE price: assumptions may be too optimistic, or this may be deep value. Verify margins/WACC.")
-    elif 0.7 <= ratio <= 1.4:
-        flag = _lt("Fair value vicino al prezzo: la sola vicinanza non dimostra la qualita' del modello.",
-                   "Fair value is near the price; proximity alone does not validate the model.")
-    else:
-        flag = _lt("Scostamento moderato: possibile sopra/sottovalutazione da approfondire.",
-                   "Moderate divergence: investigate possible over/undervaluation.")
-    if divergence > 0.5:
-        severity = "BLOCK"; exclude = True
-        headline = (_lt("VAL SOSPETTA: fair value %.0f diverge %.0f%% dal prezzo %.0f (ratio %.2f). "
-                    "Rivedere growth/margini/WACC/shares/net_debt PRIMA di fidarsi. "
-                    "ESCLUSO dalla ACTION TABLE.",
-                    "SUSPECT VALUATION: fair value %.0f diverges %.0f%% from price %.0f (ratio %.2f). "
-                    "Review growth/margins/WACC/shares/net_debt BEFORE relying on it. "
-                    "EXCLUDED from ACTION TABLE.") % (fair_value, divergence * 100, price, ratio))
-    elif divergence > 0.4:
-        severity = "WARN"; exclude = False
-        headline = (_lt("VAL da verificare: fair value %.0f diverge %.0f%% dal prezzo %.0f (ratio %.2f). Trattare con cautela.",
-                       "VALUATION needs verification: fair value %.0f diverges %.0f%% from price %.0f (ratio %.2f). Use with caution.")
-                    % (fair_value, divergence * 100, price, ratio))
-    else:
-        severity = "OK"; exclude = False; headline = None
+    flag = _lt("Scostamento dal prezzo informativo: la validita' dipende da dati, ipotesi e calcoli, non dalla vicinanza al mercato.",
+               "Distance to market is informational: validity depends on data, assumptions and calculations, not proximity to price.")
     return {"status": "ok", "ratio": round(ratio, 2),
             "upside_pct": round((ratio-1)*100, 1), "reading": flag,
-            "severity": severity, "exclude_from_action_table": exclude, "headline": headline}
+            "severity": "OK", "exclude_from_action_table": False, "headline": None}
 
 
 def _flag_file(r: Dict[str, Any]) -> None:
@@ -2068,11 +2063,10 @@ def _apply_sanity_flag(r: Dict[str, Any], price: Optional[float]) -> Dict[str, A
         # su dati sottili (CAGR meccanico -> flussi negativi). Non si emette un numero
         # falso: si RIFIUTA e si chiedono le assumption dell'analista. Il file resta
         # (FLAGGED) come pezza d'appoggio, ma fair value e tesi NON si propagano.
-        # audit/12 V0.2: stesso trattamento per il QUASI-zero (< 5% del prezzo) — lo
-        # un valore di pochi centesimi passava il guard assoluto ed era arrivato in pagina come numero.
-        _pr = price if isinstance(price, (int, float)) and price > 0 else None
-        if fv <= 0 or (_pr and fv < 0.05 * _pr):
-            _motivo = "FV<=0" if fv <= 0 else f"FV {fv:.2f} sotto il 5% del prezzo {_pr:.2f}"
+        # PM 02/10: a positive value remains valid regardless of its distance
+        # below the market price; the former relative 5% rejection is removed.
+        if fv <= 0:
+            _motivo = "FV<=0"
             r["valuation_flagged"] = True
             r["sanity_headline"] = (f"{_motivo} dal calcolo meccanico: NON attendibile. Servono le "
                                     "assumption dell'analista (growth_path/roe_path + variant_view)")
@@ -2176,7 +2170,8 @@ _SIDECAR_KEYS = ("ticker", "engine", "profile_key", "subsector", "method", "pric
                  "ok", "company", "snapshot_id", "generation_id", "acquisition_tasks",
                  "acquisition_snapshot", "input_consumption", "valuation_usability", "preparation",
                  "workbook_sha256", "exclude_from_action_table", "valuation_flagged",
-                 "managed_care", "child_valuations", "calculation_details", "valuation_date", "valuation_basis", "currency", "financial_currency")
+                 "managed_care", "child_valuations", "calculation_details", "valuation_date", "valuation_basis", "currency", "financial_currency",
+                 "analysis_usability", "exposure_analysis", "intrinsic_value_applicable")
 
 
 def _write_payload_sidecar(r: Dict[str, Any]) -> Dict[str, Any]:

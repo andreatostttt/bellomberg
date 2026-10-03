@@ -15,12 +15,17 @@ import json
 import os
 import threading
 import time
+from hashlib import sha256
+from copy import deepcopy
+from functools import wraps
 from datetime import datetime
 from bellomberg.core.llm_client import OpenRouterClient, modello as _modello_llm, somma_usage as _somma_usage
-from bellomberg.core.llm_client import thinking_consigliere
+from bellomberg.core.llm_client import thinking_consigliere, request_scope, ConfigurazioneLLMMancante
+from bellomberg.core.trade_idea_policy import role_thinking
 from bellomberg.storage.memory_db import DB_DIR   # B4 (02/09): heartbeat e rescue sotto la cartella dati
 from bellomberg.core.llm_refusal import refusal_reason as _refusal_reason
 from bellomberg.core.language import capture_language, prompt_for_language, scoped_language
+from bellomberg.core.research_analysis import is_research_mode, research_context
 from bellomberg.agents import agent_tools
 
 
@@ -34,22 +39,37 @@ from bellomberg.agents import agent_tools
 USE_PROMPT_CACHING = True
 CACHE_TTL = "1h"   # "1h" richiede il beta header; "5m" e' il default senza header
 CACHE_BETA_HEADER = {"anthropic-beta": "extended-cache-ttl-2025-04-11"}
-# 12.000 -> 16.000 il 27/08 (decisione PM su 2 punti dati: quant R2 TRONCATA su
-# max_tokens in V8 e in V9). In V9 il testo salvato della call troncata era 9.578
-# char: a 2,1 char/token (misure di casa con count_tokens, 26/07) ~4,6k token di
-# testo → STIMA: circa 2/3 del cap era ragionamento adattivo, che conta nel cap
-# («max_tokens is a hard cap on thinking plus response text», skill claude-api,
-# migrazione a Opus 5; il numero vero lo stampa il WARN qui sotto). 16.000 e' il
-# valore degli esempi della skill e la soglia oltre cui chiede lo streaming: la
-# chiamata resta NON in streaming, quindi questo e' il bordo. E' un tetto, non
-# una spesa: costa solo quando usato (<= 4k token in piu' per call troncata =
-# 0,10 $ su Opus 5, 0,04 $ su Sonnet 5 in R0: `llm_pricing.PRICING_USD_PER_MTOK`,
-# listino 24/06/2026). Caso peggiore assoluto (ogni call della run tronca):
-# ~+6 € su una run da 14 € di desk; storico 4 troncature in 8 run → ~+0,05 $/run.
-MAX_TOKENS_SPECIALIST = 16000
+# PM 02/10: increase every specialist phase, including R0 and consultations.
+# Quant R1 exhausted 16k (15,997 reasoning tokens) without a visible report.
+# This is an output ceiling, not a spending grant; model, effort, per-request
+# budget checks and tool-iteration limits retain their existing contracts.
+MAX_TOKENS_SPECIALIST = 128000
+MAX_TOKENS_TRADE_IDEA_AUTHOR = 128000
+MAX_TOKENS_FUNDAMENTALS_ANALYSIS = 128000
 # audit 11/09: testa dell'esito di ogni tool nel tool_log (heartbeat + blackboard archiviata),
 # per l'audit; il modello riceve l'esito intero come prima (TETTO_TOOL_RESULT di chat_tools)
 TOOL_LOG_OUTPUT_MAX = 400
+
+
+def _trade_idea_tool_receipt_success(result, tool_name, *, truncated=False):
+    """Only complete, affirmative tool envelopes can back operative evidence."""
+    if not isinstance(result, dict) or truncated:
+        return False
+    payload = result.get("data", result)
+    if not isinstance(payload, dict) or not payload:
+        return False
+    negative = {"error", "failed", "failure", "unavailable", "stale", "ko",
+                "partial", "incomplete", "blocked", "not_found"}
+    for row in (result, payload):
+        if (row.get("ok") is False or row.get("error")
+                or row.get("stale") is True or row.get("truncated") is True
+                or row.get("partial") is True
+                or str(row.get("status") or "").lower() in negative):
+            return False
+    if tool_name == "get_valuation":
+        from bellomberg.valuation.trade_idea_model import candidate_model_usability
+        return candidate_model_usability(payload)["usable"] is True
+    return True
 
 # Il timeout del client SEGUE il cap (review 27/08, finding ALTO per costi/API):
 # a 65-80 tok/s misurati in V9 (la call troncata da 12k e' durata <= 203 s), a
@@ -60,6 +80,73 @@ TOOL_LOG_OUTPUT_MAX = 400
 # numero, con il pavimento di #196. Legame MECCANICO in una FUNZIONE provata su
 # piu' cap (tests/test_tetto_specialisti_16k.py): a 16k «450 fisso» sarebbe
 # indistinguibile, sono il pavimento e la formula sugli altri cap a misurarlo.
+def _checkpoint_json(value):
+    """Lossless SDK blocks for a native specialist continuation."""
+    def block(item):
+        kind = getattr(item, "type", None)
+        if kind == "text":
+            return {"type": kind, "text": item.text}
+        if kind == "tool_use":
+            return {"type": kind, "id": item.id, "name": item.name, "input": item.input}
+        if kind == "thinking":
+            return {"type": kind, "thinking": item.thinking}
+        raise TypeError("unsupported checkpoint object: " + type(item).__name__)
+    return json.loads(json.dumps(value, default=block, ensure_ascii=False, allow_nan=False))
+
+
+def _checkpoint_digest(value):
+    return sha256(json.dumps(_checkpoint_json(value), sort_keys=True,
+                             ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+
+
+def _checkpoint_output_contract(fields, saved):
+    """Recognize only a complete historical contract, including its original cap.
+
+    A policy upgrade applies to new stages. A saved stage keeps the exact body
+    needed to recover its paid response; no other contract difference is waived.
+    """
+    cap = fields["max_tokens"]
+    digest = _checkpoint_digest(fields)
+    if saved is None:
+        return cap, digest
+    candidates = (cap, 16000, 64000, 65536)
+    pinned = saved.get("max_tokens")
+    for candidate in dict.fromkeys(candidates):
+        if pinned is not None and (type(pinned) is not int or pinned != candidate):
+            continue
+        candidate_digest = _checkpoint_digest({**fields, "max_tokens": candidate})
+        if saved.get("contract") == candidate_digest:
+            return candidate, candidate_digest
+    raise ValueError("specialist checkpoint identity, sources or contract differs")
+
+
+def _forced_report_nudge(max_tool_iters):
+    return ("LIMITE ITERAZIONI TOOL RAGGIUNTO (" + str(max_tool_iters)
+            + "): in questa risposta i tool sono DISABILITATI. Scrivi ORA il "
+            "report finale con le informazioni gia' raccolte. Dichiara "
+            "esplicitamente cio' che NON hai potuto verificare (n.d.), "
+            "senza inventare numeri.")
+
+
+def _persist_specialist_checkpoint(blackboard, key, payload, event):
+    callback = getattr(blackboard, "persist_run_checkpoint", None)
+    if not callable(callback):
+        return
+    state = _checkpoint_json(payload)
+    state["sha256"] = _checkpoint_digest(state)
+    with blackboard._lock:
+        blackboard.specialist_checkpoints[key] = state
+        # A failed checkpoint is a failed prerequisite for the next paid call.
+        callback(event, {"desk_key": key, "checkpoint_sha256": state["sha256"]})
+
+
+def _record_run_failure(blackboard, error, desk, round_n):
+    callback = getattr(blackboard, "record_run_failure", None)
+    if callable(callback):
+        callback(error, desk=desk, round_n=round_n,
+                 request_id=getattr(error, "request_id", None))
+
+
 def timeout_specialisti(cap: int) -> float:
     """Timeout (s) del client per una call NON in streaming con `max_tokens=cap`:
     la stima dell'SDK (3600 x cap / 128000), mai sotto i 240 s di #196."""
@@ -109,6 +196,20 @@ MAX_CHAR_BLACKBOARD = 120000
 # (MAX_TOKENS_CAPO rimossa 26/07, quick-win audit/21 §6 n.3: era morta — il
 # Capo usa il suo CAPO_MAX_TOKENS in capo.py — 64000 dal 01/08, voce 1 —, questa non era letta da nessuno)
 MAX_TOOL_ITERS_SPECIALIST = 10
+# Autore Trade Idea: spazio per fonti, salvataggi e correzioni; ultima chiamata report.
+MAX_TOOL_ITERS_TRADE_IDEA_AUTHOR = 30
+MODEL_AUTHORING_LOCAL_TOOLS = frozenset({
+    "read_company_dossier", "read_candidate_source", "get_candidate_model_inputs",
+    "read_candidate_model_consultation", "submit_candidate_model_plan", "get_valuation",
+    "read_blackboard",
+})
+RESEARCH_UNAVAILABLE_TOOLS = frozenset({
+    "get_valuation", "build_dcf_model", "get_candidate_model_inputs", "submit_candidate_model_plan",
+    "review_candidate_model", "read_candidate_model_consultation",
+})
+RESEARCH_REPLY_LOCAL_TOOLS = frozenset({
+    'respond_trade_idea_objection', 'read_candidate_source', 'read_company_dossier', 'ask_specialist',
+})
 # Resilienza R0/R1 (fix 1 §9-sextrigies, ok PM 03/08). Due guasti misurati:
 # V7 03/08 fundamentals morto alla PRIMA chiamata su HTTP 529 senza retry;
 # V6 28/07 eventdesk end_turn con 113 char di annuncio e 0 tool promosso a
@@ -227,17 +328,40 @@ class Blackboard:
     # `state.n_tool_calls ?? P.calls.length`).
     HEARTBEAT_TOOL_LOG_MAX = 50
 
-    def __init__(self, memory_db=None, memo_id=None, *, valuation_preparer=None):
+    def __init__(self, memory_db=None, memo_id=None, *, valuation_preparer=None,
+                 heartbeat_path=None, run_scope="weekly", run_id=None,
+                 target_ticker=None, pm_view="", candidate_history="", budget_gate=None):
         self.language = capture_language()
         self.data = {}
         self.current_round = 0
         self.tool_log = []
+        # Trade Idea and research weekly retain bounded tool receipts for the
+        # source seal. The visible tool_log is only an audit preview.
+        self.tool_receipts = []
         self.memory_db = memory_db
         self.valuation_results = {}
         self.valuation_attempts = []
+        self.valuation_generations = []
         # Injected only by the application's explicit valuation budget policy.
         self.valuation_preparer = valuation_preparer
+        if callable(valuation_preparer):
+            # The shared preparer already owns an authorization + paid journal.
+            # Retain that owner instead of charging its request twice to weekly.
+            @wraps(valuation_preparer)
+            def separately_journaled_preparer(*args, **kwargs):
+                with request_scope(None, phase="valuation_preparer"):
+                    return valuation_preparer(*args, **kwargs)
+            self.valuation_preparer = separately_journaled_preparer
         self.memo_id = memo_id
+        self.run_scope = run_scope
+        self.run_id = run_id
+        self.target_ticker = target_ticker
+        self.pm_view = pm_view
+        self.candidate_history = candidate_history
+        self.budget_gate = budget_gate
+        self.specialist_checkpoints = {}
+        if heartbeat_path is not None:
+            self.HEARTBEAT_PATH = os.fspath(heartbeat_path)
         self.start_time = datetime.now().isoformat(timespec="seconds")
         self.specialist_status = {}  # {name: "idle" | "running" | "done" | "error"}
         self.current_specialist = None
@@ -261,7 +385,18 @@ class Blackboard:
     def record_valuation(self, ticker, payload, specialist):
         from bellomberg.reporting.valuation_delivery import describe_result
         with self._lock:
-            self.valuation_results[ticker] = payload
+            if self.run_scope == "trade_idea":
+                from bellomberg.valuation.trade_idea_model import candidate_model_usability
+                generation = {**payload, "ticker": ticker} if isinstance(payload, dict) else {
+                    "ticker": ticker, "error": "valuation payload non oggetto"}
+                self.valuation_generations.append(generation)
+                previous = self.valuation_results.get(ticker) or {}
+                previous_usable = candidate_model_usability(previous)["usable"] is True
+                current_usable = candidate_model_usability(generation)["usable"] is True
+                if not previous_usable or current_usable:
+                    self.valuation_results[ticker] = generation
+            else:
+                self.valuation_results[ticker] = payload
             self.valuation_attempts.append({**describe_result(ticker, payload),
                 "specialist": specialist, "round": self.current_round,
                 "attempt": len(self.valuation_attempts) + 1})
@@ -312,6 +447,9 @@ class Blackboard:
             cost_status = _r.get("status", "model_unknown")
         except Exception as e:
             print("[Blackboard] WARN pricing non disponibile (" + str(agent) + "): " + str(e))
+        if "cost_usd" in u and u["cost_usd"] is None:
+            # An absent provider bill is not the historical list-price estimate.
+            cost, cost_status = None, "usage_unknown"
         # "api_error" in ingresso ha la PRECEDENZA: un agente fallito resta
         # dichiarato fallito, anche se i suoi token erano prezzabili.
         if status == "api_error":
@@ -336,6 +474,9 @@ class Blackboard:
         mancanti = [k for k in norm if norm[k] is None]
         entry = {
             "language": self.language,
+            "cost_usd": u.get("cost_usd"),
+            "known_cost_usd": u.get("known_cost_usd", u.get("cost_usd")),
+            "request_ids": list(u.get("request_ids") or []),
             "agent": agent, "round": round_n, "model": model,
             "in": norm["in"], "out": norm["out"],
             "cache_read": norm["cache_read"], "cache_write": norm["cache_write"],
@@ -359,6 +500,15 @@ class Blackboard:
             "ts": datetime.now().isoformat(timespec="seconds"),
         }
         with self._lock:
+            if entry["request_ids"]:
+                ids = set(entry["request_ids"])
+                for index, previous in enumerate(self.usage_log):
+                    if (previous.get("agent") == agent and previous.get("round") == round_n
+                            and previous.get("model") == model and previous.get("request_ids")
+                            and set(previous["request_ids"]) <= ids):
+                        self.usage_log[index] = entry
+                        self._write_heartbeat()
+                        return entry
             self.usage_log.append(entry)
             self._write_heartbeat()
         return entry
@@ -525,6 +675,9 @@ class Blackboard:
             os.makedirs(os.path.dirname(self.HEARTBEAT_PATH), exist_ok=True)
             _usage_by, _usage_tot = self._usage_state()
             state = {
+                "run_scope": self.run_scope,
+                "run_id": self.run_id,
+                "target_ticker": self.target_ticker,
                 "language": self.language,
                 "running": True,
                 "start_time": self.start_time,
@@ -535,6 +688,8 @@ class Blackboard:
                 # tappo dichiarato; prima F4 leggeva "50 su 50" per tutta la run.
                 "tool_log": self.tool_log[-self.HEARTBEAT_TOOL_LOG_MAX:],
                 "valuation_attempts": self.valuation_attempts,
+                **({"valuation_generations": len(self.valuation_generations)}
+                   if self.run_scope == "trade_idea" else {}),
                 "n_tool_calls": len(self.tool_log),  # totale VERO, non il tappo
                 "tool_log_tappato": len(self.tool_log) > self.HEARTBEAT_TOOL_LOG_MAX,
                 "reports_by_specialist": {
@@ -579,7 +734,7 @@ class Blackboard:
             self.specialist_status[name] = "error"
             self._write_heartbeat()
 
-    def mark_run_complete(self):
+    def mark_run_complete(self, *, technical_status="completed", reason=None):
         self.current_specialist = None
         self._lock.acquire()  # stesso file del heartbeat: mai scritture sovrapposte
         try:
@@ -589,9 +744,16 @@ class Blackboard:
             # dalla UI proprio quando serve (a run finita)
             _usage_by, _usage_tot = self._usage_state()
             state = {
+                "run_scope": self.run_scope,
+                "run_id": self.run_id,
+                "target_ticker": self.target_ticker,
                 "running": False,
                 "start_time": self.start_time,
-                "completed_at": datetime.now().isoformat(timespec="seconds"),
+                "technical_status": technical_status,
+                "reason": reason,
+                "completed_at": (datetime.now().isoformat(timespec="seconds")
+                                 if technical_status == "completed" else None),
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
                 "specialist_status": self.specialist_status,
                 "tool_log": self.tool_log,
                 "valuation_attempts": self.valuation_attempts,
@@ -670,6 +832,9 @@ class Blackboard:
                     print("[Blackboard] report di riserva salvato in " + _p)
                 except Exception as e2:
                     print("[Blackboard] anche il rescue file e' fallito: " + str(e2))
+                _record_run_failure(self, last_err, specialist_name, round_n)
+                if callable(getattr(self, "persist_run_checkpoint", None)):
+                    raise RuntimeError("report persistence failed: " + str(last_err)) from last_err
         self._write_heartbeat()
 
     def read(self, specialist_name=None, round_n=None):
@@ -700,6 +865,12 @@ class Blackboard:
 
     def summary_for_specialist(self, requesting_specialist):
         with self._lock:
+            independent = getattr(self, "independent_round", None)
+            building_owner = (requesting_specialist == "fundamentals" and self.current_round == 1
+                              and getattr(self, "model_phase", None) == "building")
+            if (self.run_scope == "trade_idea" and independent in (0, 1)
+                    and self.current_round <= independent and not building_owner):
+                return {}
             out = {}
             # RED TEAM visibile agli specialisti (voce P1 "invisibile per costruzione":
             # il filtro "_" sotto lo tagliava sempre). Whitelist esplicita, messa PRIMA
@@ -1039,15 +1210,36 @@ class Specialist:
         # #196: timeout duro -> una chiamata appesa fallisce e la run prosegue.
         # 27/08: il numero segue il cap di output (TIMEOUT_SPECIALIST_S, 450 s a 16k):
         # a 240 s una call da 16k a 65-80 tok/s sarebbe finita in timeout + retry.
-        self.client = client or OpenRouterClient(timeout=TIMEOUT_SPECIALIST_S, max_retries=1)
+        if getattr(blackboard, "run_scope", "weekly") == "trade_idea":
+            raw_client = client or OpenRouterClient(timeout=TIMEOUT_SPECIALIST_S, max_retries=0)
+            self._owned_trade_idea_client = raw_client if client is None else None
+            gate = getattr(blackboard, "budget_gate", None)
+            if gate is None:
+                raise ValueError("Trade Idea requires a per-run LLM budget gate")
+            self.client = gate.wrap_client(raw_client, role="specialist:" + self.name)
+        else:
+            self.client = client or OpenRouterClient(timeout=TIMEOUT_SPECIALIST_S, max_retries=1)
+            self._owned_weekly_client = self.client if client is None else None
 
     def _model_for_round(self, round_n):
         """Ripipeline 15/07 (ok PM): R0 recon sul modello leggero, analisi R1 e
         replica R2 sul modello pieno del desk. 05/09: entrambi dal .env
         (CONSIGLIERE_R0_MODEL; CONSIGLIERE_<DESK>_MODEL o CONSIGLIERE_MODEL)."""
+        if getattr(self.blackboard, "run_scope", "weekly") == "trade_idea":
+            from bellomberg.agents.trade_idea import model_for_role
+            return model_for_role("specialist")
         return _modello_llm("consigliere", self.name, round_n)
 
     def _build_tools_schema(self):
+        if (getattr(self, '_task_context', None) or {}).get('kind') == 'research_objection_completion':
+            from bellomberg.agents.trade_idea import trade_idea_review_tools
+            from bellomberg.valuation.company_dossier import company_dossier_tool_schema
+            return [tool for tool in trade_idea_review_tools(self.name)
+                    if tool['name'] in RESEARCH_REPLY_LOCAL_TOOLS] + [company_dossier_tool_schema(), {
+                'name': 'ask_specialist', 'description': 'Read an already paid desk report; no new consultation.',
+                'input_schema': {'type': 'object', 'properties': {
+                    'specialist': {'type': 'string'}, 'question': {'type': 'string'}},
+                    'required': ['specialist', 'question']}}]
         # #195: REGISTRO RICCO delle chat (36 tool, paid data) col subset per-agente.
         # I nomi specialista (quant/macro/options/eventdesk/crypto/fundamentals)
         # coincidono con gli agent_id delle chat: stesso arsenale del Capo interattivo.
@@ -1055,6 +1247,8 @@ class Specialist:
             from bellomberg.agents import chat_tools
             filtered = list(chat_tools.get_tools_for_agent(self.name))
         except Exception as e:
+            if getattr(self.blackboard, "run_scope", "weekly") == "trade_idea":
+                raise RuntimeError("Trade Idea tool registry unavailable") from e
             # P1 26/07: ripiego sul registro LEGACY (21 nomi contro i 51 vivi) e
             # filtrato per `tools_used`, che e' documentazione stantia (fundamentals
             # ne dichiara 13 e ne riceve 24). Prima era muto: ora e' dichiarato su
@@ -1064,6 +1258,33 @@ class Specialist:
                 "_build_tools_schema[" + self.name + "]", e,
                 "registro LEGACY agent_tools al posto di chat_tools: " +
                 str(len(filtered)) + " tool invece del subset vivo")
+        from bellomberg.valuation.company_dossier import company_dossier_tool_schema
+        filtered.append(company_dossier_tool_schema())
+        if callable(getattr(self.blackboard, "company_source_session", None)):
+            from bellomberg.agents.company_research_tools import company_source_tools
+            filtered.extend(company_source_tools())
+        if getattr(self.blackboard, "run_scope", "weekly") == "trade_idea":
+            # A Trade Idea is research on one accepted candidate, never a channel
+            # for writing guidance or research notes before the result is routed.
+            filtered = [tool for tool in filtered
+                        if tool["name"] not in {"add_guidance", "add_research_note"}]
+            if (self.name == "fundamentals" and self.blackboard.current_round == 1
+                    and getattr(self.blackboard, "model_phase", None) == "building"):
+                from copy import deepcopy
+                for index, tool in enumerate(filtered):
+                    if tool["name"] == "get_valuation":
+                        tool = deepcopy(tool)
+                        tool["description"] = (
+                            "Put scenario motivations in submit_candidate_model_plan.plan.scenario_rationale "
+                            "in the explicit plan before compilation. The final plan is compiled automatically after R1. "
+                            "Use get_valuation(ticker) only to compile it earlier when final.")
+                        tool["input_schema"] = {
+                            "type": "object", "properties": {"ticker": tool["input_schema"]["properties"]["ticker"]},
+                            "required": ["ticker"], "additionalProperties": False}
+                        filtered[index] = tool
+                        break
+            from bellomberg.agents.trade_idea import trade_idea_review_tools
+            filtered.extend(trade_idea_review_tools(self.name))
         # review 15/07: i nomi dei colleghi derivano dal roster VERO, non da una
         # lista hardcoded (la fusione 7->6 ha mostrato quante copie ne giravano)
         try:
@@ -1076,7 +1297,7 @@ class Specialist:
             _dichiara_fallback("_build_tools_schema[" + self.name + "].peers", e,
                                "roster HARDCODED (puo' essere stantio) al posto di "
                                "ALL_SPECIALISTS")
-        filtered.append({
+        ask_tool = {
             "name": "ask_specialist",
             "description": ("Read the latest report from another specialist on the team. "
                             "Available: " + _peers + " - plus 'red_team' (the adversarial "
@@ -1090,7 +1311,26 @@ class Specialist:
                 },
                 "required": ["specialist", "question"]
             }
-        })
+        }
+        if getattr(self.blackboard, "run_scope", "weekly") == "trade_idea":
+            ask_tool["description"] = (
+                "R1: Fundamentals, while building the model, sends a real targeted question to a peer. "
+                "Supply the explicit draft assumptions and evidence IDs. R2: read the peer's latest report; "
+                "no new consultation is dispatched. R0: unavailable. Available: " + _peers)
+            ask_tool["input_schema"]["properties"].update({
+                "draft_assumptions": {"type": "object"},
+                "evidence_refs": {"type": "array", "items": {"type": "string"}},
+            })
+            ask_tool["input_schema"]["required"].extend(["draft_assumptions", "evidence_refs"])
+            if self.name == "fundamentals" and getattr(self.blackboard, "model_phase", None) == "building":
+                ask_tool["input_schema"]["properties"]["supersedes_failed"] = {
+                    "type": "object", "additionalProperties": False,
+                    "description": "Replace only a failed current consultation or a known-cost native max_tokens partial with a new economic question after receiving at least three complete peer answers in a prior native turn; preserve its audit.",
+                    "properties": {"consultation_id": {"type": "string"},
+                        "consultation_row_sha256": {"type": "string"}, "rationale": {"type": "string"},
+                        "after_consultation_ids": {"type": "array", "items": {"type": "string"}}},
+                    "required": ["consultation_id", "consultation_row_sha256", "rationale", "after_consultation_ids"]}
+        filtered.append(ask_tool)
         filtered.append({
             "name": "read_blackboard",
             # 21/08: diceva "Read the full blackboard - all specialists' latest
@@ -1108,12 +1348,103 @@ class Specialist:
                             "stesso tetto e sopra la soglia esce con [truncated])."),
             "input_schema": {"type": "object", "properties": {}}
         })
+        if is_research_mode(self.blackboard):
+            filtered = [tool for tool in filtered if tool['name'] not in RESEARCH_UNAVAILABLE_TOOLS]
+            if getattr(self.blackboard, 'run_scope', 'weekly') == 'trade_idea':
+                ask_tool['description'] = (
+                    'Read a colleague\'s actual research report; preserve its evidence and dissent. '
+                    'R0 is independent. R1 Fundamentals can compare the completed peer reports. '
+                    'R2 addresses the common sealed research thesis and Red Team objections.')
+                ask_tool['input_schema']['required'] = ['specialist', 'question']
+                ask_tool['input_schema']['properties'].pop('supersedes_failed', None)
         return filtered
 
     def _execute_meta_tool(self, name, input_):
+        task = getattr(self, '_task_context', None) or {}
+        if task.get('kind') == 'research_objection_completion':
+            if name not in RESEARCH_REPLY_LOCAL_TOOLS:
+                return {'ok': False, 'error': 'Reply completion only reads acquired evidence and records missing replies.'}
+            if name == 'respond_trade_idea_objection':
+                ident = input_.get('objection_id') if isinstance(input_, dict) else None
+                row = next((row for row in self.blackboard.data.get('_objections', [])
+                            if row['objection']['id'] == ident), None)
+                if (ident in task['objection_ids'] and row is not None and row.get('response')
+                        and row['objection']['desk'] == self.name
+                        and all(row.get(key) == input_.get(key) for key in
+                                ('response', 'state', 'evidence_refs', 'model_revision_id'))):
+                    return {'ok': True, 'objection_id': ident, 'state': row['state']}
+                if ident not in task['objection_ids'] or row is None or row.get('response'):
+                    return {'ok': False, 'error': 'Only the exact still-missing replies in this task may be recorded.'}
+        if is_research_mode(self.blackboard) and name in RESEARCH_UNAVAILABLE_TOOLS:
+            return {'ok': False, 'status': 'not_available_in_research_mode',
+                    'reason': 'This run produces company research and memo/PDF; workbook operations are disabled.'}
+        if ((getattr(self, "_task_context", None) or {}).get("kind") == "model_authoring_completion"
+                and name not in MODEL_AUTHORING_LOCAL_TOOLS):
+            return {"ok": False, "error": "This model-completion phase only reads admitted evidence and authors/compiles the plan. Paid peer consultations and external research are preserved, not repeated."}
+        if name == "get_valuation":
+            from bellomberg.agents.company_research_tools import source_research_guard
+            # Include compilation AND record_valuation, so another desk cannot
+            # admit a source between choosing the dossier and sealing its model.
+            with source_research_guard(self.blackboard):
+                return self._execute_meta_tool_unlocked(name, input_)
+        return self._execute_meta_tool_unlocked(name, input_)
+
+    def _execute_meta_tool_unlocked(self, name, input_):
+        from bellomberg.agents.company_research_tools import TOOL_NAMES, dispatch_company_source
+        if name in TOOL_NAMES:
+            return dispatch_company_source(self.blackboard, name, input_, max_chars=_tetto_tool_result(),
+                consultation=(getattr(self, "_task_context", None) or {}).get("consultation") is True)
+        if name == "read_company_dossier":
+            from bellomberg.valuation.company_dossier import read_company_dossier
+            return read_company_dossier(self.blackboard, input_, max_chars=_tetto_tool_result())
+        consultation = (getattr(self, "_task_context", None) or {}).get("consultation") is True
+        plain_valuation = (name == "get_valuation" and input_.get("method_records") is None
+            and not input_.get("analysis_context") and not any(
+                value not in (None, "", [], {}) for key, value in input_.items()
+                if key not in ("ticker", "analysis_context", "method_records")))
+        if consultation and (name in {"ask_specialist", "review_candidate_model",
+                "submit_candidate_model_plan", "respond_trade_idea_objection",
+                "read_candidate_model_consultation", "add_guidance", "add_research_note"}
+                or name == "get_valuation" and (not plain_valuation
+                    or getattr(self.blackboard, "run_scope", "weekly") != "trade_idea")):
+            return {"ok": False, "status": "blocked_consultation",
+                    "reason": "A targeted consultation cannot recurse or mutate the common model."}
+        if (getattr(self.blackboard, "run_scope", "weekly") == "trade_idea"
+                and name in {"review_candidate_model", "respond_trade_idea_objection",
+                             "get_candidate_model_inputs", "submit_candidate_model_plan",
+                             "read_candidate_model_consultation", "read_candidate_source"}):
+            from bellomberg.agents.trade_idea import handle_trade_idea_review_tool
+            return handle_trade_idea_review_tool(self.blackboard, self.name, name, input_)
+        research = is_research_mode(self.blackboard)
+        building_owner = (self.name == "fundamentals" and self.blackboard.current_round == 1
+                          and (research or getattr(self.blackboard, "model_phase", None) == "building"))
+        independent = getattr(self.blackboard, "independent_round", None)
+        if (getattr(self.blackboard, "run_scope", "weekly") == "trade_idea"
+                and (self.blackboard.current_round == 0 or independent in (0, 1)
+                     and self.blackboard.current_round <= independent and not building_owner)
+                and name in {"ask_specialist", "read_blackboard"}):
+            return {"status": "blocked_independent_round", "ok": False,
+                    "reason": "Complete the independent first analysis before reading another desk."}
+        if (getattr(self.blackboard, "run_scope", "weekly") == "trade_idea"
+                and name in {"add_guidance", "add_research_note"}):
+            return {"ok": False, "error": "Trade Idea: tool di scrittura disabilitato"}
         if name == "ask_specialist":
             target = input_.get("specialist", "").lower()
             q = input_.get("question", "")
+            if (getattr(self.blackboard, "run_scope", "weekly") == "trade_idea"
+                    and building_owner and not research):
+                draft, refs = input_.get("draft_assumptions"), input_.get("evidence_refs")
+                if (not isinstance(q, str) or not q.strip() or not isinstance(draft, dict)
+                        or not isinstance(refs, list) or any(not isinstance(ref, str) for ref in refs)):
+                    return {"ok": False, "status": "invalid_consultation",
+                            "reason": "Question, draft_assumptions and evidence_refs are required."}
+                callback = getattr(self.blackboard, "consult_specialist", None)
+                if not callable(callback):
+                    return {"ok": False, "status": "consultation_unavailable",
+                            "reason": "No live consultation callback is bound to this run."}
+                recovery = {"supersedes_failed": input_["supersedes_failed"]} if "supersedes_failed" in input_ else {}
+                return callback(requester=self.name, target=target, question=q,
+                                draft_assumptions=draft, evidence_refs=refs, **recovery)
             latest = self.blackboard.get_latest(target)
             if not latest:
                 if target in ("news", "politics"):
@@ -1167,10 +1498,26 @@ class Specialist:
                 # V6 Lotto 3 (review B4): il registro guidance sa CHI ha scritto
                 if name == "get_valuation":
                     ticker = str(input_.get("ticker") or "").upper()
+                    target = getattr(self.blackboard, "target_ticker", None)
+                    if getattr(self.blackboard, "run_scope", "weekly") == "trade_idea" and ticker != target:
+                        return {"ok": False, "error": "Trade Idea valuation ticker fuori scope: " + ticker,
+                                "exclude_from_action_table": True}
                     existing = self.blackboard.valuation_results.get(ticker) or {}
                     plain_request = (input_.get("method_records") is None and not input_.get("analysis_context")
                         and not any(v not in (None, "", [], {}) for k, v in input_.items()
                                     if k not in ("ticker", "analysis_context", "method_records")))
+                    if getattr(self.blackboard, "run_scope", "weekly") == "trade_idea":
+                        if building_owner and not consultation:
+                            builder = getattr(self.blackboard, "build_candidate_model", None)
+                            if not callable(builder):
+                                return {"ok": False, "error": "Trade Idea model builder is not bound to this run."}
+                            return builder(input_)
+                        if not plain_request:
+                            return {"ok": False, "error": "Trade Idea model is read-only; use review_candidate_model for a motivated revision."}
+                        if not existing:
+                            return {"ok": False, "error": "Verified initial candidate model is absent; research cannot create it."}
+                        return {"ok": True, "data": {**existing, "reused_in_run": True},
+                                "_source": "get_valuation: exact Trade Idea candidate generation"}
                     if (plain_request
                             and existing.get("request_origin") == "committee-orchestrator"):
                         result = chat_tools._stamp({**existing, "reused_in_run": True},
@@ -1194,6 +1541,9 @@ class Specialist:
                     return result
                 return chat_tools.dispatch(name, input_, caller="specialista-run:" + self.name)
             except Exception as e:
+                if getattr(self.blackboard, "run_scope", "weekly") == "trade_idea":
+                    return {"ok": False, "error": "Trade Idea tool unavailable: "
+                            + type(e).__name__ + ": " + str(e)[:180]}
                 if name == "get_valuation":
                     failure = {"ok": False, "error": "Acquisizione/valutazione settoriale KO: " + str(e),
                                "exclude_from_action_table": True}
@@ -1240,6 +1590,131 @@ class Specialist:
         return None
 
     def _build_round_context(self, round_n):
+        task = getattr(self, '_task_context', None) or {}
+        if task.get('kind') == 'research_objection_completion':
+            from bellomberg.agents.trade_idea import review_evidence_catalog
+            descriptor = self.blackboard.data['_research_reply_completions'][self.name]
+            return ('RESEARCH OBJECTION COMPLETION: preserve the paid reports and their uncertainty. '
+                'Register a genuine response to EVERY supplied material objection using '
+                'respond_trade_idea_objection and its exact ID before finishing. An unresolved question '
+                'can remain state=open, or a justified concession state=conceded, with a substantive '
+                'explanation; do not invent evidence or force closure. Use state=answered only when '
+                'the supplied exact evidence IDs support the reply. Do not repeat broad research. '
+                'All tools are restricted to already acquired evidence and missing replies.\n'
+                + json.dumps({'task': task, 'objections': descriptor['objections'],
+                    'original_R2_report': self.blackboard.read(self.name, 2),
+                    'sealed_research': research_context(self.blackboard),
+                    'exact_evidence_ids': review_evidence_catalog(self.blackboard)}, ensure_ascii=False))
+        if is_research_mode(self.blackboard) and getattr(self.blackboard, 'run_scope', 'weekly') == 'trade_idea':
+            board = self.blackboard
+            consultation = (getattr(self, '_task_context', None) or {}).get('consultation') is True
+            facts = {'target_ticker': board.target_ticker, 'pm_view': getattr(board, 'pm_view', None),
+                'candidate_history': getattr(board, 'candidate_history', None),
+                'decision_context': board.data.get('_decision_context'),
+                'portfolio_context': board.data.get('_portfolio_context'),
+                'own_recon': board.read(self.name, 0) if round_n else None}
+            if round_n == 2:
+                facts['shared_research'] = research_context(board)
+                facts['objections'] = [row for row in board.data.get('_objections', [])
+                                       if row.get('objection', {}).get('desk') == self.name]
+            if round_n and (round_n == 2 or self.name == 'fundamentals'):
+                facts['peer_reports'] = board.summary_for_specialist(self.name)
+            instruction = ('Answer the targeted research question with evidence and uncertainty.' if consultation else
+                'R0: independently collect and read primary evidence, observed data and coverage gaps.' if round_n == 0 else
+                'R1: write your independent domain analysis. Fundamentals must read the statements, compare actual '
+                'peer reports and make assumptions and falsification conditions explicit.' if round_n == 1 else
+                'R2: answer the material Red Team objections on this exact sealed dossier and R1 thesis; '
+                'state concessions or maintained judgement with evidence and preserve source references.')
+            return ('TRADE IDEA: research on the exact accepted candidate only. PM view is a thesis to test. '
+                'Use [src: tool] with dates, units and currency. Missing documents/consensus are explicit gaps; '
+                'no workbook or mandatory AI fair value. Mandate, prices, risk and sizing controls remain binding.\n'
+                + json.dumps(facts, ensure_ascii=False, default=str) + '\n' + instruction)
+        if getattr(self.blackboard, "run_scope", "weekly") == "trade_idea":
+            target = self.blackboard.target_ticker
+            view = self.blackboard.pm_view or "(nessuna view fornita)"
+            history = self.blackboard.candidate_history or "(storico candidato non disponibile: dichiarare il limite)"
+            decision_context = self.blackboard.data.get("_decision_context")
+            book_context = self.blackboard.data.get("_portfolio_context")
+            other = _blocco_blackboard(self.blackboard.summary_for_specialist(self.name)) if round_n else ""
+            red = self.blackboard.get_latest("red_team") if round_n == 2 else None
+            from bellomberg.valuation.sector_analysis import valuation_results_block
+            from bellomberg.agents.trade_idea import candidate_model_context
+            own_recon = self.blackboard.read(self.name, 0) if round_n else None
+            addressed = [row for row in self.blackboard.data.get("_objections", [])
+                         if row["objection"]["desk"] == self.name]
+            building_owner = (self.name == "fundamentals" and round_n == 1
+                              and getattr(self.blackboard, "model_phase", None) == "building")
+            model_heading = ("Candidate model draft (not_created until get_valuation compiles it):\n"
+                             if building_owner else "Exact read-only common model:\n")
+            round_instruction = (
+                "R1 targeted consultation: answer only the specific question using the supplied "
+                "draft assumptions and retrieved evidence, in the requested format. "
+                "This consultation is exempt from the generic complete R1 domain report; "
+                "retain evidence gaps, dissent and all existing constraints. "
+                if round_n == 1 and (getattr(self, "_task_context", None) or {}).get("consultation") is True else
+                "R1 Fundamentals: costruisci le assunzioni economiche esplicite. Usa "
+                "get_candidate_model_inputs, poi submit_candidate_model_plan per salvare i driver. "
+                "Salva via via i gruppi di driver appena sono pronti, prima di altre letture: "
+                "non aspettare il report finale per rendere persistenti le assunzioni. "
+                "Prima leggi contract_section=method/evidence dello stesso tool: sono i formati "
+                "esatti del compilatore, non solo i nomi dei driver. Per FCFF leggi anche "
+                "accounting/shares/opening_nwc. Usa contract_section=draft_validation per "
+                "controllare gratis la bozza e correggere gli errori prima di generare Excel. "
+                "La base dichiarata espone gli input gia' presenti nelle fonti qualificate, "
+                "con provenienza e kind originali: non sono assunzioni approvate. "
+                "read_candidate_source legge il testo esatto dei documenti gia' ammessi: "
+                "usa document_id dal catalogo e query letterale per trovare le prove. "
+                "Non acquisire di nuovo un documento gia' disponibile. "
+                "plan.model e' una mappa nome-driver -> envelope; plan.scenarios contiene "
+                "bear/base/bull, ciascuno come mappa di driver; plan.scenario_rationale contiene "
+                "bear/base/bull come testi motivati. Per exposure usa solo model, scenarios={} "
+                "e analysis_rationale come testo motivato. "
+                "Gli scopi sono model/bear/base/bull (solo model per exposure), mai il ticker. "
+                "Raggruppa i quattro manifest in UNA risposta con piu' tool call; usa solo "
+                "i nomi driver effettivi del manifest. Non ripetere una lettura gia' completa. "
+                "Passa plan come OGGETTO, senza serializzarlo in una stringa. Salva "
+                "gruppi di driver in piu' submit parziali: si accumulano nel piano finale. "
+                "Usa offset per una contract_section paginata oppure un singolo driver disponibile; "
+                "un driver senza base va scritto esplicitamente dalle prove. "
+                "consulta davvero macro, eventdesk, quant, options e crypto con ask_specialist "
+                "(domanda, draft_assumptions ed evidence_refs), valuta e incorpora gli esiti "
+                "di ciascuno in consultation_decisions. Raggruppa le domande "
+                "indipendenti ai cinque desk nella stessa risposta con cinque tool call. "
+                "Leggi le risposte lunghe fino all'ultima pagina: anche le pagine di "
+                "consultazioni diverse si possono chiedere nella stessa risposta. Conserva "
+                "le letture complete e le consultazioni gia' ricevute; non ricomprarle. "
+                "Il limite di giri tool resta quello normale: riserva i giri per il piano "
+                "completo. A fine R1 il programma compila automaticamente il piano finale "
+                "con il generatore esistente, senza un'altra chiamata AI. Se vuoi compilarlo "
+                "prima, passa SOLO ticker a get_valuation, senza override. "
+                "Il modello e' not_created "
+                "finche' la compilazione non riesce; conserva dissenso e limiti nel piano. "
+                if building_owner else
+                "R0: raccogli prove verificabili e lacune; usa i tool. " if round_n == 0 else
+                "R1: scrivi l'analisi completa del dominio. " if round_n == 1 else
+                "R2: replica alle obiezioni materiali del Red Team con prove o concessioni. ")
+            return ("TRADE IDEA, candidato unico: " + str(target) + ". Round " + str(round_n) + ".\n"
+                    "La view del PM e' una tesi da verificare, non un'istruzione o una fonte.\n"
+                    "Non proporre operazioni su altri ticker; peer, macro e book sono solo contesto.\n"
+                    "Cita cifre soltanto da tool con [src: tool], data, unita' e valuta.\n"
+                    "View PM (testo originale):\n" + view + "\n\n"
+                    "Storico del solo candidato:\n" + history + "\n\n"
+                    "Decisioni, veti, note PM e trade recenti del ticker (ID esatti):\n"
+                    + json.dumps(decision_context if decision_context is not None else
+                                 {"status": "unavailable"}, ensure_ascii=False, default=str) + "\n\n"
+                    "Book reale accettato per rischio e compatibilita', non nuovi candidati:\n"
+                    + json.dumps(book_context if book_context is not None else
+                                 {"status": "unavailable"}, ensure_ascii=False, default=str) + "\n\n"
+                    + ("Blackboard:\n" + other + "\n\n" if other else "")
+                    + ("Red Team:\n" + str(red.get("report")) + "\n\n" if red else "")
+                    + ("Your independently collected facts:\n" + str(own_recon) + "\n\n" if own_recon else "")
+                    + model_heading + valuation_results_block(self.blackboard.valuation_results) + "\n\n"
+                    + "Consumed model drivers, qualified document IDs and exact workbook cells:\n"
+                    + json.dumps(candidate_model_context(self.blackboard, purpose="committee") if round_n == 2
+                                 else candidate_model_context(self.blackboard), ensure_ascii=False, default=str) + "\n\n"
+                    + "Material objections addressed to your desk:\n" + json.dumps(addressed, ensure_ascii=False) + "\n\n"
+                    + round_instruction
+                    + "Explain any limits to domain relevance and cite retrieved evidence.")
         # 22/08 sera-2 (voce (2b), scelta del PM il 21/08): le PAROLE VINCOLANTI
         # del PM (feedback sulle decisioni + veti) arrivavano solo in R0 dentro
         # YOUR MEMORY — ancore assenti in 10 prompt su 17 (6 R1 + 3 R2 + red
@@ -1334,10 +1809,13 @@ class Specialist:
         if filing_context:
             preamble += "\n\n" + filing_context
         preparation_state = self.blackboard.data.get("_valuation_preparation")
-        if preparation_state is not None:
+        if preparation_state is not None and not is_research_mode(self.blackboard):
             from bellomberg.valuation.preparation_runtime import preparation_status_text
             preamble += "\n\n" + preparation_status_text(preparation_state, language=self.blackboard.language)
-        if round_n == 2 and self.blackboard.valuation_results:
+        if round_n == 2 and is_research_mode(self.blackboard):
+            preamble += '\n\nSEALED COMPANY RESEARCH:\n' + json.dumps(
+                research_context(self.blackboard), ensure_ascii=False, default=str)
+        elif round_n == 2 and self.blackboard.valuation_results:
             from bellomberg.valuation.sector_analysis import valuation_results_block
             preamble += "\n\n" + valuation_results_block(self.blackboard.valuation_results)
         # SCORE DETERMINISTICO (#186): ancora numerica calcolata in codice, l'LLM narra.
@@ -1363,9 +1841,442 @@ class Specialist:
         return preamble + "\n\nGo. Use tools. Then write your report."
 
     @scoped_language
-    def run(self, round_n):
+    def run(self, round_n, *, task_context=None, publish_report=True):
+        consultation = isinstance(task_context, dict) and task_context.get("consultation") is True
+        trade_idea = getattr(self.blackboard, "run_scope", "weekly") == "trade_idea"
+        self.run_result_status = "failed"
+        if consultation:
+            self.consultation_result_status = "failed"
+            self.consultation_terminal_response = None
+        if task_context is not None and not isinstance(task_context, dict):
+            raise ValueError("task_context must be an explicit object")
+        context = json.loads(json.dumps(task_context, allow_nan=False)) if task_context is not None else None
+        previous_context = getattr(self, "_task_context", None)
+        self._task_context = context
+        try:
+            with request_scope(getattr(self.blackboard, "request_journal", None),
+                    phase=("consultation" if consultation else "specialist"),
+                    agent=self.name, round_n=round_n):
+                return self._run_loop(round_n, task_context=context, publish_report=publish_report)
+        except Exception as exc:
+            self.run_result_status = "failed"
+            _record_run_failure(self.blackboard, exc, self.name, round_n)
+            if consultation:
+                self.consultation_result_status = "failed"
+                self.consultation_terminal_response = None
+            if isinstance(exc, ConfigurazioneLLMMancante):
+                message = "[ERROR " + self.name + " round " + str(round_n) + "]: " + str(exc)
+                if publish_report:
+                    self.blackboard.write(self.name, round_n, message)
+                    self.blackboard.mark_specialist_error(self.name, str(exc))
+                return message
+            raise
+        finally:
+            self._task_context = previous_context
+
+    def _is_trade_idea_model_author(self, round_n, task_context=None):
+        return (self.name == "fundamentals" and round_n == 1
+                and not is_research_mode(self.blackboard)
+                and getattr(self.blackboard, "run_scope", None) == "trade_idea"
+                and getattr(self.blackboard, "model_phase", None) == "building"
+                and (task_context or {}).get("consultation") is not True)
+
+    def _max_tokens_for_round(self, round_n, task_context=None):
+        """Approved output space for every desk; explicit legacy R2 contracts stay pinned."""
+        if (is_research_mode(self.blackboard) and getattr(self.blackboard, 'run_scope', None) == 'trade_idea'
+                and self.name == 'fundamentals' and round_n == 1
+                and (task_context or {}).get('consultation') is not True):
+            return MAX_TOKENS_TRADE_IDEA_AUTHOR
+        if (getattr(self.blackboard, "run_scope", "weekly") == "weekly"
+                and self.name == "fundamentals" and round_n in (1, 2)):
+            return MAX_TOKENS_FUNDAMENTALS_ANALYSIS
+        flag = "_trade_idea_r2_completion_limits"
+        if not hasattr(self.blackboard, flag):
+            return (MAX_TOKENS_TRADE_IDEA_AUTHOR if self._is_trade_idea_model_author(round_n, task_context)
+                    else MAX_TOKENS_SPECIALIST)
+        limits = getattr(self.blackboard, flag)
+        if (not isinstance(limits, dict)
+                or set(limits) != {"scope", "round", "model_ref", "max_tokens_by_desk"}
+                or limits.get("scope") != "trade_idea_r2_final_completion_v1"
+                or type(limits.get("round")) is not int or limits["round"] != 2
+                or getattr(self.blackboard, "run_scope", None) != "trade_idea" or round_n != 2
+                or limits.get("max_tokens_by_desk") != {"macro": 65536, "crypto": 65536}
+                or any(type(value) is not int for value in limits["max_tokens_by_desk"].values())):
+            raise ValueError("Invalid private Trade Idea R2 completion token scope")
+        from bellomberg.agents.trade_idea import _verified_candidate_valuations
+        verified = _verified_candidate_valuations(self.blackboard)
+        fields = ("snapshot_id", "generation_id", "workbook_sha256")
+        if (len(verified) != 1 or not isinstance(limits["model_ref"], dict)
+                or set(limits["model_ref"]) != set(fields)
+                or limits["model_ref"] != {key: verified[0][key] for key in fields}):
+            raise ValueError("Private R2 completion requires the current exact verified workbook")
+        if self.name not in limits["max_tokens_by_desk"]:
+            return MAX_TOKENS_SPECIALIST
+        if not isinstance(task_context, dict) or task_context.get("purpose") != "final_completion":
+            raise ValueError("Private R2 token scope requires an explicit final-completion task")
+        return limits["max_tokens_by_desk"][self.name]
+
+    def _max_tool_iterations_for_round(self, round_n, task_context=None):
+        """Extra tool turns only for the native Trade Idea model author, never consultations."""
+        if (is_research_mode(self.blackboard) and getattr(self.blackboard, 'run_scope', None) == 'trade_idea'
+                and self.name == 'fundamentals' and round_n == 1
+                and (task_context or {}).get('consultation') is not True):
+            return MAX_TOOL_ITERS_TRADE_IDEA_AUTHOR
+        if self._is_trade_idea_model_author(round_n, task_context):
+            return MAX_TOOL_ITERS_TRADE_IDEA_AUTHOR
+        return MAX_TOOL_ITERS_SPECIALIST
+
+    def _request_system(self, system_round):
+        style = SPECIALIST_STYLE_RULES
+        if is_research_mode(self.blackboard):
+            style = style.replace('get_valuation (il TUO DCF a sub-settori buy-side, usalo per il fair value invece di stimare a occhio), ', '')
+        system = system_round + "\n\n" + prompt_for_language(style)
+        if self._arsenale_degradato:
+            system += ("\n\n[!! ARSENALE DEGRADATO - DICHIARALO NEL REPORT] "
+                       + self._arsenale_degradato +
+                       " -> stai lavorando con MENO TOOL del previsto: apri il "
+                       "report con questa riga, elenca cosa NON hai potuto "
+                       "verificare e NON colmare i buchi a memoria.")
+        return system
+
+    def _prepare_report_completion(self, fields, key, saved):
+        """Derive one explicitly authorized final response from a verified paid turn."""
+        descriptor = getattr(self.blackboard, "specialist_response_recovery", None)
+        if not descriptor or descriptor.get("checkpoint_key") != key:
+            historical = (saved or {}).get("response_recovery")
+            if (not historical or saved.get("status") != "complete"
+                    or historical.get("checkpoint_key") != key):
+                return fields, saved
+            gate = getattr(self.blackboard, "budget_gate", None)
+            if gate is None or not gate.store.accepted_response_recovery(self.blackboard.run_id, historical):
+                raise ValueError("completed response recovery no longer has its accepted historical grant")
+            descriptor = historical
+        if descriptor.get("kind") == "failed_model_authoring":
+            return self._prepare_failed_model_completion(fields, key, saved, descriptor)
+        if (saved is None or fields["run_scope"] != "trade_idea"
+                or fields["round"] not in (0, 1) or fields["task_context"] is not None
+                or fields["model_phase"] != "research" or fields["review_model_ref"] is not None
+                or descriptor.get("desk") != self.name or descriptor.get("round_n") != fields["round"]
+                or fields["max_tokens"] != descriptor.get("replacement_max_tokens")):
+            raise ValueError("report completion scope differs from its authorization")
+        history = self.blackboard.data.get("_specialist_response_recovery_history", [])
+        if not isinstance(history, list):
+            raise ValueError("report completion history is malformed")
+        previous = [item for item in history if item.get("request_id") == descriptor["request_id"]]
+        derived = saved.get("response_recovery") is not None
+        if derived:
+            if (saved["response_recovery"] != descriptor or len(previous) != 1
+                    or previous[0].get("descriptor") != descriptor):
+                raise ValueError("report completion authorization or history differs")
+            original = deepcopy(previous[0]["checkpoint"])
+            seal = original.pop("sha256", None)
+        else:
+            if previous:
+                raise ValueError("report completion history exists without its derived checkpoint")
+            original = deepcopy(saved)
+            seal = _checkpoint_digest(original)
+        if (seal != descriptor["specialist_checkpoint_sha256"] or seal != _checkpoint_digest(original)
+                or original.get("contract") != descriptor["original_contract"]
+                or original.get("status") != "truncated" or original.get("forced_report") is not True
+                or original.get("iteration") != fields["max_tool_iters"]
+                or original.get("pending_tools") or original.get("inflight_tools")
+                or original.get("usage_unknown") is not False
+                or original.get("thinking") != {"type": "effort", "effort": "max"}
+                or original.get("thinking_prima") is not None):
+            raise ValueError("original report completion evidence differs")
+        old_cap, _ = _checkpoint_output_contract(fields, original)
+        if (old_cap >= fields["max_tokens"] or old_cap not in (16000, 64000, 65536)
+                or descriptor.get("original_max_tokens") not in (None, old_cap)):
+            raise ValueError("report completion output contract differs")
+        self.blackboard.budget_gate.validate_response_recovery(descriptor, {
+            "model": fields["model"], "max_tokens": old_cap, "thinking": original["thinking"],
+            "system": self._request_system(fields["system"]), "tools": fields["tools"],
+            "messages": original["messages"], "tool_choice": {"type": "none"},
+        }, role="specialist:" + self.name)
+        messages = deepcopy(original["messages"])
+        nudge = ("[AUTHORIZED REPORT COMPLETION] The previous final response reached its output limit. "
+                 "Complete the report now using only the evidence already present in this conversation. "
+                 "Tools remain disabled. Keep unverifiable facts explicit as unavailable; do not invent data.")
+        if isinstance(messages[-1]["content"], list):
+            messages[-1]["content"].append({"type": "text", "text": nudge})
+        else:
+            messages[-1]["content"] += "\n\n" + nudge
+        fields = {**fields, "response_recovery": deepcopy(descriptor)}
+        if derived:
+            # Check the derivation as well as the historical proof. A valid
+            # old receipt cannot authorize substituted context on a second resume.
+            final_iteration = fields["max_tool_iters"]
+            at_final = saved.get("iteration") == final_iteration
+            if (saved.get("response_recovery_call_offset") != 1
+                    or saved.get("iteration") not in (final_iteration - 1, final_iteration)
+                    or any(saved.get(name) != original.get(name) for name in
+                        ("version", "initial_context", "forced_report", "tool_calls", "nudge_collasso",
+                         "retry_529", "retry_vuoto", "thinking", "thinking_prima", "pending_tools", "inflight_tools"))):
+                raise ValueError("derived report completion state differs")
+            if at_final:
+                if isinstance(messages[-1]["content"], list):
+                    messages[-1]["content"].append({"type": "text", "text": _forced_report_nudge(final_iteration)})
+                else:
+                    messages[-1]["content"] += "\n\n" + _forced_report_nudge(final_iteration)
+                if saved.get("status") not in ("complete", "truncated", "failed"):
+                    raise ValueError("derived report terminal status requires receipt review")
+                usage = saved.get("usage") or {}
+                ids, original_ids = usage.get("request_ids"), original["usage"].get("request_ids")
+                if (not isinstance(ids, list) or len(ids) != len(original_ids) + 1
+                        or ids[:-1] != original_ids or saved.get("usage_unknown") is not False):
+                    raise ValueError("derived report completion request accounting differs")
+                self.blackboard.budget_gate.store.validate_specialist_usage(
+                    self.blackboard.run_id, self.name, usage)
+            elif (saved.get("status") != "ready" or saved.get("usage") != original.get("usage")
+                    or saved.get("usage_unknown") != original.get("usage_unknown")
+                    or saved.get("report") is not None):
+                raise ValueError("derived report completion usage or boundary differs")
+            if saved.get("messages") != messages:
+                raise ValueError("derived report completion messages differ")
+            return fields, saved
+        original_sealed = {**deepcopy(original), "sha256": seal}
+        replacement = {**deepcopy(original), "contract": _checkpoint_digest(fields),
+            "max_tokens": fields["max_tokens"], "messages": messages,
+            "iteration": fields["max_tool_iters"] - 1, "status": "ready", "report": None,
+            "response_recovery": deepcopy(descriptor), "response_recovery_call_offset": 1}
+        self.blackboard.data.setdefault("_specialist_response_recovery_history", []).append({
+            "request_id": descriptor["request_id"], "descriptor": deepcopy(descriptor),
+            "checkpoint": original_sealed})
+        return fields, replacement
+
+    def _prepare_failed_model_completion(self, fields, key, saved, descriptor):
+        """Retry the selected error once, retaining the native author turn count."""
+        if (saved is None or fields["run_scope"] != "trade_idea" or self.name != "fundamentals"
+                or fields["round"] != 1 or fields["model_phase"] != "building"
+                or fields["review_model_ref"] is not None
+                or fields["task_context"] != descriptor.get("task_context")
+                or (fields["task_context"] or {}).get("kind") != "model_authoring_completion"
+                or fields["max_tokens"] != 128000 or fields["max_tool_iters"] != 30
+                or descriptor.get("mode") != "model_authoring_error_retry"
+                or descriptor.get("original_max_tokens") != fields["max_tokens"]
+                or descriptor.get("replacement_max_tokens") != fields["max_tokens"]):
+            raise ValueError("failed model recovery scope differs from its authorization")
+        history = self.blackboard.data.get("_specialist_response_recovery_history", [])
+        if not isinstance(history, list) or any(not isinstance(row, dict) for row in history):
+            raise ValueError("failed model recovery history is malformed")
+        previous = [row for row in history if row.get("request_id") == descriptor["request_id"]]
+        derived = saved.get("response_recovery") is not None
+        if derived:
+            if (saved["response_recovery"] != descriptor or len(previous) != 1
+                    or previous[0].get("descriptor") != descriptor):
+                raise ValueError("failed model recovery authorization or history differs")
+            original = deepcopy(previous[0]["checkpoint"])
+            seal = original.pop("sha256", None)
+        else:
+            if previous:
+                raise ValueError("failed model recovery history exists without its derived checkpoint")
+            original = deepcopy(saved)
+            seal = _checkpoint_digest(original)
+        iteration = descriptor.get("original_iteration")
+        if (seal != descriptor["specialist_checkpoint_sha256"] or seal != _checkpoint_digest(original)
+                or original.get("contract") != descriptor["original_contract"]
+                or original.get("status") != "failed" or original.get("forced_report") is not False
+                or type(iteration) is not int or not 1 <= iteration < fields["max_tool_iters"]
+                or original.get("iteration") != iteration or original.get("pending_tools")
+                or original.get("inflight_tools") or original.get("usage_unknown") is not False
+                or original.get("thinking") != {"type": "effort", "effort": "max"}
+                or original.get("thinking_prima") is not None or original.get("response_recovery") is not None):
+            raise ValueError("original failed model evidence differs")
+        old_cap, _ = _checkpoint_output_contract(fields, original)
+        if old_cap != fields["max_tokens"]:
+            raise ValueError("failed model recovery output contract differs")
+        self.blackboard.budget_gate.validate_response_recovery(descriptor, {
+            "model": fields["model"], "max_tokens": old_cap, "thinking": original["thinking"],
+            "system": self._request_system(fields["system"]), "tools": fields["tools"],
+            "messages": original["messages"],
+        }, role="specialist:" + self.name)
+        if derived:
+            nudge = previous[0].get("recovery_nudge")
+            if (not isinstance(nudge, str) or not nudge
+                    or previous[0].get("recovery_nudge_sha256") != _checkpoint_digest(nudge)):
+                raise ValueError("failed model recovery instruction seal differs")
+        else:
+            nudge = ("[EXPLICIT FAILED MODEL RESPONSE RECOVERY: " + descriptor["request_id"] + "] "
+                "The selected provider response ended with error and produced no executable tool or report. "
+                "Its original receipt and token accounting remain preserved. Continue the existing saved model "
+                "construction, preserving all author decisions, evidence and consultation outcomes. "
+                "The turn counter, model, effort and output limit are unchanged: next turn is "
+                + str(iteration + 1) + " of " + str(fields["max_tool_iters"]) + ". "
+                "Only the existing local author tools are available; do not repeat research or consultations. "
+                "Save supported inputs and compile through the normal financial gates; do not invent missing data.")
+            evidence_hook = getattr(self.blackboard, "model_authoring_recovery_evidence", None)
+            if callable(evidence_hook):
+                evidence = _checkpoint_json(evidence_hook(deepcopy(descriptor)))
+                if evidence is not None:
+                    nudge += "\n\nVERIFIED RECOVERY EVIDENCE (informational; author decisions remain required):\n" + json.dumps(
+                        evidence, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        messages = deepcopy(original["messages"])
+        if isinstance(messages[-1]["content"], list):
+            messages[-1]["content"].append({"type": "text", "text": nudge})
+        else:
+            messages[-1]["content"] += "\n\n" + nudge
+        fields = {**fields, "response_recovery": deepcopy(descriptor)}
+        if derived:
+            saved_iteration = saved.get("iteration")
+            usage = saved.get("usage") or {}
+            ids, old_ids = usage.get("request_ids"), original["usage"]["request_ids"]
+            if (type(saved_iteration) is not int or not iteration <= saved_iteration <= fields["max_tool_iters"]
+                    or saved.get("response_recovery_call_offset") != 0
+                    or saved.get("usage_unknown") is not False
+                    or not isinstance(ids, list) or ids[:len(old_ids)] != old_ids
+                    or len(ids) != len(old_ids) + saved_iteration - iteration
+                    or any(saved.get(name) != original.get(name) for name in
+                        ("version", "initial_context", "nudge_collasso", "retry_529", "retry_vuoto",
+                         "thinking", "thinking_prima", "author_progress_version"))):
+                raise ValueError("derived failed model counter or accounting differs")
+            proofs = self.blackboard.budget_gate.store.specialist_response_receipts(
+                self.blackboard.run_id, self.name, usage)
+            current_messages = saved.get("messages")
+            if not isinstance(current_messages, list):
+                raise ValueError("derived failed model conversation is missing")
+            # The entire accepted transcript and pinned instruction remain an
+            # exact prefix. Only native paid tool turns may extend it.
+            expected_prefix = deepcopy(messages)
+            if saved_iteration == fields["max_tool_iters"] and len(current_messages) == len(messages):
+                if isinstance(expected_prefix[-1]["content"], list):
+                    expected_prefix[-1]["content"].append({"type": "text", "text": _forced_report_nudge(saved_iteration)})
+                else:
+                    expected_prefix[-1]["content"] += "\n\n" + _forced_report_nudge(saved_iteration)
+            if current_messages[:len(messages)] != expected_prefix:
+                raise ValueError("derived failed model original conversation differs")
+            added = proofs[len(old_ids):]
+            tool_responses = [proof["response"] for proof in added if proof["response"].get("stop_reason") == "tool_use"]
+            tail = current_messages[len(messages):]
+            if (len(tail) != 2 * len(tool_responses)
+                    or any(tail[2 * pos] != {"role": "assistant", "content": response["content"]}
+                        or tail[2 * pos + 1].get("role") != "user" for pos, response in enumerate(tool_responses))):
+                raise ValueError("derived failed model paid tool transcript differs")
+            if saved_iteration == iteration and (saved.get("status") != "ready"
+                    or usage != original["usage"] or saved.get("report") is not None
+                    or saved.get("tool_calls") != original.get("tool_calls")):
+                raise ValueError("derived failed model initial boundary differs")
+            if saved.get("status") in ("complete", "truncated", "failed"):
+                if not added or added[-1]["response"].get("stop_reason") == "tool_use":
+                    raise ValueError("derived failed model terminal receipt is missing")
+                terminal = added[-1]["response"]
+                visible = "\n".join(block["text"] for block in terminal.get("content", ())
+                    if block.get("type") == "text" and block.get("text"))
+                if saved.get("status") == "complete":
+                    expected_report = visible
+                    if saved.get("forced_report") is True:
+                        expected_report = ("[REPORT FORZATO AL LIMITE ITERAZIONI ("
+                            + str(fields["max_tool_iters"])
+                            + "): verifiche tool esaurite, buchi dichiarati nel testo]\n\n" + visible)
+                    if (terminal.get("stop_reason") != "end_turn" or not visible
+                            or saved.get("report") != expected_report
+                            or saved.get("forced_report") is not (saved_iteration == fields["max_tool_iters"])):
+                        raise ValueError("derived failed model report differs from its paid response")
+                # The final paid wire attests every newly delivered tool result
+                # and informational ledger, not just their assistant counterparts.
+                self._attest_recovered_model_wire(fields, saved, current_messages, added[-1])
+            elif added:
+                # A ready boundary follows a paid tool response. Its request
+                # attests the preceding transcript; verify the newest result
+                # separately against the durable native tool receipts.
+                self._attest_recovered_model_wire(fields, saved, current_messages[:-2], added[-1])
+                self._attest_recovered_tool_results(tool_responses[-1], tail[-1])
+            return fields, saved
+        replacement = {**deepcopy(original), "contract": _checkpoint_digest(fields),
+            "messages": messages, "status": "ready", "report": None,
+            "response_recovery": deepcopy(descriptor), "response_recovery_call_offset": 0}
+        self.blackboard.data.setdefault("_specialist_response_recovery_history", []).append({
+            "request_id": descriptor["request_id"], "descriptor": deepcopy(descriptor),
+            "checkpoint": {**deepcopy(original), "sha256": seal}, "recovery_nudge": nudge,
+            "recovery_nudge_sha256": _checkpoint_digest(nudge)})
+        return fields, replacement
+
+    def _attest_recovered_model_wire(self, fields, saved, messages, proof):
+        from decimal import Decimal
+        from bellomberg.agents.trade_idea import _model_author_request_matches, _stable_provider_messages
+        from bellomberg.agents.model_authoring_context import project_model_authoring_messages
+        pricing = self.blackboard.budget_gate.catalog_snapshot["models"]["specialist"]["pricing"]
+        request = {"model": fields["model"], "max_tokens": fields["max_tokens"],
+            "thinking": saved["thinking"], "system": self._request_system(fields["system"]),
+            "tools": fields["tools"], "messages": _stable_provider_messages(messages),
+            "provider_max_price": {"prompt": float(Decimal(pricing["prompt"]) * 10**6),
+                "completion": float(Decimal(pricing["completion"]) * 10**6), "request": 0.0}}
+        if saved.get("forced_report"):
+            request["tool_choice"] = {"type": "none"}
+        if _model_author_request_matches(request, proof.get("request_sha256")):
+            return
+        projected, _ = project_model_authoring_messages(request["messages"])
+        if not _model_author_request_matches({**request, "messages": projected}, proof.get("request_sha256")):
+            raise ValueError("derived failed model paid request wire differs")
+
+    def _attest_recovered_tool_results(self, response, message):
+        from bellomberg.agents.chat_tools import TETTO_TOOL_RESULT
+        from bellomberg.agents.model_authoring_context import PROGRESS_MARKER
+        calls = [block for block in response["content"] if block.get("type") == "tool_use"]
+        content = message.get("content")
+        if not isinstance(content, list) or len(content) not in (len(calls), len(calls) + 1):
+            raise ValueError("derived failed model tool results are malformed")
+        for call, delivered in zip(calls, content):
+            if delivered.get("type") != "tool_result" or delivered.get("tool_use_id") != call["id"]:
+                raise ValueError("derived failed model tool result identity differs")
+            valid = False
+            for receipt in self.blackboard.tool_receipts:
+                if (receipt.get("tool") != call["name"] or receipt.get("input") != call["input"]
+                        or receipt.get("truncated") is not False):
+                    continue
+                output = receipt.get("output")
+                if not isinstance(output, str):
+                    continue
+                result = json.loads(output)
+                if call["name"] == "get_valuation" and isinstance(result, dict):
+                    from bellomberg.valuation.sector_analysis import valuation_results_block
+                    payload = result.get("data") if isinstance(result.get("data"), dict) else result
+                    output = (valuation_results_block({str(call["input"].get("ticker") or "n.d."): payload})
+                        + "\n\nDettaglio sotto, soggetto al tetto tool_result; "
+                          "snapshot integrale nel sidecar se generato:\n" + output)
+                if len(output) > TETTO_TOOL_RESULT:
+                    output = output[:TETTO_TOOL_RESULT] + "...[truncated]"
+                valid = valid or delivered.get("content") == output
+            if not valid:
+                raise ValueError("derived failed model tool result differs from its native receipt")
+        if len(content) > len(calls):
+            progress = content[-1]
+            text = progress.get("text")
+            if progress.get("type") != "text" or not isinstance(text, str) or not text.startswith(PROGRESS_MARKER):
+                raise ValueError("derived failed model unexpected user instruction")
+            ledger = json.loads(text[len(PROGRESS_MARKER):])
+            if ledger.get("contract") != "model_authoring_progress/1" or ledger.get("kind") != "informational_not_approval":
+                raise ValueError("derived failed model informational progress differs")
+
+    def _run_loop(self, round_n, *, task_context=None, publish_report=True):
+        reply_completion = (task_context or {}).get('kind') == 'research_objection_completion'
+        if reply_completion:
+            from bellomberg.core.research_analysis import research_reference
+            from bellomberg.agents.trade_idea import _plan_digest
+            descriptor = self.blackboard.data.get('_research_reply_completions', {}).get(self.name) or {}
+            if (not is_research_mode(self.blackboard) or self.blackboard.run_scope != 'trade_idea'
+                    or round_n != 2 or publish_report or descriptor.get('task') != task_context
+                    or task_context.get('desk') != self.name
+                    or task_context.get('research_ref') != research_reference(self.blackboard)
+                    or task_context.get('origin_report_sha256') != _plan_digest(self.blackboard.read(self.name, 2))):
+                raise ValueError('Research reply completion requires the original sealed desk report and exact task')
+        review_model_ref = None
+        if getattr(self.blackboard, "run_scope", None) == "trade_idea" and round_n == 2:
+            current_model = self.blackboard.valuation_results.get(self.blackboard.target_ticker) or {}
+            review_model_ref = {key: current_model.get(key) for key in
+                                ("snapshot_id", "generation_id", "workbook_sha256")}
+        checkpoint_key = (self.name + ":R" + str(round_n)
+            + (":" + _checkpoint_digest(task_context) if task_context is not None else "")
+            + (":model:" + _checkpoint_digest(review_model_ref) if review_model_ref is not None else ""))
+        saved_checkpoint = deepcopy(getattr(self.blackboard, "specialist_checkpoints", {}).get(checkpoint_key))
+        if saved_checkpoint is not None:
+            digest = saved_checkpoint.pop("sha256", None)
+            if digest != _checkpoint_digest(saved_checkpoint):
+                raise ValueError("specialist checkpoint checksum differs")
+        max_tool_iters = self._max_tool_iterations_for_round(round_n, task_context)
+        max_tokens = self._max_tokens_for_round(round_n, task_context)
         print("\n[" + self.name.upper() + "] Round " + str(round_n) + " start")
         # Una fotografia per round; la prossima chiamata vede eventuali modifiche.
+        mandato = None
         try:
             from bellomberg.core import mandato_pm
             try:
@@ -1384,16 +2295,40 @@ class Specialist:
             causa = _dichiara_fallback("mandato[" + self.name + "]", e)
             system_round = re.sub(r"\{MANDATO:[^}]+\}", "(mandato n.d.)", self.system_prompt)
             system_round += "\n[MANDATO n.d.] " + causa
+        if getattr(self.blackboard, "run_scope", "weekly") == "trade_idea":
+            from bellomberg.core.trade_idea_contract import trade_idea_specialist_instructions
+            system_round = (trade_idea_specialist_instructions(self.name,
+                analysis_mode=self.blackboard.analysis_mode) if is_research_mode(self.blackboard)
+                else trade_idea_specialist_instructions(self.name))
+            system_round += "\nSELECTED CANDIDATE: " + str(self.blackboard.target_ticker)
+            system_round += "\n" + (mandato_pm.blocco_prompt(mandato) if mandato is not None else mandato_pm.riga_senza_mandato())
+        system_round += ("\nBefore acquiring company data again, use read_company_dossier to reuse "
+                         "the verified company evidence shared by this run. Preserve its source references; "
+                         "declare partial or unavailable facts explicitly and never replace them silently.")
+        if callable(getattr(self.blackboard, "company_source_session", None)):
+            from bellomberg.agents.company_research_tools import RESEARCH_INSTRUCTIONS, RESEARCH_ONLY_INSTRUCTIONS
+            system_round += RESEARCH_ONLY_INSTRUCTIONS if is_research_mode(self.blackboard) else RESEARCH_INSTRUCTIONS
+            if (getattr(self.blackboard, "run_scope", "weekly") == "weekly"
+                    and callable(getattr(self.blackboard, "valuation_preparer", None))):
+                system_round += ("\nFor a new weekly model with automatic preparation enabled, acquire the official "
+                    "statements first, then call get_valuation with only the ticker: the authorized preparer consumes "
+                    "this run's verified dossier and builds sourced assumptions through the common compiler. "
+                    "Read and critique the returned assumptions and scenario rationales. Do not bypass preparation "
+                    "with a partial or invented method_records list; explicit complete records retain their separate contract.")
         # collaudo #44: durata per specialista (prima non esisteva alcun timer)
         _t0 = time.perf_counter()
-        self.blackboard.mark_specialist_start(self.name, round_n)
+        if publish_report:
+            self.blackboard.mark_specialist_start(self.name, round_n)
         # Fase 3 "fatti volatili": current_facts (TTL 1h) e favorites (TTL 600s)
         # vivono QUI, nel primo messaggio user, CONGELATI per il round — non piu'
         # nel system cachato, dove un refresh a run in corso (>60 min) cambiava
         # il system a meta' conversazione e invalidava l'intera cache dell'agente.
-        _ctx = self._build_round_context(round_n)
+        _ctx = (saved_checkpoint["initial_context"] if saved_checkpoint is not None
+                else self._build_round_context(round_n))
         blocchi = []
-        for nome in ("current_facts_block", "favorites_block", "pm_theses_block"):
+        for nome in (() if saved_checkpoint is not None or reply_completion else
+                ("current_facts_block",) if getattr(self.blackboard, "run_scope", "weekly") == "trade_idea"
+                else ("current_facts_block", "favorites_block", "pm_theses_block")):
             try:
                 from bellomberg.core import current_facts
                 blocchi.append(getattr(current_facts, nome)())
@@ -1401,11 +2336,22 @@ class Specialist:
                 causa = _dichiara_fallback(nome + "[" + self.name + "]", e)
                 blocchi.append("\n\n[CONTESTO n.d.] " + causa
                               + ". Dichiara il buco nel report.")
-        _ctx = "".join(blocchi) + "\n\n" + _ctx
+        if saved_checkpoint is None:
+            _ctx = "".join(blocchi) + "\n\n" + _ctx
+        if task_context is not None and saved_checkpoint is None:
+            task_heading = (
+                "\n\nTARGETED TASK: answer the explicit question below using the supplied draft and "
+                "retrieved evidence. A consultation does not replace your official report and cannot "
+                "ask another specialist or mutate the common model.\n"
+                if task_context.get("consultation") is True else
+                "\n\nEXPLICIT TASK CONTEXT: follow the task below within your current role and phase. "
+                "All source and model authorization constraints remain in force.\n")
+            _ctx += task_heading + json.dumps(task_context, ensure_ascii=False, allow_nan=False)
         # C4 16/07 (richiesta PM): pipeline RESEARCH SOLO a fundamentals e SOLO in R1/R2
         # (R0 e' gia' saturo: 10/10 iterazioni nella run #45 — aggiungere lavoro li'
         # significherebbe recon troncata, non solo costo).
-        if self.name == "fundamentals" and round_n >= 1:
+        if (saved_checkpoint is None and self.name == "fundamentals" and round_n >= 1
+                and getattr(self.blackboard, "run_scope", "weekly") != "trade_idea"):
             try:
                 from bellomberg.core.current_facts import research_block
                 _rb = research_block(sector_bundles=self._sector_bundles,
@@ -1416,7 +2362,112 @@ class Specialist:
                 causa = _dichiara_fallback("research_block[fundamentals]", e)
                 _ctx = "[CONTESTO n.d.] " + causa + "\n\n" + _ctx
         messages = [{"role": "user", "content": _ctx}]
+        author_history = getattr(self, "_trade_idea_author_history", None)
+        if author_history is not None:
+            from bellomberg.agents.trade_idea import _plan_digest
+            if (self.name != "fundamentals" or round_n != 1
+                    or (task_context or {}).get("consultation") is True
+                    or getattr(self.blackboard, "run_scope", None) != "trade_idea"
+                    or getattr(self.blackboard, "model_phase", None) != "building"
+                    or not isinstance(author_history, dict)
+                    or author_history.get("genuine_history") is not True
+                    or author_history.get("source_fingerprint") != self.blackboard.source_qualification.get("fingerprint")):
+                raise ValueError("Historical author messages require the same qualified Fundamentals building scope")
+            historical_messages = author_history.get("messages")
+            if (not isinstance(historical_messages, list) or not historical_messages
+                    or any(not isinstance(message, dict) or message.get("role") not in ("user", "assistant")
+                           or not isinstance(message.get("content"), (str, list)) for message in historical_messages)
+                    or historical_messages[0]["role"] != "user" or historical_messages[-1]["role"] != "user"
+                    or _plan_digest(historical_messages) != author_history.get("messages_sha256")):
+                raise ValueError("Historical author message seal or native SDK shape differs")
+            if saved_checkpoint is None:
+                messages = json.loads(json.dumps(historical_messages, ensure_ascii=False, allow_nan=False))
+                if (task_context or {}).get("kind") == "model_authoring_completion":
+                    # This phase attests the same sources and paid conversation.
+                    # Preserve that whole history once; do not append a second
+                    # copy of all peer reports and the accepted portfolio.
+                    current_context = ("\n\nNATIVE MODEL COMPLETION. The full preceding research remains the "
+                        "accepted historical context, with its original dates, PM view and constraints. "
+                        "Use the recorded progress below for the current saved draft and missing work. "
+                        "Complete supported driver groups and consultation outcomes, then compile the model; "
+                        "do not repeat research or replace the model with prose. The original total budget and "
+                        "all financial checks remain in force. Final prices, sizing and risk are verified "
+                        "separately before Decisions. Task: " + json.dumps(task_context, ensure_ascii=False))
+                else:
+                    current_context = "\n\nNEW AUTHOR PHASE / CURRENT OPERATING CONTEXT. Earlier messages are authentic historical reads; their usage belongs to the prior child. Current source authorization and all current constraints follow:\n" + _ctx
+                if isinstance(messages[-1]["content"], list):
+                    messages[-1]["content"].append({"type": "text", "text": current_context})
+                else:
+                    messages[-1]["content"] += current_context
         tools_schema = self._build_tools_schema()
+        original_tools_schema = deepcopy(tools_schema)
+        model_completion = (task_context or {}).get("kind") == "model_authoring_completion"
+        if model_completion:
+            if (not self._is_trade_idea_model_author(round_n, task_context)
+                    or not author_history or author_history.get("native_model_completion") is not True):
+                raise ValueError("Model completion requires the native attested author history")
+            tools_schema = [tool for tool in tools_schema if tool["name"] in MODEL_AUTHORING_LOCAL_TOOLS]
+        consultation = (task_context or {}).get("consultation") is True
+        if consultation:
+            tools_schema = [tool for tool in tools_schema if tool["name"] not in {
+                "ask_specialist", "review_candidate_model", "submit_candidate_model_plan",
+                "respond_trade_idea_objection", "read_candidate_model_consultation",
+                "add_guidance", "add_research_note", "acquire_company_source"}]
+
+        contract_fields = {"version": 1, "desk": self.name, "round": round_n,
+            "model": self._model_for_round(round_n), "system": system_round,
+            "tools": tools_schema, "max_tokens": max_tokens, "max_tool_iters": max_tool_iters,
+            "run_scope": getattr(self.blackboard, "run_scope", None), "task_context": task_context,
+            "target_ticker": getattr(self.blackboard, "target_ticker", None),
+            "source_fingerprint": (getattr(self.blackboard, "source_admission", None)
+                or getattr(self.blackboard, "source_qualification", None) or {}).get("fingerprint"),
+            "model_phase": getattr(self.blackboard, "model_phase", None),
+            "review_model_ref": review_model_ref}
+        if model_completion:
+            original = deepcopy(author_history["origin"])
+            seal = original.pop("sha256", None)
+            if (seal != _checkpoint_digest(original)
+                    or seal != task_context.get("origin_checkpoint_sha256")):
+                raise ValueError("Model completion origin checkpoint differs")
+            original_fields = {**contract_fields, "task_context": None, "tools": original_tools_schema}
+            old_cap, _ = _checkpoint_output_contract(original_fields, original)
+            from bellomberg.agents.trade_idea import _plan_digest, _model_author_request_matches
+            pricing = self.blackboard.budget_gate.catalog_snapshot["models"]["specialist"]["pricing"]
+            from decimal import Decimal
+            old_messages = original["messages"]
+            receipt = author_history["last_receipt"]
+            old_request = {"model": original_fields["model"], "max_tokens": old_cap,
+                "thinking": original["thinking"], "system": self._request_system(system_round),
+                "tools": original_tools_schema, "messages": old_messages,
+                "provider_max_price": {"prompt": float(Decimal(pricing["prompt"]) * 10**6),
+                    "completion": float(Decimal(pricing["completion"]) * 10**6), "request": 0.0}}
+            if original.get("forced_report"):
+                old_request["tool_choice"] = {"type": "none"}
+            if not _model_author_request_matches(old_request, receipt.get("request_sha256")):
+                raise ValueError("Original model-authoring wire differs from the paid request")
+            author_history = {**author_history, "system_sha256": _plan_digest(self._request_system(system_round))}
+        contract_fields, saved_checkpoint = self._prepare_report_completion(
+            contract_fields, checkpoint_key, saved_checkpoint)
+        max_tokens, checkpoint_contract = _checkpoint_output_contract(contract_fields, saved_checkpoint)
+        if saved_checkpoint is not None:
+            if saved_checkpoint.get("status") == "complete":
+                self.run_result_status = "complete"
+                if consultation:
+                    self.consultation_result_status = "complete"
+                return saved_checkpoint["report"]
+            if saved_checkpoint.get("status") in ("truncated", "failed"):
+                raise RuntimeError("preserved specialist response is incomplete; explicit review required before a new request")
+            messages = saved_checkpoint["messages"]
+
+        owned_client = (getattr(self, "_owned_trade_idea_client", None)
+                        or getattr(self, "_owned_weekly_client", None))
+        if owned_client is not None:
+            # New and historical stages use their effective output cap. Keep
+            # connect/retry settings and externally injected clients unchanged.
+            timeout = timeout_specialisti(max_tokens)
+            http_timeout = owned_client._http.timeout
+            owned_client._http.timeout = type(http_timeout)(timeout, connect=http_timeout.connect)
+            owned_client.timeout = timeout
 
         iteration = 0
         final_text = None
@@ -1448,21 +2499,74 @@ class Specialist:
         # del round (recon 12/09 par. 2.3). None = nessun ripristino in sospeso.
         _thinking_prima = None
 
-        while iteration < MAX_TOOL_ITERS_SPECIALIST:
+        if saved_checkpoint is not None:
+            iteration = saved_checkpoint["iteration"]
+            _usage = saved_checkpoint["usage"]
+            _usage_unknown = saved_checkpoint["usage_unknown"]
+            _forced_report = saved_checkpoint["forced_report"]
+            _tool_calls_round = saved_checkpoint["tool_calls"]
+            _nudge_collasso_dato = saved_checkpoint["nudge_collasso"]
+            _retry_529, _retry_vuoto = saved_checkpoint["retry_529"], saved_checkpoint["retry_vuoto"]
+            _thinking, _thinking_prima = saved_checkpoint["thinking"], saved_checkpoint["thinking_prima"]
+        _pending_tools = deepcopy((saved_checkpoint or {}).get("pending_tools", {}))
+        _inflight_tools = deepcopy((saved_checkpoint or {}).get("inflight_tools", {}))
+        _response_recovery = (saved_checkpoint or {}).get("response_recovery")
+        _recovery_call_offset = (saved_checkpoint or {}).get("response_recovery_call_offset", 0)
+        progress_callback = getattr(self.blackboard, "model_authoring_progress", None)
+        author_progress_version = ((saved_checkpoint or {}).get("author_progress_version")
+            if saved_checkpoint is not None else 1 if self._is_trade_idea_model_author(round_n, task_context)
+            and callable(progress_callback) else None)
+
+        def append_author_progress():
+            if author_progress_version != 1:
+                return
+            if not callable(progress_callback):
+                raise RuntimeError("Saved model author progress callback is unavailable")
+            ledger = progress_callback(remaining_turns=max(0, max_tool_iters - iteration - 1),
+                                       messages=_checkpoint_json(messages))
+            text = "\n\nRECORDED MODEL WORK / MISSING AUTHOR ACTIONS:\n" + json.dumps(
+                ledger, ensure_ascii=False, sort_keys=True, allow_nan=False)
+            if isinstance(messages[-1]["content"], list):
+                messages[-1]["content"].append({"type": "text", "text": text})
+            else:
+                messages[-1]["content"] += text
+
+        # New stages receive the ledger once per tool boundary. Saved messages
+        # already contain it: replay never rebuilds a prompt from changed state.
+        if saved_checkpoint is None:
+            append_author_progress()
+
+        def save_checkpoint(event, state=None, *, complete=False):
+            state = state or {"version": 1, "contract": checkpoint_contract, "max_tokens": max_tokens,
+                "initial_context": _ctx, "messages": messages, "iteration": iteration,
+                "usage": _usage, "usage_unknown": _usage_unknown, "forced_report": _forced_report,
+                "tool_calls": _tool_calls_round, "nudge_collasso": _nudge_collasso_dato,
+                "retry_529": _retry_529, "retry_vuoto": _retry_vuoto,
+                "thinking": _thinking, "thinking_prima": _thinking_prima,
+                "pending_tools": _pending_tools, "inflight_tools": _inflight_tools,
+                "status": "complete" if complete else "ready",
+                "report": final_text if complete else None}
+            state = _checkpoint_json(state)
+            if author_progress_version is not None:
+                state["author_progress_version"] = author_progress_version
+            if _response_recovery:
+                state.update(response_recovery=deepcopy(_response_recovery),
+                             response_recovery_call_offset=_recovery_call_offset)
+            _persist_specialist_checkpoint(self.blackboard, checkpoint_key, state, event)
+            return state
+
+        safe_snapshot = save_checkpoint("specialist_ready")
+
+        while iteration < max_tool_iters:
             iteration += 1
             # §9-bis n.5 (ok PM 21/07): l'ULTIMA iterazione e' SEMPRE il report —
-            # tool_choice none + nudge dichiarato. Prima il 10o giro poteva essere un
-            # tool_use i cui risultati venivano eseguiti ma MAI riletti dal modello
-            # (giro buttato) e il round moriva in "[No output produced]". Budget
-            # effettivo: 9 giri tool + report garantito, stesso costo di oggi.
-            _final_forced = (iteration == MAX_TOOL_ITERS_SPECIALIST)
+            # tool_choice none + nudge dichiarato. Il limite locale concede
+            # max_tool_iters - 1 passaggi tool e riserva l'ultimo al report.
+            # Il gate costi per chiamata resta indipendente e invariato.
+            _final_forced = (iteration == max_tool_iters)
             if _final_forced:
                 _forced_report = True
-                _nudge = ("LIMITE ITERAZIONI TOOL RAGGIUNTO (" + str(MAX_TOOL_ITERS_SPECIALIST)
-                          + "): in questa risposta i tool sono DISABILITATI. Scrivi ORA il "
-                          "report finale con le informazioni gia' raccolte. Dichiara "
-                          "esplicitamente cio' che NON hai potuto verificare (n.d.), "
-                          "senza inventare numeri.")
+                _nudge = _forced_report_nudge(max_tool_iters)
                 _lastm = messages[-1]
                 if isinstance(_lastm.get("content"), list):
                     # dopo un giro tool: il nudge va IN CODA ai tool_result dello
@@ -1474,24 +2578,22 @@ class Specialist:
                 # fatti volatili spostati nel primo messaggio user (v. run()):
                 # il system resta IDENTICO per tutta la run -> cache stabile.
                 if _thinking is None:
-                    _thinking = thinking_consigliere(self._model_for_round(round_n))
-                _sys = system_round + "\n\n" + prompt_for_language(SPECIALIST_STYLE_RULES)
+                    _thinking = (role_thinking(self.blackboard, 'specialist')
+                                 if getattr(self.blackboard, "run_scope", "weekly") == "trade_idea"
+                                 else thinking_consigliere(self._model_for_round(round_n)))
+                _sys = self._request_system(system_round)
                 # P1 26/07: se l'arsenale e' degradato il MODELLO deve saperlo e
                 # dirlo, altrimenti il PM legge un report che tace un buco. Nel
                 # caso sano questa riga non aggiunge nulla e il system resta
                 # IDENTICO per tutta la run (cache stabile, v. commento sopra).
-                if self._arsenale_degradato:
-                    _sys += ("\n\n[!! ARSENALE DEGRADATO - DICHIARALO NEL REPORT] "
-                             + self._arsenale_degradato +
-                             " -> stai lavorando con MENO TOOL del previsto: apri il "
-                             "report con questa riga, elenca cosa NON hai potuto "
-                             "verificare e NON colmare i buchi a memoria.")
+                if author_history is not None and _plan_digest(_sys) != author_history.get("system_sha256"):
+                    raise ValueError("Historical author system differs from the current native system")
                 # 200a: cache_control su tools (ultimo elemento = tutta la lista) e system.
                 # NB tools_schema[-1] e' il meta-tool read_blackboard creato fresco per call: safe da decorare.
                 _kw = {}
                 if _final_forced:
                     _kw["tool_choice"] = {"type": "none"}
-                if USE_PROMPT_CACHING:
+                if USE_PROMPT_CACHING and getattr(self.blackboard, "run_scope", "weekly") != "trade_idea":
                     _cc = {"type": "ephemeral"}
                     if CACHE_TTL == "1h":
                         _cc["ttl"] = "1h"
@@ -1507,10 +2609,27 @@ class Specialist:
                 # errore ri-esce subito verso il ramo di dichiarazione qui sotto.
                 while True:
                     try:
+                        check_blocked = getattr(self.blackboard, "raise_if_run_blocked", None)
+                        if callable(check_blocked):
+                            check_blocked()
                         _t_call = time.perf_counter()  # 27/08: durata della call nel WARN TRONCATA
+                        _author_snapshot = None
+                        if (self.name == "fundamentals" and round_n == 1 and not consultation
+                                and getattr(self.blackboard, "run_scope", "weekly") == "trade_idea"
+                                and getattr(self.blackboard, "model_phase", None) == "building"):
+                            from bellomberg.agents.trade_idea import _model_consultation_read_snapshot
+                            _author_snapshot = _model_consultation_read_snapshot(self.blackboard)
+                        if model_completion:
+                            # Keep the complete raw conversation in the native
+                            # checkpoint. The gate tries its paid wire first,
+                            # validates this reproducible view and pins any new
+                            # projected request before reservation/dispatch.
+                            from bellomberg.agents.model_authoring_context import project_model_authoring_messages
+                            _, _kw["model_authoring_context_projection"] = project_model_authoring_messages(
+                                _checkpoint_json(messages))
                         response = self.client.messages.create(
                             model=self._model_for_round(round_n),
-                            max_tokens=MAX_TOKENS_SPECIALIST,
+                            max_tokens=max_tokens,
                             thinking=_thinking,
                             system=_sys,
                             tools=tools_schema,
@@ -1529,7 +2648,9 @@ class Specialist:
                         # messaggi (prima rimandava gli stessi messaggi senza una parola).
                         # Sull'ultima iterazione (_final_forced) i tool restano spenti per
                         # la regola del report garantito, e il nudge lo dice.
-                        if (getattr(response, "stop_reason", None) == "max_tokens"
+                        if (getattr(self.blackboard, "run_scope", "weekly") != "trade_idea"
+                                and getattr(response, "stop_reason", None) == "max_tokens"
+                                and getattr(getattr(response, "usage", None), "cost_usd", None) is not None
                                 and _retry_vuoto < 1
                                 and not any(str(getattr(b, "text", "") or "").strip()
                                             for b in (getattr(response, "content", None) or []))):
@@ -1537,7 +2658,7 @@ class Specialist:
                             _u0 = getattr(response, "usage", None)
                             _out0 = getattr(_u0, "output_tokens", None)
                             print("  [" + self.name + "] WARN: risposta TRONCATA (stop_reason="
-                                  "max_tokens, cap " + str(MAX_TOKENS_SPECIALIST) + " token) con "
+                                  "max_tokens, cap " + str(max_tokens) + " token) con "
                                   "0 char di testo visibile (output_tokens="
                                   + (str(_out0) if _out0 is not None else "n.d.")
                                   + ", tutto ragionamento, call di %.1f s): RITENTO una volta "
@@ -1577,20 +2698,9 @@ class Specialist:
                             _t_call = time.perf_counter()
                             continue
                         break
-                    except Exception as _e_api:
-                        _sc = getattr(_e_api, "status_code", None)
-                        if _sc is None and ("529" in str(_e_api)
-                                            or "overloaded" in str(_e_api).lower()):
-                            _sc = 529  # idioma di news_aggregator._classify_with_haiku
-                        if _sc == 529 and _retry_529 < len(RETRY_529_BACKOFF_S):
-                            _pausa = RETRY_529_BACKOFF_S[_retry_529]
-                            _retry_529 += 1
-                            print("[" + self.name + "] API 529 overloaded (iter "
-                                  + str(iteration) + "): retry " + str(_retry_529)
-                                  + "/" + str(len(RETRY_529_BACKOFF_S)) + " fra "
-                                  + str(_pausa) + "s")
-                            time.sleep(_pausa)
-                            continue
+                    except Exception:
+                        # No outer retry from a status code alone: the request
+                        # journal retains the original uncertain reservation.
                         raise
                 # 12/09: il ritentativo e' finito (in un verso o nell'altro): le iterazioni
                 # successive del round tornano al ragionamento di prima.
@@ -1598,11 +2708,13 @@ class Specialist:
                     _thinking = _thinking_prima
                     _thinking_prima = None
             except Exception as e:
+                _record_run_failure(self.blackboard, e, self.name, round_n)
                 print("[" + self.name + "] API error: " + str(e))
                 err_txt = "[ERROR " + self.name + " round " + str(round_n) + "]: " + str(e)
                 try:
-                    self.blackboard.write(self.name, round_n, err_txt)
-                    self.blackboard.mark_specialist_error(self.name, str(e))
+                    if publish_report:
+                        self.blackboard.write(self.name, round_n, err_txt)
+                        self.blackboard.mark_specialist_error(self.name, str(e))
                 except Exception:
                     pass
                 # collaudo #44: qui si usciva BUTTANDO i token gia' spesi nelle
@@ -1610,10 +2722,13 @@ class Specialist:
                 # sparite dal conto). Un agente fallito che non compare nei costi e'
                 # il fallback silenzioso vietato dal PM il 14/07: lo dichiariamo.
                 try:
+                    prior_known_cost = _usage.get("cost_usd")
+                    _usage = _somma_usage(_usage, None)
+                    _usage["known_cost_usd"] = prior_known_cost
                     self.blackboard.record_usage(
                         self.name, round_n, self._model_for_round(round_n), _usage,
                         duration_s=round(time.perf_counter() - _t0, 2),
-                        api_calls=iteration + _retry_529 + _retry_vuoto,
+                        api_calls=iteration + _retry_529 + _retry_vuoto + _recovery_call_offset,
                         cache_ttl=CACHE_TTL if USE_PROMPT_CACHING else None,
                         status="api_error", retry_vuoto=_retry_vuoto)
                 except Exception as ue:
@@ -1632,6 +2747,15 @@ class Specialist:
                 print("[" + self.name + "] WARN usage non esposto dalla risposta "
                       "(iter " + str(iteration) + "): " + str(e))
 
+            save_checkpoint("specialist_response", {**safe_snapshot,
+                "pending_tools": _pending_tools, "inflight_tools": _inflight_tools,
+                "last_response_id": getattr(response, "id", None),
+                "last_request_id": getattr(response, "request_id", None)})
+
+            if _author_snapshot is not None:
+                from bellomberg.agents.trade_idea import _record_fundamentals_received_consultations
+                _record_fundamentals_received_consultations(self.blackboard, _author_snapshot, response)
+
             stop = response.stop_reason
             if stop == "end_turn":
                 # audit/11 §2: concatena TUTTI i blocchi text (fix del Capo 25/06 mai
@@ -1647,6 +2771,12 @@ class Specialist:
                 _collasso = (round_n <= 1 and _tool_calls_round == 0
                              and len(final_text.strip()) < SOGLIA_COLLASSO_ANNUNCIO
                              and not _final_forced)
+                if _collasso and (getattr(self.blackboard, "run_scope", "weekly") == "trade_idea"
+                                  or _usage.get("cost_usd") is None):
+                    final_text = ("[ERROR " + self.name + " round " + str(round_n)
+                                  + "]: report troppo breve senza tool; nessun retry pagato. "
+                                  + "Testo ricevuto: " + final_text)
+                    break
                 if _collasso and not _nudge_collasso_dato:
                     _nudge_collasso_dato = True
                     print("  [" + self.name + "] end_turn SENZA tool con "
@@ -1670,6 +2800,12 @@ class Specialist:
                     final_text = _marcatore + "\n\n" + final_text
                 break
             elif stop == "tool_use":
+                if _response_recovery and (_response_recovery.get("mode") == "report_only" or _final_forced):
+                    final_text = "[ERROR " + self.name + " round " + str(round_n) + "]: report-only completion returned tools; no tool dispatched."
+                    break
+                if _usage.get("cost_usd") is None:
+                    final_text = "[ERROR " + self.name + " round " + str(round_n) + "]: provider cost unknown; pending tools preserved without dispatch."
+                    break
                 messages.append({"role": "assistant", "content": response.content})
                 tool_results = []
                 for block in response.content:
@@ -1678,7 +2814,29 @@ class Specialist:
                         tname = block.name
                         tinput = block.input
                         print("  [" + self.name + "] -> " + tname + "(" + str(tinput)[:80] + ")")
-                        result = self._execute_meta_tool(tname, tinput)
+                        tool_key = _checkpoint_digest({"iteration": iteration,
+                            "response_id": getattr(response, "id", None),
+                            "tool_id": block.id, "name": tname, "input": tinput})
+                        replayed_tool = tool_key in _pending_tools
+                        if not replayed_tool and tool_key in _inflight_tools:
+                            from bellomberg.agents.company_research_tools import TOOL_NAMES
+                            # These three run-native tools journal the GET intent
+                            # and verified bytes before returning. Their service
+                            # replays durable receipts and rejects an unknown GET;
+                            # no other tool receives automatic replay authority.
+                            local_reply_replay = reply_completion and tname in RESEARCH_REPLY_LOCAL_TOOLS
+                            if not local_reply_replay and (tname not in TOOL_NAMES or not callable(
+                                    getattr(self.blackboard, "company_source_session", None))):
+                                raise RuntimeError("tool dispatch outcome unknown; automatic replay blocked: " + tname)
+                        if not replayed_tool:
+                            check_blocked = getattr(self.blackboard, "raise_if_run_blocked", None)
+                            if callable(check_blocked):
+                                check_blocked()
+                            _inflight_tools[tool_key] = {"name": tname, "input": tinput, "tool_id": block.id}
+                            save_checkpoint("specialist_tool_dispatch", {**safe_snapshot,
+                                "pending_tools": _pending_tools, "inflight_tools": _inflight_tools})
+                        result = (json.loads(_pending_tools[tool_key]["output_json"]) if replayed_tool
+                                  else self._execute_meta_tool(tname, tinput))
                         # Audit 11/09 (Fable 5.1): il tool_log registrava SOLO l'input; per
                         # ricostruire cosa un desk avesse letto (il «35%» dal web, il «count
                         # 0» di Polymarket) non c'era nulla. Si conserva la testa dell'esito
@@ -1688,13 +2846,25 @@ class Specialist:
                             _out_s = json.dumps(result, default=str, ensure_ascii=False)
                         except Exception:
                             _out_s = str(result)
-                        self.blackboard.tool_log.append({
+                        if not replayed_tool and (getattr(self.blackboard, "run_scope", "weekly") == "trade_idea"
+                                                  or is_research_mode(self.blackboard)):
+                            _receipt_truncated = len(_out_s) > 200000
+                            self.blackboard.tool_receipts.append({
+                                "tool": tname, "input": tinput,
+                                "source": result.get("_source") if isinstance(result, dict) else None,
+                                "timestamp": result.get("_timestamp") if isinstance(result, dict) else None,
+                                "success": _trade_idea_tool_receipt_success(
+                                    result, tname, truncated=_receipt_truncated),
+                                "output": _out_s[:200000], "truncated": _receipt_truncated,
+                            })
+                        if not replayed_tool:
+                            self.blackboard.tool_log.append({
                             "specialist": self.name, "round": round_n, "tool": tname,
                             "input": str(tinput)[:200], "time": datetime.now().strftime("%H:%M:%S"),
                             "output": _out_s[:TOOL_LOG_OUTPUT_MAX],
                             "output_tappato": len(_out_s) > TOOL_LOG_OUTPUT_MAX,
                             "output_chars": len(_out_s),
-                        })
+                            })
                         self.blackboard._write_heartbeat()
                         result_str = json.dumps(result, default=str, ensure_ascii=False)
                         if tname == "get_valuation" and isinstance(result, dict):
@@ -1723,10 +2893,20 @@ class Specialist:
                                   + "): uso 6000, il valore prudente di prima (dichiarato)")
                         if len(result_str) > _TETTO:
                             result_str = result_str[:_TETTO] + "...[truncated]"
+                        if replayed_tool:
+                            result_str = _pending_tools[tool_key]["delivered_text"]
                         tool_results.append({
                             "type": "tool_result", "tool_use_id": block.id, "content": result_str,
                         })
+                        _pending_tools[tool_key] = {"output_json": _out_s, "tool": tname,
+                                                   "input": tinput, "delivered_text": result_str}
+                        _inflight_tools.pop(tool_key, None)
+                        save_checkpoint("specialist_tool", {**safe_snapshot,
+                            "pending_tools": _pending_tools, "inflight_tools": _inflight_tools})
                 messages.append({"role": "user", "content": tool_results})
+                _pending_tools = {}
+                append_author_progress()
+                safe_snapshot = save_checkpoint("specialist_turn")
             else:
                 _parts = [b.text for b in response.content if hasattr(b, "text")]
                 final_text = "\n".join(p for p in _parts if p)
@@ -1742,7 +2922,7 @@ class Specialist:
                     # (usage.reasoning_tokens): quando c'e', il log la stampa invece di stimarla
                     _rt_tok = getattr(getattr(response, "usage", None), "reasoning_tokens", None)
                     print("  [" + self.name + "] WARN: risposta TRONCATA (stop_reason="
-                          "max_tokens, cap " + str(MAX_TOKENS_SPECIALIST) + " token): "
+                          "max_tokens, cap " + str(max_tokens) + " token): "
                           "output_tokens=" + (str(_out_tok) if _out_tok is not None else "n.d.")
                           + " (ragionamento adattivo + testo), testo visibile "
                           + str(len(final_text))
@@ -1763,14 +2943,15 @@ class Specialist:
                     final_text = (_rif + "\n\n" + final_text) if final_text.strip() else _rif
                 break
 
+        raw_final_text = final_text
         # §9-bis n.5: il report forzato si DICHIARA in testa (Capo/memo/DB lo vedono)
         if final_text and _forced_report:
             # Voce 6 §9-quattuortrigies (01/08): il marcatore stava SOLO nel testo
             # del report (DB) — grep 'REPORT FORZATO' sul log dava 0 e chi legge il
             # log concludeva che non era successo. Si dichiara anche su stdout.
             print("  [" + self.name + "] REPORT FORZATO AL LIMITE ITERAZIONI ("
-                  + str(MAX_TOOL_ITERS_SPECIALIST) + "): verifiche tool esaurite")
-            final_text = ("[REPORT FORZATO AL LIMITE ITERAZIONI (" + str(MAX_TOOL_ITERS_SPECIALIST)
+                  + str(max_tool_iters) + "): verifiche tool esaurite")
+            final_text = ("[REPORT FORZATO AL LIMITE ITERAZIONI (" + str(max_tool_iters)
                           + "): verifiche tool esaurite, buchi dichiarati nel testo]\n\n" + final_text)
         # 12/09 (Fable 5.1, prerequisito 3 del mandato): un round >= 1 chiuso con ZERO
         # chiamate tool si DICHIARA in testa al testo, nella stessa forma dei marcatori
@@ -1797,8 +2978,25 @@ class Specialist:
                 final_text += (" (2 tentativi: anche il ritentativo senza ragionamento e' "
                                "uscito con 0 char di testo)")
 
-        self.blackboard.write(self.name, round_n, final_text)
-        self.blackboard.mark_specialist_done(self.name)
+        visible = any(str(getattr(block, "text", "") or "").strip() for block in response.content)
+        result_status = ("truncated" if stop == "max_tokens" else
+            "complete" if stop == "end_turn" and visible and not _usage_unknown
+                and _usage.get("cost_usd") is not None
+                and not raw_final_text.startswith("[ERROR")
+                and not _refusal_reason(response, self.name) else "failed")
+        self.run_result_status = result_status
+        if consultation:
+            self.consultation_result_status = result_status
+        if result_status != "complete":
+            error = RuntimeError("specialist response " + result_status + ": stop_reason=" + str(stop))
+            error.request_id = getattr(response, "request_id", None)
+            _record_run_failure(self.blackboard, error, self.name, round_n)
+        if publish_report:
+            self.blackboard.write(self.name, round_n, final_text)
+            if result_status == "complete":
+                self.blackboard.mark_specialist_done(self.name)
+            else:
+                self.blackboard.mark_specialist_error(self.name, str(stop))
         print("[" + self.name + "] Round " + str(round_n) + " done (" + str(len(final_text)) + " chars)")
         # collaudo #44: l'usage non si butta piu' col return — va nel usage_log del
         # blackboard (-> heartbeat -> UI). Modello EFFETTIVO del round (R0 = Sonnet,
@@ -1808,13 +3006,21 @@ class Specialist:
         try:
             _entry = self.blackboard.record_usage(
                 self.name, round_n, self._model_for_round(round_n), _usage,
-                duration_s=_duration_s, api_calls=iteration + _retry_529 + _retry_vuoto,
+                duration_s=_duration_s, api_calls=iteration + _retry_529 + _retry_vuoto + _recovery_call_offset,
                 cache_ttl=CACHE_TTL if USE_PROMPT_CACHING else None,
                 status="usage_unknown" if _usage_unknown else "ok",
                 retry_vuoto=_retry_vuoto)
         except Exception as ue:
             print("[" + self.name + "] WARN usage non registrato: " + str(ue))
+        if consultation and self.consultation_result_status == "truncated":
+            from bellomberg.agents.trade_idea import _native_consultation_terminal_response
+            self.consultation_terminal_response = _native_consultation_terminal_response(
+                response, final_text, _usage, _entry, self.name)
+        terminal_checkpoint = save_checkpoint("specialist_report", complete=result_status == "complete")
+        if result_status != "complete":
+            save_checkpoint("specialist_incomplete", {**terminal_checkpoint,
+                "status": result_status, "report": final_text})
         print(f"  [{self.name}] usage R{round_n}: in={_usage['in'] if _usage['in'] is not None else 'n.d.'} out={_usage['out'] if _usage['out'] is not None else 'n.d.'} "
               f"cache_read={_usage['cache_read'] if _usage['cache_read'] is not None else 'n.d.'} cache_write={_usage['cache_write'] if _usage['cache_write'] is not None else 'n.d.'} "
-              f"({iteration + _retry_529 + _retry_vuoto} call API, {_duration_s}s, costo {_fmt_cost((_entry or {}).get('cost_eur'))})")
+              f"({iteration + _retry_529 + _retry_vuoto + _recovery_call_offset} call API, {_duration_s}s, costo {_fmt_cost((_entry or {}).get('cost_eur'))})")
         return final_text

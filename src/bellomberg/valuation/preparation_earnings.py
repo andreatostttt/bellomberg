@@ -89,8 +89,15 @@ def collect_earnings_evidence(ticker, *, primary, as_of, archive_root, fetch=Non
             raise ValueError("opening date after information cutoff")
         out["selection"]["opening_date"] = since.isoformat()
         reasons = []
-        rows = (fetch or get_recent_filings)(ticker, form_types=forms,
-            days=max(1, (date.today() - since).days + 1), max_items=40, motivo=reasons)
+        days = max(1, (date.today() - since).days + 1)
+        if fetch is None and foreign and '.' in ticker:
+            from bellomberg.market_data.sec_edgar import get_filing_catalog
+            catalog = get_filing_catalog(ticker, days=days, max_pages=2, issuer_name=meta.get('issuer'))
+            reasons.extend(catalog.get('motivi') or [])
+            rows = [row for row in catalog.get('documenti', []) if row.get('form') in forms][:40]
+        else:
+            rows = (fetch or get_recent_filings)(ticker, form_types=forms,
+                days=days, max_items=40, motivo=reasons)
         for reason in reasons:
             issue(str(reason))
         if not isinstance(rows, list):

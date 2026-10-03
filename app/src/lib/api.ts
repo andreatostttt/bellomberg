@@ -7,6 +7,59 @@ import type { AnteprimaMandato, StatoMandato, ValoriMandato } from './mandato';
 
 export const API_BASE = (window as any).bellomberg?.apiUrl || 'http://127.0.0.1:8765';
 
+export interface FundResearchSource {
+  id?: string; source?: string; url?: string | null; as_of?: string | null;
+  published_at?: string | null; summary?: string; metadata?: { title?: string };
+}
+export interface FundResearchContent {
+  summary?: string;
+  dossier?: { key: string; title: string; paragraphs: string[]; tables?: {
+    title: string; columns: string[]; rows: string[][]; source: string; unit: string; period: string;
+  }[] }[];
+  scenarios?: { name: string; analysis: string; evidence_ids?: string[] }[];
+  risks?: string[]; catalysts?: string[]; invalidation?: string[]; review_conditions?: string[];
+  data_gaps?: (string | { reason?: string })[];
+  evidence?: FundResearchSource[]; documents?: FundResearchSource[]; report?: string;
+}
+export interface FundObservationRefresh {
+  status?: string; last_attempt_at?: string | null; last_success_at?: string | null; error?: string | null;
+}
+export interface FundResearchCompany {
+  ticker: string; name: string | null;
+  quote: { value: number | null; currency: string | null; source: string | null; observed_at: string | null; status: string;
+    acquired_at?: string | null; refresh?: FundObservationRefresh | null };
+  consensus: { status: string; source: string | null; currency: string | null; currency_source?: string | null;
+    acquired_at: string | null; data_as_of: string | null; mean: number | null; median: number | null;
+    low: number | null; high: number | null; number_of_analysts: number | null;
+    reason?: string | null; refresh?: FundObservationRefresh | null };
+  comparison: { upside_pct: number | null; status: string };
+  analysis: { status: string; origin: string | null; scope: string | null; as_of: string | null;
+    run_id?: string | null; memo_id?: number | null; mode?: string | null; summary: string | null;
+    judgment: string | null; technical_status?: string; round?: number;
+    content: FundResearchContent | null; reference?: unknown };
+}
+export interface FundResearchList {
+  status: string; count: number | null; items: FundResearchCompany[]; notices: string[];
+  read_at?: string;
+  market_refresh?: {status: string; last_completed_at?: string | null; last_result?: Record<string, unknown> | null;
+    error?: string | null; next_retry_at?: string | null};
+}
+export interface FundArchiveItem {
+  id: string; file: string; ticker: string | null; as_of: string | null; file_modified_at?: string;
+  historical: boolean; available: boolean; reason?: string | null; integrity: string; download_path: string;
+}
+export interface FundArchiveList { items: FundArchiveItem[]; notices: string[] }
+
+export interface WeeklyRecovery {
+  memo_id: number; run_id?: string; status: string;
+  analytical_status?: string; artifact_status?: string; delivery_status?: string;
+  resume_available?: boolean; delivery_recovery_available?: boolean;
+  blocked_reason?: string; reason?: string; remaining_work?: string[];
+  first_error?: { phase?: string; desk?: string; message?: string; request_id?: string };
+  request_costs?: { known_cost_usd?: number | null; cost_usd?: number | null; authorized_usd?: number | null;
+    reserved_usd?: number | null; remaining_known_usd?: number | null; unknown_requests?: number };
+}
+
 export interface FilingCitation {
   sezione?: string; testo?: string; url?: string; sha256?: string;
   pagine_fisiche?: number[]; inizio?: number; fine?: number; src?: string;
@@ -165,6 +218,11 @@ export interface DecisionNote {
 
 export interface Decision {
   id: number;
+  trade_idea?: {
+    origin: 'trade_idea'; run_id: string; destination_kind: 'dcn' | 'research';
+    ticker: string; memo_id: number | null; technical_status: string;
+    destination_reason: string | null; artifacts_ready: boolean;
+  } | null;
   esecuzione?: {
     trade_ids: number[]; eur: number | null; pct: number | null;
     inferito: boolean; data: string | null;
@@ -1146,6 +1204,9 @@ export const Bellomberg = {
   fx: () => api.get<{rates: Record<string, number>}>('/fx').then(r => r.data),
   memos: (limit = 20) => api.get<{memos: Memo[]}>(`/memos?limit=${limit}`).then(r => r.data),
   valuationModels: () => api.get<{count: number; models: ValuationModel[]; nota?: string}>('/fundamentals/models').then(r => r.data),
+  fundamentalsResearch: () => api.get<FundResearchList>('/fundamentals/research').then(r => r.data),
+  fundamentalsCompany: (ticker: string) => api.get<FundResearchCompany>(`/fundamentals/research/${encodeURIComponent(ticker)}`).then(r => r.data),
+  fundamentalsArchive: () => api.get<FundArchiveList>('/fundamentals/archive').then(r => r.data),
   filingList: (ticker: string) => api.get<FilingListing>(`/filings/${encodeURIComponent(ticker)}`).then(r => r.data),
   filingRun: (runId: number) => api.get<FilingRunDetail>(`/filings/runs/${encodeURIComponent(runId)}`).then(r => r.data),
   filingRefresh: (ticker: string) => api.post<{run_id: number; status: 'queued'}>(`/filings/${encodeURIComponent(ticker)}/refresh`).then(r => r.data),
@@ -1260,6 +1321,10 @@ export const Bellomberg = {
   validateTicker: (symbol: string) =>
     api.get<TickerValidation>('/portfolio/validate_ticker', { params: { symbol }, timeout: 15000 }).then(r => r.data),
   runConsigliere: () => api.post('/consigliere/run').then(r => r.data),
+  weeklyRecoveries: () => api.get<{ runs: WeeklyRecovery[]; reason?: string }>('/consigliere/runs').then(r => r.data),
+  recoverConsigliere: (memoId: number, deliveryOnly: boolean) => api.post<{ task_id: string }>('/consigliere/run', {
+    resume_memo_id: memoId, delivery_only: deliveryOnly, authorize_new_ai: !deliveryOnly, send_email: false,
+  }).then(r => r.data),
   mandato: () => api.get<StatoMandato>('/mandato').then(r => r.data),
   mandatoAnteprima: (valori?: ValoriMandato) => (valori
     ? api.post<AnteprimaMandato>('/mandato/anteprima', valori)

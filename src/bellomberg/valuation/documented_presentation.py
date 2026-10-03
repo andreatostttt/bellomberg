@@ -176,6 +176,7 @@ def present_operating(wb, payload):
         _finish(ws, 30, end)
 
     assumptions = _sheet(wb, 'Assumptions', tr('Ipotesi documentate', 'Documented assumptions'), end)
+    source_rows = {}
     _line(assumptions, 4, static, end, height=32)
     row = 7
     drivers = ('revenue_growth', 'gross_margin', 'rnd_pct', 'sga_pct', 'capdev_pct', 'da_tan_pct', 'tax_rate', 'capex_pct', 'nwc_pct')
@@ -184,6 +185,7 @@ def present_operating(wb, payload):
         for driver in drivers:
             row += 1
             _values(assumptions, row, driver, '%', inputs.get((key, driver)) or [], PERCENT, len(years))
+            source_rows[row] = [(key, driver)]
         row += 3
     _header(assumptions, row, [tr('Capitale e sconto', 'Capital and discounting'), tr('Unita', 'Units'), *names.values()])
     for driver in ('wacc', 'terminal_growth', 'terminal_ronic', 'net_debt', 'equity_adjustments', 'shares', 'opening_nwc'):
@@ -192,8 +194,11 @@ def present_operating(wb, payload):
         values = [inputs.get(('model' if driver in ('shares', 'opening_nwc') else key, driver)) for key in names]
         unit = '%' if ratio else tr('mln azioni', 'million shares') if driver == 'shares' else money
         _values(assumptions, row, driver, unit, values, PERCENT if ratio else PRICE if driver == 'shares' else AMOUNT)
-    _line(assumptions, row + 3, tr('Fonti e motivazioni: Qualita e revisioni.',
-                                 'Sources and rationales: Qualita e revisioni.'), end, height=32)
+        source_rows[row] = list(dict.fromkeys(('model' if driver in ('shares', 'opening_nwc') else key, driver)
+                                            for key in names))
+    wb._assumption_source_rows = {'rows': source_rows, 'end': end, 'footer': row+3}
+    _line(assumptions, row + 3, tr('Tipi di dato, motivazioni e fonti consumate: Sources. Dettagli tecnici: Qualita e revisioni.',
+                                 'Data types, rationales and consumed sources: Sources. Technical detail: Qualita e revisioni.'), end, height=32)
     _finish(assumptions, row + 4, end)
 
     segment_data = inputs.get(('base', 'revenue_build')) or {}
@@ -247,11 +252,19 @@ def present_operating(wb, payload):
     _line(summary, 23, tr('Fair value alla data del modello, non rivalutato alla quotazione osservata. ',
                           'Fair value at the model date, not rolled forward to the observed quote. ') + static, 6, height=46)
     reasons = payload['valuation_usability'].get('reasons') or []
-    checks = (payload.get('sanity') or {}).get('scenario_checks', {})
-    warnings = [names[k] + ': ' + str(v.get('headline') or v.get('reading') or v.get('severity'))
+    sanity = payload.get('sanity') or {}
+    checks = sanity.get('scenario_checks', {})
+    from .dcf_quality import DOCUMENTED_OPERATING_SANITY_POLICY
+    base_policy = sanity.get('policy') == DOCUMENTED_OPERATING_SANITY_POLICY
+    if base_policy:
+        _line(summary, 24, tr('Bear, base e bull: lo scostamento dal prezzo e informativo, senza soglie di esclusione. Restano i controlli su dati, ipotesi e calcoli.',
+                              'Bear, base and bull: distance to market is informational, with no exclusion thresholds. Data, assumption and calculation checks still apply.'),
+              6, height=42)
+    warnings = [names[k] + (' [' + str(v.get('severity')) + ']') + ': ' + str(v.get('headline') or v.get('reading') or v.get('severity'))
                 for k, v in checks.items() if k in names and v.get('severity') != 'OK']
     _line(summary, 26, tr('Attenzione: ', 'Attention: ') + '; '.join([*reasons, *warnings]) if reasons or warnings else
-          tr('Dati e controlli nei fogli finali.', 'Data and checks in the final tabs.'), 6, height=55)
+          tr('Dati e controlli nei fogli finali.', 'Data and checks in the final tabs.'), 6,
+          height=max(55, 22 * ceil(sum(len(str(item)) for item in [*reasons, *warnings]) / 80)))
     if usable and all(_number(payload.get('fair_value_' + k)) for k in names):
         chart = BarChart(); chart.type = 'bar'; chart.style = 13
         chart.add_data(Reference(summary, min_col=4, max_col=6, min_row=8, max_row=8), from_rows=True)

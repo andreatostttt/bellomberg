@@ -8,6 +8,9 @@ from bellomberg.agents import agent_tools, specialist_scores
 from bellomberg.core import llm_client
 
 
+_USE_MODEL_PRICE = object()
+
+
 @pytest.fixture
 def score_inputs(monkeypatch, tmp_path):
     import test_sector_usability as fixtures
@@ -19,11 +22,13 @@ def score_inputs(monkeypatch, tmp_path):
     return {"positions": [{"ticker": "SYNTH", "peso_pct": 100}]}, tmp_path
 
 
-def _score(score_inputs, source, fair_value, price=100, **extra):
+def _score(score_inputs, source, fair_value, price=_USE_MODEL_PRICE, **extra):
     from hashlib import sha256
     from test_sector_usability import payload_for
     portfolio, report_dir = score_inputs
     documented = payload_for()
+    if price is _USE_MODEL_PRICE:
+        price = documented["price"]
     documented.pop("fair_value_weighted")  # Preserve the original per-test FV precedence.
     if source == "sidecar":
         workbook = report_dir / "VAL_SYNTH.xlsx"
@@ -41,12 +46,12 @@ def _score(score_inputs, source, fair_value, price=100, **extra):
 
 @pytest.mark.parametrize("source", ["injected", "sidecar"])
 @pytest.mark.parametrize("fair_value,price", [
-    (float("nan"), 100), (float("inf"), 100), (True, 100), ("120", 100),
-    (120, float("nan")), (120, float("inf")), (120, 0), (120, -1),
-    (120, True), (120, "100"), (1e308, 1e-308),
+    (float("nan"), 10), (float("inf"), 10), (True, 10), ("14.13", 10),
+    (14.13, float("nan")), (14.13, float("inf")), (14.13, 0), (14.13, -1),
+    (14.13, True), (14.13, "10"), (1e308, 1e-308),
 ])
 def test_invalid_valuation_never_becomes_a_scored_name(score_inputs, source, fair_value, price):
-    assert _score(score_inputs, source, 120)["metrics"]["n_valued"] == 1
+    assert _score(score_inputs, source, 14.13)["metrics"]["n_valued"] == 1
     assert _score(score_inputs, source, fair_value, price) is None
 
 
@@ -59,33 +64,34 @@ def test_zero_fair_value_is_not_missing_or_replaced(score_inputs, source):
 
 
 def test_absent_final_value_can_use_lower_priority_present_value(score_inputs):
-    result = _score(score_inputs, "sidecar", None, fair_value_weighted=120)
-    assert result["metrics"]["avg_mos_pct"] == 20.0
+    result = _score(score_inputs, "sidecar", None, fair_value_weighted=14.13)
+    assert result["metrics"]["avg_mos_pct"] == 41.3
 
 
 def test_invalid_final_value_cannot_silently_use_lower_priority_value(score_inputs):
-    assert _score(score_inputs, "sidecar", float("nan"), fair_value_weighted=120) is None
+    assert _score(score_inputs, "sidecar", float("nan"), fair_value_weighted=14.13) is None
 
 
 @pytest.mark.parametrize("source", ["injected", "sidecar"])
 def test_flagged_valuation_remains_excluded(score_inputs, source):
-    assert _score(score_inputs, source, 120, valuation_flagged=True) is None
+    assert _score(score_inputs, source, 14.13, valuation_flagged=True) is None
 
 
 def test_sidecar_sanity_block_remains_excluded(score_inputs):
-    assert _score(score_inputs, "sidecar", 120, sanity={"severity": "BLOCK"}) is None
+    assert _score(score_inputs, "sidecar", 14.13, sanity={"severity": "BLOCK"}) is None
 
 
 def test_partial_score_declares_name_with_invalid_valuation(score_inputs):
     from test_sector_usability import payload_for
     portfolio, _ = score_inputs
     portfolio["positions"].append({"ticker": "BAD", "peso_pct": 50})
+    documented = payload_for()
     result = specialist_scores.fundamentals_score(portfolio, valuations={
-        "SYNTH": {**payload_for(), "fair_value": 120, "price": 100},
-        "BAD": {**payload_for(), "ticker": "BAD", "fair_value": float("nan"), "price": 100},
+        "SYNTH": {**documented, "fair_value": documented["fair_value_base"]},
+        "BAD": {**documented, "ticker": "BAD", "fair_value": float("nan")},
     })
     assert result["metrics"]["n_valued"] == 1
-    assert result["metrics"]["avg_mos_pct"] == 20.0
+    assert result["metrics"]["avg_mos_pct"] == 41.3
     assert "1/2 nomi valutati" in result["verdict"]
     assert "FV/prezzo assenti o non validi: BAD" in result["verdict"]
 

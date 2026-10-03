@@ -211,6 +211,13 @@ def apply_operating_formulas(wb, payload):
         55: ('Valore / azione - unita quotata', 'Value / share - quoted unit'),
         56: ('Peso terminale / enterprise value', 'Terminal share / enterprise value'),
     }
+    share_proof = next((row.get('evidence', {})
+        for row in payload.get('analytical_quality', {}).get('rows', [])
+        if row.get('driver') == 'shares' and row.get('scenario') == 'model'), {})
+    if share_proof.get('kind') == 'analyst_estimate':
+        labels[53] = (('Azioni diluite stimate (proxy; mln)', 'Estimated diluted shares (proxy; million)')
+                      if str(share_proof.get('rationale', '')).startswith('PROXY/STIMA DILUZIONE') else
+                      ('Azioni diluite stimate (mln)', 'Estimated diluted shares (million)'))
     money = tr('mln ', 'million ') + payload['financial_currency']
     for scenario in ('bear', 'base', 'bull'):
         del wb[scenario]

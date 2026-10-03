@@ -222,13 +222,14 @@ class PreparationRuntime:
         proposer = self.proposer_for(trigger, opening_excerpt_manifest=opening_excerpt_manifest,
             forecast_excerpt_manifest=forecast_excerpt_manifest, opening_drivers_per_stage=opening_drivers_per_stage)
         filings = deepcopy(filing_results)
-        def prepare(bundle, *, prior_preparation=None, reuse_prepared=None):
+        def prepare(bundle, *, prior_preparation=None, reuse_prepared=None, research_sources=None):
             self._unchanged(trigger, policy)
             require_ticker(policy, (bundle.get("case") or {}).get("ticker"))
             from .preparation_service import collect_and_prepare
             return collect_and_prepare(bundle, archive_root=self.archive_root, output_dir=self.output_dir,
                                        filing_results=deepcopy(filings), propose=proposer,
-                                       prior_preparation=deepcopy(prior_preparation), reuse_prepared=reuse_prepared)
+                                       prior_preparation=deepcopy(prior_preparation), reuse_prepared=reuse_prepared,
+                                       research_sources=research_sources)
         return prepare
 
 

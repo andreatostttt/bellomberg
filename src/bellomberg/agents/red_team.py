@@ -30,6 +30,13 @@ Robusto: se fallisce, ritorna "" e il consigliere procede senza (zero regression
 # critica gli arriva come DATO, via blackboard.write("_red_team").
 from bellomberg.agents.specialists.base import RECUPERO_NESSUNO, _blocco_blackboard, _dichiara_fallback
 from bellomberg.core.language import prompt_for_language, scoped_language
+from datetime import datetime, timezone
+from copy import deepcopy
+
+from bellomberg.core.trade_idea_policy import role_thinking
+
+TRADE_IDEA_RED_MAX_TOKENS = 128000
+WEEKLY_RED_MAX_TOKENS = 128000
 
 RED_TEAM_PROMPT = """Sei il RISK MANAGER SCETTICO di Bellomberg, l'avvocato del diavolo del team. Gli specialisti hanno prodotto le loro tesi. Il tuo compito NON e' proporre trade, ma ATTACCARE le tesi prima che il Capo decida, in italiano professionale e diretto.
 
@@ -124,11 +131,101 @@ def motivo_critica_non_utilizzabile(testo):
     return None
 
 
+
+def _validate_citation_correction(original, corrected, catalog):
+    """The native provider may change exact evidence IDs only, never the analysis."""
+    import json
+    from copy import deepcopy
+    from bellomberg.core.trade_idea_contract import validate_committee_review
+    from bellomberg.agents.trade_idea import _plan_digest
+    before, after = json.loads(original), json.loads(corrected)
+    validate_committee_review(before)
+    validate_committee_review(after)
+    allowed = {row["id"] for row in catalog}
+    for row in after["objections"]:
+        if set(row["evidence_refs"]) - allowed:
+            raise ValueError("Citation correction contains an unknown exact evidence ID")
+    def analysis(value):
+        value = deepcopy(value)
+        for row in value["objections"]:
+            row.pop("evidence_refs")
+        return value
+    if _plan_digest(analysis(before)) != _plan_digest(analysis(after)):
+        raise ValueError("Citation correction changed the immutable analysis")
+    return after
+
+
+def _run_citation_correction(blackboard, original):
+    """One explicitly requested native correction; the full/weekly Red loop is unchanged."""
+    import json
+    import math
+    import time
+    from bellomberg.core.llm_client import OpenRouterClient, somma_usage
+    from bellomberg.agents.specialists.base import timeout_specialisti
+    from bellomberg.core.trade_idea_contract import validate_committee_review, TRADE_IDEA_REVIEW_SCHEMA
+    from bellomberg.agents.trade_idea import candidate_model_context, model_for_role, _plan_digest
+    parsed = validate_committee_review(original)
+    context = candidate_model_context(blackboard, purpose="committee")
+    catalog = context["review_evidence_catalog"]
+    model = model_for_role("red_team")
+    gate = getattr(blackboard, "budget_gate", None)
+    if gate is None:
+        raise ValueError("Trade Idea citation correction requires its native budget gate")
+    blackboard.data.pop("_red_team_citation_correction", None)
+    usage = {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "cost_usd": 0.0}
+    started, calls, status = time.perf_counter(), 0, "api_error"
+    try:
+        client = gate.wrap_client(OpenRouterClient(
+            timeout=timeout_specialisti(TRADE_IDEA_RED_MAX_TOKENS), max_retries=0), role="red_team")
+        calls = 1
+        response = client.messages.create(model=model, max_tokens=TRADE_IDEA_RED_MAX_TOKENS,
+            thinking=role_thinking(blackboard, 'red_team'),
+            system=prompt_for_language("Correct only evidence_refs in the supplied immutable CommitteeReview. "
+                "Return the complete JSON with every other field/value and list order unchanged. "
+                "Use exact catalog IDs only, preserving admitted_document/retrieved_tool/derived_model/desk_opinion kinds. "
+                "Do not conduct new research or change any question, objection, desk, category, material flag or requested_change. "
+                "A descriptive citation is not an ID. If no supplied ID supports it, use an empty evidence_refs list. "
+                "Never invent a source or promote software calculations/peer opinions to primary financial facts."),
+            messages=[{"role": "user", "content": json.dumps({"mode": "citation_correction_only",
+                "original_review": parsed, "original_review_sha256": _plan_digest(original),
+                "review_evidence_catalog": catalog, "evidence_refs_contract": context["evidence_refs_contract"]},
+                ensure_ascii=False, allow_nan=False)}],
+            response_format={"type": "json_schema", "json_schema": {
+                "name": "trade_idea_committee_review", "strict": True, "schema": TRADE_IDEA_REVIEW_SCHEMA}})
+        usage = somma_usage(usage, getattr(response, "usage", None))
+        text = "\n".join(block.text for block in response.content if getattr(block, "type", None) == "text" and block.text)
+        blackboard.data["_red_team_native_terminal"] = {"response_id": getattr(response, "id", None),
+            "stop_reason": getattr(response, "stop_reason", None), "text_present": bool(text.strip()), "text_chars": len(text)}
+        cost = usage.get("cost_usd")
+        if (getattr(response, "stop_reason", None) != "end_turn" or not text.strip()
+                or usage.get("tokens_status") != "completo" or isinstance(cost, bool)
+                or not isinstance(cost, (int, float)) or not math.isfinite(cost) or cost < 0):
+            raise ValueError("Native citation correction is incomplete or its usage is unknown")
+        _validate_citation_correction(original, text, catalog)
+        blackboard.write("_red_team", 1, text)
+        blackboard.data["_red_team_citation_correction"] = {"original_report_sha256": _plan_digest(original),
+            "corrected_report_sha256": _plan_digest(text), "catalog_sha256": _plan_digest(catalog),
+            "response_id": getattr(response, "id", None), "evidence_refs_only": True}
+        status = "ok"
+        return text
+    except Exception as exc:
+        blackboard.write("_red_team", 1, SEGNAPOSTO_NON_DISPONIBILE + " citation correction rejected: " + str(exc)[:300] + "]")
+        return ""
+    finally:
+        blackboard.record_usage("_red_team", 1, model, usage,
+            duration_s=round(time.perf_counter() - started, 2), api_calls=calls, cache_ttl=None, status=status)
+
+
 @scoped_language
-def run_red_team(blackboard, portfolio_data=None, memory_db=None) -> str:
+def run_red_team(blackboard, portfolio_data=None, memory_db=None, *, citation_correction=None) -> str:
     """Esegue il red team sui report degli specialisti. Ritorna la critica (str).
     Best-effort: in caso di errore ritorna "" senza propagare."""
     import time as _time
+    trade_idea = getattr(blackboard, "run_scope", "weekly") == "trade_idea"
+    if citation_correction is not None:
+        if not trade_idea:
+            raise ValueError("Citation correction belongs only to Trade Idea")
+        return _run_citation_correction(blackboard, citation_correction)
     try:
         from bellomberg.core.llm_client import OpenRouterClient, modello as _modello_llm, somma_usage as _somma_usage
         from bellomberg.core.llm_refusal import refusal_reason as _refusal_reason
@@ -136,10 +233,38 @@ def run_red_team(blackboard, portfolio_data=None, memory_db=None) -> str:
         # il red team girava su Opus contro il design dichiarato nel docstring.
         # 05/09 (ordine PM): il modello vive nel .env (RED_TEAM_MODEL); assente =
         # ConfigurazioneLLMMancante col nome, che finisce nel log qui sotto.
-        MODEL_SYNTHESIZER = _modello_llm("red_team")
+        if trade_idea:
+            from bellomberg.agents.trade_idea import model_for_role
+            MODEL_SYNTHESIZER = model_for_role("red_team")
+        else:
+            MODEL_SYNTHESIZER = _modello_llm("red_team")
     except Exception as e:
         print(f"[RED_TEAM] import skip: {e}")
+        callback = getattr(blackboard, "record_run_failure", None)
+        if callable(callback):
+            callback(e, desk="red_team", round_n=1)
+            raise
         return ""
+
+    from bellomberg.agents.specialists.base import _checkpoint_digest
+    checkpoint_key = None
+    saved_checkpoint = None
+    if callable(getattr(blackboard, "persist_run_checkpoint", None)):
+        checkpoint_key = "red_team:R1"
+        if trade_idea:
+            current_model = blackboard.valuation_results.get(blackboard.target_ticker) or {}
+            reference = {key: current_model.get(key) for key in
+                         ("snapshot_id", "generation_id", "workbook_sha256")}
+            checkpoint_key += ":model:" + _checkpoint_digest(reference)
+        saved_checkpoint = deepcopy(getattr(blackboard, "specialist_checkpoints", {}).get(checkpoint_key))
+        if saved_checkpoint is not None:
+            stored_digest = saved_checkpoint.pop("sha256", None)
+            if stored_digest != _checkpoint_digest(saved_checkpoint):
+                raise ValueError("Red Team checkpoint checksum differs")
+            # No refreshed PM memory or live book is mixed into a received request.
+            return _run_red_team_loop(blackboard, trade_idea, MODEL_SYNTHESIZER,
+                saved_checkpoint["user_msg"], saved_checkpoint["tools_schema"],
+                checkpoint_key, saved_checkpoint)
 
     # raccogli i report specialisti (ultimo round di ciascuno)
     reports = {}
@@ -175,15 +300,24 @@ def run_red_team(blackboard, portfolio_data=None, memory_db=None) -> str:
     # TESI PM (16/07): il dump del portafoglio qui sopra non porta le tesi (la vista
     # compatta le toglie apposta perche' sarebbero un duplicato);
     # il mandato 5-bis del prompt le richiede, quindi arrivano su canale dedicato.
-    try:
-        from bellomberg.core.current_facts import pm_theses_block
-        _tesi = pm_theses_block()
-        if _tesi:
-            parts.append(_tesi.strip())
-            parts.append("")
-    except Exception as e:
-        print(f"[RED_TEAM] tesi PM skip (dichiarato): {e}")
-        parts.append("[CONTESTO n.d.] Tesi PM: " + type(e).__name__ + ": " + str(e))
+    if trade_idea:
+        import json as _json
+        parts.append("CANDIDATO UNICO: " + str(blackboard.target_ticker))
+        parts.append("VIEW PM DA ATTACCARE COME TESI, NON COME FONTE: "
+                     + (blackboard.pm_view or "(assente)"))
+        parts.append("DECISIONI, VETI, NOTE PM E TRADE RECENTI DEL TICKER: "
+                     + _json.dumps(blackboard.data.get("_decision_context") or
+                                   {"status": "unavailable"}, ensure_ascii=False, default=str))
+    else:
+        try:
+            from bellomberg.core.current_facts import pm_theses_block
+            _tesi = pm_theses_block()
+            if _tesi:
+                parts.append(_tesi.strip())
+                parts.append("")
+        except Exception as e:
+            print(f"[RED_TEAM] tesi PM skip (dichiarato): {e}")
+            parts.append("[CONTESTO n.d.] Tesi PM: " + type(e).__name__ + ": " + str(e))
     try:
         from bellomberg.agents.specialists import ALL_SPECIALISTS as _ALL_SP
         order = [s.name for s in _ALL_SP]  # roster vero, niente copie hardcoded (review 15/07)
@@ -227,8 +361,17 @@ def run_red_team(blackboard, portfolio_data=None, memory_db=None) -> str:
     except Exception as e:
         print(f"[RED_TEAM] vincoli PM skip (dichiarato): {e}")
     parts.append(_blocco_blackboard(ordinati, recupero=RECUPERO_NESSUNO))
-    from bellomberg.valuation.sector_analysis import valuation_results_block
-    parts.append(valuation_results_block(getattr(blackboard, "valuation_results", {})))
+    from bellomberg.core.research_analysis import is_research_mode, research_context
+    if not trade_idea and is_research_mode(blackboard):
+        parts.append('SEALED COMPANY RESEARCH AND R1 THESIS:\n' + _json.dumps(
+            research_context(blackboard), ensure_ascii=False, default=str))
+    else:
+        from bellomberg.valuation.sector_analysis import valuation_results_block
+        parts.append(valuation_results_block(getattr(blackboard, "valuation_results", {})))
+    if trade_idea:
+        from bellomberg.agents.trade_idea import candidate_model_context
+        parts.append("EXACT COMMON MODEL DRIVERS AND EVIDENCE:\n" + _json.dumps(
+            candidate_model_context(blackboard, purpose="committee"), ensure_ascii=False, default=str))
     user_msg = "\n".join(parts)
 
     # mandato sui numeri (15/07): 3 tool READ-ONLY dal registro delle chat.
@@ -252,6 +395,19 @@ def run_red_team(blackboard, portfolio_data=None, memory_db=None) -> str:
                      + "\nDichiara quali numeri non hai potuto verificare con questi tool; "
                        "non colmare i dati mancanti a memoria.")
 
+    return _run_red_team_loop(blackboard, trade_idea, MODEL_SYNTHESIZER, user_msg,
+                              tools_schema, checkpoint_key, saved_checkpoint)
+
+
+def _run_red_team_loop(blackboard, trade_idea, MODEL_SYNTHESIZER, user_msg,
+                      tools_schema, checkpoint_key, saved_checkpoint):
+    """Resume exact paid messages; a completed or ambiguous tool is never repeated."""
+    import time as _time
+    from bellomberg.core.llm_client import OpenRouterClient, somma_usage as _somma_usage
+    from bellomberg.core.llm_refusal import refusal_reason as _refusal_reason
+    from bellomberg.core.research_analysis import is_research_mode
+    from bellomberg.agents.specialists.base import (
+        _checkpoint_json, _checkpoint_digest, _persist_specialist_checkpoint, timeout_specialisti)
     print(f"[RED_TEAM] context {len(user_msg)} chars, model {MODEL_SYNTHESIZER}, "
           f"{len(tools_schema)} tool read-only")
     # collaudo #44: usage/durata/chiamate dichiarati FUORI dal try — se l'API muore
@@ -263,16 +419,93 @@ def run_red_team(blackboard, portfolio_data=None, memory_db=None) -> str:
     _usage_unknown = False
     _calls = 0
     _t0 = _time.perf_counter()
+    _request_inflight = False
     try:
-        client = OpenRouterClient(timeout=240.0, max_retries=1)
         messages = [{"role": "user", "content": user_msg}]
+        if trade_idea:
+            from bellomberg.core.trade_idea_contract import TRADE_IDEA_RED_TEAM_INSTRUCTIONS, RESEARCH_RED_TEAM_INSTRUCTIONS
+            selected_system = prompt_for_language(RESEARCH_RED_TEAM_INSTRUCTIONS
+                if is_research_mode(blackboard) else TRADE_IDEA_RED_TEAM_INSTRUCTIONS)
+        else:
+            selected_system = prompt_for_language(RED_TEAM_PROMPT)
+            if is_research_mode(blackboard):
+                selected_system += ('\nChallenge the exact sealed company research and R1 thesis: '
+                    'observed statements, management guidance, analyst consensus and independent '
+                    'assumptions remain distinct. Name material uncertainties and falsification '
+                    'conditions. Missing consensus/documents must be declared. No workbook or AI '
+                    'fair value is required; do not request compiler inputs or workbook repairs. '
+                    'Mandate, prices, risk and sizing controls remain binding.')
+        max_tokens = TRADE_IDEA_RED_MAX_TOKENS if trade_idea else WEEKLY_RED_MAX_TOKENS
+        def contract_for(output_limit):
+            return _checkpoint_digest({"version": 1, "model": MODEL_SYNTHESIZER,
+                "system": selected_system, "tools": tools_schema, "iterations": 4,
+                "max_tokens": output_limit,
+                "thinking": role_thinking(blackboard, 'red_team') if trade_idea else {"type": "adaptive"}})
+        contract = contract_for(max_tokens)
+        start_iteration = 0
+        pending_tools = {}
+        inflight_tools = {}
+        if saved_checkpoint is not None:
+            if saved_checkpoint["contract"] != contract:
+                # Only the exact previous policy is compatible. Keep its whole
+                # loop at the original cap, including already journaled bodies.
+                legacy_cap = 65536 if trade_idea else 4200
+                if saved_checkpoint["contract"] != contract_for(legacy_cap):
+                    raise ValueError("Red Team checkpoint contract changed")
+                max_tokens = legacy_cap
+                contract = saved_checkpoint["contract"]
+            if ("max_tokens" in saved_checkpoint
+                    and (type(saved_checkpoint["max_tokens"]) is not int
+                         or saved_checkpoint["max_tokens"] != max_tokens)):
+                raise ValueError("Red Team checkpoint contract changed")
+            from bellomberg.agents import chat_tools
+            current_tools = [t for t in chat_tools.TOOL_DEFINITIONS if t["name"] in
+                             ("get_portfolio_live", "get_portfolio_risk", "get_advanced_metrics")]
+            if _checkpoint_digest(current_tools) != _checkpoint_digest(tools_schema):
+                raise ValueError("Red Team tool contract changed")
+            if saved_checkpoint["status"] == "complete":
+                return saved_checkpoint["critique"]
+            if saved_checkpoint["status"] in ("failed", "truncated"):
+                raise ValueError("Red Team response incomplete: explicit review required")
+            messages = deepcopy(saved_checkpoint["messages"])
+            start_iteration = saved_checkpoint["iteration"]
+            _usage, _usage_unknown = saved_checkpoint["usage"], saved_checkpoint["usage_unknown"]
+            _calls = saved_checkpoint["calls"]
+            pending_tools = deepcopy(saved_checkpoint.get("pending_tools", {}))
+            inflight_tools = deepcopy(saved_checkpoint.get("inflight_tools", {}))
+        client = OpenRouterClient(timeout=timeout_specialisti(max_tokens), max_retries=0)
+        if trade_idea:
+            gate = getattr(blackboard, "budget_gate", None)
+            if gate is None:
+                raise ValueError("Trade Idea red team senza budget gate")
+            client = gate.wrap_client(client, role="red_team")
+
+        def checkpoint(event, state):
+            state = _checkpoint_json(state)
+            if checkpoint_key is not None:
+                _persist_specialist_checkpoint(blackboard, checkpoint_key, state, event)
+            return state
+
+        def loop_state(iteration):
+            return {"contract": contract, "max_tokens": max_tokens, "status": "running", "user_msg": user_msg,
+                "tools_schema": tools_schema, "messages": messages, "iteration": iteration,
+                "usage": _usage, "usage_unknown": _usage_unknown, "calls": _calls,
+                "pending_tools": pending_tools, "inflight_tools": inflight_tools}
+
         critique = ""
         # mini tool-loop (max 3 giri di verifica + risposta finale): il red team
         # VERIFICA i numeri che attacca invece di fidarsi o inventare
         _forced_final = False
-        for _it in range(4):
+        _it = start_iteration - 1
+        for _it in range(start_iteration, 4):
+            safe_snapshot = checkpoint("red_team_ready", loop_state(_it))
             _calls += 1
             _kw = {"tools": tools_schema} if tools_schema else {}
+            if trade_idea:
+                from bellomberg.core.trade_idea_contract import TRADE_IDEA_REVIEW_SCHEMA
+                _kw["response_format"] = {"type": "json_schema", "json_schema": {
+                    "name": "trade_idea_committee_review", "strict": True,
+                    "schema": TRADE_IDEA_REVIEW_SCHEMA}}
             # §9-bis n.5 (ok PM 21/07): l'ULTIMO giro e' SEMPRE la critica — tool_choice
             # none + nudge. Prima, 4 giri tutti tool_use = critique "" scritta VUOTA e
             # zitta nel blackboard (memo senza red team, nessuna dichiarazione).
@@ -287,27 +520,19 @@ def run_red_team(blackboard, portfolio_data=None, memory_db=None) -> str:
                     _lastm["content"].append({"type": "text", "text": _ndg})
                 else:
                     _lastm["content"] = str(_lastm.get("content") or "") + "\n\n" + _ndg
+            _request_inflight = True
             resp = client.messages.create(
                 model=MODEL_SYNTHESIZER,
-                # E 16/07: era 2000 e la critica della run #45 e' stata TRONCATA a meta'
-                # frase (5.917 char, stop su max_tokens): mancavano i "3 RISCHI" finali.
-                # 26/07 pre-V6: 3000 -> 4200. MISURATO con count_tokens su QUESTO
-                # prompt: RED_TEAM_PROMPT = 1098 token su sonnet-4-6 e 1505 su
-                # sonnet-5, cioe' +37,1% (la doc dice ~+30%: sull'italiano e' peggio).
-                # Quindi i 3000 tarati su 4.6 valgono ~2.190 token vecchi: appena
-                # sopra i 2000 che il 16/07 avevano GIA' troncato la critica. 4200
-                # ripristina il margine reale di allora. Il tetto non e' una spesa
-                # (l'output si paga a consumo): previene il troncamento, non lo compra.
-                max_tokens=4200,
-                # 05/09 (ordine PM «accendiamo anche il ragionamento»): ACCESO (effort medium
-                # via llm_client). Prima (26/07) era SPENTO esplicito per il budget: i token
-                # di ragionamento contano nei 4200 e in usage.reasoning_tokens — se la critica
-                # esce troncata, il WARN qui sotto lo dice e il tetto si alza.
-                thinking={"type": "adaptive"},
-                system=prompt_for_language(RED_TEAM_PROMPT),
+                # PM 02/10: 128k per nuovo lavoro; un loop verificato gia' iniziato
+                # conserva il suo limite storico e gli stessi body di richiesta.
+                max_tokens=max_tokens,
+                # Ragionamento invariato: concorre al limite e alla usage registrata.
+                thinking=role_thinking(blackboard, 'red_team') if trade_idea else {"type": "adaptive"},
+                system=selected_system,
                 messages=messages,
                 **_kw,
             )
+            _request_inflight = False
             # Se la risposta non espone usage i token NON diventano zero in silenzio:
             # zero direbbe "questo giro non e' costato nulla" su una chiamata vera.
             # Il buco si segna e a fine agente lo status diventa "usage_unknown"
@@ -324,7 +549,18 @@ def run_red_team(blackboard, portfolio_data=None, memory_db=None) -> str:
                 results = []
                 for block in resp.content:
                     if block.type == "tool_use":
+                        tool_key = _checkpoint_digest({"iteration": _it, "id": block.id,
+                                                       "name": block.name, "input": block.input})
+                        if tool_key in pending_tools:
+                            results.append(deepcopy(pending_tools[tool_key]))
+                            continue
+                        if tool_key in inflight_tools:
+                            raise ValueError("Red Team tool outcome unknown: " + block.name)
+                        inflight_tools[tool_key] = {"name": block.name, "id": block.id}
+                        checkpoint("red_team_tool_dispatch", {**safe_snapshot,
+                            "pending_tools": pending_tools, "inflight_tools": inflight_tools})
                         print(f"[RED_TEAM] -> {block.name}({str(block.input)[:60]})")
+                        r, receipt_truncated = None, False
                         try:
                             from bellomberg.agents import chat_tools; import json as _j
                             # V6 Lotto 3 (review B4): attribuzione del chiamante
@@ -341,17 +577,37 @@ def run_red_team(blackboard, portfolio_data=None, memory_db=None) -> str:
                             except Exception:
                                 _TETTO = 6000
                             if len(r_str) > _TETTO:
+                                receipt_truncated = True
                                 r_str = r_str[:_TETTO] + "...[truncated]"
                         except Exception as te:
                             r_str = f"[tool error dichiarato: {te}]"
-                        results.append({"type": "tool_result",
-                                        "tool_use_id": block.id, "content": r_str})
+                        if trade_idea:
+                            from bellomberg.agents.specialists.base import _trade_idea_tool_receipt_success
+                            blackboard.tool_receipts.append({"tool": block.name, "input": block.input or {},
+                                "source": r.get("_source") if isinstance(r, dict) else None,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "success": _trade_idea_tool_receipt_success(r, block.name, truncated=receipt_truncated),
+                                "output": r_str, "truncated": receipt_truncated})
+                            blackboard.tool_log.append({"tool": block.name, "specialist": "red_team",
+                                "time": datetime.now(timezone.utc).isoformat()})
+                        result = {"type": "tool_result", "tool_use_id": block.id, "content": r_str}
+                        pending_tools[tool_key] = result
+                        inflight_tools.pop(tool_key, None)
+                        checkpoint("red_team_tool", {**safe_snapshot,
+                            "pending_tools": pending_tools, "inflight_tools": inflight_tools})
+                        results.append(result)
                 messages.append({"role": "user", "content": results})
+                checkpoint("red_team_turn", loop_state(_it + 1))
                 continue
             # audit/11 §5: concatena TUTTI i blocchi text (stessa classe di bug di
             # specialists/base: la coda 'I 3 RISCHI...' e' la prima a perdersi)
             _parts = [b.text for b in resp.content if hasattr(b, "text")]
             critique = "\n".join(p for p in _parts if p)
+            if trade_idea:
+                blackboard.data["_red_team_native_terminal"] = {
+                    "response_id": getattr(resp, "id", None),
+                    "stop_reason": getattr(resp, "stop_reason", None),
+                    "text_present": bool(critique.strip()), "text_chars": len(critique)}
             # E 16/07: se il modello ha sbattuto sul tetto token il testo finisce a meta'
             # frase — il buco si DICHIARA nel testo stesso (il Capo e il DB lo vedono),
             # non si lascia una critica che sembra completa.
@@ -366,7 +622,7 @@ def run_red_team(blackboard, portfolio_data=None, memory_db=None) -> str:
                 print("[RED_TEAM] " + _rif[:220])
                 critique = (_rif + "\n\n" + critique) if critique.strip() else _rif
             # §9-bis n.5: la critica del giro forzato si dichiara in testa
-            if critique and _forced_final:
+            if critique and _forced_final and not trade_idea:
                 critique = ("[CRITICA AL LIMITE VERIFICHE (4 giri): tool esauriti, "
                             "buchi dichiarati nel testo]\n" + critique)
             break
@@ -381,7 +637,8 @@ def run_red_team(blackboard, portfolio_data=None, memory_db=None) -> str:
         try:
             blackboard.write("_red_team", 1, critique)
         except Exception:
-            pass
+            if checkpoint_key is not None:
+                raise
         # collaudo #44: il red team entra nel conto della run come gli specialisti.
         # cache_ttl=None: NON usa prompt caching (nessun cache_control nelle sue
         # chiamate) -> cache_read/cache_write restano 0, ed e' corretto cosi'.
@@ -395,6 +652,15 @@ def run_red_team(blackboard, portfolio_data=None, memory_db=None) -> str:
                 status="usage_unknown" if _usage_unknown else "ok")
         except Exception as ue:
             print(f"[RED_TEAM] usage non registrato (procedo): {ue}")
+            if checkpoint_key is not None:
+                raise
+        issue = motivo_critica_non_utilizzabile(critique)
+        if getattr(resp, "stop_reason", None) != "end_turn":
+            issue = issue or "terminal response incomplete: " + str(getattr(resp, "stop_reason", None))
+        checkpoint("red_team_report", {**loop_state(_it + 1),
+            "status": "failed" if issue else "complete", "critique": critique})
+        if issue and checkpoint_key is not None:
+            raise ValueError("Red Team incomplete: " + issue)
         print(f"[RED_TEAM] critica generata: {len(critique)} chars")
         _cost = (_entry or {}).get("cost_eur")
         print(f"[RED_TEAM] usage: in={_usage['in'] if _usage['in'] is not None else 'n.d.'} out={_usage['out'] if _usage['out'] is not None else 'n.d.'} "
@@ -402,6 +668,15 @@ def run_red_team(blackboard, portfolio_data=None, memory_db=None) -> str:
               f"({_calls} call API, costo {_fmt_cost(_cost)})")
         return critique
     except Exception as e:
+        if _request_inflight:
+            _usage = _somma_usage(_usage, None)
+            _usage_unknown = True
+            request_id = getattr(e, "request_id", None)
+            if request_id and request_id not in _usage.get("request_ids", []):
+                _usage.setdefault("request_ids", []).append(request_id)
+        callback = getattr(blackboard, "record_run_failure", None)
+        if callable(callback):
+            callback(e, desk="red_team", round_n=1)
         print(f"[RED_TEAM] API error (procedo senza): {e}")
         # Audit 11/09 (Fable 5.1, run 10/09 memo #53): il 403 del modello (gate 18+ di
         # OpenRouter) restava SOLO nel log; il registro `_red_team` non veniva scritto,
@@ -423,4 +698,6 @@ def run_red_team(blackboard, portfolio_data=None, memory_db=None) -> str:
                                     api_calls=_calls, cache_ttl=None, status="api_error")
         except Exception as ue:
             print(f"[RED_TEAM] usage non registrato (procedo): {ue}")
+        if checkpoint_key is not None:
+            raise
         return ""

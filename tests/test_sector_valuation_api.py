@@ -44,7 +44,7 @@ def test_external_ticker_uses_canonical_sidecar_identity_and_common_number(tmp_p
     model = endpoint(tmp_path)["models"][0]
     assert model["ticker"] == "SYNTH" and not model["matched"]
     assert model["identity_status"] == "canonical"
-    assert model["fair_value"] == payload["fair_value_weighted"]
+    assert model["fair_value"] == payload["fair_value_base"] == 14.13
     assert model["valuation_usability"]["usable"]
     assert model["snapshot_id"] == payload["snapshot_id"]
 
@@ -144,7 +144,7 @@ def test_current_matching_sidecar_keeps_its_value_and_uses_snapshot_revision_tim
     model = data["models"][0]
     assert model["current_generation"] is False and model["canonical"] is True
     assert model["automation"]["status"] == "unavailable"
-    assert model["fair_value"] == 120
+    assert model["fair_value"] == current["fair_value_base"] == 14.13
     assert model["generated_at"] == "2026-09-10 10:00:00"
 
 

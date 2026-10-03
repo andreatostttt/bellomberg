@@ -36,7 +36,8 @@ def test_primary_xbrl_listing_and_exact_day_price_share_one_catalog(tmp_path, mo
     assert calls == [("SYNTH", "2025-12-31")]
     assert result["preparation_ready"] and len(result["documents"]) == 4
     assert result["selection"]["opening_date"] == "2025-12-31"
-    assert all("archive_path" not in doc for doc in result["documents"])
+    assert result["documents"][0]["archive_path"] == primary["archive_path"]
+    assert all("archive_path" not in doc for doc in result["documents"][1:])
     assert result["documents"][0]["id"] == primary["id"]
 
 
@@ -125,6 +126,39 @@ def test_missing_annual_prevents_paid_preparation(tmp_path, monkeypatch):
     assert any(issue["source"] == "annual coverage" for issue in result["issues"])
 
 
+@pytest.mark.parametrize('case', ['same_day', 'missing_acceptance', 'cross_utc_date', 'earlier_filing'])
+def test_same_period_sec_reports_need_explicit_acceptance_order_and_keep_both(tmp_path, monkeypatch, case):
+    from copy import deepcopy
+    from bellomberg.valuation import valuation_sources
+    from bellomberg.valuation.preparation_sources import collect_preparation_evidence
+    annual = _setup(monkeypatch, tmp_path)
+    primary = {**deepcopy(annual), 'id': 'latest', 'published_at': '2026-08-01',
+        'metadata': {'report_date': '2026-06-30', 'form': '6-K', 'emittente_id': 'CIK:0000000123',
+                     'tipo': 'semestrale', 'accepted_at': '2026-08-01T14:30:00Z'}}
+    earlier = {**deepcopy(primary), 'id': 'earlier'}
+    earlier['metadata']['accepted_at'] = '2026-08-01T13:00:00Z'
+    if case == 'missing_acceptance':
+        earlier['metadata'].pop('accepted_at')
+    elif case == 'cross_utc_date':
+        earlier['metadata']['accepted_at'] = '2026-07-31T23:55:41Z'
+    elif case == 'earlier_filing':
+        earlier['published_at'] = '2026-07-31'
+        earlier['metadata']['accepted_at'] = '2026-07-31T13:00:00Z'
+    monkeypatch.setattr(valuation_sources, 'collect_documents', lambda *a, **k: {
+        'status': 'ready', 'documents': [earlier, annual, primary], 'issues': [], 'coverage': {}})
+    result = collect_preparation_evidence('SYNTH', as_of='2026-08-02', archive_root=tmp_path,
+        price_fetch=lambda ticker, on: {'symbol': ticker, 'date': on, 'currency': 'EUR', 'close': 12.5})
+    if case != 'missing_acceptance':
+        assert result['preparation_ready'], result['issues']
+        assert result['selection']['selected_document_id'] == 'latest'
+        assert 'earlier' in result['selection']['selected_document_ids']
+        assert result['selection']['same_period_selection_basis'] == (
+            'latest_filing_date' if case == 'earlier_filing' else 'latest_verified_sec_acceptance')
+    else:
+        assert not result['preparation_ready']
+        assert any('ambiguous' in issue['reason'] for issue in result['issues'])
+
+
 @pytest.mark.parametrize('fx_status', ['ready', 'incomplete'])
 def test_known_cross_currency_requires_exact_day_fx_before_paid_preparation(tmp_path,monkeypatch,fx_status):
     from bellomberg.valuation.preparation_sources import collect_preparation_evidence
@@ -144,3 +178,30 @@ def test_known_cross_currency_requires_exact_day_fx_before_paid_preparation(tmp_
     assert observed[0]['on']=='2025-12-31'
     assert result['preparation_ready']==(fx_status=='ready')
     if fx_status=='incomplete': assert not result['documents']
+
+
+def test_collected_original_file_survives_catalog_and_detects_later_tampering(tmp_path, monkeypatch):
+    from datetime import date
+    from bellomberg.valuation.preparation_sources import collect_preparation_evidence
+    from bellomberg.valuation.input_preparation import _catalog
+    from bellomberg.valuation.quotation_evidence import verify_sec_listing
+    primary = _setup(monkeypatch, tmp_path)
+    path = tmp_path / 'statement.html'
+    raw = path.read_bytes() + b'<ix:nonNumeric name="dei:EntityRegistrantName" contextRef="listed">Synthetic issuer</ix:nonNumeric>'
+    path.write_bytes(raw)
+    digest = sha256(raw).hexdigest()
+    primary.update(id=digest, document_sha256=digest)
+    primary['metadata']['issuer'] = 'Synthetic issuer'
+    report = collect_preparation_evidence('SYNTH', as_of='2026-02-02', archive_root=tmp_path,
+        price_fetch=lambda ticker, on: {'symbol': ticker, 'date': on, 'currency': 'EUR', 'close': 12.5})
+    assert report['preparation_ready']
+    documents = [d for d in report['documents'] if d['id'] != 'synthetic-xbrl']
+    catalog, issues, _ = _catalog(documents, date(2026, 2, 2))
+    assert issues == []
+    original = catalog[digest]
+    assert original['archive_path'] == str(path)
+    listing = catalog['listing-' + digest]
+    assert verify_sec_listing(listing, original, ticker='SYNTH', on='2025-12-31')['id'] == listing['id']
+    path.write_bytes(b'altered after acquisition')
+    with pytest.raises(ValueError, match='Original SEC listing bytes differ'):
+        verify_sec_listing(listing, original, ticker='SYNTH', on='2025-12-31')

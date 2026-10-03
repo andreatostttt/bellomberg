@@ -25,7 +25,7 @@ def test_snapshot_read_uses_its_cutoff_but_explicit_requests_stay_strict(monkeyp
 
     monkeypatch.setattr(dcf_quality, "date", ReadingDate)
     assert dcf_quality.assess_valuation_usability(original)["usable"] is True
-    assert dcf_quality.normalize_valuation_payload(original)["fair_value_weighted"] == 120.0
+    assert dcf_quality.normalize_valuation_payload(original)["fair_value_base"] == 14.13
     assert original == before
     assert dcf_quality.assess_valuation_usability(original, as_of=DAY)["usable"] is True
     requested = ReadingDate.today().isoformat()
@@ -42,11 +42,23 @@ def test_historical_read_never_invents_a_missing_or_invalid_snapshot_cutoff(inva
     original["valuation_decision"]["as_of"] = invalid_cutoff
     result = dcf_quality.normalize_valuation_payload(original)
     assert result["valuation_usability"]["usable"] is False
-    assert result["fair_value_weighted"] is None
+    assert result["fair_value_base"] is None
     assert any("cutoff" in reason for reason in result["valuation_usability"]["reasons"])
 
 
 def payload_for(model="software"):
+    if model == "software":
+        # The operating gate attests the calculation against its quoted inputs.
+        # Use the existing frozen records and real adapter, not a DOCUMENTATA
+        # label around an invented result. Only workbook rendering is outside
+        # this consumer test; market_quote tests exercise the real workbook.
+        from bellomberg.valuation import dcf_engine, documented_inputs
+        from test_sector_operating_drivers import bundle_for
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(documented_inputs, "build_documented_workbook", lambda *args: None)
+            payload = dcf_engine.generate_valuation("SYNTH", prepared_bundle=bundle_for(symbol="SYNTH"))
+        assert payload["valuation_usability"]["usable"], payload["valuation_usability"]
+        return payload
     evidence = [{"field": field, "value": value, "source_id": "synthetic-issuer", "as_of": DAY}
                 for field, value in (("instrument", "equity"), ("business_model", model))]
     decision = select_valuation_method(resolve_valuation_profile(
@@ -83,7 +95,7 @@ def assess(payload, **kwargs):
 
 
 @pytest.mark.parametrize("model", ["software", "bank", "cef", "dat"])
-def test_documented_method_specific_payload_is_usable_without_operating_requirements(model):
+def test_documented_method_specific_payload_uses_its_family_requirements(model):
     original = payload_for(model)
     before = deepcopy(original)
     result = assess(original, expected_decision=original["valuation_decision"])
@@ -91,6 +103,14 @@ def test_documented_method_specific_payload_is_usable_without_operating_requirem
     assert original == before
     if model != "software":
         assert "reinvestment" not in original["input_consumption"]["consumed_fields"]
+
+
+def test_operating_payload_cannot_omit_calculation_attestation_policy():
+    payload = payload_for()
+    del payload["sanity"]["policy"]
+    result = assess(payload)
+    assert result["usable"] is False
+    assert any("policy documentata non riconciliata" in reason for reason in result["reasons"])
 
 
 def test_legacy_number_is_readable_but_never_usable():
@@ -114,7 +134,7 @@ def test_archived_preparation_basis_is_evidence_and_survives_output_masking(bloc
     result = dcf_quality.normalize_valuation_payload(payload, as_of=DAY)
     assert result['valuation_usability']['usable'] is not blocked
     assert result['preparation']['review_basis'] == basis
-    assert result['fair_value_weighted'] == (None if blocked else 120.)
+    assert result['fair_value_base'] == (None if blocked else 14.13)
 
 
 @pytest.mark.parametrize('branch', ['calculation_details', 'sidecar'])
@@ -203,7 +223,7 @@ def test_number_requires_documentation_sanity_and_consumed_family_inputs(key, ch
 @pytest.mark.parametrize("number", [float("inf"), float("nan"), True, "120", None])
 def test_primary_fair_value_must_be_a_finite_number(number):
     payload = payload_for()
-    payload["fair_value_weighted"] = number
+    payload["fair_value_base"] = number
     assert assess(payload)["usable"] is False
 
 
@@ -280,7 +300,7 @@ def test_existing_refusal_is_not_promoted_by_another_consumer():
     payload["valuation_usability"] = {"usable": False, "reasons": ["sidecar belongs to another snapshot"],
                                       "missing_fields": ["generation_proof"]}
     normalized = dcf_quality.normalize_valuation_payload(payload, as_of=DAY)
-    assert normalized["fair_value_weighted"] is None
+    assert normalized["fair_value_base"] is None
     assert "sidecar belongs to another snapshot" in normalized["valuation_usability"]["reasons"]
     assert "generation_proof" in normalized["valuation_usability"]["missing_fields"]
 
@@ -312,7 +332,7 @@ def test_explicit_top_level_exclusion_overrides_sanity_ok(flag):
     payload[flag] = True
     normalized = dcf_quality.normalize_valuation_payload(payload, as_of=DAY)
     assert normalized["valuation_usability"]["usable"] is False
-    assert normalized["fair_value_weighted"] is None
+    assert normalized["fair_value_base"] is None
 
 
 @pytest.mark.parametrize("flag", ["exclude_from_action_table", "valuation_flagged"])

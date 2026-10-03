@@ -1,4 +1,5 @@
 """The public DCF tool must preserve the validated engine's contract."""
+from copy import deepcopy
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ import pytest
 
 def _engines(monkeypatch, outcome):
     from bellomberg.agents import agent_tools
+    from bellomberg.valuation import dcf_engine
     calls = []
 
     def modern(ticker, **kwargs):
@@ -19,7 +21,9 @@ def _engines(monkeypatch, outcome):
     def legacy(*args, **kwargs):
         pytest.fail("The unvalidated legacy builder must never be invoked")
 
-    monkeypatch.setitem(sys.modules, 'bellomberg.valuation.dcf_engine', SimpleNamespace(generate_valuation=modern))
+    # Replace the provider boundary only. Real sanity/normalization helpers
+    # inside this module are part of the tool's validation contract.
+    monkeypatch.setattr(dcf_engine, 'generate_valuation', modern)
     monkeypatch.setitem(sys.modules, 'bellomberg.valuation.dcf_modeler', SimpleNamespace(build_dcf_excel=legacy))
     return agent_tools, calls
 
@@ -34,23 +38,40 @@ def test_engine_failure_never_degrades_to_legacy(monkeypatch, outcome):
     assert len(calls) == 1
 
 
-def test_terminal_growth_is_forwarded_and_model_metadata_preserved(monkeypatch):
-    module, calls = _engines(monkeypatch, {
-        "ok": True, "path": "synthetic.xlsx", "engine": "operating",
+def test_terminal_growth_is_forwarded_and_model_metadata_preserved(monkeypatch, tmp_path):
+    from bellomberg.valuation import dcf_engine
+    from test_sector_operating_drivers import bundle_for
+    payload = dcf_engine.generate_valuation("SYNTH", prepared_bundle=bundle_for(symbol="SYNTH"),
+                                            output_dir=str(tmp_path))
+    assert payload["valuation_usability"]["usable"], payload["valuation_usability"]
+    workbook = Path(payload["path"])
+    original_bytes = workbook.read_bytes()
+    payload.update({
         "damodaran_wacc": {"wacc_pct": 0.0, "wacc": 0.10},
         "values_baked": False, "bake_error": "synthetic bake error",
-        "sanity": {"severity": "WARN"}, "exclude_from_action_table": True,
+        "exclude_from_action_table": True,
         "fx_conversion": {"status": "missing"},
     })
+    before = deepcopy(payload)
+    module, calls = _engines(monkeypatch, payload)
     result = module.tool_build_dcf_model("SYNTH", perpetual_growth=0.02)
     assert calls == [("SYNTH", {"output_dir": str(Path(__file__).resolve().parents[1] / "models"), "terminal_growth": 0.02})]
-    assert result["path"] == "synthetic.xlsx"
+    assert result["path"] == str(workbook)
     assert result["wacc_pct"] == 0.0
     assert result["values_baked"] is False
     assert result["bake_error"] == "synthetic bake error"
-    assert result["sanity"] == {"severity": "WARN"}
+    expected_sanity = deepcopy(payload["sanity"])
+    expected_sanity["upside_pct"] = None
+    for check in expected_sanity["scenario_checks"].values():
+        check["upside_pct"] = None
+    assert result["sanity"] == expected_sanity
     assert result["exclude_from_action_table"] is True
     assert result["fx_conversion"] == {"status": "missing"}
+    # Preserve the artifact and diagnostics, while keeping an explicit
+    # exclusion unusable. The forwarding adapter must never bless its FV.
+    assert result["valuation_usability"]["usable"] is False
+    assert result["fair_value_base"] is None
+    assert payload == before and workbook.read_bytes() == original_bytes
 
 
 def test_decimal_wacc_is_reported_as_percentage(monkeypatch):

@@ -264,7 +264,9 @@ def test_common_collector_retains_packet_and_recompilable_document(tmp_path, mon
     assert primary == before and report['preparation_ready']
     assert report['balance_details']['status'] == 'ready'
     docs = [d for d in report['documents'] if d['id'] in (primary['id'], 'balance-details-'+primary['id'])]
-    assert len(docs) == 2 and all('archive_path' not in d for d in docs)
+    assert len(docs) == 2
+    assert next(d for d in docs if d['id'] == primary['id'])['archive_path'] == primary['archive_path']
+    assert 'archive_path' not in next(d for d in docs if d['id'] != primary['id'])
+    assert all('archive_path' not in row for row in report['acquired_document_index'])
     catalog, issues, _ = _catalog(docs, date(2026, 2, 2))
     assert not issues and len(catalog) == 2
-

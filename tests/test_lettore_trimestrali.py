@@ -82,6 +82,24 @@ def test_estrazione_html_spoglia_i_tag(tmp_path):
     assert "var x=1" not in r["testo"]      # gli script non sono testo
 
 
+def test_ixbrl_header_resources_are_not_visible_but_tagged_financial_facts_are(tmp_path):
+    p = tmp_path / 'inline.html'
+    p.write_text('<html><body><ix:header><ix:hidden><ix:nonNumeric>HIDDEN CIK</ix:nonNumeric>'
+        '</ix:hidden><ix:references>TECHNICAL TAXONOMY</ix:references><ix:resources>'
+        '<xbrli:context>TECHNICAL CONTEXT 2020-01-01</xbrli:context></ix:resources></ix:header>'
+        '<h1>Visible issuer</h1><p>For the quarterly period ended '
+        '<ix:nonNumeric>June 30, 2026</ix:nonNumeric></p>'
+        '<p>Consolidated revenue <ix:nonFraction>13,000</ix:nonFraction></p></body></html>',
+        encoding='utf-8')
+    r = estrai_testo(str(p))
+    assert r['stato'] == 'ok'
+    assert 'TECHNICAL' not in r['testo'] and 'HIDDEN CIK' not in r['testo']
+    assert r['testo'].startswith('Visible issuer')
+    assert 'For the quarterly period ended June 30, 2026' in r['testo']
+    assert 'Consolidated revenue 13,000' in r['testo']
+    assert r['caratteri'] == len(r['testo'])
+
+
 def test_estrazione_vuota_dichiarata_illeggibile(tmp_path):
     p = tmp_path / "garbage.pdf"
     p.write_bytes(b"\x00\x01\x02NONSONOUNPDF")

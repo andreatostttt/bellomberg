@@ -115,13 +115,16 @@ def test_fundamentals_no_universal_operating_or_us_filter():
 
 
 def test_score_rejects_workbook_changed_after_valid_generation(tmp_path, monkeypatch):
+    from pathlib import Path
     from bellomberg.agents import specialist_scores
     from bellomberg.storage import classificazione
-    from test_sector_valuation_integration import synthetic_bundle, documented_payload, SYMBOL
-    workbook = tmp_path / ("VAL_" + SYMBOL + ".xlsx")
-    workbook.write_bytes(b"synthetic original workbook")
-    bundle = synthetic_bundle(day=date.today().isoformat())
-    payload = documented_payload(bundle, workbook)
+    from bellomberg.valuation.dcf_engine import generate_valuation
+    from test_sector_operating_drivers import bundle_for
+    from test_sector_valuation_integration import SYMBOL
+    bundle = bundle_for(symbol=SYMBOL)
+    payload = generate_valuation(SYMBOL, prepared_bundle=bundle, output_dir=str(tmp_path))
+    assert payload["valuation_usability"]["usable"], payload["valuation_usability"]
+    workbook = Path(payload["path"])
     payload["_timestamp"] = date.today().isoformat()
     sidecar = workbook.with_suffix(".payload.json")
     sidecar.write_text(json.dumps(payload), encoding="utf-8")

@@ -1,7 +1,7 @@
 # CI Bellomberg (§9-bis n.7, piano ok PM 21/07):
 #   1) compile-check del package src/bellomberg, launcher e strumenti pubblici;
 #      archivio privato e directory runtime esclusi;
-#   2) suite pytest OFFLINE in tests/ (zero rete/API/DB vivo:
+#   2) suite research OFFLINE esplicita, senza generazione Excel (zero rete/API/DB vivo:
 #      la ANTHROPIC_API_KEY qui e' un dummy dichiarato, mai una chiave vera).
 # NB: in locale il progetto gira su Python 3.14; il job Linux prova 3.12 (copertura dei
 # wheel binari chromadb/arch/scipy) E 3.14 (matrice, 12/09); il job macOS resta su 3.12
@@ -57,7 +57,7 @@ jobs:
         run: npm ci
 
       - name: Suite offline
-        run: pytest tests/ -q
+        run: python -I tools/testing/research_ci.py
 
       - name: Frontend TypeScript
         working-directory: app
@@ -156,7 +156,7 @@ jobs:
         run: npm ci
 
       - name: Suite offline (POSIX, APFS)
-        run: pytest tests/ -q
+        run: python -I tools/testing/research_ci.py
 
       - name: Frontend production bundles and release contracts
         working-directory: app

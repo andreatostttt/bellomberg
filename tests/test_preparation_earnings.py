@@ -65,6 +65,27 @@ def test_verified_earnings_exhibit_joins_source_catalog_with_its_original_filing
     assert result['numeric_guidance_extracted'] is False
 
 
+def test_foreign_earnings_use_verified_issuer_name_not_stripped_ticker(tmp_path, monkeypatch):
+    from bellomberg.market_data import sec_edgar
+    from bellomberg.valuation.preparation_earnings import collect_earnings_evidence
+    primary = _anchor()
+    primary['metadata'].update(form='20-F', issuer='Synthetic Issuer')
+    entry = _entry()
+    entry.update(form='6-K', ticker='SYNTH.MI')
+    calls = []
+    def catalog(ticker, **kwargs):
+        calls.append((ticker, kwargs['issuer_name']))
+        return {'stato': 'ok', 'documenti': [entry], 'motivi': []}
+    monkeypatch.setattr(sec_edgar, 'get_filing_catalog', catalog)
+    monkeypatch.setattr(sec_edgar, 'get_recent_filings',
+                        lambda *_a, **_k: pytest.fail('Foreign symbol went through stripped lookup'))
+    result = collect_earnings_evidence('SYNTH.MI', primary=primary, as_of='2026-09-10',
+        archive_root=tmp_path, download=_transport(tmp_path, [], html='<html><h1>FORM 6-K</h1></html>'))
+    assert result['status'] == 'ready', result['issues']
+    assert calls == [('SYNTH.MI', 'Synthetic Issuer')]
+    assert result['documents'][0]['metadata']['emittente_id'] == 'CIK:0000000123'
+
+
 @pytest.mark.parametrize('change', ['issuer', 'accession', 'future', 'old', 'not_earnings', 'bad_date'])
 def test_unrelated_future_or_unqualified_entries_are_not_downloaded(tmp_path, change):
     entry = _entry()

@@ -1,12 +1,13 @@
 """
-regenerate_memo.py — RECUPERO: rigenera il memo dai report degli specialisti GIA'
-salvati nel DB (Round 2 persistiti), senza rifare i 3 round. Utile quando una run
-si impalla su un agente: si recupera il lavoro gia' pagato facendo partire SOLO il Capo.
-Costo: solo la chiamata del Capo (+ qualche scorer veloce), non un'altra run intera.
+regenerate_memo.py — Ripresa esplicita dello stesso memo tramite il percorso
+ordinario Consigliere e i suoi checkpoint nativi. Conserva richieste, report,
+decisioni e contesto originali. I memo precedenti privi di checkpoint restano
+conservati ma non sono convertiti implicitamente in una nuova run.
 
-USO: python regenerate_memo.py [--language it|en]
-Il comando esplicito aggiorna il memo recuperato nella stessa lingua nota.
-Una lingua diversa richiede una nuova versione; cambiare preferenza non lo avvia.
+USO: python regenerate_memo.py --memo-id ID --delivery-only [--send-email]
+      python regenerate_memo.py --memo-id ID --authorize-new-ai
+La selezione e' esplicita. La consegna non richiama AI; la continuazione conserva
+il contesto originale e richiede autorizzazione per le fasi mancanti.
 """
 import os, sys
 from datetime import datetime
@@ -39,10 +40,22 @@ def _recovery_language(memo_language, report_languages, explicit=None):
     return languages[0]
 
 
-def main(language=None):
+def main(language=None, *, memo_id=None, delivery_only=False, authorize_new_ai=False, send_email=False):
+    if memo_id is not None:
+        from bellomberg.agents.consigliere_multi import run_multi_agent
+        if language is not None:
+            db = MemoryDB()
+            with db._conn() as conn:
+                row = conn.execute("SELECT output_language FROM memos WHERE id=?", (memo_id,)).fetchone()
+            if row is None:
+                raise ValueError("Memo selezionato inesistente / Selected memo does not exist")
+            _recovery_language(row[0], [row[0]], language)
+        return run_multi_agent(resume_memo_id=memo_id, delivery_only=delivery_only,
+                               authorize_new_ai=authorize_new_ai, send_email=send_email)
     db = MemoryDB()
     with db._conn() as conn:
-        memo = conn.execute("SELECT id,output_language,full_markdown FROM memos ORDER BY id DESC LIMIT 1").fetchone()
+        memo = conn.execute("SELECT id,output_language,full_markdown FROM memos "
+                            "WHERE substr(COALESCE(notes,''),1,11) <> 'trade_idea:' ORDER BY id DESC LIMIT 1").fetchone()
         if not memo:
             print("Nessun memo nel DB. / No memo in the database."); return
         memo_id = memo["id"]
@@ -55,25 +68,9 @@ def main(language=None):
               f"No saved reports for memo #{memo_id}: nothing to recover "
               f"(the run stopped before finalizing Round 2)."); return
 
-    selected = _recovery_language(memo["output_language"], [r["output_language"] for r in rows], language)
-    # 05/09 (criterio 5, review): senza mandato run_capo solleva MandatoMancante — dillo QUI, prima
-    # del Blackboard (che scrive l'heartbeat di F4) e dei minuti di risk/sizing, non alla fine.
-    from bellomberg.core import mandato_pm
-    try:
-        mandato_pm.carica()
-    except mandato_pm.MandatoMancante as _mm:
-        _log(text("MANDATO NON DICHIARATO: ", "MANDATE NOT DECLARED: ", language=selected) + str(_mm))
-        _log(text("Il recupero del memo non parte senza il mandato del PM: compila la pagina Mandato e Diario (F18) e rilancia.",
-                  "Memo recovery requires the PM mandate: complete the Mandate and Journal page (F18) and run again.", language=selected))
-        raise SystemExit(2)
-    with language_context(selected):
-        bb = Blackboard(memory_db=db, memo_id=memo_id)
-    from hashlib import sha256
-    original_text = memo["full_markdown"]
-    original_hash = (sha256(original_text.encode("utf-8")).hexdigest()
-                     if isinstance(original_text, str) and original_text.strip()
-                     and original_text != "[IN PROGRESS]" else None)
-    return _regenerate(db, memo_id, rows, bb, memo_sha256=original_hash, language=selected)
+    raise ValueError("Seleziona --memo-id " + str(memo_id) + " e --delivery-only oppure --authorize-new-ai; "
+                     "nessun recupero a pagamento implicito dell'ultimo memo / Select a memo and recovery mode")
+
 
 
 def _persist_recovery_outputs(conn, memo_id, memo, pdf_path, appendix_path, selected, usage):
@@ -88,7 +85,9 @@ def _persist_recovery_outputs(conn, memo_id, memo, pdf_path, appendix_path, sele
 
 
 @scoped_language
-def _regenerate(db, memo_id, rows, bb, *, memo_sha256=None):
+def _regenerate(db, memo_id, rows, bb, *, memo_sha256=None, portfolio_snapshot=None):
+    raise ValueError("Helper legacy disabilitato: usa main(memo_id=..., delivery_only=True) "
+                     "o la ripresa nativa esplicitamente autorizzata; nessun mix con dati attuali")
     selected = capture_language()
     found = {}
     for r in rows:
@@ -96,7 +95,9 @@ def _regenerate(db, memo_id, rows, bb, *, memo_sha256=None):
         found[r["specialist"]] = r["round_n"]
     _log(f"Memo #{memo_id}: recuperati {len(found)} specialisti -> {sorted(found)}")
 
-    portfolio = db.get_portfolio_summary()
+    if portfolio_snapshot is None:
+        raise ValueError("Contesto portfolio storico assente: vietato mescolare report salvati e book corrente")
+    portfolio = portfolio_snapshot
 
     # rischio + sizing (come consigliere_multi)
     risk_data = None
@@ -156,6 +157,8 @@ def _regenerate(db, memo_id, rows, bb, *, memo_sha256=None):
     _log("CAPO synthesis (recupero)...")
     memo, usage = run_capo(bb, portfolio_data=portfolio, memory_db=db,
                            sizing_context=sizing_context, scoring_context=scoring_context)
+    from bellomberg.agents.weekly_lifecycle import validate_memo
+    validate_memo(memo, usage)
 
     # MEMO LINTER (audit/07 P2, v1 solo flag) — stessa passata del run principale
     try:
@@ -220,39 +223,15 @@ def _regenerate(db, memo_id, rows, bb, *, memo_sha256=None):
     except Exception as e:
         _log("appendix error: " + str(e))
 
-    # update memo nel DB + email
-    try:
-        with db._conn() as conn:
-            _persist_recovery_outputs(conn, memo_id, memo, pdf_path, appendix_path, selected, usage)
-            # idempotente: cancella le decisioni gia' estratte per questo memo prima di ri-estrarre
-            conn.execute("DELETE FROM decisions WHERE memo_id=? AND status='PENDING'", (memo_id,))
-            # #204b HARD (review Lotto C, F1c): via anche le auto-chiusure di codice
-            # dello STESSO memo — senza questo ogni regenerate ne creava un
-            # duplicato fantasma (la ri-estrazione reinserisce la riga, l'apply la
-            # richiude). Tocca SOLO righe generate dal codice e mai annotate dal PM.
-            conn.execute("DELETE FROM decisions WHERE memo_id=? AND status='SKIPPED' "
-                         "AND outcome_notes LIKE '%AUTO-ESCLUSA%' "
-                         "AND (pm_feedback IS NULL OR TRIM(pm_feedback)='')", (memo_id,))
-    except Exception as e:
-        _log("DB update skip: " + str(e))
-    else:
-        # audit/11 §4: il DELETE sopra e' gia' COMMITTATO — se la ri-estrazione fallisce
-        # le PENDING sono perse in silenzio. Ora l'errore URLA e dice come recuperare.
-        try:
-            db.extract_and_save_decisions(memo_id, memo)
-        except Exception as e:
-            _log(f"[!] ATTENZIONE: PENDING del memo {memo_id} CANCELLATE ma ri-estrazione "
-                 f"FALLITA ({e}): rilancia regenerate_memo.py per ricrearle dall'ACTION TABLE")
-        else:
-            # #204b HARD fase APPLY (dopo la ri-estrazione: le righe esistono ora)
-            try:
-                if _sanity_pairs:
-                    from bellomberg.agents.action_validator import apply_sanity_exclusions
-                    _n_x = apply_sanity_exclusions(db, memo_id, _sanity_pairs)
-                    _log("ACTION VALIDATOR: esclusioni HARD applicate: "
-                         + str(_n_x) + "/" + str(len(_sanity_pairs)))
-            except Exception as _xe:
-                _log("[!] esclusioni HARD non applicate: " + str(_xe))
+    from bellomberg.agents.weekly_lifecycle import file_receipt
+    file_receipt(pdf_path, kind="PDF")
+    # Prepare first; memo and replacement proposals commit in one transaction.
+    db.replace_memo_decisions(memo_id, memo,
+        update_memo=lambda conn: _persist_recovery_outputs(
+            conn, memo_id, memo, pdf_path, appendix_path, selected, usage))
+    if _sanity_pairs:
+        from bellomberg.agents.action_validator import apply_sanity_exclusions
+        apply_sanity_exclusions(db, memo_id, _sanity_pairs)
 
     # Recovery uses the exact saved receipt for this memo. Recent files on disk
     # do not identify a run and may belong to another memo or be personal copies.
@@ -305,6 +284,18 @@ def _regenerate(db, memo_id, rows, bb, *, memo_sha256=None):
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Recover the latest memo without translating historical content")
+    parser = argparse.ArgumentParser(description="Recover an explicitly selected weekly memo")
     parser.add_argument("--language", choices=("it", "en"))
-    main(language=parser.parse_args().language)
+    parser.add_argument("--memo-id", type=int, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--delivery-only", action="store_true")
+    mode.add_argument("--authorize-new-ai", action="store_true")
+    parser.add_argument("--send-email", action="store_true")
+    args = parser.parse_args()
+    outcome = main(language=args.language, memo_id=args.memo_id, delivery_only=args.delivery_only,
+                   authorize_new_ai=args.authorize_new_ai, send_email=args.send_email)
+    print("Memo #" + str(args.memo_id) + ": " + str((outcome or {}).get("status", "unavailable")))
+    if (outcome or {}).get("blocked_reason"):
+        print(outcome["blocked_reason"])
+    if (outcome or {}).get("status") != "completed":
+        raise SystemExit(2)

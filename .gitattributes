@@ -45,3 +45,20 @@ docs/assets/screenshots/manifest.json -text
 *.tsx text eol=lf
 *.cjs text eol=lf
 app/tests/fixtures/filing-pipeline.json text eol=lf
+# Frozen public SEC bytes: identical transport on every platform.
+tests/fixtures/sec_cover/uber-20260630.part-*.html -text
+# Preserve exact bytes of PM-ratified public-content privacy fixtures.
+app/src/pages/chat-desk.css -text
+app/src/pages/dashboard-command.css -text
+app/src/pages/memo-banco.css -text
+app/src/pages/movimenti.css -text
+app/src/pages/settings-veglia.css -text
+app/src/pages/trade-cassa.css -text
+docs/assets/screenshots/dashboard-en.dom.txt -text
+docs/assets/screenshots/performance-attribution-en.dom.txt -text
+docs/assets/screenshots/performance-en.dom.txt -text
+docs/guide/build_mockups.py -text
+tests/fixtures/sec_cover/uber-20260630.part-1.html -text
+tests/fixtures/sec_cover/uber-catalog.json -text
+tests/test_prev_close_dal_carico.py -text
+tests/test_sec_preparation_two_filings.py -text

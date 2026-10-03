@@ -227,6 +227,7 @@ if __name__ == "__main__":
     with db._conn() as conn:
         rows = conn.execute(
             "SELECT id, full_markdown FROM memos WHERE LENGTH(full_markdown) > 1000 "
+            "AND substr(COALESCE(notes,''),1,11) <> 'trade_idea:' "
             "ORDER BY id DESC LIMIT 3").fetchall()
     pf = None
     try:

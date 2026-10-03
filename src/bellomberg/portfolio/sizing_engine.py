@@ -116,7 +116,12 @@ def _stress_var_budget(invested, cash, risk_data, stress_data, p):
         out["gfc_zero_filled_names"] = len(_zf) if isinstance(_zf, dict) else None
         # review 14/07: il replay MC e' in base valuta LOCALE (dichiarato); per la
         # finestra GFC (USD in apprezzamento) sovrastima la perdita EUR = conservativo
-        out["gfc_basis_note"] = "replay in valuta locale per-asset (dichiarato, direzione conservativa per GFC)"
+        _fx = _meta.get("fx_conversion") or {}
+        out["gfc_basis_note"] = ("replay EUR per-asset, prezzi convertiti con FX storico alle date osservate"
+            if _fx.get("qualified") is True and _fx.get("base_currency")=="EUR"
+            else "replay in valuta locale per-asset (dichiarato, direzione conservativa per GFC)")
+        if _fx.get("qualified") is True and _fx.get("base_currency")=="EUR":
+            out["gfc_basis_currency"] = "EUR"
         if loss_pct < 0:
             d_max = nav * (p["budget_stress_nav_pct"] / loss_pct) - invested
             rooms.append(max(0.0, d_max))
@@ -574,10 +579,11 @@ def format_for_capo(sizing: dict) -> str:
                 if b.get("gfc_zero_filled_names"):
                     _base += ", {} nomi con buchi riempiti a 0".format(b["gfc_zero_filled_names"])
             L.append("BUDGET STRESS (#187, sul NAV): replay GFC 2008 = {:.1f}% del NAV "
-                     "(budget {:.0f}%, {}; base valuta locale dichiarata, conservativa){} "
+                     "(budget {:.0f}%, {}; {}){} "
                      "[src: get_portfolio_montecarlo replay]".format(
                          b["gfc_replay_nav_pct"], b["budget_gfc_replay_nav_pct"],
-                         b.get("gfc_status", "?"), _base))
+                         b.get("gfc_status", "?"),
+                         b["gfc_basis_note"] if b.get("gfc_basis_currency")=="EUR" else "base valuta locale dichiarata, conservativa", _base))
         else:
             L.append("BUDGET STRESS: " + str(b.get("gfc_replay", "n.d.")))
         if b.get("var99_1d_nav_pct") is not None:

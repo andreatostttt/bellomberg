@@ -2,6 +2,7 @@
 from copy import deepcopy
 from hashlib import sha256
 import json
+from pathlib import Path
 import socket
 import sys
 from types import SimpleNamespace
@@ -54,6 +55,12 @@ def documented_payload(bundle, path, *, generation="synthetic-generation"):
                                   "consumed_records": [{"record_index":i, **{key:r.get(key) for key in
                                       ("field","scenario","driver","entity","period","source_id")}}
                                       for i,r in enumerate(bundle["case"]["records"])]}}
+
+
+def documented_operating_bundle():
+    """Frozen economic records for positive tests of the real compiler contract."""
+    from test_sector_operating_drivers import bundle_for
+    return bundle_for(symbol=SYMBOL)
 
 
 @pytest.fixture
@@ -129,19 +136,23 @@ def test_acquired_records_are_not_treated_as_consumed_legacy_inputs(isolated_too
 
 def test_build_uses_cutoff_of_prepared_historical_bundle(isolated_tools, monkeypatch):
     tools = isolated_tools
-    bundle = synthetic_bundle(day="2024-04-17")
-    path = tools.directory / "synthetic.xlsx"
-    path.write_bytes(b"synthetic oracle workbook bytes")
-    payload = documented_payload(bundle, path)
+    # Keep the dated records unchanged: this is a historical research snapshot.
+    bundle = documented_operating_bundle()
+    payload = tools.engine.generate_valuation(SYMBOL, prepared_bundle=bundle,
+                                               output_dir=str(tools.directory))
+    assert payload["valuation_usability"]["usable"], payload["valuation_usability"]
     monkeypatch.setattr(tools.engine, "generate_valuation", lambda *args, **kwargs: deepcopy(payload))
     chat = tools.chat.dispatch("get_valuation", {"ticker": SYMBOL}, prepared_bundle=bundle)["data"]
     build = tools.build(SYMBOL, prepared_bundle=bundle)
     assert chat["valuation_usability"]["usable"] is True
     assert build["valuation_usability"] == chat["valuation_usability"]
-    assert build["fair_value_weighted"] == chat["fair_value_weighted"] == 120.0
+    assert build["fair_value_base"] == chat["fair_value_base"] == pytest.approx(14.13)
+    assert build["valuation_decision"]["as_of"] == chat["valuation_decision"]["as_of"] == DAY
+    assert build["acquisition_snapshot"] == chat["acquisition_snapshot"] == bundle
 
 
 def test_exposure_result_preserves_identity_and_missing_fields_on_both_tools(isolated_tools):
+    from bellomberg.valuation.trade_idea_model import candidate_model_usability
     tools = isolated_tools
     bundle = synthetic_bundle(model="etf", complete=False)
     chat = tools.chat.dispatch("get_valuation", {"ticker": SYMBOL}, prepared_bundle=bundle)["data"]
@@ -150,27 +161,37 @@ def test_exposure_result_preserves_identity_and_missing_fields_on_both_tools(iso
     for key in ("valuation_decision", "snapshot_id", "valuation_usability"):
         assert build[key] == chat[key]
     assert build["valuation_decision"]["missing_fields"]
+    for result in (chat, build):
+        assert not result.get('path')
+        assert not result['valuation_usability']['usable']
+        assert not candidate_model_usability(result)['usable']
 
 
 def seed_cache(tools, bundle):
-    path = tools.directory / "VAL_SYNTH.xlsx"
-    path.write_bytes(b"synthetic cached workbook bytes")
-    payload = documented_payload(bundle, path)
+    payload = tools.engine.generate_valuation(SYMBOL, prepared_bundle=bundle,
+                                               output_dir=str(tools.directory))
+    assert payload["valuation_usability"]["usable"], payload["valuation_usability"]
+    path = Path(payload["path"])
     sidecar = path.with_suffix(".payload.json")
-    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    persisted = json.loads(sidecar.read_text(encoding="utf-8"))
+    # The returned envelope adds presentation fields; the persisted proof is native.
+    for key in ("valuation_decision", "snapshot_id", "generation_id", "acquisition_snapshot",
+                "workbook_sha256", "sanity", "analytical_quality", "input_consumption",
+                "fair_value_base"):
+        assert persisted[key] == payload[key], key
     tools.memory.history = [{"valuation_payload": deepcopy(payload), "generation_id": payload["generation_id"]}]
     return payload, path, sidecar
 
 
 def test_current_cache_requires_same_bundle_generation_sidecar_and_workbook(isolated_tools, monkeypatch):
     tools = isolated_tools
-    bundle = synthetic_bundle()
+    bundle = documented_operating_bundle()
     payload, path, sidecar = seed_cache(tools, bundle)
     monkeypatch.setattr(tools.engine, "generate_valuation", lambda *args, **kwargs:
                         pytest.fail("A verified current cache must be reused"))
     result = tools.chat.dispatch("get_valuation", {"ticker": SYMBOL}, prepared_bundle=bundle)["data"]
     assert result["reused"] is True
-    assert result["fair_value_weighted"] == payload["fair_value_weighted"] == 120
+    assert result["fair_value_base"] == payload["fair_value_base"] == pytest.approx(14.13)
     assert result["valuation_usability"]["usable"] is True
     assert result["snapshot_id"] == bundle["snapshot_id"]
     assert tools.memory.saved == []
@@ -180,7 +201,7 @@ def test_current_cache_requires_same_bundle_generation_sidecar_and_workbook(isol
                                    "snapshot", "generation", "workbook", "quality", "missing_sidecar"])
 def test_cache_changes_force_new_result_and_never_return_old_number(isolated_tools, monkeypatch, change):
     tools = isolated_tools
-    bundle = synthetic_bundle()
+    bundle = documented_operating_bundle()
     old, path, sidecar = seed_cache(tools, bundle)
     tool_input = {"ticker": SYMBOL}
     if change == "method":

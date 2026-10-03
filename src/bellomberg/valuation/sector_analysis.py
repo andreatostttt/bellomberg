@@ -11,7 +11,7 @@ import hashlib
 import json
 import math
 
-from bellomberg.valuation.method_registry import get_method_requirements
+from bellomberg.valuation.method_registry import get_method_requirements, requirements_for_records
 from bellomberg.valuation.method_records_archive import SOURCE_ID as ARCHIVE_SOURCE
 
 PROVIDERS = ("profile", "financials", "filings", "guidance", "consensus", "method_inputs")
@@ -313,7 +313,9 @@ are deliberately outside the economic snapshot.
             "data": {"previous_acquisition": previous, "provider_records": deepcopy(previous_records)},
             "message": "Record espliciti dell'analista; fonte e data di ciascun dato da validare, acquisizione precedente conservata",
             "records": _json_value(previous_records + context["method_records"])}
-    requirements = get_method_requirements(decision["method_id"]) if decision["method_id"] else {}
+    selection_records = [record for source in sources.values() if source.get('status') == 'ok'
+                         and isinstance(source.get('records'), list) for record in source['records']]
+    requirements = requirements_for_records(decision["method_id"], selection_records) if decision["method_id"] else {}
     fields = {f["field"] for f in requirements.get("fields", []) if f.get("required")}
     metadata = requirements.get("record_metadata", [])
     records, issues, tasks = [], [], []
@@ -438,7 +440,7 @@ def revise_sector_analysis(bundle, *, assumptions=None, analysis_context=None, m
 
 def sector_analysis_summary(bundle):
     decision = bundle["decision"]
-    requirements = get_method_requirements(decision["method_id"]) if decision.get("method_id") else {}
+    requirements = requirements_for_records(decision["method_id"], bundle['case'].get('records') or []) if decision.get("method_id") else {}
     valuation_date = _record_valuation_date(bundle["case"].get("records") or [])
     age = _days_before_cutoff(valuation_date, bundle["case"].get("as_of"))
     return ("Metodo: " + str(decision.get("method_id") or "n.d.")

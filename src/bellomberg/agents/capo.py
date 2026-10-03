@@ -25,7 +25,7 @@ from bellomberg.core.llm_refusal import refusal_reason as _refusal_reason
 # cio' che cade dal suo blocco non e' recuperabile in nessun modo. Misurato il 21/08
 # dopo la cura: il blocco pesa 11.113 char, ne restano liberi 4.887.
 MAX_CHAR_MEMORIA_CAPO = 16000
-CAPO_MAX_TOKENS = 64000   # 01/08 (voce 1 §9-quattuortrigies, decisione PM): era 32000 e i DUE memo su Opus 5 (id 48 e 49) sono usciti a 32000 ESATTI, sezione 7 persa — Opus 5 scrive piu' lungo di 4.8. Il tetto copre thinking+testo; la chiamata e' in STREAMING (v. sotto). Storia: 25/06 era 20000, stesso sintomo.
+CAPO_MAX_TOKENS = 128000  # PM 02/10: nuovo lavoro; i checkpoint già pagati conservano il cap originale.
 # Guardia anti-collasso del MEMO (12/08, ok PM "scegli tu"): nella run di
 # collaudo 12/08 il Capo ha risposto con l'ECO della coda del prompt (EDGE
 # SCAN + "Genera il memo...", out=396 token) e il memo #50 era un moncherino
@@ -93,6 +93,10 @@ DEVI USARE QUESTA MEMORIA, scrivendo in prosa:
 
 ## INTEGRITA' DEI TICKER
 MAI citare un ticker come posizione in portafoglio se non compare nei dati get_portfolio_live che ricevi. Conserva il simbolo esatto e il suffisso del listino presenti nei dati. Se uno specialista ha usato un proxy o un altro listino, riferisciti al TICKER REALMENTE DETENUTO.
+
+## SCARTO FAIR VALUE/PREZZO
+Qualunque scarto positivo o negativo fra fair value e prezzo e' informativo in tutti gli scenari: bear, base e bull. La sua ampiezza non rende il modello errato e non esclude un titolo dalla ACTION TABLE. Non calibrare crescita, margini, tassi o altri driver per avvicinare il fair value alla quotazione; valuta le ipotesi economiche e le loro prove.
+Se un report precedente indica BLOCK o esclusione per la sola pura distanza dimostrata, non trasformare quella vecchia etichetta in un vincolo vigente. Usa lo stato validato del modello corrente e spiega la distinzione; un BLOCK di origine ambigua o dovuto ad altri errori resta da chiarire. Restano vincolanti i controlli su dati, fonti, unita, identita, integrita e matematica, insieme alle regole di rischio e sizing. Nessuna ampiezza dello scarto sostituisce queste verifiche o autorizza una size.
 
 ## RICONCILIAZIONE BOOK (obbligatoria, #31)
 Prima di scrivere la ACTION TABLE riconcilia OGNI riga con il PORTAFOGLIO live e con i TRADE ESEGUITI che ricevi nella memoria:
@@ -540,6 +544,25 @@ def run_capo(blackboard, portfolio_data=None, memory_db=None, sizing_context=Non
     import bellomberg.core.mandato_pm as _mandato_pm
     _mandato = _mandato_pm.carica()
     _system = _mandato_pm.compila(prompt_for_language(CAPO_SYSTEM_PROMPT), _mandato)
+    from bellomberg.core.research_analysis import is_research_mode, research_context
+    if is_research_mode(blackboard):
+        _system += ('\nCOMPANY RESEARCH MODE: the shared dossier and R1 thesis are identified by '
+            'version/hash; decide from the actual Red Team challenge and final desk replies. '
+            'Keep observed statements, management guidance, analyst consensus and independent '
+            'assumptions distinct. No workbook or AI fair value is required. Missing consensus or '
+            'documents must be explicit and can support a completed RESEARCH conclusion with no '
+            'operational proposal. Do not invent target prices, data, approval or completed Excel. '
+            'Mandate, current prices, risk and sizing controls remain binding. The expected '
+            'delivery is memo/PDF with source references. Technical failures remain incomplete.')
+    _saved_request = getattr(blackboard, "data", {}).get("_capo_request")
+    if _saved_request is not None:
+        if (_saved_request.get("model") != CAPO_MODEL or _saved_request.get("system") != _system
+                or type(_saved_request.get("max_tokens")) is not int
+                or _saved_request["max_tokens"] not in (64000, CAPO_MAX_TOKENS)):
+            raise ValueError("Capo checkpoint contract changed; original request preserved")
+        return _execute_capo_request(CAPO_MODEL, _system, _saved_request["user_message"],
+                                     _mandato, _saved_request["research_date"],
+                                     max_tokens=_saved_request["max_tokens"])
     print("\n" + "=" * 70)
     print("BELLOMBERG CAPO synthesis (" + CAPO_MODEL + ") - memory-aware v4")  # voce 5: etichetta derivata dal model string, non puo' piu' invecchiare
     print("=" * 70)
@@ -677,8 +700,13 @@ def run_capo(blackboard, portfolio_data=None, memory_db=None, sizing_context=Non
         print("[CAPO] Look-through CEF GUASTO (dichiarato NEL MEMO): " + str(e))
 
     # MOTORE DI SIZING (#184): limiti deterministici vol x correlazione, base = investito
-    from bellomberg.valuation.sector_analysis import valuation_results_block
-    user_msg_parts.append(valuation_results_block(getattr(blackboard, "valuation_results", {})))
+    if is_research_mode(blackboard):
+        import json as _research_json
+        user_msg_parts.append('SEALED COMPANY RESEARCH:\n' + _research_json.dumps(
+            research_context(blackboard), ensure_ascii=False, default=str))
+    else:
+        from bellomberg.valuation.sector_analysis import valuation_results_block
+        user_msg_parts.append(valuation_results_block(getattr(blackboard, "valuation_results", {})))
     if sizing_context:
         user_msg_parts.append(sizing_context)
         user_msg_parts.append("")
@@ -770,9 +798,21 @@ def run_capo(blackboard, portfolio_data=None, memory_db=None, sizing_context=Non
 
     user_msg = "\n".join(user_msg_parts)
     print("[CAPO] Context: " + str(len(user_msg)) + " chars")
+    research_date = datetime.now().strftime("%d/%m/%Y")
+    _persist = getattr(blackboard, "persist_run_checkpoint", None)
+    if callable(_persist):
+        blackboard.data["_capo_request"] = {"model": CAPO_MODEL, "system": _system,
+            "max_tokens": CAPO_MAX_TOKENS, "user_message": user_msg, "research_date": research_date}
+        _persist("capo_request", blackboard.data["_capo_request"])
+    return _execute_capo_request(CAPO_MODEL, _system, user_msg, _mandato, research_date,
+                                 max_tokens=CAPO_MAX_TOKENS)
 
-    client = OpenRouterClient(timeout=900.0, max_retries=2)  # 30c-bis + 26/06: retry del client; 05/09: OpenRouter
-    import time as _time
+
+def _execute_capo_request(CAPO_MODEL, _system, user_msg, _mandato, research_date, *, max_tokens):
+    """Dispatch only the frozen prompt; a restart never reacquires Capo context."""
+    import bellomberg.core.mandato_pm as _mandato_pm
+    from bellomberg.agents.specialists.base import timeout_specialisti
+    client = OpenRouterClient(timeout=max(900.0, timeout_specialisti(max_tokens)), max_retries=0)
     # Guardia anti-collasso (12/08): il giro esterno riprova UNA volta col nudge
     # se il testo esce sotto soglia senza refusal (l'eco del memo #50).
     _messages = [{"role": "user", "content": user_msg}]
@@ -783,18 +823,16 @@ def run_capo(blackboard, portfolio_data=None, memory_db=None, sizing_context=Non
     while True:
         response = None
         last_err = None
-        # 26/06: il Capo e' un single point of failure (1 sola chiamata); un blip di rete azzerava
-        # tutto il memo (gli specialisti restavano persi). Ritenta su errori transitori (Connection error).
-        for _attempt in range(3):
+        # An ambiguous transport outcome is retained by the request journal.
+        # Neither this layer nor the SDK may blindly dispatch a paid copy.
+        for _attempt in range(1):
             try:
-                # Voce 1 (01/08, decisione PM): STREAMING + tetto 64k. Una non-streaming
-                # da 64k l'SDK la rifiuta (stima >10 min); get_final_message() restituisce
-                # lo stesso oggetto Message, quindi refusal/stop_reason/usage sotto
-                # non cambiano di una virgola.
+                # Streaming conservato; il tetto e' quello del nuovo lavoro o
+                # della richiesta storica verificata, mai ricalcolato nel replay.
                 api_calls += 1
                 with client.messages.stream(
                     model=CAPO_MODEL,
-                    max_tokens=CAPO_MAX_TOKENS,
+                    max_tokens=max_tokens,
                     thinking={"type": "adaptive"},
                     system=_system,
                     messages=_messages,
@@ -804,17 +842,17 @@ def run_capo(blackboard, portfolio_data=None, memory_db=None, sizing_context=Non
                 break
             except Exception as e:
                 last_err = e
-                print("[CAPO] tentativo " + str(_attempt + 1) + "/3 fallito: " + str(e)[:160])
-                if _attempt < 2:
-                    _time.sleep(5 * (_attempt + 1))
+                print("[CAPO] richiesta fallita, nessun replay automatico: " + str(e)[:160])
         if response is None:
-            print("[CAPO] API error definitivo dopo 3 tentativi: " + str(last_err))
+            print("[CAPO] API error: " + str(last_err))
             # I due zeri qui NON sono un consumo reale: sono un Capo morto. Senza "error"
             # sparirebbe dai costi come se fosse gratis (fallback silenzioso): chi registra
             # l'usage legge questa chiave e marca la riga api_error.
             failed_usage = total_usage or somma_usage(None, None)
             failed_usage.update(model=CAPO_MODEL, input_tokens=failed_usage["in"],
-                                output_tokens=failed_usage["out"], api_calls=api_calls, error=str(last_err))
+                                output_tokens=failed_usage["out"], api_calls=api_calls, error=str(last_err),
+                                complete=False, error_type=type(last_err).__name__,
+                                request_id=getattr(last_err, "request_id", None))
             return "[CAPO ERROR]: " + str(last_err), failed_usage
 
         text = ""
@@ -832,8 +870,9 @@ def run_capo(blackboard, portfolio_data=None, memory_db=None, sizing_context=Non
             text = (_rif + "\n\n" + text) if text.strip() else _rif
         # Guardia anti-collasso (12/08): sotto soglia senza refusal = eco/annuncio,
         # non un memo. UN retry col nudge (assistant+user in coda, ruoli alternati).
+        _stop = getattr(response, "stop_reason", None)
         _collassato = (not _rif) and len(text.strip()) < SOGLIA_COLLASSO_MEMO
-        if _collassato and not _collasso_ritentato:
+        if _collassato and not _collasso_ritentato and _stop == "end_turn":
             _collasso_ritentato = True
             print("[CAPO] memo COLLASSATO (" + str(len(text.strip())) + " char < soglia "
                   + str(SOGLIA_COLLASSO_MEMO) + "): eco/annuncio invece del memo — UN retry col nudge")
@@ -852,7 +891,7 @@ def run_capo(blackboard, portfolio_data=None, memory_db=None, sizing_context=Non
     if not text:
         text = "[CAPO] No output"
     if getattr(response, "stop_reason", None) == "max_tokens":
-        print("[CAPO] WARNING: output a max_tokens (" + str(CAPO_MAX_TOKENS) + "): possibile troncamento del memo")
+        print("[CAPO] WARNING: output a max_tokens (" + str(max_tokens) + "): possibile troncamento del memo")
         text += ("\n\n> *[NOTA AUTOMATICA: la sintesi ha raggiunto il limite di output e potrebbe essere "
                  "troncata in coda. Aumentare CAPO_MAX_TOKENS o ridurre il budget di thinking.]*")
 
@@ -863,7 +902,7 @@ def run_capo(blackboard, portfolio_data=None, memory_db=None, sizing_context=Non
     for old, new in rimpiazzi.items():
         text = text.replace(old, new)
 
-    data = datetime.now().strftime("%d/%m/%Y")
+    data = research_date
     marker_mandato = ("[MANDATO PM: impronta " + _mandato_pm.impronta(_mandato)
                       + "; origine " + str(_mandato.get("origine"))
                       + "; dichiarato_il " + str(_mandato.get("dichiarato_il")) + "]")
@@ -872,5 +911,11 @@ def run_capo(blackboard, portfolio_data=None, memory_db=None, sizing_context=Non
 
     usage = total_usage or somma_usage(None, None)
     usage.update(model=CAPO_MODEL, input_tokens=usage["in"], output_tokens=usage["out"], api_calls=api_calls)
+    usage["stop_reason"] = getattr(response, "stop_reason", None)
+    usage["complete"] = bool(text.strip()) and not _rif and not _collassato and usage["stop_reason"] == "end_turn"
+    if not usage["complete"]:
+        usage["error"] = (_rif or ("Capo memo collapsed" if _collassato else
+                                  "Capo incomplete response: " + str(usage["stop_reason"])))
+    usage["request_id"] = getattr(response, "id", None)
     print("[CAPO] Done. Tokens: in=" + str(usage["input_tokens"]) + " out=" + str(usage["output_tokens"]))
     return final, usage

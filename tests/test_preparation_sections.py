@@ -287,6 +287,33 @@ def test_fcff_small_context_retains_complete_scenario_proofs(tmp_path):
     assert 'completed_plan_projection' not in view.get('stage_view', {})
 
 
+def test_opening_view_can_drop_acquisition_envelope_without_restoring_excluded_narratives(tmp_path):
+    from test_preparation_view import _dossier
+    from bellomberg.valuation.preparation_view import select_stage_view
+    source = _dossier()
+    source['document_acquisition']['acquired_document_index'] = {'raw': 'Index detail. ' * 7000}
+    source['document_acquisition']['issues'] = ['Coverage still incomplete.']
+    source['documents'][0]['text'] *= 10
+    source['documents'][0]['sha256'] = sha256(source['documents'][0]['text'].encode()).hexdigest()
+    initial = select_stage_view(source, 'model')
+    original = deepcopy((source, initial))
+    contract = {'schema': {}, 'preparation_stage': {'scope': 'model', 'drivers': []}}
+    calls = []; proposer = _budgeted(tmp_path, calls=calls, context_length=45000)
+    view = proposer.prepare_context(initial, contract, source_dossier=source)
+    assert view['documents'] == initial['documents']
+    assert view['stage_view'] == initial['stage_view']
+    assert view['document_acquisition']['issues'] == ['Coverage still incomplete.']
+    assert 'acquired_document_index' not in view['document_acquisition']
+    assert any(r['field'] == 'document_acquisition.acquired_document_index' for r in view['review_view_omissions'])
+    assert (source, initial) == original and not calls
+    assert proposer.summary()['requests'] == 0
+    proposer(view, contract)
+    proposer.metadata = lambda _: pytest.fail('paid lean opening must replay without live metadata')
+    assert proposer.prepare_context(initial, contract, source_dossier=source,
+        allow_selection=False, allow_cached_selection=True) == view
+    assert len(calls) == 1
+
+
 def test_fcff_raw_acquisition_can_be_omitted_without_losing_sources_gaps_or_plan(tmp_path):
     from bellomberg.valuation.preparation_seed import _digest
     dossier = _case()

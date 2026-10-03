@@ -54,7 +54,8 @@ def test_valuation_gate_language_preserves_source_identity_and_fair_values(db):
     with language_context("en"):
         valid_en = quality.normalize_valuation_payload(source)
     assert valid_it == valid_en
-    assert valid_en["fair_value_weighted"] == 120
+    assert {scenario: valid_en["fair_value_" + scenario] for scenario in ("bear", "base", "bull")} == {
+        "bear": 14.13, "base": 14.13, "bull": 14.13}
     assert valid_en["valuation_usability"]["usable"] is True
     assert json.dumps(source, sort_keys=True) == source_json
     damaged = deepcopy(source)
@@ -64,7 +65,7 @@ def test_valuation_gate_language_preserves_source_identity_and_fair_values(db):
     with language_context("en"):
         refused_en = quality.normalize_valuation_payload(damaged)
         relabeled = render_payload(refused_it["valuation_usability"])
-    assert refused_en["fair_value_weighted"] is None
+    assert all(refused_en["fair_value_" + scenario] is None for scenario in ("bear", "base", "bull"))
     assert refused_en["valuation_usability"] == relabeled
     assert any("generation provenance cannot be verified" in reason for reason in relabeled["reasons"])
     assert refused_en["valuation_decision"] == source["valuation_decision"]

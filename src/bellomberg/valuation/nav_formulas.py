@@ -39,6 +39,13 @@ def _inputs_sheet(wb, payload, records, digital):
     ws = _sheet(wb, "NAV Inputs", tr("Input NAV documentati", "Documented NAV inputs"), 8)
     _line(ws, 4, tr("Blu: input modificabili per simulazione; le formule non approvano nuove ipotesi.",
                      "Blue: editable simulation inputs; formulas do not approve new assumptions."), 8, height=34)
+    components = records.get("components") or {}
+    incremental = not digital and components.get('basis') == 'incremental_claim_deductions'
+    if incremental:
+        covered = components.get('coverage', {}).get('classification', {}).get('aggregate_coverage', {})
+        accounts = ', '.join(covered)
+        _line(ws, 5, tr('Deduzioni AGGIUNTIVE: gli aggregati '+accounts+' sono gia sottratti nelle altre passivita. Zero non significa saldo economico zero.',
+                         'ADDITIONAL deductions: aggregates '+accounts+' are already deducted in other liabilities. Zero is not a zero economic stock.'), 8, height=46)
     _header(ws, 7, [tr("Input", "Input"), tr("Unità", "Unit"), "Value", tr("Fonte", "Source"), "", "", ""])
     row = 8
     refs = {}
@@ -85,8 +92,11 @@ def _inputs_sheet(wb, payload, records, digital):
             fx = put(f"{asset} FX", "ratio", price.get("fx_to_financial"), "asset_prices", PRICE)
             refs["asset_rows"][asset] = (quantity, ownership, price_row, fx)
     else:
+        labels = {'accrued_fees': tr('Deduzione AGGIUNTIVA commissioni', 'ADDITIONAL fee deduction'),
+                  'distributions_payable': tr('Deduzione AGGIUNTIVA distribuzioni', 'ADDITIONAL distribution deduction')}
         for key in ("gross_assets", "cash", "debt", "preferred", "other_liabilities", "accrued_fees", "distributions_payable", "tax", "equity_adjustments"):
-            put(key, tr("mln valuta", "currency million"), (records.get("components") or {}).get(key), key, comment=_source(records, "components"))
+            put(labels.get(key, key) if incremental else key, tr("mln valuta", "currency million"), components.get(key), key,
+                comment=_source(records, "components") + ('; additional deduction after covered aggregate claims, not a zero economic stock' if incremental and key in labels else ''))
     targets = {}
     for scenario in SCENARIOS:
         target_row = put(f"target {scenario}", "ratio", (records.get("nav_target") or {}).get(scenario), "nav_target", PRICE)
@@ -142,6 +152,9 @@ def _model_sheet(wb, payload, records, refs, digital, ready):
     ws = _sheet(wb, "NAV Model", tr("Modello NAV collegato", "Linked NAV model"), 6)
     _line(ws, 4, tr("Simulazione formula; i fogli raw e Valuation restano invariati.",
                      "Formula simulation; raw scenario sheets and Valuation remain unchanged."), 6, height=34)
+    if not digital and (records.get('components') or {}).get('basis') == 'incremental_claim_deductions':
+        _line(ws, 5, tr('Commissioni e distribuzioni: solo deduzioni aggiuntive dopo gli aggregati gia detratti. Nessuna attestazione di saldo zero.',
+                         'Fees and distributions: additional deductions after aggregates already deducted. No assertion of zero economic balances.'), 6, height=42)
     _header(ws, 7, [tr("Voce", "Item"), tr("Unità", "Unit"), *SCENARIOS])
     rows = {"gross": 8, "cash": 9, "debt": 10, "preferred": 11, "claims": 12,
             "adjustments": 13, "shares": 14, "equity": 15, "navps": 16, "target": 17, "fv": 18, "quoted": 19}
@@ -258,9 +271,19 @@ def apply_nav_formulas(wb, payload):
     wb.calculation.forceFullCalc = True
     wb.move_sheet(summary, -wb.index(summary))
     link_refs = {('model','components',k): refs[k] for k in records['components'] if k in refs}
+    for driver_key, input_key in (('price', 'quotation_price'), ('financial_to_quote_rate', 'quote_fx'),
+                                  ('quote_units_per_currency', 'quote_units'), ('shares_per_quote', 'quote_shares')):
+        link_refs[('model', 'quotation', driver_key)] = refs[input_key]
+    for scenario, cell in refs['target_rows'].items():
+        link_refs[(scenario, 'nav_target')] = cell
     link_refs[('model','shares')] = "'NAV Model'!D14"
     if digital:
         link_refs[('model','capitalization','basic_shares')] = refs['basic_shares']
+        for asset, cells in refs['asset_rows'].items():
+            for driver, key, row in (('holdings', 'quantity_millions', cells[0]),
+                                     ('holdings', 'ownership_fraction', cells[1]),
+                                     ('asset_prices', 'price', cells[2]), ('asset_prices', 'fx_to_financial', cells[3])):
+                link_refs[('model', driver, asset, key)] = "'NAV Inputs'!D" + str(row)
     wb._model_link = {'refs': link_refs,
         'raw': {s: f"'NAV Model'!{chr(68+i)}18" for i,s in enumerate(SCENARIOS)},
         'shares': {s: f"'NAV Model'!{chr(68+i)}14" for i,s in enumerate(SCENARIOS)},

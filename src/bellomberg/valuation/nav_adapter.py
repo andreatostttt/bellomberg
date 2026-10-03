@@ -73,10 +73,18 @@ def generate_nav(bundle,*,output_dir,metadata):
     from .dcf_mnav import compute_mnav_values
     digital=bundle['decision']['method_id']=='digital_asset_nav'
     bound=bind_inputs(bundle,DIGITAL if digital else FUND,horizon='snapshot');problem=bound['problem'];results={}
+    incremental=False; component_coverage=None
     if not bound['issues']:
         model=bound['values']['model'];components=model['components']
+        if not digital and components.get('basis')=='incremental_claim_deductions':
+            from .nav_components_evidence import verify_components_contract
+            incremental=True; component_coverage=deepcopy(components.get('coverage'))
+            components,error=verify_components_contract(components,entity=bound['perimeter']['entity'],
+                share_class=bound['perimeter']['share_class'],on=bound['calendar']['valuation_date'],
+                currency=bound['perimeter']['currency'],as_of=bundle['case']['as_of'])
+            if error:problem('components','Copertura esaustiva delle deduzioni aggiuntive non verificata: '+error)
         expected=COMPONENTS-{'gross_assets'}|{'operating_assets'} if digital else COMPONENTS
-        if set(components)!=expected or any(not _finite(v) or (k!='equity_adjustments' and v<0) for k,v in components.items()):
+        if not isinstance(components,dict) or set(components)!=expected or any(not _finite(v) or (k!='equity_adjustments' and v<0) for k,v in components.items()):
             problem('components','Attivita/cash/claims/fees/tax completi e numerici richiesti')
         if model['shares']<=0:problem('shares','Denominatore azioni deve essere positivo')
         for row in bundle['case']['records']:
@@ -92,8 +100,20 @@ def generate_nav(bundle,*,output_dir,metadata):
                 problem('publication','Pubblicazione NAV ufficiale datata/perimetro/classe e base netta richiesti')
             elif not _date(pub['publication_date']) or not _date(pub['valuation_date'])<=_date(pub['publication_date'])<=_date(bundle['case']['as_of']):
                 problem('publication','Data pubblicazione non coerente con valore e cutoff informativo')
-            if model['policy']!={'liability_basis':'all_claims_in_components','fees_basis':'accrued_fees_in_components',
-                'distributions_basis':'payables_deducted','share_basis':'basic_no_convertibles_or_other_dilution'}:
+            if incremental:
+                from .nav_components_evidence import verify_dilution_proof
+                policy=model['policy']; expected_policy={'liability_basis':'all_reported_claims_in_components',
+                    'fees_basis':'incremental_deductions_after_covered_aggregates',
+                    'distributions_basis':'incremental_deductions_after_covered_aggregates',
+                    'share_basis':'basic_no_convertibles_or_other_dilution'}
+                if set(policy)!=set(expected_policy)|{'dilution_proof'} or any(policy.get(k)!=v for k,v in expected_policy.items()):
+                    problem('policy','Deduzioni aggiuntive richiedono policy esplicita e prova separata della diluizione')
+                elif component_coverage is not None:
+                    error=verify_dilution_proof(policy['dilution_proof'],coverage=component_coverage,
+                        entity=bound['perimeter']['entity'],on=bound['calendar']['valuation_date'],as_of=bundle['case']['as_of'])
+                    if error:problem('policy','Diluizione fuori bilancio non verificata: '+error)
+            elif model['policy']!={'liability_basis':'all_claims_in_components','fees_basis':'accrued_fees_in_components',
+                  'distributions_basis':'payables_deducted','share_basis':'basic_no_convertibles_or_other_dilution'}:
                 problem('policy','Basi NAV/claims/fee/distribuzioni/diluizione non supportate o non riconciliate')
     if not bound['issues']:
         if digital:components=digital_components(model,bound)
@@ -113,4 +133,11 @@ def generate_nav(bundle,*,output_dir,metadata):
                         problem('reported_nav_per_share','NAV pubblicato non riconciliato ad attivita/claims/azioni e precisione dichiarata; nessun proxy')
                 results[scenario]={**result,'fair_value_per_share':result['fair_value_nav'],'value_basis':'equity',
                     'value_description':'Snapshot NAV at the declared balance/price date and explicit premium/discount target.'}
+                if incremental:
+                    results[scenario].update(components_basis='incremental_claim_deductions',
+                        components_coverage=deepcopy(component_coverage), component_semantics={
+                            'accrued_fees':'Additional deduction after covered aggregate claims; not a zero economic fee stock.',
+                            'distributions_payable':'Additional deduction after covered aggregate claims; not a zero economic payable stock.',
+                            'covered_aggregates':[{'account':account,'covers':deepcopy(covers)} for account,covers in
+                                component_coverage['classification']['aggregate_coverage'].items()]})
     return finish_documented(bundle,bound,results,metadata=metadata,output_dir=output_dir,engine='mnav')

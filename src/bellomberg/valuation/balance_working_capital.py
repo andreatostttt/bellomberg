@@ -6,7 +6,7 @@ import json
 import re
 
 from .balance_sheet_evidence import NORMALIZER, PREFIX, normalize_balance_sheet
-from .input_evidence import same_entity_name
+from .input_evidence import same_entity_name, same_sec_filing_issuer
 
 OPERATION = 'balance_sheet_nwc'
 TREATMENTS = ('operating_nwc', 'cash_or_investment', 'financing', 'fixed_or_intangible_asset',
@@ -73,7 +73,7 @@ def balance_nwc_selection_problem(item, catalog, entity, period):
             return 'NWC: PDF observations require a complete reported balance and economic classifications'
         return None
     matching = [d for d in ledgers if (d.get('metadata') or {}).get('report_date') == period
-                and same_entity_name((d.get('metadata') or {}).get('entity'), entity)]
+                and balance_issuer_matches(d, entity, catalog)]
     if len(matching) != 1:
         return 'NWC: unique reported balance for the opening issuer/date required'
     calculation = item.get('calculation')
@@ -82,6 +82,17 @@ def balance_nwc_selection_problem(item, catalog, entity, period):
             or matching[0]['id'] not in item.get('evidence_ids', [])):
         return 'NWC: complete reported-balance classifications required; a narrow sum or literal APM is insufficient'
     return None
+
+
+def balance_issuer_matches(ledger, entity, catalog):
+    """Keep the normalized issuer tied to its SEC primary; no general alias."""
+    metadata = ledger.get('metadata') or {}
+    if same_entity_name(metadata.get('entity'), entity):
+        return True
+    original = catalog.get(metadata.get('source_document_id')) or {}
+    return (metadata.get('normalizer') == NORMALIZER
+            and same_entity_name(metadata.get('entity'), (original.get('metadata') or {}).get('issuer'))
+            and same_sec_filing_issuer(original, entity))
 
 
 def _judgment(row, catalog, entity, used):
@@ -98,7 +109,7 @@ def _judgment(row, catalog, entity, used):
         from .filing_pdf_evidence import verify_filing_pdf
         verify_filing_pdf(doc)
         issuer = meta['emittente_id']  # Preserve the curated identifier; no legal-name alias inferred.
-    if (meta.get('normalizer') or not same_entity_name(issuer, entity)
+    if (meta.get('normalizer') or not (same_entity_name(issuer, entity) or same_sec_filing_issuer(doc, entity))
             or not isinstance(quote, str) or not quote.strip() or quote not in doc['text']):
         raise ValueError('classification quote must occur in an original narrative of the same issuer')
     used.add(ids[0])

@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 
 SCENARIOS = ("bear", "base", "bull")
+DOCUMENTED_OPERATING_SANITY_POLICY = 'documented_operating_base_v1'
 # The two o/w personnel/services splits do not change UFCF.
 MATERIAL_DRIVERS = ("revenue_growth", "gross_margin", "rnd_pct", "sga_pct", "capdev_pct",
                     "nwc_pct", "capex_pct", "tax_rate", "da_tan_pct")
@@ -353,8 +354,9 @@ _DERIVED_VALUATION_KEYS = frozenset({"fv", "fv_ps", "upside", "downside", "targe
                                   "raw_equity_value", "owned_equity_value"})
 _SOURCE_BRANCHES = frozenset({"case", "analysis_context", "valuation_decision", "evidence",
                               "acquisition_tasks", "input_consumption"})
-_PREPARATION_EVIDENCE_PATHS = frozenset({'payload.preparation.review_basis',
-                                        'payload.preparation.proposal.plan'})
+_PREPARATION_EVIDENCE_PATHS = frozenset({('preparation', 'review_basis'),
+    ('preparation', 'proposal', 'plan'),
+    ('preparation', 'provenance', 'trade_idea_revision', 'scoped_review', 'context', 'before')})
 _CALCULATED_VALUATION_KEYS = frozenset({'common_equity_nav','nav_per_share',
     'residual_income_value','cash_equity_value','terminal_common_equity_value',
     'value_contribution','asset_value','gross_assets','terminal_equity','terminal_value',
@@ -372,10 +374,99 @@ def _valuation_number_key(key):
                                     or key in _DERIVED_VALUATION_KEYS)
 
 
-def _decision_usability_issues(decision, cutoff):
+def _documented_operating_scenario_valid(calculated):
+    """The displayed FV must preserve the original operating engine bridge."""
+    if not isinstance(calculated, dict):
+        return False
+    raw = calculated.get('fair_value_per_share')
+    bridged = _mapping(calculated.get('valuation_bridge')).get('fair_value_per_share')
+    return (_finite(raw) and raw > 0 and _finite(bridged) and bridged > 0 and raw == bridged)
+
+
+def _attest_documented_sanity_policy(payload, quotation):
+    """Attest scenario arithmetic and quotation independently of market distance.
+
+    Current comparison arithmetic remains authoritative. Text may be
+    localized; numbers, status and boolean exclusions must reproduce the engine.
+    This attests sanity/quotation, not the economics of the supplied forecasts.
+    """
+    from .dcf_engine import sanity_check
+
+    sanity = _mapping(payload.get('sanity'))
+    if (sanity.get('policy') != DOCUMENTED_OPERATING_SANITY_POLICY
+            or payload.get('method') != 'operating_fcff'
+            or _mapping(payload.get('valuation_decision')).get('method_id') != 'operating_fcff'
+            or _mapping(payload.get('analytical_quality')).get('record_adapter') is not True
+            or not isinstance(quotation, dict)):
+        return False
+    for key in ('price', 'financial_to_quote_rate', 'quote_units_per_currency', 'shares_per_quote'):
+        if not _finite(quotation.get(key)) or quotation[key] <= 0:
+            return False
+    if (not _finite(payload.get('price')) or payload['price'] != quotation['price']
+            or payload.get('financial_currency') != quotation.get('financial_currency')
+            or payload.get('currency') != quotation.get('quote_unit')):
+        return False
+    financial, quoted, unit = (quotation.get(k) for k in ('financial_currency', 'quote_currency', 'quote_unit'))
+    if (any(not isinstance(c, str) or not re.fullmatch('[A-Z]{3}', c) for c in (financial, quoted))
+            or financial == quoted and quotation['financial_to_quote_rate'] != 1
+            or not ((unit == quoted and quotation['quote_units_per_currency'] == 1)
+                    or quoted == 'GBP' and unit in ('GBX', 'GBp') and quotation['quote_units_per_currency'] == 100)):
+        return False
+    factor = quotation['financial_to_quote_rate'] * quotation['quote_units_per_currency'] * quotation['shares_per_quote']
+    if not _finite(factor) or factor <= 0:
+        return False
+    scenarios = _mapping(payload.get('calculation_details')).get('scenarios')
+    checks = sanity.get('scenario_checks')
+    if (not isinstance(scenarios, dict) or set(scenarios) != set(SCENARIOS)
+            or not isinstance(checks, dict) or set(checks) != set(SCENARIOS)):
+        return False
+
+    def matches(actual, expected):
+        if not isinstance(actual, dict):
+            return False
+        for key in ('status', 'ratio', 'upside_pct', 'severity', 'exclude_from_action_table'):
+            value, target = actual.get(key), expected.get(key)
+            if isinstance(target, bool):
+                if type(value) is not bool or value != target:
+                    return False
+            elif _finite(target):
+                if not _finite(value) or value != target:
+                    return False
+            elif type(value) is not type(target) or value != target:
+                return False
+        return True
+
+    original = {}
+    for scenario in SCENARIOS:
+        calculated = scenarios[scenario]
+        if not _documented_operating_scenario_valid(calculated):
+            return False
+        raw = calculated.get('fair_value_per_share')
+        value = payload.get('fair_value_' + scenario)
+        if not _finite(raw) or raw <= 0 or not _finite(value) or value <= 0:
+            return False
+        converted = raw * factor
+        if not _finite(converted) or round(converted, 2) != value:
+            return False
+        original[scenario] = sanity_check(value, quotation['price'])
+        if not matches(checks[scenario], original[scenario]):
+            return False
+        if scenario == 'base':
+            if 'divergence_informational' in checks[scenario]:
+                return False
+        elif checks[scenario].get('divergence_informational') is not True:
+            return False
+    return (sanity.get('method_id') == 'operating_fcff'
+            and 'divergence_informational' not in sanity
+            and matches(sanity, original['base'])
+            and _finite(payload.get('upside_pct'))
+            and payload['upside_pct'] == original['base']['upside_pct'])
+
+
+def _decision_usability_issues(decision, cutoff, records=()):
     """Validate S1 identity using its existing selector, without resolving again or I/O."""
     from bellomberg.valuation.method_registry import (
-        CONTRACT_VERSION, REGISTRY_VERSION, get_method_requirements, select_valuation_method,
+        CONTRACT_VERSION, REGISTRY_VERSION, get_method_requirements, requirements_for_records, select_valuation_method,
     )
     from bellomberg.valuation.valuation_profile import PROFILE_VERSION
 
@@ -446,7 +537,7 @@ def _decision_usability_issues(decision, cutoff):
         except (KeyError, TypeError, ValueError, OverflowError):
             reasons.append(_message('evidenze/fingerprint non serializzabili secondo il contratto', 'evidence/fingerprint not serializable under the contract'))
     try:
-        required = [r["field"] for r in get_method_requirements(decision.get("method_id"))["fields"]
+        required = [r["field"] for r in requirements_for_records(decision.get("method_id"), records)["fields"]
                     if r["required"]]
     except ValueError:
         required = []
@@ -466,11 +557,13 @@ def assess_valuation_usability(payload, *, expected_decision=None, as_of=None):
     cache request must supply its cutoff/identity; historical reads do not expire
     at midnight and do not revalue the snapshot using today's data.
     """
-    payload = _mapping(payload)
+    from .price_comparison import refresh_price_comparison
+    payload = refresh_price_comparison(_mapping(payload))
     decision = _mapping(payload.get("valuation_decision"))
     cutoff = _date(decision.get("as_of")) if as_of is None else _date(as_of) if isinstance(as_of, str) else as_of
     cutoff = cutoff if type(cutoff) is date else None
-    reasons, missing, required = _decision_usability_issues(decision, cutoff)
+    snapshot_records = _mapping(_mapping(payload.get('acquisition_snapshot')).get('case')).get('records', ())
+    reasons, missing, required = _decision_usability_issues(decision, cutoff, snapshot_records)
     method = decision.get("method_id")
     for key in ("snapshot_id", "generation_id"):
         if not _text(payload.get(key)):
@@ -504,6 +597,7 @@ def assess_valuation_usability(payload, *, expected_decision=None, as_of=None):
             missing.extend(unconsumed)
 
     consumption_checks(payload.get("input_consumption"), "input_consumption")
+    sanity_quotation = None
     from bellomberg.valuation.method_registry import is_record_method
     if is_record_method(decision):
         # The first integrated record adapter must attest actual records, not
@@ -526,6 +620,7 @@ def assess_valuation_usability(payload, *, expected_decision=None, as_of=None):
             quotations = [row.get('value') for row in records
                           if row.get('driver') == 'quotation' and row.get('scenario') == 'model']
             reasons.extend(attest_market_quote(payload, bundle, quotations[0] if len(quotations) == 1 else {}))
+            sanity_quotation = quotations[0] if len(quotations) == 1 else None
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             reasons.append(_message('input_consumption: {error}', 'input_consumption: {error}', error=error_text(exc)))
 
@@ -553,6 +648,15 @@ def assess_valuation_usability(payload, *, expected_decision=None, as_of=None):
 
     quality_checks(payload.get("analytical_quality"), "analytical_quality")
     sanity_checks(payload.get("sanity"), "sanity")
+    informational_stress_paths = frozenset()
+    if (method == 'operating_fcff'
+            or _mapping(payload.get('sanity')).get('policy') == DOCUMENTED_OPERATING_SANITY_POLICY):
+        if _attest_documented_sanity_policy(payload, sanity_quotation):
+            informational_stress_paths = frozenset({('sanity', 'scenario_checks', 'bear'),
+                                                   ('sanity', 'scenario_checks', 'bull')})
+        else:
+            reasons.append(_message('sanity: policy documentata non riconciliata ai risultati e alla quotazione',
+                                    'sanity: documented policy not reconciled to results and quotation'))
     primary = next((payload[key] for key in _PRIMARY_FAIR_VALUES if payload.get(key) is not None), None)
     if not _finite(primary):
         reasons.append(_message('fair_value primario assente o non numerico finito', 'primary fair_value missing or not a finite number'))
@@ -582,15 +686,15 @@ def assess_valuation_usability(payload, *, expected_decision=None, as_of=None):
             reasons.append(_message('child_valuations: {error}', 'child_valuations: {error}', error=error_text(exc)))
             child_values = {}
 
-    def inspect(value, path="payload"):
-        if path in _PREPARATION_EVIDENCE_PATHS:
+    def inspect(value, path="payload", components=()):
+        if components in _PREPARATION_EVIDENCE_PATHS:
             # Immutable preparation evidence, never a competing valuation output.
             # Raw provider labels such as units.equity are not calculated amounts.
             # A future refresh recompiles this basis with its own original contract.
             return
         if isinstance(value, list):
             for index, child in enumerate(value):
-                inspect(child, path + "[%s]" % index)
+                inspect(child, path + "[%s]" % index, components + (index,))
         elif isinstance(value, dict):
             if method == 'mixed_business_sotp' and path == 'payload.child_valuations':
                 return  # Independently gated above against the actual acquired child bundles.
@@ -608,7 +712,8 @@ def assess_valuation_usability(payload, *, expected_decision=None, as_of=None):
             def valuation_key(key):
                 return _valuation_number_key(key) or _calculated_valuation_key(key, path)
             has_value = any(valuation_key(key) and child is not None for key, child in value.items())
-            if value.get("exclude_from_action_table") is True or value.get("valuation_flagged") is True:
+            if (value.get("exclude_from_action_table") is True and components not in informational_stress_paths
+                    or value.get("valuation_flagged") is True):
                 reasons.append(_message('{path}: risultato esplicitamente escluso dalla valutazione utilizzabile', '{path}: result explicitly excluded from usable valuation', path=path))
             if value.get("usable") is False:
                 reasons.append(_message('{path}: risultato dichiarato non utilizzabile', '{path}: result declared unusable', path=path))
@@ -639,7 +744,7 @@ def assess_valuation_usability(payload, *, expected_decision=None, as_of=None):
                 # Acquired cases retain original S1 routing and raw observations;
                 # these are provenance, not a competing result/attestation.
                 if key not in _SOURCE_BRANCHES:
-                    inspect(child, child_path)
+                    inspect(child, child_path, components + (key,))
 
     inspect(payload)
     snapshot = _mapping(_mapping(payload.get("analytical_quality")).get("snapshot"))
@@ -651,11 +756,12 @@ def assess_valuation_usability(payload, *, expected_decision=None, as_of=None):
 
 def normalize_valuation_payload(payload, *, expected_decision=None, as_of=None):
     """Preserve evidence/observed price/NAV; hide unusable valuation outputs recursively."""
-    result = deepcopy(_mapping(payload))
+    from .price_comparison import refresh_price_comparison
+    result = refresh_price_comparison(_mapping(payload))
     usability = assess_valuation_usability(result, expected_decision=expected_decision, as_of=as_of)
     if not usability["usable"]:
-        def hide(value, *, irr=False, path='payload'):
-            if path in _PREPARATION_EVIDENCE_PATHS:
+        def hide(value, *, irr=False, path='payload', components=()):
+            if components in _PREPARATION_EVIDENCE_PATHS:
                 return deepcopy(value)  # Keep archived evidence intact even on a blocked result.
             if isinstance(value, dict):
                 cleaned = {}
@@ -665,15 +771,18 @@ def normalize_valuation_payload(payload, *, expected_decision=None, as_of=None):
                     elif _valuation_number_key(key) or _calculated_valuation_key(key, path):
                         cleaned[key] = None
                     elif key == "holding_irr":
-                        cleaned[key] = hide(child, irr=True,path=path+'.'+str(key)) if isinstance(child, dict) else None
+                        cleaned[key] = hide(child, irr=True,path=path+'.'+str(key),
+                                            components=components+(key,)) if isinstance(child, dict) else None
                     elif irr and key not in ("years", "entry_price", "entry_pb"):
-                        cleaned[key] = hide(child, irr=True,path=path+'.'+str(key)) if isinstance(child, (dict, list)) else (
+                        cleaned[key] = hide(child, irr=True,path=path+'.'+str(key),
+                                            components=components+(key,)) if isinstance(child, (dict, list)) else (
                             None if isinstance(child, (int, float)) else child)
                     else:
-                        cleaned[key] = hide(child,path=path+'.'+str(key))
+                        cleaned[key] = hide(child,path=path+'.'+str(key),components=components+(key,))
                 return cleaned
             if isinstance(value, list):
-                return [hide(child, irr=irr,path=path+'[%s]'%i) for i,child in enumerate(value)]
+                return [hide(child, irr=irr,path=path+'[%s]'%i,components=components+(i,))
+                        for i,child in enumerate(value)]
             return None if irr and isinstance(value, (int, float)) else value
         result = hide(result)
     result["valuation_usability"] = usability

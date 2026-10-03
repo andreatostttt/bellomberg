@@ -49,6 +49,23 @@ def test_industry_distinctions_precede_legacy_keyword_routing(industry, want):
     assert p["profile_id"] == want
 
 
+def test_exact_information_technology_services_uses_registered_services_method_only():
+    from bellomberg.valuation.method_registry import select_valuation_method
+
+    acn = resolve(facts(quote_type="EQUITY", sector="Technology",
+                        industry="Information Technology Services"))
+    assert acn["decision_status"] == "resolved" and acn["profile_id"] == "services"
+    assert select_valuation_method(acn)["method_id"] == "operating_fcff"
+
+    unknown = resolve(facts(quote_type="EQUITY", sector="Technology",
+                            industry="Information Technology Consulting"))
+    assert unknown["decision_status"] == "unknown" and unknown["profile_id"] is None
+
+    software = resolve(facts(quote_type="EQUITY", sector="Technology",
+                             industry="Software - Application"))
+    assert software["decision_status"] == "resolved" and software["profile_id"] == "software"
+
+
 @pytest.mark.parametrize("industry", ["Credit Services", "Asset Management", "Insurance",
                                        "Biotechnology", "Utilities - Regulated Electric",
                                        "Utilities - Independent Power Producers", "Investment Banking & Brokerage"])

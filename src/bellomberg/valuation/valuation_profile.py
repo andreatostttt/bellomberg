@@ -52,6 +52,7 @@ _INDUSTRY_CANDIDATES = {
     "payment processing": {"payment_processor"}, "mortgage finance": {"mortgage_lender"},
     "reit - mortgage": {"mortgage_lender"}, "real estate - development": {"property_developer"},
     "real estate services": {"services"},
+    "information technology services": {"services"},
     "utilities - independent power producers": {"merchant_generation", "contracted_generation"},
     "investment banking & brokerage": {"bank", "broker_fee", "mixed_business"},
     "capital markets": {"bank", "broker_fee", "mixed_business"},

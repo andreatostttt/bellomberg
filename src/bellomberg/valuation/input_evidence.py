@@ -1,6 +1,7 @@
 """Deterministic numerical proofs against primary structured tool documents."""
 import json
 import re
+from hashlib import sha256
 from datetime import date, timedelta
 from math import fsum, isclose, isfinite
 
@@ -87,6 +88,69 @@ def same_entity_name(left, right):
     return key is not None and key == entity_name_key(right)
 
 
+def same_sec_bound_issuer(document, body, fact, expected_entity, filings):
+    """Permit only Inc display punctuation bound to the selected SEC filing bytes."""
+    from .balance_detail_evidence import _same_sec_inline_issuer
+    if (not isinstance(body, dict) or not isinstance(fact, dict)
+            or not _same_sec_inline_issuer(body.get('issuer'), expected_entity)
+            or 'entity' in fact and not same_entity_name(fact['entity'], expected_entity)):
+        return False
+    meta = document.get('metadata')
+    raw_cik, observation = body.get('cik'), fact.get('observation')
+    if (not isinstance(raw_cik, str) or not raw_cik.isascii() or not raw_cik.isdecimal()
+            or len(raw_cik) > 10 or not isinstance(meta, dict) or not isinstance(observation, dict)):
+        return False
+    cik = raw_cik.zfill(10)
+    accession = meta.get('accession')
+    if (not isinstance(accession, str) or not re.fullmatch(r'[0-9]{18}', accession)
+            or meta.get('emittente_id') != 'CIK:' + cik
+            or document.get('id') != 'xbrl-' + cik + '-' + accession
+            or document.get('url') != 'https://data.sec.gov/api/xbrl/companyfacts/CIK' + cik + '.json'
+            or observation.get('accn') != accession[:10] + '-' + accession[10:12] + '-' + accession[12:]
+            or observation.get('filed') != document.get('published_at')
+            or not isinstance(document.get('text'), str)
+            or document.get('sha256') != sha256(document['text'].encode('utf-8')).hexdigest()):
+        return False
+    matches = []
+    for filing in filings:
+        if not isinstance(filing, dict):
+            continue
+        filing_meta = filing.get('metadata')
+        filing_accession = filing_meta.get('accession') if isinstance(filing_meta, dict) else None
+        url = filing.get('url')
+        source = re.fullmatch(r'https://www\.sec\.gov/Archives/edgar/data/([1-9][0-9]*)/([0-9]{18})/[^/?#]+',
+                              url) if isinstance(url, str) else None
+        if (not isinstance(filing_meta, dict) or not source
+                or source[1] != str(int(cik)) or source[2] != accession
+                or filing_meta.get('emittente_id') != 'CIK:' + cik
+                or filing_accession not in (accession,
+                    accession[:10] + '-' + accession[10:12] + '-' + accession[12:])
+                or not _same_sec_inline_issuer(filing_meta.get('issuer'), expected_entity)
+                or filing_meta.get('form') not in ('10-K', '10-Q')
+                or observation.get('form') != filing_meta['form']
+                or filing.get('published_at') != document['published_at']
+                or not isinstance(filing.get('id'), str)
+                or not re.fullmatch(r'[0-9a-f]{64}', filing['id'])
+                or filing.get('document_sha256') != filing['id']
+                or not isinstance(filing.get('text'), str)
+                or filing.get('sha256') != sha256(filing['text'].encode('utf-8')).hexdigest()):
+            continue
+        matches.append(filing['id'])
+    return len(matches) == 1
+
+
+def same_sec_filing_issuer(document, expected_entity):
+    """Inc typography only for a SEC primary with intact native identity proof."""
+    from .balance_detail_evidence import _same_sec_inline_issuer
+    from .statement_table_evidence import _identity
+    try:
+        metadata, _cik, _accession = _identity(document)
+        return (metadata['form'] in ('10-K', '10-Q')
+                and _same_sec_inline_issuer(metadata['issuer'], expected_entity))
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return False
+
+
 def parent_regulatory_components(driver, taxonomy="fr-y-9lp-pc"):
     """Exact per-form balances; neither distributability nor total debt is inferred."""
     return {
@@ -99,9 +163,14 @@ def parent_regulatory_components(driver, taxonomy="fr-y-9lp-pc"):
     }.get(taxonomy, {}).get(driver)
 
 
+def opening_share_concepts():
+    return {('us-gaap', 'CommonStockSharesOutstanding'), ('dei', 'EntityCommonStockSharesOutstanding')}
+
+
 def structured_fact_proof(item, evidence, unit, period, *, scale, require_annual=False,
                           allowed_concepts=None, concept_signs=None, expected_entity=None,
-                          regulatory_components=None, parent_cash_pointer_repairs=None):
+                          regulatory_components=None, parent_cash_pointer_repairs=None, sec_share_count=False,
+                          revenue_pointer_repairs=None, sec_opening_bridge=False):
     """Read exact values/periods, a signed sum, or a three-observation revenue TTM.
 
     No arbitrary arithmetic, assumed missing operands, mixed-period openings or
@@ -131,7 +200,13 @@ def structured_fact_proof(item, evidence, unit, period, *, scale, require_annual
                 raise ValueError("misura primaria normalizzata /facts/index richiesta")
             root, field = match.groups()
             parent = root + ("/observation" if field == "observation/val" else "")
-            if pointers["unit"] != root + "/unit" or pointers["period"] != parent + "/end":
+            unit_pointer = pointers['unit']
+            unit_repair = (revenue_pointer_repairs is not None and ttm and require_annual
+                           and allowed_concepts == revenue_concepts()
+                           and field == 'observation/val' and unit_pointer == value_pointer)
+            if unit_repair:
+                unit_pointer = root + '/unit'
+            if unit_pointer != root + "/unit" or pointers["period"] != parent + "/end":
                 raise ValueError("valore, unita e periodo devono appartenere alla stessa osservazione")
             identity = ids[0], value_pointer
             if identity in seen:
@@ -151,7 +226,24 @@ def structured_fact_proof(item, evidence, unit, period, *, scale, require_annual
                           or isinstance(metadata, dict) and str(metadata.get("emittente_id", "")).startswith("CIK:"))
             if sec_source and expected_entity is not None:
                 issuer = raw.get("issuer") if isinstance(raw, dict) else None
-                if not same_entity_name(issuer, expected_entity):
+                opening_count = (sec_share_count and isinstance(source_fact, dict)
+                    and (source_fact.get('taxonomy'), source_fact.get('concept')) in opening_share_concepts()
+                    and isinstance(source_fact.get('observation'), dict)
+                    and not source_fact['observation'].get('start')
+                    and source_fact['observation'].get('end') == period)
+                opening_claim = (sec_opening_bridge and isinstance(source_fact, dict)
+                    and isinstance(source_fact.get('observation'), dict)
+                    and not source_fact['observation'].get('start')
+                    and source_fact['observation'].get('end') == period)
+                if sec_opening_bridge:
+                    filings = [doc for doc in evidence if isinstance(doc.get('metadata'), dict)
+                               and doc['metadata'].get('report_date') == period]
+                    if not opening_claim or not same_sec_bound_issuer(
+                            document, raw, source_fact, expected_entity, filings):
+                        raise ValueError('opening SEC bridge requires an instant bound to the original dated filing')
+                elif (not same_entity_name(issuer, expected_entity)
+                        and not ((require_annual and allowed_concepts == revenue_concepts() or opening_count)
+                            and same_sec_bound_issuer(document, raw, source_fact, expected_entity, evidence))):
                     raise ValueError("entita SEC normalizzata assente o diversa dal perimetro del driver")
             declared_entity = metadata.get("entity") if isinstance(metadata, dict) else None
             if isinstance(source_fact, dict) and ("entity" in source_fact or declared_entity is not None):
@@ -198,7 +290,7 @@ def structured_fact_proof(item, evidence, unit, period, *, scale, require_annual
                     or (source_fact.get("taxonomy"), source_fact.get("concept")) not in allowed_concepts):
                 raise ValueError("concept XBRL non ammesso per il driver storico")
             value = _pointer(raw, value_pointer)
-            source_unit = _pointer(raw, pointers["unit"])
+            source_unit = _pointer(raw, unit_pointer)
             source_period = _pointer(raw, pointers["period"])
             if not ttm and period is not None and source_period != period:
                 raise ValueError("periodo fonte diverso dal saldo iniziale: rollforward non implicito")
@@ -259,6 +351,11 @@ def structured_fact_proof(item, evidence, unit, period, *, scale, require_annual
             start, end = date.fromisoformat(start_raw), date.fromisoformat(source_period)
             if start.isoformat() != start_raw or end.isoformat() != source_period or start > end:
                 raise ValueError("TTM: intervallo osservato non valido")
+            if unit_repair:
+                pointer_repairs.append({'source_id': ids[0], 'supplied_unit_pointer': pointers['unit'],
+                    'validated_unit_pointer': unit_pointer,
+                    'reason': 'unit duplicated the value pointer of the same SEC TTM observation; '
+                              'quoted amount, unit, period, issuer, concept and accession verified'})
             return {"amount": amount, "issuer": cik, "concept": concept, "unit": source_unit,
                     "start": start, "end": end}
         if "calculation" in item:
@@ -334,4 +431,6 @@ def structured_fact_proof(item, evidence, unit, period, *, scale, require_annual
         return str(exc)
     if parent_cash_pointer_repairs is not None:
         parent_cash_pointer_repairs.extend(pointer_repairs)
+    if revenue_pointer_repairs is not None:
+        revenue_pointer_repairs.extend(pointer_repairs)
     return None

@@ -24,6 +24,7 @@ class _Usage:
     output_tokens = 50
     cache_read_input_tokens = 0
     cache_creation_input_tokens = 0
+    cost_usd = 0.03  # Simulated provider receipt for successful tool/report turns.
 
 
 class _ToolUseBlock:

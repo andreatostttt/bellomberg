@@ -410,6 +410,8 @@ def _canonical_sanity(ticker, report_dir=None):
     variante opposta). Review Lotto C F2: i modelli BLOCK vivono SOLO nel
     sidecar _FLAGGED (misurati 6/6 nel report/ reale) — guardare solo il
     canonico rendeva l'esclusione morta per costruzione.
+    La lettura applica la policy corrente ai soli vecchi scarti FV/prezzo
+    dimostrati; file, valori e blocchi tecnici o ambigui restano conservati.
     Ritorna (severity, judged_at) — (None, None) = sidecar assente/illeggibile:
     MAI escludere per assenza di dato."""
     try:
@@ -422,7 +424,15 @@ def _canonical_sanity(ticker, report_dir=None):
                 continue
             with open(p, "r", encoding="utf-8") as f:
                 payload = json.load(f)
+            from bellomberg.valuation.price_comparison import refresh_price_comparison
+            original_severity = ((payload.get("sanity") or {}).get("severity") or "").upper()
+            payload = refresh_price_comparison(payload)
             sev = ((payload.get("sanity") or {}).get("severity") or "").upper() or None
+            if original_severity == "BLOCK" and (payload.get("error")
+                    or payload.get("valuation_flagged") is True
+                    or payload.get("exclude_from_action_table") is True):
+                # A proven comparison does not waive another recorded failure.
+                sev = "BLOCK"
             judged_at = str(payload.get("_timestamp") or "")[:10] or None
             return sev, judged_at
     except Exception:
@@ -520,6 +530,7 @@ if __name__ == "__main__":
     with db._conn() as conn:
         memo_id, md = conn.execute(
             "SELECT id, full_markdown FROM memos WHERE LENGTH(full_markdown) > 1000 "
+            "AND substr(COALESCE(notes,''),1,11) <> 'trade_idea:' "
             "ORDER BY id DESC LIMIT 1").fetchone()
     print(f"Test su memo #{memo_id} ({len(md)} char)")
     sizing = None

@@ -21,6 +21,8 @@ from bellomberg.core.paths import DATA_DIR
 from bellomberg.core.language import current_language, prompt_for_language, scoped_language
 from bellomberg.core.llm_refusal import refusal_reason as _refusal_reason
 
+REFLECTION_MAX_TOKENS = 8000
+
 LESSONS_PATH = str(DATA_DIR / "reflection_lessons.json")
 MAX_LESSONS_KEPT = 24
 
@@ -97,6 +99,7 @@ def generate_lesson(memo_markdown: str = "", memo_id: Optional[int] = None,
                        "status": "skipped"})
     try:
         from bellomberg.core.llm_client import OpenRouterClient, modello as _modello_llm, somma_usage
+        from bellomberg.agents.specialists.base import timeout_specialisti
         from bellomberg.agents.scorekeeper import compute_scorecard, format_track_record_for_capo
         # 05/09 (ordine PM): modello dal .env (REFLECTION_MODEL); assente = errore col nome
         MODEL_SYNTHESIZER = _modello_llm("reflection")
@@ -132,15 +135,11 @@ def generate_lesson(memo_markdown: str = "", memo_id: Optional[int] = None,
 
     _t0 = _time.perf_counter()
     try:
-        client = OpenRouterClient(timeout=120.0, max_retries=1)
+        client = OpenRouterClient(timeout=timeout_specialisti(REFLECTION_MAX_TOKENS), max_retries=1)
         resp = client.messages.create(
             model=MODEL_SYNTHESIZER,
-            # 26/07 pre-V6: 700 -> 1000. Stessa causa del red team, MISURATA con
-            # count_tokens su questo prompt: REFLECTION_PROMPT = 373 token su
-            # sonnet-4-6 e 515 su sonnet-5 (+38,1%). I 700 tarati su 4.6 valevano
-            # ~507 token vecchi: la lezione (3-6 righe ancorate ai numeri) finiva a
-            # meta' riga. 1000 ripristina il budget effettivo di prima. Tetto, non spesa.
-            max_tokens=1000,
+            # PM 02/10: 8k; una lezione troncata non viene salvata nel priming.
+            max_tokens=REFLECTION_MAX_TOKENS,
             # Sonnet 5 (26/07): omesso = adaptive acceso; SPENTO esplicito — con
             # un budget cosi' corto il thinking mangerebbe la lezione stessa
             thinking={"type": "disabled"},
@@ -220,6 +219,7 @@ if __name__ == "__main__":
     with db._conn() as conn:
         memo_id, md = conn.execute(
             "SELECT id, full_markdown FROM memos WHERE LENGTH(full_markdown) > 1000 "
+            "AND substr(COALESCE(notes,''),1,11) <> 'trade_idea:' "
             "ORDER BY id DESC LIMIT 1").fetchone()
     print(f"Genero lezione dal memo #{memo_id}...")
     lesson = generate_lesson(md, memo_id=memo_id)

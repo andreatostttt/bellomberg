@@ -250,7 +250,9 @@ def generate_managed_care(bundle, *, output_dir, metadata):
         factor = quotation['financial_to_quote_rate'] * quotation['quote_units_per_currency'] * quotation['shares_per_quote']
         for scenario in SCENARIOS:
             value = projection['scenarios'][scenario]['fair_value_per_share']
-            result['fair_value_' + scenario] = value * factor if _finite(value) else None
+            # The common Summary formula rounds quoted values to two decimals.
+            # Retain the full engine amount in projection/baselines.
+            result['fair_value_' + scenario] = round(value * factor, 2) if _finite(value) else None
         checks = {s: sanity_check(result['fair_value_' + s], quotation['price']) for s in SCENARIOS}
         for scenario, check in checks.items():
             if check.get('status') != 'ok' or result['fair_value_' + scenario] is None or result['fair_value_' + scenario] <= 0:
@@ -337,6 +339,8 @@ def build_managed_care_workbook(payload, output_dir):
     from .sourcebook_presentation import present_sourcebook
     present_sourcebook(wb, payload)
     present_analysis(wb, payload)
+    from .preparation_workbook_packet import capture_bindings
+    capture_bindings(wb, payload)
     wb.save(path)
     wb.close()
     return str(path)

@@ -298,6 +298,59 @@ def test_historical_revenue_ttm_reconciles_three_traceable_observations():
     assert _fact_proof("historical_revenue", item, documents, "EUR million", "2026-06-30") is not None
 
 
+def test_ttm_unit_pointer_typo_is_verified_and_traced_without_changing_the_claim():
+    from copy import deepcopy
+    from bellomberg.valuation.input_preparation import _fact_proof
+
+    item, documents = _ttm_case()
+    term = item['calculation']['terms']['prior_ytd']
+    term['evidence_pointer']['unit'] = term['evidence_pointer']['value']
+    original = deepcopy(item)
+    repairs = []
+    assert _fact_proof('historical_revenue', item, documents, 'EUR million', '2026-06-30',
+                       expected_entity='SYNTH-GROUP', pointer_repairs=repairs) is None
+    assert item == original
+    assert len(repairs) == 1
+    assert repairs[0]['source_id'] == documents[1]['id']
+    assert repairs[0]['supplied_unit_pointer'] == '/facts/1/observation/val'
+    assert repairs[0]['validated_unit_pointer'] == '/facts/1/unit'
+    assert _fact_proof('historical_revenue', item, documents, 'EUR million', '2026-06-30')
+
+
+@pytest.mark.parametrize('problem', ['other_fact', 'other_field', 'currency', 'amount',
+                                    'period', 'issuer', 'accession', 'concept', 'total'])
+def test_ttm_unit_pointer_repair_never_changes_economic_evidence(problem):
+    from bellomberg.valuation.input_preparation import _fact_proof
+
+    item, documents = _ttm_case()
+    term = item['calculation']['terms']['prior_ytd']
+    term['evidence_pointer']['unit'] = term['evidence_pointer']['value']
+    raw = json.loads(documents[1]['text'])
+    if problem == 'other_fact':
+        term['evidence_pointer']['unit'] = '/facts/0/unit'
+    elif problem == 'other_field':
+        term['evidence_pointer']['unit'] = '/facts/1/observation/end'
+    elif problem == 'currency':
+        term['quoted_unit'] = 'USD'
+    elif problem == 'amount':
+        term['quoted_value'] += 1
+    elif problem == 'period':
+        raw['facts'][1]['observation']['end'] = '2025-03-31'
+    elif problem == 'issuer':
+        raw['issuer'] = 'Different Issuer'
+    elif problem == 'accession':
+        raw['facts'][1]['observation']['accn'] = '0000000001-26-999999'
+    elif problem == 'concept':
+        raw['facts'][1]['concept'] = 'Revenues'
+    else:
+        item['value'] += 1
+    documents[1]['text'] = json.dumps(raw)
+    repairs = []
+    assert _fact_proof('historical_revenue', item, documents, 'EUR million', '2026-06-30',
+                       expected_entity='SYNTH-GROUP', pointer_repairs=repairs)
+    assert repairs == []
+
+
 @pytest.mark.parametrize("change", ["current_start", "prior_start", "prior_end", "current_end",
                                      "trailing_horizon", "short_annual", "long_ytd"])
 def test_ttm_rejects_invalid_period_reconciliation(change):

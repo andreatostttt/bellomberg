@@ -173,8 +173,8 @@ PASSI_SUITE = (
     # dipende da, gemello in .github/workflows/ci.yml = (comando, working-directory).
     PassoSuite("npm ci", ("npm", "ci", "--no-audit", "--no-fund"), "app", 900, True, (),
                ("npm ci", "app")),
-    PassoSuite("pytest", ("python", "-m", "pytest", "tests/", "-q", "-p", "no:cacheprovider", "-rfE"),
-               "", 3600, False, ("npm ci",), ("pytest tests/ -q", "")),
+    PassoSuite("pytest", ("python", "-I", "tools/testing/research_ci.py"),
+               "", 3600, False, ("npm ci",), ("python -I tools/testing/research_ci.py", "")),
     PassoSuite("tsc --noEmit", ("npm", "exec", "--no", "--", "tsc", "--noEmit"), "app", 300, True,
                ("npm ci",), ("npx tsc --noEmit", "app")),
     PassoSuite("test:release", ("npm", "run", "test:release"), "app", 900, True, ("npm ci",),

@@ -16,11 +16,174 @@ Cosa e' pinnato qui (spec docs/superpowers/specs/2026-09-05-openrouter-migrazion
 import asyncio
 import json
 import os
+import sqlite3
 
 import httpx
 import pytest
 
 from bellomberg.core import llm_client
+
+
+def _journal(tmp_path):
+    from bellomberg.core.request_journal import RequestJournal
+    return RequestJournal(tmp_path / "requests.sqlite", run_id="offline-weekly",
+        authorization={"source": "explicit_test_launch"}, authorized_usd="1",
+        metadata=lambda model: {"id": model, "context_length": 1000,
+                                "pricing": {"prompt": "0.000001", "completion": "0.000002"}})
+
+
+def test_journal_saved_before_dispatch_replayed_after_restart_without_double_cost(tmp_path):
+    journal = _journal(tmp_path)
+    dispatches = []
+    def send(request):
+        with sqlite3.connect(journal.path) as db:
+            state, cost, reserve = db.execute("SELECT state,cost,reserved FROM requests").fetchone()
+        assert state == "reserved" and cost is None and reserve > 0
+        dispatches.append(request)
+        return httpx.Response(200, json={"id": "resp-paid", "model": "test/model",
+            "choices": [{"message": {"content": "Verified response"}, "finish_reason": "stop"}],
+            "usage": {"cost": 0.00003}})
+    client = llm_client.OpenRouterClient(api_key="test", trasporto=httpx.MockTransport(send))
+    kwargs = {"model": "test/model", "max_tokens": 20, "messages": [{"role": "user", "content": "test"}]}
+    for attempt in range(3):
+        with llm_client.request_scope(_journal(tmp_path), phase="R1", agent="macro", round_n=1):
+            response = client.messages.create(**kwargs)
+        assert response.content[0].text == "Verified response"
+    assert len(dispatches) == 1
+    assert journal.summary()["request_count"] == 1
+    assert journal.summary()["cost_usd"] == 0.00003
+
+
+@pytest.mark.parametrize("fault", ["503", "504", "timeout", "disconnect", "incomplete"])
+def test_journal_ambiguous_post_is_never_retried_and_reservation_survives(tmp_path, fault):
+    journal = _journal(tmp_path)
+    dispatches = []
+    def send(request):
+        dispatches.append(request)
+        if fault == "timeout":
+            raise httpx.ReadTimeout("simulated provider timeout")
+        if fault == "disconnect":
+            raise httpx.RemoteProtocolError("simulated lost connection")
+        if fault == "incomplete":
+            return httpx.Response(200, json={"id": "partial", "model": "test/model",
+                "choices": [{"message": {"content": "partial"}, "finish_reason": None}]})
+        return httpx.Response(int(fault), json={"error": {"code": int(fault), "message": "original provider cause"}})
+    client = llm_client.OpenRouterClient(api_key="test", max_retries=4, trasporto=httpx.MockTransport(send))
+    kwargs = {"model": "test/model", "max_tokens": 20, "messages": [{"role": "user", "content": "test"}]}
+    with llm_client.request_scope(journal, phase="R1"):
+        with pytest.raises(Exception) as first:
+            client.messages.create(**kwargs)
+    assert getattr(first.value, "request_id", None)
+    with llm_client.request_scope(_journal(tmp_path), phase="R1"):
+        with pytest.raises(Exception):
+            client.messages.create(**kwargs)
+    assert len(dispatches) == 1
+    summary = journal.summary()
+    assert summary["cost_usd"] is None and summary["unknown_requests"] == 1
+    assert summary["reserved_usd"] > 0
+
+
+def test_missing_finish_reason_cannot_become_complete():
+    with pytest.raises(llm_client.APIConnectionError, match="INCOMPLETA"):
+        llm_client.messaggio_da_json({"id": "partial", "model": "test/model",
+            "choices": [{"message": {"content": "partial"}, "finish_reason": None}]})
+
+
+def test_journal_corrupt_cost_cannot_be_replayed_as_measured_zero(tmp_path):
+    journal = _journal(tmp_path)
+    scope = {"phase": "R1", "agent": "macro", "round_n": 1}
+    body = {"model": "test/model", "max_tokens": 20, "messages": [{"role": "user", "content": "frozen"}]}
+    request_id, _, _ = journal.prepare(body, scope)
+    journal.receive(request_id, {"id": "real-receipt", "model": "test/model", "usage": {"cost": 0.00003},
+        "choices": [{"message": {"content": "full response"}, "finish_reason": "stop"}]})
+    with sqlite3.connect(journal.path) as db:
+        db.execute("UPDATE requests SET cost=0")
+    with pytest.raises(ValueError, match="cost|receipt"):
+        _journal(tmp_path).prepare(body, scope)
+
+
+def test_wrong_response_identity_keeps_unknown_reservation(tmp_path):
+    journal = _journal(tmp_path)
+    body = {"model": "test/model", "max_tokens": 20, "messages": [{"role": "user", "content": "frozen"}]}
+    request_id, _, _ = journal.prepare(body, {"phase": "R1"})
+    journal.receive(request_id, {"id": "other-response", "model": "other/model", "usage": {"cost": 0.00003},
+        "choices": [{"message": {"content": "wrong request"}, "finish_reason": "stop"}]})
+    assert journal.summary()["cost_usd"] is None
+    assert journal.summary()["reserved_usd"] > 0
+
+
+def test_crash_after_reserve_blocks_reopen_before_any_dispatch(tmp_path):
+    journal = _journal(tmp_path)
+    body = {"model": "test/model", "max_tokens": 20, "messages": [{"role": "user", "content": "frozen"}]}
+    request_id, _, _ = journal.prepare(body, {"phase": "R1"})
+    with pytest.raises(RuntimeError, match="unresolved") as exc:
+        _journal(tmp_path).prepare({**body, "messages": [{"role": "user", "content": "different"}]}, {"phase": "R2"})
+    assert exc.value.request_id == request_id
+    assert journal.summary()["unknown_requests"] == 1
+
+
+def test_known_overrun_is_recorded_as_measured_cost_but_still_blocks_spending(tmp_path):
+    journal = _journal(tmp_path)
+    body = {"model": "test/model", "max_tokens": 20, "messages": [{"role": "user", "content": "frozen"}]}
+    request_id, _, _ = journal.prepare(body, {"phase": "R1"})
+    journal.receive(request_id, {"id": "over-ceiling", "model": "test/model", "usage": {"cost": 0.2},
+        "choices": [{"message": {"content": "response with known bill"}, "finish_reason": "stop"}]})
+    summary = journal.summary()
+    assert summary["cost_usd"] == 0.2 and summary["known_cost_usd"] == 0.2
+    assert summary["unknown_requests"] == 0 and summary["overrun_requests"] == 1
+    assert summary["requests"][0]["state"] == "overrun"
+    with pytest.raises(RuntimeError, match="unresolved"):
+        journal.prepare({**body, "messages": [{"role": "user", "content": "next"}]}, {"phase": "R2"})
+
+
+@pytest.mark.parametrize("malformed", ["nan_cost", "choices_item", "choices_mapping"])
+def test_malformed_provider_evidence_is_retained_without_masking_or_false_completion(tmp_path, malformed):
+    journal = _journal(tmp_path)
+    payload = {"id": "malformed", "model": "test/model", "usage": {"cost": float("nan")},
+        "choices": [{"finish_reason": "stop", "message": {"content": "Retained response"}}]}
+    if malformed == "choices_item": payload["choices"] = [None]
+    if malformed == "choices_mapping": payload["choices"] = {"unexpected": True}
+    calls = []
+    def send(request):
+        calls.append(request)
+        return httpx.Response(200, content=json.dumps(payload).encode(), headers={"content-type": "application/json"})
+    client = llm_client.OpenRouterClient(api_key="offline", trasporto=httpx.MockTransport(send))
+    kwargs = {"model": "test/model", "max_tokens": 20, "messages": [{"role": "user", "content": "frozen"}]}
+    expected = RuntimeError if malformed == "nan_cost" else llm_client.APIConnectionError
+    with llm_client.request_scope(journal, phase="malformed"):
+        with pytest.raises(expected):
+            client.messages.create(**kwargs)
+        with pytest.raises(RuntimeError, match="unresolved"):
+            client.messages.create(**kwargs)
+    summary = journal.summary()
+    assert len(calls) == 1 and summary["cost_usd"] is None and summary["reserved_usd"] > 0
+    with sqlite3.connect(journal.path) as db:
+        state, response, receipt = db.execute("SELECT state,response,receipt FROM requests").fetchone()
+    assert state == "unknown" and "invalid_numeric" in response
+    assert json.loads(receipt)["complete"] is False
+
+
+def test_original_transport_cause_survives_nonserializable_partial_evidence(tmp_path, monkeypatch):
+    journal = _journal(tmp_path)
+    class SensitiveSDK:
+        def __repr__(self):
+            return "SECRET_CANARY_MUST_NOT_SERIALIZE"
+    cause = llm_client.APIConnectionError("original disconnected provider")
+    cause.partial_response = {"id": "partial", "model": "test/model", "choices": [None],
+                              "usage": {"cost": float("nan")}, "sdk": SensitiveSDK()}
+    client = llm_client.OpenRouterClient(api_key="offline", trasporto=httpx.MockTransport(lambda _: pytest.fail("network")))
+    def fail(body):
+        raise cause
+    monkeypatch.setattr(client, "_post_json", fail)
+    with llm_client.request_scope(journal, phase="original-cause"):
+        with pytest.raises(llm_client.APIConnectionError) as caught:
+            client.messages.create(model="test/model", max_tokens=20, messages=[{"role": "user", "content": "frozen"}])
+    assert caught.value is cause and cause.request_id
+    with sqlite3.connect(journal.path) as db:
+        response, receipt = db.execute("SELECT response,receipt FROM requests").fetchone()
+    assert "SECRET_CANARY" not in response + receipt and "SensitiveSDK" in response
+    assert json.loads(receipt)["diagnostic"]["message"] == str(cause)
+    assert journal.summary()["unknown_requests"] == 1
 
 
 # ---------------------------------------------------------------- utilita' di prova

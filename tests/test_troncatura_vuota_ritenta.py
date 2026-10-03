@@ -73,3 +73,14 @@ def test_troncatura_con_testo_non_ritenta(bb):
     out = _MockSpecialist(bb, client=client).run(2)
     assert len(client.calls) == 1
     assert "meta' analisi" in out
+
+
+def test_troncatura_vuota_con_costo_ignoto_non_ritenta(bb):
+    receipt = _Usage(out=16000)
+    receipt.cost_usd = None
+    client = _FakeClient(lambda n, kw: _Resp("max_tokens", [], receipt))
+    spec = _MockSpecialist(bb, client=client)
+    spec.run(2)
+    assert len(client.calls) == 1
+    assert spec.run_result_status == "truncated"
+    assert bb.usage_log[-1]["cost_usd"] is None

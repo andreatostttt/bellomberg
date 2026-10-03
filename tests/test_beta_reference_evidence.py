@@ -46,6 +46,7 @@ def test_beta_is_a_replayable_reference_with_explicit_adjustment_convention(tmp_
     assert data['regression']['beta'] == pytest.approx(2, abs=1e-12)
     assert data['regression']['n_obs'] == len(histories()['SYNTH']['observations']) - 1
     assert data['regression']['last_observation'] == '2026-02-02'
+    assert 'excluded_endpoint_observations' not in data['coverage']
     assert calls == [('SYNTH', '2021-02-03', DAY), ('^GSPC', '2021-02-03', DAY)]
     assert doc['published_at'] is None and doc['available_at'] == DAY
     assert 'price index' in data['limitation'] and 'forward beta' in data['limitation']
@@ -154,6 +155,7 @@ def test_euro_listing_beta_uses_same_date_usd_conversion_and_retains_all_legs(tm
     assert body['regression']['beta'] == pytest.approx(2, abs=1e-12)
     assert calls[-1] == ('EURUSD=X', '2021-02-03', DAY)
     assert body['currency_conversion']['source_currency'] == 'EUR'
+    assert 'excluded_endpoint_observations' not in body['coverage']
     assert body['currency_conversion']['rate_unit'] == 'USD per EUR'
     assert 'different closing times' in body['limitation']
     raw = next(tmp_path.glob('beta-*.json')).read_bytes()
@@ -164,7 +166,7 @@ def test_euro_listing_beta_uses_same_date_usd_conversion_and_retains_all_legs(tm
 
 
 @pytest.mark.parametrize('fault', ['inverse', 'currency', 'field', 'missing', 'duplicate', 'stale',
-                                  'short', 'nonpositive', 'future_value', 'extra_leg', 'wrong_direction'])
+                                  'short', 'nonpositive', 'extra_leg', 'wrong_direction'])
 def test_unqualified_fx_cannot_become_a_usd_beta(tmp_path, fault):
     from bellomberg.valuation.beta_reference_evidence import normalize_beta_reference
     values = euro_histories(); fx = values['EURUSD=X']; rows = fx['observations']
@@ -176,7 +178,6 @@ def test_unqualified_fx_cannot_become_a_usd_beta(tmp_path, fault):
     elif fault == 'stale': fx['observations'] = rows[:-10]
     elif fault == 'short': fx['observations'] = rows[300:]
     elif fault == 'nonpositive': rows[-1]['close'] = 0
-    elif fault == 'future_value': rows.append({'date': DAY, 'close': 1.1})
     if fault in ('extra_leg', 'wrong_direction'):
         result, _ = collect(tmp_path, values); doc, = result['documents']
         snapshot = json.loads(next(tmp_path.glob('beta-*.json')).read_bytes())
@@ -208,12 +209,51 @@ def test_missing_fx_dates_are_declared_and_never_forward_filled(tmp_path):
 def test_blank_endpoint_is_preserved_as_excluded_not_an_observation(tmp_path):
     values = euro_histories(); values['EURUSD=X']['observations'].append({'date': DAY, 'close': None})
     result, _ = collect(tmp_path, values)
-    assert result['status'] == 'partial'
+    assert result['status'] == 'ready' and not result['issues']
     body = json.loads(result['documents'][0]['text'])
-    assert body['coverage']['missing_observations']['EURUSD=X'] == [DAY]
+    assert body['coverage']['missing_observations']['EURUSD=X'] == []
+    assert body['coverage']['excluded_endpoint_observations'] == {
+        'EURUSD=X': [{'date': DAY, 'value_state': 'blank'}]}
     assert body['regression']['last_observation'] == '2026-02-02'
     assert body['regression']['n_obs'] == len(values['SYNTH']['observations'])-1
     assert json.loads(next(tmp_path.glob('beta-*.json')).read_bytes())['series']['EURUSD=X']['observations'][-1]['close'] is None
+
+
+def test_nonblank_fx_endpoint_is_archived_but_excluded_from_regression(tmp_path):
+    values = euro_histories()
+    values['EURUSD=X']['observations'].append({'date': DAY, 'close': 1.23})
+    result, _ = collect(tmp_path, values)
+
+    assert result['status'] == 'ready' and result['documents'] and not result['issues'], result
+    doc = result['documents'][0]
+    body = json.loads(doc['text'])
+    assert body['regression']['last_observation'] == '2026-02-02'
+    assert body['regression']['n_obs'] == len(values['SYNTH']['observations']) - 1
+    assert body['coverage']['excluded_endpoint_observations'] == {
+        'EURUSD=X': [{'date': DAY, 'value_state': 'observed'}]}
+    assert 'exclusive endpoint' in body['limitation']
+    raw = next(tmp_path.glob('beta-*.json')).read_bytes()
+    assert sha256(raw).hexdigest() == doc['document_sha256']
+    assert json.loads(raw)['series']['EURUSD=X']['observations'][-1] == {
+        'date': DAY, 'close': 1.23}
+
+
+@pytest.mark.parametrize('fault', ['duplicate_endpoint', 'later_date', 'before_start', 'bad_endpoint_price'])
+def test_fx_endpoint_exception_does_not_hide_other_provider_errors(tmp_path, fault):
+    values = euro_histories()
+    rows = values['EURUSD=X']['observations']
+    rows.append({'date': DAY, 'close': 1.23})
+    if fault == 'duplicate_endpoint':
+        rows.append({'date': DAY, 'close': 1.24})
+    elif fault == 'later_date':
+        rows[-1]['date'] = '2026-02-04'
+    elif fault == 'before_start':
+        rows[-1]['date'] = '2021-02-02'
+    else:
+        rows[-1]['close'] = -1
+    result, _ = collect(tmp_path, values)
+    assert result['status'] == 'incomplete' and not result['documents']
+    assert result['issues']
 
 
 def test_default_provider_fetches_fx_close_without_relabelling_euro_prices(tmp_path, monkeypatch):

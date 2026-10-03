@@ -62,6 +62,7 @@ class _DeskFinto:
         self.bb = blackboard
 
     def run(self, round_n):
+        self.run_result_status = "complete"
         if self.name == "fundamentals" and round_n == 1:
             # Real adapter/workbook/storage, synthetic inputs; only the LLM desk is replaced.
             from pathlib import Path
@@ -94,13 +95,21 @@ def _modulo_finto(monkeypatch, nome, **attrs):
 @pytest.fixture
 def run_offline(monkeypatch, tmp_path):
     """Rende `run_multi_agent()` eseguibile offline. Ritorna cio' che i finti hanno catturato."""
+    # This fixture exercises the archived workbook contract explicitly. New
+    # research tests opt back into the ordinary current contract before running.
+    native_weekly_contract = cm._weekly_contract
+    monkeypatch.setattr(cm, '_weekly_contract', lambda **kwargs:
+                        native_weekly_contract(analysis_mode=kwargs.get('analysis_mode')))
     # --- DB e cartelle runtime in tmp
+    monkeypatch.setattr(memory_db.MemoryDB, "_init_chroma", lambda self: self.__dict__.update(
+        chroma_client=None, col_memos=None, col_decisions=None, col_feedback=None))
     monkeypatch.setattr(memory_db, "SQLITE_PATH", str(tmp_path / "cablaggio.db"))
+    memory_db.MemoryDB()  # Existing, deliberately empty test book before the paid-run prerequisite.
     monkeypatch.setattr("bellomberg.agents.filing_context.SQLITE_PATH", str(tmp_path / "cablaggio.db"))
     monkeypatch.setattr(memory_db.MemoryDB, "get_portfolio_summary",
                         lambda self: {"n_positions": 0, "positions": []})
     monkeypatch.setattr(memory_db.MemoryDB, "extract_and_save_decisions",
-                        lambda self, memo_id, memo, usage_out=None: [])
+                        lambda self, memo_id, memo, usage_out=None, **kwargs: [])
     for d in ("research_notes", "models", "report"):
         (tmp_path / d).mkdir()
     monkeypatch.setattr(cm, "RESEARCH_NOTES_DIR", str(tmp_path / "research_notes"))
@@ -147,14 +156,16 @@ def run_offline(monkeypatch, tmp_path):
                   generate_lesson=lambda memo, memo_id=None, usage_out=None: None)
 
     def _pdf_finto(**kw):
-        p = tmp_path / "report" / "weekly_finto.pdf"
+        from pathlib import Path
+        p = Path(kw.get("output_path") or tmp_path / "report" / "weekly_finto.pdf")
         p.write_bytes(b"%PDF-1.4 finto")
         return str(p)
     _modulo_finto(monkeypatch, "bellomberg.reporting.pdf_institutional", build_institutional_memo=_pdf_finto)
     _modulo_finto(monkeypatch, "bellomberg.reporting.charts_quant", build_quant_appendix_v2=lambda **k: None)
     _modulo_finto(monkeypatch, "bellomberg.agents.score_history",
                   record_completed_run=lambda *a, **k: {"reason": "finto"})
-    monkeypatch.setattr(red_team, "run_red_team", lambda bb, **k: "")
+    monkeypatch.setattr(red_team, "run_red_team", lambda bb, **k:
+                        bb.write("_red_team", 1, "Synthetic complete challenge") or "Synthetic complete challenge")
     # --- sonda modelli: uno slug respinto, gli altri ok
     sondati = []
     _RESPINTO = "claude-opus-5"   # CAPO_MODEL/CONSIGLIERE_MODEL di prova del conftest
@@ -172,7 +183,8 @@ def run_offline(monkeypatch, tmp_path):
         catturato["bb"] = bb
         catturato["sizing_context"] = sizing_context or ""
         return "MEMO FINTO " + "m" * 100, {"model": "m/finto", "in": 10, "out": 10,
-                                             "input_tokens": 10, "output_tokens": 10, "api_calls": 1}
+                                             "input_tokens": 10, "output_tokens": 10, "api_calls": 1,
+                                             "complete": True, "stop_reason": "end_turn"}
     monkeypatch.setattr(cm, "run_capo", _capo)
     # --- desk finti al posto del roster
     monkeypatch.setattr(_DeskFinto, "xlsx_path", str(tmp_path / "report" / "VAL_ALFA.xlsx"))
@@ -184,7 +196,7 @@ def run_offline(monkeypatch, tmp_path):
     monkeypatch.setattr(es.smtplib, "SMTP_SSL", _SMTP)
     _SMTP.inviati.clear()
     return SimpleNamespace(catturato=catturato, sondati=sondati, inviati=_SMTP.inviati,
-                           respinto=_RESPINTO)
+                           respinto=_RESPINTO, native_weekly_contract=native_weekly_contract)
 
 
 def _html(msg):
@@ -212,7 +224,7 @@ def test_il_corpo_valutazioni_e_l_excel_della_run_arrivano_al_mittente(run_offli
     name = Path(payload["path"]).name
     assert "ALFA" in html and str(payload["fair_value_base"]) in html, html
     assert name in html and "Nessun modello Excel allegato" not in html, html
-    assert name in _allegati(msg) and "weekly_finto.pdf" in _allegati(msg), _allegati(msg)
+    assert name in _allegati(msg) and any(filename.endswith('_memo.pdf') for filename in _allegati(msg)), _allegati(msg)
     receipt = json.loads(next(Path(cm.RESEARCH_NOTES_DIR).glob("*_valuations.json")).read_text(encoding="utf-8"))
     assert receipt["email_status"] == "sent"
     assert receipt["valuations"][0]["email_included"] is True
@@ -305,10 +317,12 @@ def test_run_policy_binds_common_preparer_and_emails_new_workbook(run_offline, m
         ensure_schema(conn)
     seen_by_red_team, seen_by_r2 = [], []
     monkeypatch.setattr(red_team, "run_red_team", lambda bb, **k:
-        seen_by_red_team.append(dict(bb.valuation_results)))
+        (seen_by_red_team.append(dict(bb.valuation_results)),
+         bb.write("_red_team", 1, "Synthetic complete challenge"))[1] or "Synthetic complete challenge")
     class PreparedDesk(_DeskFinto):
         name = "fundamentals"
         def run(self, round_n):
+            self.run_result_status = "complete"
             if round_n == 1 and desk_requests:
                 payload = self.bb.valuation_preparer(_bundle())
                 assert payload["valuation_usability"]["usable"], payload.get("error")

@@ -36,6 +36,29 @@ def test_reuses_filing_diff_verified_bytes_and_deduplicates(tmp_path):
     assert result["coverage"]["accepted"] == 1
 
 
+@pytest.mark.parametrize('financial', [True, False])
+def test_new_sec_interim_is_admitted_only_after_current_byte_verification(tmp_path, financial):
+    from bellomberg.valuation.valuation_sources import collect_documents
+    from test_sec_interim_sources import _candidate, _filing
+    path = _filing(tmp_path, statement=financial, announcement=not financial)
+    entry = {**_candidate(path), 'ticker': 'EXAMPLE.MI'}
+    calls = []
+    def download(url, dest_dir, **kwargs):
+        calls.append(url)
+        return {'stato': 'ok', 'path': str(path), 'sha256': entry['sha256']}
+    result = collect_documents('EXAMPLE.MI', as_of='2025-10-02', archive_root=tmp_path,
+        catalog=lambda _: {'stato': 'ok', 'documenti': [entry], 'motivi': []}, download=download)
+    assert calls == [entry['url']]
+    if financial:
+        assert result['documents'][0]['metadata']['tipo'] == 'semestrale'
+        assert result['documents'][0]['metadata']['periodo_fine'] == '2025-06-30'
+        assert result['documents'][0]['document_sha256'] == entry['sha256']
+    else:
+        assert result['documents'] == []
+        assert result['coverage']['excluded'] == 1
+        assert result['coverage']['nonfinancial_filings'][0]['url'] == entry['url']
+
+
 def test_newer_catalog_filing_beats_old_archive_under_cap(tmp_path):
     from bellomberg.valuation.valuation_sources import collect_documents
     old = source(tmp_path, b"Old synthetic filing")

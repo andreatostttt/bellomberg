@@ -82,6 +82,10 @@ def _funding(funding,debt,forward_end,problem):
 
 
 def generate_property(bundle,*,output_dir,metadata):
+    from .property_nav_requirements import reported_policy_selected
+    if reported_policy_selected(bundle['case']['records']):
+        from .property_reported_nav import generate_reported_property
+        return generate_reported_property(bundle,output_dir=output_dir,metadata=metadata)
     from .dcf_mnav import compute_mnav_values
     candidates=[r['value'] for r in bundle['case']['records'] if r.get('driver')=='forward_year' and r.get('scenario')=='model']
     period=candidates[0] if len(candidates)==1 else {}

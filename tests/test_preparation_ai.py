@@ -11,7 +11,7 @@ def _metadata():
             "pricing": {"prompt": "0.00001", "completion": "0.00002"}}
 
 
-@pytest.mark.parametrize('muse, expected_cap', [(True, 65536), (False, 16000)])
+@pytest.mark.parametrize('muse, expected_cap', [(True, 128000), (False, 128000)])
 def test_configured_preparer_cap_preserves_specialists_model_and_budget(tmp_path, monkeypatch, muse, expected_cap):
     from bellomberg.core import llm_client
     from bellomberg.agents.specialists.base import MAX_TOKENS_SPECIALIST
@@ -21,7 +21,7 @@ def test_configured_preparer_cap_preserves_specialists_model_and_budget(tmp_path
     proposer = configured_proposer(tmp_path / 'configured.sqlite3', authorized_usd='1.25')
     assert proposer.max_tokens == expected_cap
     assert proposer.model == model and proposer.thinking == llm_client.thinking_consigliere(model)
-    assert proposer.automatic_sections and MAX_TOKENS_SPECIALIST == 16000
+    assert proposer.automatic_sections and MAX_TOKENS_SPECIALIST == 128000
     assert proposer.summary() == {'authorized_usd': 1.25, 'requests': 0, 'unknown_requests': 0,
         'spent_usd': 0, 'known_cost_usd': 0, 'reserved_usd': 0}
 
@@ -51,6 +51,65 @@ def test_paid_response_reused_after_restart_with_measured_cost(tmp_path):
     assert seen[0]["response_format"] == {"type": "json_object"}
     assert p.summary()["spent_usd"] == .2
     assert p.summary()["unknown_requests"] == 0
+    assert _proposer(tmp_path, call=lambda **_: pytest.fail("second replay dispatched"))(
+        {"ticker": "SYNTH"}, {"schema": {}}) == first
+
+
+@pytest.mark.parametrize("tamper", ["response", "cost", "model", "response_id", "missing_seal", "request"])
+def test_saved_preparer_response_and_bill_are_verified_before_reuse_or_new_dispatch(tmp_path, tamper):
+    p = _proposer(tmp_path)
+    p({"ticker": "SYNTH"}, {})
+    with p._db() as db:
+        row = db.execute("SELECT * FROM requests").fetchone()
+        receipt = json.loads(row["receipt"])
+        if tamper == "response":
+            db.execute("UPDATE requests SET response=?", ('{"model":{"invented":1}}',))
+        elif tamper == "cost":
+            db.execute("UPDATE requests SET cost=0")
+        elif tamper == "request":
+            request = json.loads(row["request"])
+            request["messages"][0]["content"] = '{"different":true}'
+            db.execute("UPDATE requests SET request=?", (json.dumps(request),))
+        else:
+            if tamper == "model": receipt["model"] = "other/model"
+            elif tamper == "response_id": receipt["response_id"] = ""
+            else: receipt.pop("response_sha256", None)
+            db.execute("UPDATE requests SET receipt=?", (json.dumps(receipt),))
+        preserved = [dict(row) for row in db.execute("SELECT * FROM requests")]
+    restarted = _proposer(tmp_path, call=lambda **_: pytest.fail("unverifiable paid request dispatched"))
+    for operation in (lambda: restarted({"ticker": "SYNTH"}, {}),
+                      lambda: restarted.cached_response({"ticker": "SYNTH"}, {}),
+                      lambda: restarted({"ticker": "DIFFERENT"}, {})):
+        with pytest.raises(ValueError, match="receipt|response|identity|cost|request|legacy"):
+            operation()
+    if tamper == "missing_seal":
+        summary = restarted.summary()
+        assert summary["spent_usd"] == .2 and summary["unknown_requests"] == 0
+        assert summary["unverifiable_responses"] == [preserved[0]["key"]]
+        assert summary["replay_status"].startswith("legacy_unverifiable")
+    with p._db() as db:
+        assert [dict(row) for row in db.execute("SELECT * FROM requests")] == preserved
+
+
+def test_preparer_wrong_provider_identity_keeps_response_and_unknown_reservation(tmp_path):
+    sent = []
+    def wrong(**kwargs):
+        sent.append(kwargs)
+        return SimpleNamespace(id="another-response", model="other/model", stop_reason="end_turn",
+            provider="synthetic", usage=SimpleNamespace(cost_usd=.2),
+            content=[SimpleNamespace(type="text", text='{"model":{"retained":1}}')])
+    p = _proposer(tmp_path, call=wrong)
+    with pytest.raises(RuntimeError, match="unresolved"):
+        p({"ticker": "SYNTH"}, {})
+    with pytest.raises(RuntimeError, match="unresolved"):
+        p({"ticker": "SYNTH"}, {})
+    summary = p.summary()
+    assert len(sent) == 1 and summary["spent_usd"] is None and summary["reserved_usd"] > 0
+    with p._db() as db:
+        row = db.execute("SELECT * FROM requests").fetchone()
+        receipt = json.loads(row["receipt"])
+        assert row["cost"] is None and json.loads(row["response"])["model"]["retained"] == 1
+        assert receipt["response_sha256"] == sha256(row["response"].encode()).hexdigest()
 
 
 def _receipted_dossier():

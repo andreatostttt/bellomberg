@@ -67,7 +67,7 @@ def test_empty_recovery_before_language_resolution_is_bilingual(tmp_path, monkey
     assert ("Nessun report" if has_memo else "Nessun memo") in output
 
 
-def test_recovery_pipeline_uses_one_language_after_preference_changes(tmp_path, monkeypatch):
+def test_recovery_requires_explicit_selection_before_paid_work_or_history_changes(tmp_path, monkeypatch):
     from bellomberg.core.language import current_language, language_context
     from bellomberg.storage import memory_db, preferences
     from bellomberg.core import mandato_pm
@@ -114,8 +114,9 @@ def test_recovery_pipeline_uses_one_language_after_preference_changes(tmp_path, 
     monkeypatch.setattr(email_sender, "invia_email_multi_allegati", lambda **kw: render("email", **kw))
     for path_name in ("RESEARCH_NOTES_DIR", "MODELS_DIR", "REPORT_DIR"):
         monkeypatch.setattr(recovery, path_name, tmp_path / path_name)
-    recovery.main()
-    assert seen == [("capo", "en"), ("pdf", "en"), ("appendix", "en"), ("email", "en")]
+    with pytest.raises(ValueError, match="--memo-id"):
+        recovery.main()
+    assert seen == []
     with db._conn() as conn:
-        assert tuple(conn.execute("SELECT full_markdown,output_language FROM memos WHERE id=?", (memo_id,)).fetchone()) == ("New English memo", "en")
+        assert tuple(conn.execute("SELECT full_markdown,output_language FROM memos WHERE id=?", (memo_id,)).fetchone()) == ("Original English memo", "en")
         assert conn.execute("SELECT content FROM specialist_reports").fetchone()[0] == "Original source: citazione italiana verbatim"

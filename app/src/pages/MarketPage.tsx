@@ -3,7 +3,7 @@ import { externalWebUrl } from '../../electron/security';
 import { Bellomberg, MktSearchHit, MktQuote, MktNewsItem, MktFinancials, MktHolders, FinBlock, MktOverview, MktOverviewRow } from '@/lib/api';
 import TvChartPanel from '@/components/TvChartPanel';
 import FilingDiffPanel from '@/components/FilingDiffPanel';
-import { Search, Cpu, Heart, Activity, RefreshCw, AlertOctagon } from 'lucide-react';
+import { Search, Cpu, Heart, Activity, RefreshCw, AlertOctagon, Lightbulb } from 'lucide-react';
 import { isInPulse, togglePulse } from '@/lib/pulse';
 import { useT } from '@/i18n/provider';
 import { t as tr } from '@/i18n/t';
@@ -339,6 +339,10 @@ export default function MarketPage() {
                           title={inPulse ? tr('ui.pulse_remove') : tr('ui.pulse_add')}
                           className={'flex items-center gap-1.5 px-2 py-0.5 border font-mono text-3xs uppercase tracking-wider transition-colors ' + (inPulse ? 'border-cyan text-cyan bg-cyan/10' : 'border-border text-muted hover:text-cyan hover:border-cyan')}>
                     <Activity size={10} /> {inPulse ? tr('ui.pulse_selected') : '+ MACRO PULSE'}
+                  </button>
+                  <button onClick={() => { window.location.hash = `/agents/trade-idea?ticker=${encodeURIComponent(tk)}&source=market`; }}
+                          className="flex items-center gap-1.5 px-2 py-0.5 border border-amber-deep text-amber font-mono text-3xs uppercase tracking-wider hover:bg-amber/10 transition-colors">
+                    <Lightbulb size={10} /> {tr('tradeidea.analyzeStock')}
                   </button>
                   {quote?.recommendation && (
                     <span className="font-mono text-3xs uppercase tracking-wider px-1.5 py-0.5 border border-cyan-deep text-cyan">{quote.recommendation}</span>

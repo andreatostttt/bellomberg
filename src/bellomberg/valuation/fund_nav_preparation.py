@@ -65,6 +65,63 @@ def _numeric(driver, item, evidence, unit, period, perimeter, prove):
 
 def prove_nav(driver, item, evidence, unit, period, perimeter, model, prove):
     """Return a blocking reason or None; no record or model value is filled in."""
+    if driver == 'publication' and len(evidence) == 1 and (
+            evidence[0].get('metadata') or {}).get('normalizer') == 'fund_nav_publication_catalog_v1':
+        if (item.get('evidence_ids') != [evidence[0]['id']]
+                or item.get('evidence_pointer') != {'value': '/publication'}
+                or any(key in item for key in {'facts', 'calculation', 'record_pointer', 'evidence_quote',
+                                               'quoted_value', 'quoted_unit', 'period_quote'})):
+            return 'publication: exact publisher catalog receipt pointer required; no ignored mixed proofs'
+        try:
+            import json
+            from math import isclose
+            from .input_preparation import _day, _finite, _source_scale
+            from .fund_nav_statement import PREFIX
+            document, value = evidence[0], item.get('value')
+            body, metadata = json.loads(document['text']), document['metadata']
+            if (value != body['publication'] or value['publisher'] != perimeter['entity']
+                    or value['share_class'] != perimeter['share_class'] or value['valuation_date'] != period
+                    or value['basis'] != 'common_equity_net' or metadata['entity'] != perimeter['entity']
+                    or metadata['share_class'] != perimeter['share_class'] or metadata['on'] != period
+                    or body['raw_primary_page_downloaded'] is not False
+                    or body['publication_date_basis'] != 'publisher_catalog_calendar_date'):
+                return 'publication: publisher catalog, exact legal class, date or common NAV basis differs'
+            published, available, cutoff = _day(value['publication_date']), _day(document['available_at']), _day(metadata['as_of'])
+            if not published or not available or not cutoff or not _day(period) <= published <= available <= cutoff:
+                return 'publication: publisher date and actual tool availability are not ordered before the cutoff'
+            primary = body['statement_source_document_id']
+            nav = model.get('reported_nav_per_share') or {}
+            if nav.get('evidence_ids') not in ([primary], [PREFIX+primary]):
+                return 'publication: published NAV must cite the exact original financial PDF behind the catalog link'
+            reported = [fact for fact in body['net_class_facts'] if fact.get('concept') == 'ClassNavPerShare'
+                        and fact.get('entity') == perimeter['entity'] and fact.get('share_class') == perimeter['share_class']
+                        and fact.get('end') == period]
+            if len(reported) != 1:
+                return 'publication: one exact class-specific reported NAV required'
+            scale = _source_scale(reported[0]['unit'], perimeter['currency']+' per share')
+            if scale is None or not _finite(nav.get('value')) or not isclose(nav['value'], reported[0]['value']*scale, rel_tol=1e-10, abs_tol=1e-9):
+                return 'publication: reported NAV amount or currency differs from the linked primary statement'
+            return None
+        except (ValueError, TypeError, KeyError, IndexError) as exc:
+            return 'publication: '+str(exc)
+    if driver == 'components' and isinstance(item.get('value'), dict) and item['value'].get('basis') == 'incremental_claim_deductions':
+        from .nav_components_evidence import NORMALIZER, verify_components_contract
+        if (len(evidence) != 1 or (evidence[0].get('metadata') or {}).get('normalizer') != NORMALIZER
+                or item.get('evidence_ids') != [evidence[0]['id']]
+                or item.get('evidence_pointer') != {'value': '/component_value'}
+                or any(key in item for key in {'facts', 'calculation', 'record_pointer', 'evidence_quote',
+                                               'quoted_value', 'quoted_unit', 'period_quote'})):
+            return 'components: exact exhaustive normalized coverage pointer required; no ignored mixed proofs'
+        try:
+            import json
+            if json.loads(evidence[0]['text'])['component_value'] != item['value']:
+                return 'components: values or complete coverage differ from the recompiled primary observation'
+            _component_values, error = verify_components_contract(item['value'], entity=perimeter['entity'],
+                share_class=perimeter['share_class'], on=period, currency=perimeter['currency'],
+                as_of=evidence[0]['metadata']['as_of'])
+            return error
+        except (ValueError, KeyError, TypeError) as exc:
+            return 'components: ' + str(exc)
     if 'evidence_pointer' in item:
         from .fund_nav_statement import structured_nav_proof
         return structured_nav_proof(driver, item, evidence, unit, period, perimeter, model)
@@ -134,6 +191,37 @@ def prove_nav(driver, item, evidence, unit, period, perimeter, model, prove):
         digits = len(token.split('.')[1]) if '.' in token else 0
         return None if digits == item['value'] else 'reported_nav_precision: decimali diversi da quelli stampati nella fonte'
     return _numeric(driver, item, evidence, unit, period, perimeter, prove)
+
+
+def prove_incremental_policy(item, model, catalog, perimeter, period, cutoff):
+    """Authenticate the opt-in dilution judgment against the complete primary.
+
+    Closed balance accounts prove the reported ledger. They do not prove the
+    absence of outstanding claims which could dilute the selected share class.
+    """
+    components = (model.get('components') or {}).get('value')
+    if not isinstance(components, dict) or components.get('basis') != 'incremental_claim_deductions':
+        return None
+    from .nav_components_evidence import verify_components_contract, verify_dilution_proof
+    policy = item.get('value')
+    expected = {'liability_basis': 'all_reported_claims_in_components',
+                'fees_basis': 'incremental_deductions_after_covered_aggregates',
+                'distributions_basis': 'incremental_deductions_after_covered_aggregates',
+                'share_basis': 'basic_no_convertibles_or_other_dilution'}
+    if (not isinstance(policy, dict) or set(policy) != set(expected) | {'dilution_proof'}
+            or any(policy.get(key) != value for key, value in expected.items())):
+        return 'policy: explicit incremental claim coverage and off-balance dilution policy required'
+    _values, error = verify_components_contract(components, entity=perimeter['entity'],
+        share_class=perimeter['share_class'], on=period, currency=perimeter['currency'], as_of=cutoff)
+    if error:
+        return 'policy: component coverage not verified: ' + error
+    coverage = components['coverage']
+    primary_id = coverage['primary_document_id']
+    if primary_id not in catalog or primary_id not in (item.get('evidence_ids') or []):
+        return 'policy: the original complete primary dilution disclosure must be cited'
+    error = verify_dilution_proof(policy['dilution_proof'], coverage=coverage,
+        entity=perimeter['entity'], on=period, as_of=cutoff, source=catalog[primary_id])
+    return 'policy: ' + error if error else None
 
 
 def wire_values(obj, text):

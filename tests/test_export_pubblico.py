@@ -780,16 +780,24 @@ def test_un_timeout_o_un_guasto_del_processo_e_un_ko_dichiarato(tmp_path, npm_fi
     assert "contratti mandato" in [c["nome"] for c in chiamate]
 
 
-def test_l_argv_vero_non_scarica_pacchetti_e_ogni_passo_ha_un_timeout(tmp_path, npm_finto):
+def test_l_argv_vero_non_scarica_pacchetti_e_ogni_passo_ha_un_timeout(tmp_path, npm_finto, monkeypatch):
     """`npx` senza terminale assume --yes e scaricherebbe typescript se mancasse: si chiama
     `npm exec --no --`, che invece fallisce. Si guarda l'argv che arriva al processo."""
     tree = _tree_suite(tmp_path, "def test_ok():\n    assert 1\n", lockfile=True)
+    git_calls = []
+
+    def git_finto(args, cwd, check=False):
+        git_calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(ep, "_run", git_finto)
     lancia, chiamate = _lancio_finto()
     ep.esegui_suite(str(tree), lancia=lancia)
+    assert git_calls == [["git", "init", "-q"], ["git", "add", "-A"]]
     npm, node = os.path.join(os.sep, "finto", "npm"), os.path.join(os.sep, "finto", "node")
     argv = {c["nome"]: c["argv"] for c in chiamate}
     assert argv["npm ci"] == [npm, "ci", "--no-audit", "--no-fund"]
-    assert argv["pytest"][:5] == [sys.executable, "-m", "pytest", "tests/", "-q"]
+    assert argv["pytest"] == [sys.executable, "-I", "tools/testing/research_ci.py"]
     assert argv["tsc --noEmit"] == [npm, "exec", "--no", "--", "tsc", "--noEmit"]
     assert argv["test:release"] == [npm, "run", "test:release"]
     assert argv["build:bundles"] == [npm, "run", "build:bundles"]

@@ -50,11 +50,14 @@ export function dataTrade(day: string, time: string, today: string): string | un
   return `${value.iso}T${time.trim().length === 5 ? time.trim() + ':00' : time.trim()}`;
 }
 
-export function decisioneCompatibile(d: Pick<Decision, 'ticker' | 'action' | 'status' | 'veto'>,
+export function decisioneCompatibile(d: Pick<Decision, 'ticker' | 'action' | 'status' | 'veto' | 'trade_idea'>,
                                      ticker: string, action: string): boolean {
   const side = (s: string) => ['BUY', 'ADD'].includes(s) ? 'buy'
     : ['SELL', 'TRIM'].includes(s) ? 'sell' : null;
-  return d.ticker.toUpperCase() === ticker.toUpperCase() && !!side(action)
+  const idea = d.trade_idea;
+  const usableIdea = !idea || (idea.technical_status === 'completed'
+    && idea.destination_kind === 'dcn' && idea.artifacts_ready === true);
+  return usableIdea && d.ticker.toUpperCase() === ticker.toUpperCase() && !!side(action)
     && side(d.action) === side(action) && ['PENDING', 'EXECUTED', 'PARTIAL'].includes(d.status) && !d.veto;
 }
 

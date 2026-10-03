@@ -188,7 +188,7 @@ def _get_holdings_weights(salta: frozenset):
     return {t: w / total for t, w in raw.items()}, total
 
 
-def _download_returns(tickers: List[str], years: int = 5) -> Optional[pd.DataFrame]:
+def _download_returns(tickers: List[str], years: int = 5, *, currencies=None) -> Optional[pd.DataFrame]:
     if not tickers:
         return None
     period_map = {1: "1y", 2: "2y", 5: "5y", 10: "10y"}
@@ -205,7 +205,11 @@ def _download_returns(tickers: List[str], years: int = 5) -> Optional[pd.DataFra
         prices = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
         if isinstance(prices, pd.Series):
             prices = prices.to_frame(tickers[0])
-        returns = prices.pct_change().dropna(how="all")
+        if currencies is not None:
+            from bellomberg.portfolio.portfolio_risk import historical_eur_returns
+            returns, _ = historical_eur_returns(prices, currencies)
+        else:
+            returns = prices.pct_change().dropna(how="all")
         if len(returns) < MIN_OBSERVATIONS:
             return None
         return returns
@@ -382,7 +386,7 @@ def _spy_recent_returns_2y():
 
 
 def _stress_window_returns(tickers: List[str], scenario: str,
-                             recent_rdf: Optional[pd.DataFrame]
+                             recent_rdf: Optional[pd.DataFrame], *, currencies=None
                              ) -> Tuple[Optional[pd.DataFrame], Any]:
     """Rendimenti REALI della finestra stress via download DEDICATO (fix 14/07:
     prima la finestra usciva dal lookback di calibrazione, quindi il 2008 era
@@ -403,6 +407,45 @@ def _stress_window_returns(tickers: List[str], scenario: str,
         dl_map = data_ticker_map(tickers, riservati=("SPY",))
     except Exception as e:
         return None, _message("alias yfinance non risolvibile: {error}", "Cannot resolve yfinance alias: {error}", error=str(e)[:160])
+
+    if currencies is not None:
+        # Local-return caches lack the prior-close FX anchor. Reuse the common
+        # price converter with explicit dates, never relabel the cached matrix.
+        from bellomberg.portfolio.portfolio_risk import historical_eur_returns
+        try:
+            anchor_start = (pd.Timestamp(start) - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+            raw = yf.download(list(dict.fromkeys(dl_map.values())), start=anchor_start,
+                              end=end, progress=False, auto_adjust=True, threads=True)
+            renames = {value: key for key, value in dl_map.items() if value != key}
+            if renames:
+                raw = (raw.rename(columns=renames, level=-1) if isinstance(raw.columns, pd.MultiIndex)
+                       else raw.rename(columns=renames))
+            prices = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
+            if isinstance(prices, pd.Series):
+                prices = prices.to_frame(tickers[0])
+            if not set(tickers).issubset(prices.columns):
+                raise ValueError("historical prices absent for: " + ", ".join(sorted(set(tickers) - set(prices.columns))))
+            # Include exactly the preceding observed close as the first anchor.
+            before = prices.index[prices.index < pd.Timestamp(start)]
+            if not len(before):
+                raise ValueError("prior-close price anchor absent for historical stress")
+            selected = prices.loc[before[-1]:, tickers]
+            converted, fx_meta = historical_eur_returns(selected, currencies)
+            converted = converted.loc[(converted.index >= pd.Timestamp(start)) & (converted.index < pd.Timestamp(end))]
+            if not fx_meta["qualified"] or converted.empty or converted.isna().any().any():
+                return None, {"reason": "historical EUR stress unqualified", "fx_conversion": fx_meta}
+            if len(converted) < 10:
+                raise ValueError("insufficient historical EUR stress observations")
+            if (converted.index.min() > pd.Timestamp(start) + pd.Timedelta(days=7)
+                    or converted.index.max() < pd.Timestamp(end) - pd.Timedelta(days=7)):
+                raise ValueError("historical EUR stress window truncated by source")
+            return converted, {"window": {"start": start, "end": end,
+                "trading_days": len(converted), "source": "dated historical prices and FX"},
+                "real_history": list(tickers), "proxied": {}, "zero_filled_days": {},
+                "fx_conversion": fx_meta}
+        except Exception as exc:
+            return None, {"reason": type(exc).__name__ + ": " + str(exc)[:300],
+                          "fx_conversion": {"qualified": False}}
 
     # Cache disco per scenario e coppie reali->fonte: la finestra e' storia immutabile.
     alias_key = ",".join("%s=%s" % item for item in sorted(dl_map.items()))
@@ -505,7 +548,7 @@ def _stress_window_returns(tickers: List[str], scenario: str,
 
 def _apply_stress(sim_returns: np.ndarray, scenario: str,
                     returns_df: Optional[pd.DataFrame] = None,
-                    cov: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
+                    cov: Optional[np.ndarray] = None, *, currencies=None) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Modifica sim_returns per stress scenario.
 
     Ritorna (sim_returns, meta): meta DICHIARA cosa e' stato applicato davvero
@@ -527,12 +570,15 @@ def _apply_stress(sim_returns: np.ndarray, scenario: str,
     if scenario in ("gfc_2008", "covid_2020"):
         tickers = list(returns_df.columns) if returns_df is not None else []
         win_df, wmeta = (None, _message('returns_df mancante (serve per ordine colonne/beta)', 'Missing returns_df (needed for column order/beta)')) \
-            if not tickers else _stress_window_returns(tickers, scenario, returns_df)
+            if not tickers else (_stress_window_returns(tickers, scenario, returns_df, currencies=currencies)
+                                if currencies is not None else _stress_window_returns(tickers, scenario, returns_df))
         if win_df is None:
             _log(f"stress {scenario} NON applicabile ({wmeta}): fallback DICHIARATO a shock_3sigma")
             arr, m3 = _apply_stress(sim_returns, "shock_3sigma", cov=cov)
             meta.update({"applied": "shock_3sigma", "fallback": True,
                          "fallback_reason": wmeta if isinstance(wmeta, str) else str(wmeta), "shock_note": m3.get("shock_note")})
+            if isinstance(wmeta, dict) and "fx_conversion" in wmeta:
+                meta["fx_conversion"] = wmeta["fx_conversion"]
             return arr, meta
         stress_returns = win_df.values  # (n_stress_days, n_assets)
         n_stress = min(len(stress_returns), n_periods)
@@ -627,6 +673,7 @@ def run_monte_carlo(
     _override_weights: Optional[Dict[str, float]] = None,
     _override_nav: Optional[float] = None,
     _extra_meta: Optional[Dict[str, Any]] = None,
+    return_currencies: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Bank-grade Monte Carlo.
 
@@ -672,7 +719,7 @@ def run_monte_carlo(
     # diversi, e il PM avrebbe letto un ES99 su F5 e un altro nel memo.
     cache_key = (f"mc:v3:{horizon_days}:{n_sims}:{lookback_years}:{method}:{drift_mode}:"
                  f"{stress_scenario}:{sorted(add_tickers or [])}:{sorted(remove_tickers or [])}:"
-                 f"{_ow_key}:{_override_nav}:{seed}")
+                 f"{_ow_key}:{_override_nav}:{seed}:{sorted(return_currencies.items()) if return_currencies is not None else 'local'}")
     if not force_refresh and cache_key in _CACHE:
         entry = _CACHE[cache_key]
         if time.time() - entry["ts"] < CACHE_TTL_SEC:
@@ -737,13 +784,22 @@ def run_monte_carlo(
     tickers = list(weights.keys())
     _log(f"download returns for {len(tickers)} tickers, lookback={lookback_years}y")
     try:
-        returns_df = _download_returns(tickers, years=lookback_years)
+        returns_df = (_download_returns(tickers, years=lookback_years, currencies=return_currencies)
+                      if return_currencies is not None else _download_returns(tickers, years=lookback_years))
     except Exception as e:
         return {"error": _message("Rendimenti di portafoglio non disponibili: {error}", "Portfolio returns failed: {error}", error=str(e)),
                 "timestamp": datetime.now().isoformat()}
     if returns_df is None:
         return {"error": _message('impossibile scaricare i rendimenti', 'cannot download returns'),
                 "timestamp": datetime.now().isoformat()}
+
+    fx_meta = returns_df.attrs.get("fx_conversion") if return_currencies is not None else None
+    if return_currencies is not None:
+        absent = sorted(set(tickers) - set(returns_df.columns))
+        if absent or not fx_meta or fx_meta.get("qualified") is not True:
+            return {"error": _message("Rendimenti storici EUR non qualificati", "Historical EUR returns not qualified"),
+                    "fx_conversion": fx_meta or {"qualified": False}, "missing_tickers": absent,
+                    "timestamp": datetime.now().isoformat()}
 
     available = [t for t in tickers if t in returns_df.columns]
     if len(available) < 2:
@@ -789,7 +845,9 @@ def run_monte_carlo(
 
     # Apply stress scenario (modifies sim_returns); meta dichiara cosa e' stato
     # applicato DAVVERO (fix 14/07: niente piu' fallback silenziosi etichettati replay)
-    sim_returns, stress_meta = _apply_stress(sim_returns, stress_scenario, returns_df=rdf, cov=cov_daily)
+    sim_returns, stress_meta = (_apply_stress(sim_returns, stress_scenario, returns_df=rdf,
+        cov=cov_daily, currencies=return_currencies) if return_currencies is not None else
+        _apply_stress(sim_returns, stress_scenario, returns_df=rdf, cov=cov_daily))
 
     # Perdita DETERMINISTICA della finestra replay (il replay e' identico su ogni
     # sim): e' IL numero "replay 2008/2020 in EUR" per memo e budget stress (#187)
@@ -800,7 +858,10 @@ def run_monte_carlo(
             _wloss = float(np.prod(1.0 + _port_stress) - 1.0)
             stress_meta["window_loss_pct"] = round(_wloss * 100, 2)
             stress_meta["window_loss_eur"] = round(_wloss * base_nav, 0)
-            stress_meta["basis"] = (_message('rendimenti in valuta LOCALE per-asset scalati sul NAV EUR (dichiarato; per il replay GFC direzione conservativa)', 'Per-asset LOCAL currency returns scaled on EUR NAV (declared; conservative direction for GFC replay)'))
+            stress_meta["basis"] = (_message('rendimenti EUR da prezzi e FX storici sulle medesime date',
+                'EUR returns from prices and historical FX on matching dates')
+                if (stress_meta.get("fx_conversion") or {}).get("qualified") is True else
+                _message('rendimenti in valuta LOCALE per-asset scalati sul NAV EUR (dichiarato; per il replay GFC direzione conservativa)', 'Per-asset LOCAL currency returns scaled on EUR NAV (declared; conservative direction for GFC replay)'))
 
     # Portfolio path
     port_daily = sim_returns @ w
@@ -912,7 +973,10 @@ def run_monte_carlo(
         # il NAV EUR solo come SCALA. Per il replay GFC (USD in apprezzamento
         # nella finestra) la perdita EUR vera e' meno negativa: direzione
         # conservativa. Conversione EUR completa del motore = voce P1 nel MASTER.
-        "returns_basis": (_message('valuta LOCALE per-asset (FX non convertito, dichiarato): i campi *_eur scalano sul NAV EUR', 'LOCAL currency per asset (FX not converted, as declared): *_eur fields scale on EUR NAV')),
+        "returns_basis": (_message('EUR (FX convertito su date storiche corrispondenti)',
+                                   'EUR (FX converted on matching historical dates)') if fx_meta else
+            _message('valuta LOCALE per-asset (FX non convertito, dichiarato): i campi *_eur scalano sul NAV EUR', 'LOCAL currency per asset (FX not converted, as declared): *_eur fields scale on EUR NAV')),
+        **({"fx_conversion": fx_meta} if fx_meta is not None else {}),
         "tickers_analyzed": available,
         "removed_tickers": remove_tickers or [],
         "added_tickers": add_tickers or [],

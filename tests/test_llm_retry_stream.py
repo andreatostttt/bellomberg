@@ -134,3 +134,65 @@ def test_sse_nonretryable_or_zero_budget_is_reported(run, code, retries):
         run([sse(error(code))], retries=retries)
     assert exc.value.status_code == code
     assert len(run.requests) == 1 and not run.waits
+
+
+def scoped_journal(tmp_path):
+    from bellomberg.core.request_journal import RequestJournal
+    return RequestJournal(tmp_path / 'stream.sqlite', run_id='offline-stream',
+        authorization={'source': 'test-launch'}, authorized_usd='1',
+        metadata=lambda model: {'id': model, 'context_length': 1000,
+            'pricing': {'prompt': '0.000001', 'completion': '0.000002'}})
+
+
+def scoped_success():
+    return sse({'id': 'stream-receipt', 'model': 'provider/test',
+        **chunk({'content': 'Complete.'})},
+        {**chunk(finish='stop'), 'usage': {'cost': 0.00002}})
+
+
+@pytest.mark.parametrize('failure', ['503', '504', 'sse_error', 'partial', 'empty'])
+def test_scoped_stream_ambiguous_failure_never_replays_and_keeps_evidence(run, tmp_path, failure):
+    journal = scoped_journal(tmp_path)
+    response = (httpx.Response(int(failure), json=error(int(failure))) if failure.isdigit()
+        else sse(error(503)) if failure == 'sse_error'
+        else sse({'id': 'partial-receipt', 'model': 'provider/test', **chunk({'content': 'Partial.'})})
+        if failure == 'partial' else sse(chunk()))
+    with llm.request_scope(journal, phase='capo'):
+        with pytest.raises((llm.APIStatusError, llm.APIConnectionError)) as exc:
+            run([response])
+    assert getattr(exc.value, 'request_id', None)
+    assert len(run.requests) == 1 and not run.waits
+    summary = journal.summary()
+    assert summary['request_count'] == 1 and summary['cost_usd'] is None
+    assert summary['reserved_usd'] > 0
+    if failure == 'partial':
+        import sqlite3
+        with sqlite3.connect(journal.path) as db:
+            recorded = db.execute('SELECT payload FROM checkpoints').fetchall()
+        assert any('Partial.' in row[0] for row in recorded)
+
+
+def test_scoped_stream_replay_after_reopen_preserves_one_charge(run, tmp_path):
+    for index in range(3):
+        with llm.request_scope(scoped_journal(tmp_path), phase='capo'):
+            result = run([scoped_success()])
+        assert result.content[0].text == 'Complete.'
+    assert len(run.requests) == 1
+    assert scoped_journal(tmp_path).summary()['cost_usd'] == 0.00002
+
+
+def test_scoped_partial_stream_nan_is_diagnostic_and_keeps_original_failure(run, tmp_path):
+    import sqlite3
+    journal = scoped_journal(tmp_path)
+    response = sse({'id': 'partial-nan', 'model': 'provider/test',
+                    **chunk({'content': 'Partial evidence'}), 'usage': {'cost': float('nan')}})
+    with llm.request_scope(journal, phase='capo'):
+        with pytest.raises(llm.APIConnectionError, match='INCOMPLETA'):
+            run([response])
+    assert journal.summary()['cost_usd'] is None and journal.summary()['reserved_usd'] > 0
+    with sqlite3.connect(journal.path) as db:
+        checkpoints = db.execute('SELECT payload FROM checkpoints').fetchall()
+        response, receipt = db.execute('SELECT response,receipt FROM requests').fetchone()
+    assert any('Partial evidence' in row[0] and 'invalid_numeric' in row[0] for row in checkpoints)
+    assert 'invalid_numeric' in response and 'INCOMPLETA' in receipt
+    assert len(run.requests) == 1

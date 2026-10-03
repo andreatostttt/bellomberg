@@ -53,6 +53,11 @@ const giorniDa = (ts?: string | null) => {
 export default function Decisions() {
   const tr = useT();
   const navigate = useNavigate();
+  // The shell uses HashRouter. Reading the route query here also keeps the
+  // decision desk renderable in the existing isolated i18n harness.
+  const routeQuery = typeof window !== 'undefined' ? window.location?.hash.split('?')[1] || '' : '';
+  const linkedId = Number(new URLSearchParams(routeQuery).get('decision'));
+  const targetDecision = Number.isSafeInteger(linkedId) && linkedId > 0 ? linkedId : null;
   const [filter, setFilter] = useState<string>('');
   const [decisions, setDecisions] = useState<Decision[]>([]);
   const [expanded, setExpanded] = useState<number | null>(null);
@@ -103,6 +108,19 @@ export default function Decisions() {
   const archResearch = tuttaResearch.filter(d => isArchived(d));
   const archiveEstimated = decisions.filter(d => d.archive_override == null && typeof d.archived !== 'boolean').length;
   const countLabel = (n: number) => loadErr !== null ? tr('decisiondesk.na') : loading ? '…' : fmtNum(n, 0);
+
+  useEffect(() => {
+    if (loading || loadErr !== null || targetDecision == null) return;
+    const selected = decisions.find(d => d.id === targetDecision);
+    if (!selected) return;
+    if (isArchived(selected)) {
+      if ((selected.action || '').toUpperCase() === 'RESEARCH') setArchOpenRes(true);
+      else setArchOpenOps(true);
+    }
+    if ((selected.action || '').toUpperCase() !== 'RESEARCH') setExpanded(targetDecision);
+    const timer = setTimeout(() => document.getElementById(`decision-${targetDecision}`)?.scrollIntoView({ block: 'center' }), 60);
+    return () => clearTimeout(timer);
+  }, [decisions, loading, loadErr, targetDecision]);
 
   const toggle = (id: number) => {
     setExpanded(expanded === id ? null : id);
@@ -278,6 +296,7 @@ export default function Decisions() {
             {d.memo_id && <span>{tr('decisiondesk.f010')} <span className="text-gold">#{d.memo_id}</span> {tr('decisiondesk.f011')}</span>}
             {d.closed_at && <span>{tr('decisiondesk.f012')} {displayDate(d.closed_at)}</span>}
           </div>
+          {ideaProvenance(d)}
           <div>
             <div className={`${HDR} mb-1`}>{tr('decisiondesk.f013')}</div>
             <p className="text-white/90 whitespace-pre-wrap">{d.rationale || tr('decisiondesk.f014')}</p>
@@ -380,8 +399,8 @@ export default function Decisions() {
 
   const opsRows = (list: Decision[], archived: boolean) => list.map(d => (
     <Fragment key={d.id}>
-      <tr onClick={() => toggle(d.id)}
-          className="border-b border-border/20 hover:bg-bg/40 cursor-pointer">
+      <tr id={`decision-${d.id}`} onClick={() => toggle(d.id)}
+          className={`border-b border-border/20 hover:bg-bg/40 cursor-pointer ${targetDecision === d.id ? 'outline outline-1 outline-gold' : ''}`}>
         <td className="text-muted pl-2">
           {expanded === d.id ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         </td>
@@ -436,11 +455,26 @@ export default function Decisions() {
     </div>
   );
 
+  const ideaProvenance = (d: Decision) => d.trade_idea && (
+    <div className="text-xs mt-1.5" onClick={event => event.stopPropagation()}>
+      <button className="text-cyan underline underline-offset-2"
+        onClick={() => navigate(`/agents/trade-idea?run=${encodeURIComponent(d.trade_idea!.run_id)}`)}>
+        {tr('tradeidea.linkedResearch')}
+      </button>
+      {d.trade_idea.destination_kind === 'dcn' &&
+        (d.trade_idea.technical_status !== 'completed' || !d.trade_idea.artifacts_ready) && (
+        <p className="text-crimson mt-1" role="status">
+          {tr('tradeidea.decisionBlocked')} {d.trade_idea.destination_reason || ''}
+        </p>
+      )}
+    </div>
+  );
+
   const researchCard = (d: Decision, archived: boolean) => {
     const g = giorniDa(d.timestamp);
     return (
-      <div key={d.id}
-           className={`bg-black/40 border border-border p-3 mb-3 ${archived ? 'opacity-75' : ''}`}>
+      <div key={d.id} id={`decision-${d.id}`}
+           className={`bg-black/40 border p-3 mb-3 ${targetDecision === d.id ? 'border-gold' : 'border-border'} ${archived ? 'opacity-75' : ''}`}>
         <div className="flex items-center gap-2 flex-wrap">
           <span className="font-mono font-semibold text-white">{d.ticker}</span>
           <span className={`text-[10px] px-2 py-0.5 rounded ${STATUS_STYLE[d.status] || 'bg-panel text-muted'}`}>
@@ -451,6 +485,7 @@ export default function Decisions() {
           <span className="ml-auto text-[10px] text-muted">#{d.id} · {displayDate(d.timestamp)}</span>
         </div>
         {d.rationale && <p className="text-xs text-white/80 mt-1.5 whitespace-pre-wrap">{d.rationale}</p>}
+        {ideaProvenance(d)}
         {d.rationale && <span className="text-[10px] text-faint">{tr('decisiondesk.archivedText')}</span>}
         {d.timing && <p className="text-[11px] text-cyan mt-1">{tr('decisiondesk.f045')} {d.timing}</p>}
         {d.outcome_notes && <p className="text-[10px] text-muted italic mt-1">{d.outcome_notes}</p>}
@@ -530,6 +565,8 @@ export default function Decisions() {
           {tr('decisiondesk.f058')} {loadErr || tr('decisiondesk.errorUnknown')}{tr('decisiondesk.f059')}
         </p>
       )}
+      {targetDecision != null && !loading && loadErr === null && !decisions.some(d => d.id === targetDecision) &&
+        <p className="text-xs text-amber border border-amber-deep px-3 py-2">{tr('tradeidea.decisionNotFound', { id: targetDecision })}</p>}
       {archiveEstimated > 0 && <p className="text-xs text-muted">{tr('decisiondesk.archiveEstimated', { n: archiveEstimated })}</p>}
 
       {/* split 50/50 di F10 v3 (scelta PM) — reskin stile C */}

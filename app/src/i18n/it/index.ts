@@ -18,6 +18,8 @@ import { progress } from './progress.js';
 import { shell, nav, login } from './shell.js';
 import { trade } from './trade.js';
 import { dashboard } from './dashboard.js';
+import { tradeidea } from './tradeidea.js';
+import { research as tradeIdeaResearch } from './tradeideaResearch.js';
 
 export const it = {
   ui,
@@ -40,6 +42,8 @@ export const it = {
   shell, nav, login,
   trade,
   dashboard,
+  tradeidea,
+  tradeIdeaResearch,
   lingua: {
     italiano: 'ITALIANO', inglese: 'INGLESE', titolo: 'Scegli la lingua',
     descrizione: 'Interfaccia e nuovi contenuti seguiranno la lingua scelta. Puoi cambiarla nelle impostazioni. I documenti esistenti restano nella lingua originale.',
