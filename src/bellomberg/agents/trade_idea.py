@@ -799,11 +799,13 @@ class TradeIdeaBudgetGate:
 
     def _unknown(self, request_id, exc):
         partial = _partial_provider_evidence(getattr(exc, "partial_response", None))
+        from bellomberg.core.generation_lookup import generation_id_from
         receipt = {"request_sha256": self._requests.get(request_id, {}).get("request_sha256"),
                    "complete": False, "partial_response": partial,
                    "partial_response_sha256": _plan_digest(partial),
                    "response_id": partial.get("id"), "model": partial.get("model"),
-                   "status_code": getattr(exc, "status_code", None)}
+                   "status_code": getattr(exc, "status_code", None),
+                   "generation_id": generation_id_from({"partial_response": partial}, exc)}
         self._durable(self.store.mark_cost_unknown, self.run_id, request_id,
                                      reason=type(exc).__name__ + ": " + str(exc)[:250], receipt=receipt)
         request = self._requests.get(request_id, {})
@@ -4273,11 +4275,24 @@ def _candidate_quote_receipt(blackboard, ticker):
 
 
 def _candidate_quote_matches(initial, final):
+    # Identity, source and currency are exact; the observed price may move within
+    # the PM's 0.5% tolerance (a later quote then carries its own as-of).
+    from bellomberg.core.trade_idea_policy import within_price_tolerance
     return bool(initial and final and initial.get("status") == "ready"
                 and final.get("status") == "ready"
                 and all(initial.get(key) == final.get(key)
-                        for key in ("ticker", "price", "price_asof", "source",
-                                    "currency", "currency_basis")))
+                        for key in ("ticker", "source", "currency", "currency_basis"))
+                and (initial.get("price") == final.get("price") and initial.get("price_asof") == final.get("price_asof")
+                     or within_price_tolerance(initial.get("price"), final.get("price"))))
+
+
+def _fx_observations_match(initial, final):
+    from bellomberg.core.trade_idea_policy import within_price_tolerance
+    old, new = list(initial or []), list(final or [])
+    return len(old) == len(new) and all(
+        a.get("ticker") == b.get("ticker") and a.get("currency") == b.get("currency")
+        and a.get("source") == b.get("source") and within_price_tolerance(a.get("rate"), b.get("rate"))
+        for a, b in zip(old, new))
 
 
 def _measure_operational_risk(portfolio, *, risk_loader=None, stress_loader=None,
@@ -4417,7 +4432,7 @@ def _operational_checks(run, result, blackboard, sizing, portfolio, mandate,
             blackboard.data.get("_candidate_quote_final")),
         "fx_revalidated": bool(fx_initial and fx_final and fx_initial["valid"]
                                and fx_final["valid"]
-                               and fx_initial["observations"] == fx_final["observations"]),
+                               and _fx_observations_match(fx_initial["observations"], fx_final["observations"])),
     }
 
 

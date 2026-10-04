@@ -3,6 +3,7 @@
 Absence is the historical contract, never an invitation to upgrade an old run.
 Changing these choices requires a new policy version.
 """
+from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 
 from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE
@@ -58,6 +59,22 @@ def report_quality_sufficient(quality):
     if quality.get('execution_policy') in RESEARCH_POLICIES:
         return quality.get('content_integrity') == 'complete'
     return quality.get('analytical_pages', 0) >= 10 and quality.get('analytical_words', 0) >= 4000
+
+
+# PM 04/10/2026 (option A): prices and FX that move by at most 0.5% between run
+# acceptance and routing do not invalidate an operational proposal. Identity,
+# currency and source stay exact; a larger move still routes the idea to research.
+PRICE_TOLERANCE = Decimal("0.005")
+
+
+def within_price_tolerance(accepted, current, tolerance=PRICE_TOLERANCE):
+    try:
+        old, new = Decimal(str(accepted)), Decimal(str(current))
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+    if not old.is_finite() or not new.is_finite() or old <= 0 or new <= 0:
+        return False
+    return abs(new - old) / old <= tolerance
 
 
 def output_cap(value, role, legacy_cap):

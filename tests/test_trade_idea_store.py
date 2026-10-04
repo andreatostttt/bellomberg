@@ -504,7 +504,9 @@ def test_research_rationale_keeps_missing_and_revisit_after_long_summary(migrate
 
 
 @pytest.mark.parametrize("new_price,same_timestamp,expected", [
-    (101, False, "dcn"), (102, False, "research"), (102, True, "research")])
+    (101, False, "dcn"), (102, False, "research"), (102, True, "research"),
+    # PM option A (04/10/2026): a move within 0.5% keeps the proposal operative.
+    (101.4, False, "dcn"), (101.6, False, "research")])
 def test_price_refresh_compares_economic_values_and_breaks_timestamp_ties(
         migrated, new_price, same_timestamp, expected):
     with sqlite3.connect(migrated) as conn:

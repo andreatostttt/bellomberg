@@ -252,9 +252,23 @@ class RequestJournal:
             return preparation_price_ceiling(self._quotes[model], model=model,
                                               max_tokens=body.get("max_tokens"))
 
+    def _attempt_labels(self, body, labels):
+        """A request settled from the provider's bill (paid, no usable answer) is closed:
+        the same work becomes a new attempt with its own key, never a replay or a block."""
+        attempt = 0
+        with self._db() as db:
+            while True:
+                current = {**labels, **({"attempt": attempt} if attempt else {})}
+                key = sha256(_json({"request": body, "scope": current}).encode()).hexdigest()
+                row = db.execute("SELECT state FROM requests WHERE key=?", (key,)).fetchone()
+                if row is None or row["state"] != "settled":
+                    return current
+                attempt += 1
+
     def prepare(self, body, scope):
         """Return (request_id, exact wire body, saved response or None)."""
         labels = {key: scope.get(key) for key in ("phase", "agent", "round_n")}
+        labels = self._attempt_labels(body, labels)
         source = _json(body)
         key = sha256(_json({"request": body, "scope": labels}).encode()).hexdigest()
         candidates = [(key, source)]
@@ -323,7 +337,7 @@ class RequestJournal:
 
     @staticmethod
     def _verify_row(row):
-        if (row["state"] not in ("reserved", "received", "unknown", "incomplete", "overrun")
+        if (row["state"] not in ("reserved", "received", "unknown", "incomplete", "overrun", "settled")
                 or type(row["reserved"]) is not int or row["reserved"] < 0
                 or row["cost"] is not None and (type(row["cost"]) is not int or row["cost"] < 0)):
             raise ValueError("invalid stored request accounting")
@@ -332,11 +346,16 @@ class RequestJournal:
             raise ValueError("stored request checksum differs")
         if (receipt.get("quote") or {}).get("reserve_nano_usd") != row["reserved"]:
             raise ValueError("stored reservation differs from its quote")
+        if row["state"] == "settled":
+            settlement = receipt.get("settlement") or {}
+            if row["cost"] is None or settlement.get("cost_nano") != row["cost"] or not settlement.get("generation_id"):
+                raise ValueError("settled request lacks its provider bill")
         if row["response"] is not None:
             if receipt.get("response_sha256") != sha256(row["response"].encode()).hexdigest():
                 raise ValueError("saved response checksum differs")
             response = json.loads(row["response"])
-            if row["cost"] is not None and _nano((response.get("usage") or {}).get("cost")) != row["cost"]:
+            if (row["state"] != "settled" and row["cost"] is not None
+                    and _nano((response.get("usage") or {}).get("cost")) != row["cost"]):
                 raise ValueError("stored cost differs from its original provider receipt")
         if row["state"] == "received" and (row["response"] is None or row["cost"] is None
                 or receipt.get("identity_verified") is not True or receipt.get("complete") is not True):
@@ -403,12 +422,65 @@ class RequestJournal:
                 db.execute("UPDATE requests SET state='unknown',error=COALESCE(error,?) "
                            "WHERE request_id=? AND state='reserved'",
                            (_json({"type": type(error).__name__, "message": str(error)[:1000],
-                                   "status_code": getattr(error, "status_code", None)}), request_id))
+                                   "status_code": getattr(error, "status_code", None),
+                                   "generation_id": getattr(error, "generation_id", None)}), request_id))
                 self._inflight.discard(request_id)
         try:
             error.request_id = request_id
         except (AttributeError, TypeError):
             pass
+
+    @staticmethod
+    def unknown_requests(path):
+        """Read-only: unknown native requests with model and the provider id captured for them."""
+        with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=15)) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute("SELECT * FROM requests WHERE state='unknown'").fetchall()
+            out = []
+            for row in rows:
+                receipt = json.loads(row["receipt"] or "{}")
+                error = json.loads(row["error"]) if row["error"] and row["error"].startswith("{") else {}
+                first = db.execute("SELECT payload FROM checkpoints WHERE request_id=? ORDER BY sequence LIMIT 5",
+                                   (row["request_id"],)).fetchall()
+                chunk_ids = [json.loads(item["payload"]).get("id") for item in first
+                             if isinstance(json.loads(item["payload"]), dict)]
+                out.append({"request_id": row["request_id"], "model": json.loads(row["request"]).get("model"),
+                            "reserved": row["reserved"],
+                            "receipt": {**receipt, "generation_id": error.get("generation_id") or
+                                        next((value for value in chunk_ids if value), None)}})
+        return out
+
+    @staticmethod
+    def settle_unknown(path, request_id, *, charged_usd, generation_id, provider_generation, lookup_sha256):
+        """unknown -> settled with the provider's measured bill; idempotent, never overwrites."""
+        cost = _nano(charged_usd)
+        with closing(sqlite3.connect(str(Path(path).resolve()), timeout=15)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                row = db.execute("SELECT * FROM requests WHERE request_id=?", (request_id,)).fetchone()
+                if row is None:
+                    raise KeyError("request not in this journal")
+                receipt = json.loads(row["receipt"])
+                if row["state"] == "settled":
+                    same = (receipt.get("settlement") or {}).get("generation_id") == generation_id and row["cost"] == cost
+                    db.execute("COMMIT")
+                    if same:
+                        return False
+                    raise ValueError("request already settled with a different bill")
+                if row["state"] != "unknown":
+                    raise ValueError("only an unknown request can be settled from the provider bill")
+                receipt["settlement"] = {"source": "OpenRouter GET /api/v1/generation",
+                                         "generation_id": generation_id, "cost_nano": cost,
+                                         "lookup_sha256": lookup_sha256, "provider_generation": provider_generation}
+                db.execute("UPDATE requests SET state='settled',cost=?,receipt=? WHERE request_id=? AND state='unknown'",
+                           (cost, _json(receipt), request_id))
+                db.execute("COMMIT")
+                return True
+            except BaseException:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
 
     def summary(self):
         with self._db() as db:

@@ -47,6 +47,11 @@ class StartBody(PreflightBody):
     authorization: "RunAuthorization"
 
 
+class CostReconcileBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    apply: bool = False
+
+
 class EmailRetryBody(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     acknowledge_uncertain: bool = False
@@ -365,7 +370,7 @@ def _worker_state(run_id):
 def _revalidate_orphan_route(current, detail, *, quote_sampler=None, portfolio_loader=None):
     """Recheck free, mutable inputs before reusing persisted routing attestations."""
     from bellomberg.agents.trade_idea import (
-        _candidate_quote_matches, _candidate_quote_receipt, _fx_receipt)
+        _candidate_quote_matches, _candidate_quote_receipt, _fx_receipt, _fx_observations_match)
     from bellomberg.reporting.trade_idea_delivery import _candidate_workbooks
     from bellomberg.storage.memory_db import MemoryDB
 
@@ -411,8 +416,8 @@ def _revalidate_orphan_route(current, detail, *, quote_sampler=None, portfolio_l
         return None, "Rilettura FX/book KO: " + type(exc).__name__
     if not (fx_initial and fx_final and fx_initial.get("valid") is True
             and fx_final.get("valid") is True and current_fx["valid"]
-            and fx_initial.get("observations") == fx_final.get("observations")
-            == current_fx["observations"]):
+            and _fx_observations_match(fx_initial.get("observations"), fx_final.get("observations"))
+            and _fx_observations_match(fx_final.get("observations"), current_fx["observations"])):
         return None, "FX/book cambiato o non verificabile al riavvio"
 
     refs = result.get("valuation_refs") or []
@@ -755,6 +760,24 @@ def install_trade_idea_routes(app, require_session, *, db_path=SQLITE_PATH,
         except KeyError as exc:
             raise HTTPException(404, "Run Trade Idea non trovata") from exc
         except (RunConflict, ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @router.post("/runs/{run_id}/costs/reconcile")
+    def reconcile_costs(run_id: str, body: CostReconcileBody | None = None):
+        """Uncertain costs: preview the provider's measured bills; record them only with apply=true.
+
+        A free read-only OpenRouter lookup per uncertain request; no model is called and
+        nothing is assumed free (missing id, 404 not yet indexed or model mismatch stay unknown).
+        """
+        from bellomberg.core.cost_reconciliation import reconcile_trade_idea_costs
+        current = store()
+        try:
+            if current.get_run(run_id)["run"]["technical_status"] == "running":
+                raise RunConflict("Run in corso: riconciliazione dei costi solo a run ferma")
+            return reconcile_trade_idea_costs(current, run_id, apply=bool(body and body.apply))
+        except KeyError as exc:
+            raise HTTPException(404, "Run Trade Idea non trovata") from exc
+        except (RunConflict, ValueError, RuntimeError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
     @router.get("/runs/{run_id}/artifacts/{artifact_id}")

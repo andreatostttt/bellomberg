@@ -46,6 +46,8 @@ SUITE = (
     "tests/test_trade_idea_unbilled_retry.py",
     "tests/test_trade_idea_mutation_guards.py",
     "tests/test_trade_idea_mutation_guards_e2e.py",
+    "tests/test_cost_reconciliation.py",
+    "tests/test_trade_idea_price_tolerance.py",
     # Weekly Consigliere research path and Fund market data: no workbook writes.
     "tests/test_weekly_research_without_workbook.py",
     "tests/test_fund_market_refresh.py",

@@ -220,11 +220,29 @@ def _capo_request_bindings(row):
 
 
 def _same_non_price_context(accepted, current):
-    """Only the stored quote-input fingerprint may differ; everything else is exact."""
+    """Only the stored quote inputs may differ; everything else is exact."""
     def without_prices(context):
         return {**context, "book": {key: value for key, value in context["book"].items()
-                                    if key != "price_inputs_sha256"}}
+                                    if key not in ("price_inputs_sha256", "price_points")}}
     return without_prices(accepted) == without_prices(current)
+
+
+def _book_within_tolerance(accepted, current):
+    """PM option A: same positions/trades/cash/currencies, each latest price within 0.5%.
+
+    Books accepted before price points were recorded keep the exact comparison.
+    """
+    from bellomberg.core.trade_idea_policy import within_price_tolerance
+    if accepted == current:
+        return True
+    old, new = accepted.get("price_points"), current.get("price_points")
+    if not isinstance(old, list) or not isinstance(new, list) or len(old) != len(new):
+        return False
+    strip = lambda book: {key: value for key, value in book.items()
+                          if key not in ("price_inputs_sha256", "price_points")}
+    return strip(accepted) == strip(current) and all(
+        a[0] == b[0] and a[2] == b[2] and a[3] == b[3] and within_price_tolerance(a[1], b[1])
+        for a, b in zip(old, new))
 
 
 def _price_refresh_grant(request, context):
@@ -445,7 +463,7 @@ class TradeIdeaStore:
         portfolio = [tuple(r) for r in conn.execute("SELECT * FROM positions ORDER BY ticker")]
         active = [r for r in conn.execute(
             "SELECT ticker,valuta FROM positions WHERE is_active=1 AND quantita>0 ORDER BY ticker")]
-        price_inputs = []
+        price_inputs, price_points = [], []
         for item in active:
             symbol = item["ticker"]
             # Scheduler refreshes are append-only. A new row/time with identical
@@ -460,6 +478,8 @@ class TradeIdeaStore:
                 "ORDER BY timestamp DESC,id DESC LIMIT 1", (symbol, symbol)).fetchone()
             price_inputs.append((symbol, tuple(latest) if latest else None,
                                  tuple(previous) if previous else None))
+            price_points.append([symbol, latest["prezzo"] if latest else None,
+                                 latest["valuta"] if latest else None, latest["source"] if latest else None])
         non_eur = sorted({(item["valuta"] or "EUR").upper() for item in active
                           if (item["valuta"] or "EUR").upper() != "EUR"})
         cash = conn.execute("SELECT balance_cents,version FROM cash_state WHERE singleton_id=1").fetchone()
@@ -467,6 +487,7 @@ class TradeIdeaStore:
                 "trades_sha256": _digest(trades), "trades_count": len(trades),
                 "portfolio_sha256": _digest(portfolio),
                 "price_inputs_sha256": _digest(price_inputs),
+                "price_points": price_points,
                 "non_eur_active_currencies": non_eur,
                 "cash_state": list(cash) if cash else None}
         feedback = {"decisions_sha256": _digest(decisions),
@@ -2009,6 +2030,15 @@ class TradeIdeaStore:
                     conn.execute("ROLLBACK")
                 raise
 
+    def unknown_costs(self, run_id):
+        """Read-only: every unknown-cost request in this run's continuation chain."""
+        with self._connect() as conn:
+            chain = self._ancestry(conn, run_id)
+            ids = [row["id"] for row in chain]
+            rows = conn.execute("SELECT * FROM trade_idea_costs WHERE status='unknown' AND run_id IN ("
+                                + ",".join("?" for _ in ids) + ") ORDER BY rowid", ids).fetchall()
+        return [dict(row) for row in rows]
+
     def reconcile_cost(self, run_id, request_id, *, charged_usd, usage, receipt):
         return self._settle_cost(run_id, request_id, "charged", charged=charged_usd,
                                  usage=usage, receipt=receipt)
@@ -2158,7 +2188,7 @@ class TradeIdeaStore:
                 if mandate_hash is None or mandate_hash != context["mandate_sha256"]:
                     operative = False
                     reasons.append("PM mandate changed or unavailable" + (f" ({mandate_error})" if mandate_error else ""))
-                book_matches = (book == context["book"] and feedback == context["feedback"])
+                book_matches = (_book_within_tolerance(context["book"], book) and feedback == context["feedback"])
                 if price_grant is not None:
                     price_verified = _price_refresh_verified(checks.get("price_refresh_verification"),
                         run_id=run_id, accepted=context, current=current_context,

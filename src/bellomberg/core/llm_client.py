@@ -1123,6 +1123,8 @@ class OpenRouterClient:
                     resp.read()
                 ultimo = _errore_da_corpo(resp.status_code, _decodifica(resp))
                 headers = resp.headers
+                # The provider's generation id lets an uncertain outcome be reconciled later.
+                ultimo.generation_id = headers.get("x-generation-id")
                 resp.close()
                 if not _ritentabile(resp.status_code):
                     raise ultimo
@@ -1303,6 +1305,8 @@ class AsyncOpenRouterClient:
                     await resp.aread()
                 ultimo = _errore_da_corpo(resp.status_code, _decodifica(resp))
                 headers = resp.headers
+                # The provider's generation id lets an uncertain outcome be reconciled later.
+                ultimo.generation_id = headers.get("x-generation-id")
                 await resp.aclose()
                 if not _ritentabile(resp.status_code):
                     raise ultimo
