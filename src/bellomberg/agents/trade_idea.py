@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 from bellomberg.core.llm_client import OpenRouterClient, costruisci_corpo
 from bellomberg.core.research_analysis import (RESEARCH_ANALYSIS_MODE, is_research_mode,
     seal_research_thesis, research_reference, research_context)
-from bellomberg.core.trade_idea_policy import (RESEARCH_POLICIES, EXECUTION_POLICY_V3, execution_policy,
+from bellomberg.core.trade_idea_policy import (RESEARCH_POLICIES, EXECUTION_POLICY_V3, EXECUTION_POLICY_V4, execution_policy,
     role_effort, role_thinking, output_cap as policy_output_cap,
     report_quality_sufficient as _quality_sufficient)
 
@@ -1134,7 +1134,8 @@ def _accept_capo_response(blackboard, response, verified_valuations, incomplete_
     blackboard.write("_capo", 3, content)
     wire_result = _parse_capo_json(content)
     result = validate_result(wire_result, run_id=blackboard.run_id,
-                             ticker=blackboard.target_ticker, pm_view=blackboard.pm_view)
+                             ticker=blackboard.target_ticker, pm_view=blackboard.pm_view,
+                             execution_policy=execution_policy(blackboard))
     # Provider JSON mode does not enforce wire keys; reject reader defaults here.
     if wire_result != {key: value for key, value in result.items()
                                if key not in {"run_id", "run_type", "pm_view"}}:
@@ -1153,7 +1154,7 @@ def run_trade_idea_capo(blackboard, *, portfolio, mandate, decision_context=None
     from bellomberg.agents.capo import scegli_report_specialisti
     from bellomberg.core.trade_idea_contract import (
         CAPO_TRADE_IDEA_INSTRUCTIONS, CAPO_RESEARCH_INSTRUCTIONS, CAPO_RESEARCH_INSTRUCTIONS_V2, CAPO_RESEARCH_INSTRUCTIONS_V3,
-        TRADE_IDEA_RESULT_SCHEMA, validate_result)
+        CAPO_RESEARCH_INSTRUCTIONS_V4, trade_idea_result_schema, validate_result)
     from bellomberg.valuation.sector_analysis import valuation_results_block
     from bellomberg.core.language import output_language_instruction
     verified_valuations = _require_final_desk_models(blackboard)
@@ -1203,22 +1204,43 @@ def run_trade_idea_capo(blackboard, *, portfolio, mandate, decision_context=None
     from bellomberg.core import mandato_pm
     research = is_research_mode(blackboard)
     finalization = _capo_finalization_policy(blackboard)
-    policy_v2 = execution_policy(blackboard) in RESEARCH_POLICIES
-    research_prompt = (CAPO_RESEARCH_INSTRUCTIONS_V3 if execution_policy(blackboard) == EXECUTION_POLICY_V3
+    policy = execution_policy(blackboard)
+    policy_v2 = policy in RESEARCH_POLICIES
+    policy_v4 = policy == EXECUTION_POLICY_V4
+    research_prompt = (CAPO_RESEARCH_INSTRUCTIONS_V4 if policy_v4
+                       else CAPO_RESEARCH_INSTRUCTIONS_V3 if policy == EXECUTION_POLICY_V3
                        else CAPO_RESEARCH_INSTRUCTIONS_V2 if policy_v2 else CAPO_RESEARCH_INSTRUCTIONS)
+    evidence_rule = ("\n\nPer ogni Evidence.source usa il formato esatto '[src: nome_tool] fonte'. "
+                     "Il nome_tool deve essere una chiamata riuscita nei report della run; "
+                     "Evidence.as_of deve essere la data osservata nella risposta del tool, "
+                     "non la data di oggi inferita. Mantieni unità, valuta e URL presenti nel tool.")
+    # /2-/3 keep their byte-identical inline-citation rule (paid resumes compare the
+    # request sha256); /4 forbids tags in prose and binds numbers through evidence_ids.
+    citation_rule = (("\nNella prosa NON scrivere [src: ...], [evidence: ...] o altri marcatori di fonte. "
+                      "La tracciabilita' sta nei campi: ogni cifra di un campo, pilastro, scenario, riga "
+                      "o sezione deve comparire nell'output delle Evidence elencate nei suoi evidence_ids "
+                      "(per le sezioni del dossier: gli evidence_ids della sezione). Metti negli evidence_ids "
+                      "di ogni campo tutte le Evidence da cui ne prendi i numeri. probability_pct e "
+                      "price_target degli scenari e variant_view.committee sono stime del comitato: "
+                      "dichiarale come stime, con il metodo e gli evidence_ids degli input, e scrivile solo "
+                      "nei campi della stima stessa (analysis e method dello scenario, rationale della riga "
+                      "variant_view): altrove nel memo ogni numero va attestato da una Evidence. "
+                      "Ogni numero mantiene segno e scala della fonte (milioni, miliardi, %).")
+                     if policy_v4 else
+                     ("\nOgni frase con una cifra quantitativa e ogni tabella deve citare "
+                      "nello stesso contesto [src: nome_tool] oppure [evidence: id] "
+                      "collegato a una Evidence realmente verificabile. I valori osservati "
+                      "devono comparire nel tool citato. Per una derivazione ipotetica "
+                      "usa [assumption] o [ipotesi], formula esplicita e input citati; "
+                      "non presentarla come dato osservato."))
     system = ((research_prompt if research else CAPO_TRADE_IDEA_INSTRUCTIONS)
               + "\n\n" + output_language_instruction(blackboard.language)
-              + "\n\nPer ogni Evidence.source usa il formato esatto '[src: nome_tool] fonte'. "
-                "Il nome_tool deve essere una chiamata riuscita nei report della run; "
-                "Evidence.as_of deve essere la data osservata nella risposta del tool, "
-                "non la data di oggi inferita. Mantieni unità, valuta e URL presenti nel tool."
-              + "\nOgni frase con una cifra quantitativa e ogni tabella deve citare "
-                "nello stesso contesto [src: nome_tool] oppure [evidence: id] "
-                "collegato a una Evidence realmente verificabile. I valori osservati "
-                "devono comparire nel tool citato. Per una derivazione ipotetica "
-                "usa [assumption] o [ipotesi], formula esplicita e input citati; "
-                "non presentarla come dato osservato."
-              + "\n\n" + mandato_pm.blocco_prompt(mandate))
+              + evidence_rule + citation_rule
+              + "\n\n" + mandato_pm.blocco_prompt(mandate)
+              + ("\n\nTAGLIA DELLA PROPOSTA: la SIZING BAND del server applica le regole di questo "
+                 "mandato (size di una nuova posizione, peso massimo per posizione, posizione minima, "
+                 "cassa minima), limitate dai limiti misurati del motore di sizing; azione e importo si "
+                 "scelgono solo dentro la fascia di quell'azione." if policy_v4 else ""))
     if incomplete_reasons:
         system += ("\n\nQuesta run ha componenti obbligatori incompleti: "
                    + "; ".join(incomplete_reasons)
@@ -1279,7 +1301,7 @@ def run_trade_idea_capo(blackboard, *, portfolio, mandate, decision_context=None
                          {"status": "unavailable"}, ensure_ascii=False, default=str, separators=(",", ":")),
         "Required complete JSON schema. Include every declared object field, including "
             "nullable fields as null and empty arrays explicitly. Return only the JSON object:\n"
-            + json.dumps(TRADE_IDEA_RESULT_SCHEMA, ensure_ascii=False, separators=(",", ":")),
+            + json.dumps(trade_idea_result_schema(policy), ensure_ascii=False, separators=(",", ":")),
         "Produci adesso il risultato JSON. Una proposta operativa richiede dati, "
             "mandato, sizing e feedback verificabili; se mancano, proposal=null.",
     ]
@@ -1318,7 +1340,8 @@ def run_trade_idea_capo(blackboard, *, portfolio, mandate, decision_context=None
                     for row in verified_valuations]):
             raise ValueError("Capo finalization draft differs from the current reviewed checkpoint")
         draft = validate_result(material.get("draft"), run_id=blackboard.run_id,
-                                ticker=blackboard.target_ticker, pm_view=blackboard.pm_view)
+                                ticker=blackboard.target_ticker, pm_view=blackboard.pm_view,
+                                execution_policy=policy)
         if (material["draft"] != {key: value for key, value in draft.items()
                                   if key not in {"run_id", "run_type", "pm_view"}}
                 or not _valuation_refs_match(draft, verified_valuations)
@@ -1348,6 +1371,10 @@ def run_trade_idea_capo(blackboard, *, portfolio, mandate, decision_context=None
                     "valuation_date", "workbook_sha256", "model_values")}
                     for row in verified_valuations], ensure_ascii=False, separators=(",", ":")),
             *parts[13:]]
+    if policy_v4:
+        # Inserted after every positional rewrite of parts (indices 7, 10-13 above):
+        # the /2-/3 bodies stay byte-identical. Placed right after the sizing block.
+        parts.insert(len(parts) - 3, _sizing_band_block(sizing, portfolio, blackboard.target_ticker, mandate))
     gate = getattr(blackboard, "budget_gate", None)
     if gate is None:
         raise ValueError("Trade Idea Capo senza budget gate")
@@ -1954,6 +1981,14 @@ def _incomplete_capo_result(run, blackboard, reason):
             "resolved": False, "evidence_ids": []}],
         "history_review": [], "valuation_refs": [], "evidence": [],
         "dossier": dossier, "proposal": None}
+    if execution_policy(run) == EXECUTION_POLICY_V4:
+        # /4: the memo model cannot hold a package without a Capo verdict (no
+        # pillars, scenarios, conviction). It keeps the historical shape and is
+        # declared by origin; store and resume accept it only as incomplete.
+        from bellomberg.storage.trade_idea_store import SERVER_INCOMPLETE_ORIGIN, validate_run_result
+        return validate_run_result({**payload, "result_origin": SERVER_INCOMPLETE_ORIGIN},
+            run_id=run["id"], ticker=run["ticker"], pm_view=run["view_text"],
+            policy=EXECUTION_POLICY_V4)
     return validate_result(payload, run_id=run["id"], ticker=run["ticker"],
                            pm_view=run["view_text"])
 
@@ -3950,10 +3985,501 @@ def _compute_sizing(portfolio, ticker, mandate, *, currency=None,
     return sizing
 
 
-def _sizing_valid(result, sizing, portfolio):
+def _buy_limits(sizing, portfolio, ticker, reasons):
+    """Measured BUY/ADD limits of the common engine, or None with the reason.
+
+    Shared by the historical check and the /4 band: estimated volatility,
+    correlation or class, unmeasured candidate metrics, a missing sector residual
+    or stress budget never become a limit.
+    """
+    measurements = sizing.get("_trade_idea_measurements") or {}
+    positions = [row for row in sizing.get("positions", []) if row.get("ticker") == ticker]
+    candidates = [row for row in sizing.get("candidates", []) if row.get("ticker") == ticker]
+    capacity = (positions[0].get("remaining_capacity_eur") if positions else
+                candidates[0].get("max_add_eur") if candidates else None)
+    if capacity is None:
+        reasons.append("il motore non ha una capacita' per il ticker")
+        return None
+    row = positions[0] if positions else candidates[0]
+    if row.get("vol_estimated") or row.get("corr_estimated") or row.get("class_fallback"):
+        reasons.append("metriche stimate dal motore (volatilita', correlazione o classe di ripiego), non misurate")
+        return None
+    if not positions:
+        metrics = measurements.get("candidate_metrics") or {}
+        compared = {p.get("ticker") for p in (portfolio or {}).get("positions") or []
+                    if p.get("ticker") != ticker}
+        if (measurements.get("candidate_status") != "measured"
+                or set(metrics.get("compared_tickers") or []) != compared):
+            reasons.append("metriche del candidato non misurate sul book corrente")
+            return None
+    sector = None
+    if not positions and row.get("class") == "single":
+        if not row.get("sector_policy") or row.get("sector_remaining_eur") is None:
+            reasons.append("settore di policy o residuo di settore non disponibili")
+            return None
+        sector = Decimal(str(row["sector_remaining_eur"]))
+    stress_budget = (sizing["summary"].get("stress_var_budget") or {}).get("additional_capacity_eur")
+    if stress_budget is None:
+        reasons.append("budget di stress non disponibile")
+        return None
+    return {"held": bool(positions), "row": row,
+            "cash": Decimal(str(sizing["summary"].get("cash_buffer_eur") or 0)),
+            "capacity": Decimal(str(capacity)), "sector": sector, "stress": Decimal(str(stress_budget))}
+
+
+def _mandate_number(value):
+    """A finite Decimal from a real number, or None (bool and text are not numbers)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        return None
+    number = Decimal(str(value))
+    return number if number.is_finite() else None
+
+
+def _mandate_pair(value):
+    """A mandate interval [min, max] of numbers (mandato_pm "intervallo_pct"), else None."""
+    pair = ([_mandate_number(item) for item in value]
+            if isinstance(value, (list, tuple)) and len(value) == 2 else [None])
+    return None if None in pair or not (0 <= pair[0] <= pair[1] <= 100) else pair
+
+
+_CAP_FIELD_BY_CLASS = {"single": "cap_single_pct", "veicolo": "cap_veicolo_pct"}
+
+
+def _mandate_band_rules(mandate, reasons, action, size_class=None):
+    """The /4 band rules of one action, read from the CURRENT mandate (never constants).
+
+    Bases as declared in mandato_pm: size_nuova_posizione_pct and cassa_minima_pct are
+    "% del capitale" (NAV), posizione_minima_pct "% del NAV", cap_single/cap_veicolo and
+    top3_max_pct "% dell'investito", taglio_* "% della posizione". Required fields missing
+    or unreadable -> None with the reason; the OPTIONAL fields max_posizioni and
+    top3_max_pct may be absent: the rule is then declared not applicable, never defaulted.
+    """
+    if not isinstance(mandate, dict):
+        reasons.append("mandato del PM non disponibile")
+        return None
+    sizing_rules = mandate.get("sizing") if isinstance(mandate.get("sizing"), dict) else {}
+    cash_rules = mandate.get("cassa") if isinstance(mandate.get("cassa"), dict) else {}
+    discipline = mandate.get("disciplina") if isinstance(mandate.get("disciplina"), dict) else {}
+    rules = {"not_applicable": []}
+    if action == "BUY":
+        size = sizing_rules.get("size_nuova_posizione_pct")
+        if size is None:
+            reasons.append("il mandato non definisce la size di una nuova posizione")
+            return None
+        pair = _mandate_pair(size)
+        if pair is None or pair[0] <= 0:
+            reasons.append("size nuova posizione del mandato illeggibile: " + repr(size)[:80])
+            return None
+        rules.update(new_min_pct=pair[0], new_max_pct=pair[1])
+        raw = sizing_rules.get("max_posizioni")
+        if raw is None:
+            rules["not_applicable"].append("max_posizioni (non definito nel mandato)")
+        elif isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+            reasons.append("max_posizioni del mandato illeggibile: " + repr(raw)[:40])
+            return None
+        else:
+            rules["max_positions"] = raw
+    if action in ("BUY", "ADD"):
+        raw_minimum = cash_rules.get("cassa_minima_pct")
+        if raw_minimum is None:
+            reasons.append("il mandato non definisce la cassa minima")
+            return None
+        cash_minimum = _mandate_number(raw_minimum)
+        if cash_minimum is None or not (0 <= cash_minimum <= 100):
+            reasons.append("cassa minima del mandato illeggibile: " + repr(raw_minimum)[:80])
+            return None
+        rules["cash_minimum_pct"] = cash_minimum
+        raw = sizing_rules.get("top3_max_pct")
+        if raw is None:
+            rules["not_applicable"].append("top3_max_pct (non definito nel mandato)")
+        else:
+            top3 = _mandate_number(raw)
+            if top3 is None or not (0 < top3 < 100):
+                reasons.append("top3_max_pct del mandato illeggibile: " + repr(raw)[:40])
+                return None
+            rules["top3_pct"] = top3
+    if action == "ADD":
+        field = _CAP_FIELD_BY_CLASS.get(size_class)
+        if field is None:
+            reasons.append("classe di sizing della posizione non riconosciuta: " + repr(size_class)[:40])
+            return None
+        cap = _mandate_number(sizing_rules.get(field))
+        if cap is None or not (0 < cap < 100):
+            reasons.append("peso massimo per posizione (" + field + ") del mandato assente o illeggibile")
+            return None
+        rules["position_cap_pct"] = cap
+    if action in ("TRIM", "SELL"):
+        free = _mandate_pair(discipline.get("taglio_max_senza_condizioni_pct"))
+        switches = discipline.get("condizioni_taglio_oltre")
+        if free is None or not isinstance(switches, dict) or any(
+                not isinstance(value, bool) for value in switches.values()):
+            reasons.append("regole di taglio del mandato (taglio_max_senza_condizioni_pct, "
+                           "condizioni_taglio_oltre) assenti o illeggibili")
+            return None
+        rules["free_cut_pct"] = free[1]
+        rules["cut_conditions"] = sorted(name for name, on in switches.items() if on)
+    raw_position = sizing_rules.get("posizione_minima_pct")
+    position_minimum = _mandate_number(raw_position)
+    if position_minimum is None or not (0 <= position_minimum <= 100):
+        reasons.append("posizione minima del mandato assente o illeggibile: " + repr(raw_position)[:80])
+        return None
+    rules["position_minimum_pct"] = position_minimum
+    return rules
+
+
+def _book_value(row):
+    """EUR value of a book row (MemoryDB.get_portfolio_summary shape), or None.
+
+    Non-EUR rows carry valore_mercato_eur; EUR rows carry only valore_mercato (the
+    summary leaves valore_mercato_eur None), which is then already in EUR.
+    """
+    value = row.get("valore_mercato_eur")
+    if value is None and str(row.get("valuta") or "").upper() == "EUR":
+        value = row.get("valore_mercato")
+    return _mandate_number(value)
+
+
+def _held_value(portfolio, ticker, reasons):
+    """Current EUR value of a held position, only at a qualified price and FX."""
+    rows = [row for row in (portfolio or {}).get("positions") or [] if row.get("ticker") == ticker]
+    if len(rows) != 1:
+        reasons.append("posizione non trovata (o duplicata) nel book")
+        return None
+    row = rows[0]
+    value = _book_value(row)
+    currency = str(row.get("valuta") or "").upper()
+    fx = _mandate_number(row.get("fx_to_eur"))
+    if (row.get("price_stale") or value is None or value <= 0 or not currency
+            or (currency != "EUR" and (row.get("fx_source") != "live" or fx is None or fx <= 0))):
+        reasons.append("posizione non valorizzata a prezzo corrente e FX qualificati")
+        return None
+    return value
+
+
+def _top3_limits(portfolio, ticker, current, invested, top3_pct, reasons):
+    """(minimum, maximum) addition keeping the three largest weights within top3_max_pct.
+
+    Weights on invested capital (mandate base): after adding d to the ticker,
+    top3 = max(S3, S2 + current + d) over invested + d, where S3/S2 are the sums of the
+    three/two largest OTHER positions. Both pieces are linear: the bound is exact.
+    """
+    others = []
+    for row in (portfolio or {}).get("positions") or []:
+        if row.get("ticker") == ticker:
+            continue
+        value = _book_value(row)
+        if value is None:
+            reasons.append("valore di una posizione del book non disponibile per la regola top3")
+            return None
+        others.append(value)
+    others.sort(reverse=True)
+    share = top3_pct / Decimal(100)
+    s3, s2 = sum(others[:3], Decimal(0)), sum(others[:2], Decimal(0))
+    low = max(Decimal(0), (s3 - share * invested) / share)
+    high = (share * invested - s2 - current) / (1 - share)
+    return low, high
+
+
+def _sizing_band(sizing, portfolio, ticker, reasons=None, *, mandate, action="BUY"):
+    """/4 server band for one action on the accepted ticker (PM 04/10: every mandate rule).
+
+    NAV = engine invested capital + book cash, as in the engine's tail budgets.
+    BUY (new position; the mandate wins): band_min = mandate new-position minimum x NAV;
+      band_max = min(new-position maximum x NAV, cash above the mandate's minimum cash
+      (rounded down), engine capacity, sector residual, stress budget, top3 room). None
+      when the book already holds max_posizioni names.
+    ADD (held): band_min = mandate minimum position x NAV; band_max = min(class cap room on
+      invested capital, engine remaining capacity, cash above the minimum, stress, top3).
+    TRIM: band_min = minimum position x NAV; band_max = taglio_max_senza_condizioni (upper)
+      x current value, unless no cut condition is switched on in the mandate.
+    SELL: the whole current value. With cut conditions switched on, the band carries
+      conditions_required: the server cannot verify them, the proposal goes to research.
+    The engine starter is information only. An empty band (min > max) is returned as
+    such. None, with the reason in ``reasons``, when a measure or a required mandate
+    field is missing, or when a BUY/ADD maximum is below the mandate's minimum position.
+    """
+    from decimal import ROUND_CEILING as _UP, ROUND_FLOOR as _DOWN
+    reasons = [] if reasons is None else reasons
+    if action not in ("BUY", "ADD", "TRIM", "SELL"):
+        reasons.append("nessuna fascia per l'azione " + str(action))
+        return None
+    if not isinstance(sizing, dict) or sizing.get("error"):
+        reasons.append("motore di sizing in errore o assente")
+        return None
+    if (portfolio or {}).get("fx_incomplete") or (portfolio or {}).get("stale_positions"):
+        reasons.append("book con FX incompleto o posizioni stale")
+        return None
+    measurements = sizing.get("_trade_idea_measurements") or {}
+    if measurements.get("risk_status") != "measured" or measurements.get("stress_status") != "measured":
+        reasons.append("rischio o stress del book non misurati")
+        return None
+    buying = action in ("BUY", "ADD")
+    if buying and (portfolio or {}).get("cash_source") is None:
+        reasons.append("cassa operativa senza fonte nel DB")
+        return None
+    held_rows = [row for row in sizing.get("positions", []) if row.get("ticker") == ticker]
+    if action == "BUY" and held_rows:
+        reasons.append("posizione gia' in portafoglio: la fascia di acquisto e' quella ADD")
+        return None
+    if action != "BUY" and not held_rows:
+        reasons.append("l'azione " + action + " richiede una posizione esistente")
+        return None
+    candidates = [row for row in sizing.get("candidates", []) if row.get("ticker") == ticker]
+    row = held_rows[0] if held_rows else (candidates[0] if candidates else {})
+    summary = sizing.get("summary") if isinstance(sizing.get("summary"), dict) else {}
+    # Engine numbers must be numbers: a string ("4000") is refused, never parsed.
+    raw = {"cash_eur": (portfolio or {}).get("cash_disponibile_eur"),
+           "invested_capital_eur": summary.get("invested_capital_eur")}
+    if buying:
+        raw["capacity_eur"] = row.get("remaining_capacity_eur") if held_rows else row.get("max_add_eur")
+        raw["stress_budget_eur"] = (summary.get("stress_var_budget") or {}).get("additional_capacity_eur") \
+            if isinstance(summary.get("stress_var_budget"), dict) else None
+        if not held_rows and row.get("class") == "single":
+            raw["sector_remaining_eur"] = row.get("sector_remaining_eur")
+    broken = sorted(name for name, value in raw.items() if _mandate_number(value) is None)
+    if broken:
+        reasons.append("componenti non finiti o assenti: " + ", ".join(broken))
+        return None
+    try:
+        if buying:
+            limits = _buy_limits(sizing, portfolio, ticker, reasons)
+            if limits is None:
+                return None
+        elif row.get("vol_estimated") or row.get("corr_estimated") or row.get("class_fallback"):
+            reasons.append("metriche stimate dal motore (volatilita', correlazione o classe di ripiego), non misurate")
+            return None
+    except (InvalidOperation, TypeError, ValueError, KeyError, AttributeError) as exc:
+        reasons.append("componenti del motore non numerici: " + type(exc).__name__)
+        return None
+    rules = _mandate_band_rules(mandate, reasons, action, row.get("class"))
+    if rules is None:
+        return None
+    values = {name: _mandate_number(value) for name, value in raw.items()}
+    raw_cash, invested = values["cash_eur"], values["invested_capital_eur"]
+    position_value = Decimal(0)
+    if action != "BUY":
+        position_value = _held_value(portfolio, ticker, reasons)
+        if position_value is None:
+            return None
+    nav = invested + max(Decimal(0), raw_cash)
+    if nav <= 0 or invested <= 0:
+        reasons.append("capitale (NAV o investito) non positivo")
+        return None
+    hundred = Decimal(100)
+    position_minimum = nav * rules["position_minimum_pct"] / hundred
+    components = {"action": action, "nav_eur": float(nav.quantize(Decimal(1))),
+                  "position_minimum_eur": float(position_minimum.quantize(Decimal("0.01")))}
+    if rules["not_applicable"]:
+        components["rules_not_applicable"] = list(rules["not_applicable"])
+    if action in ("TRIM", "SELL"):
+        value = position_value.quantize(Decimal("0.01"))
+        components["position_value_eur"] = float(value)
+        conditions = rules["cut_conditions"]
+        if action == "TRIM":
+            band_min = position_minimum.to_integral_value(rounding=_UP)
+            band_max = (value if not conditions else
+                        (value * rules["free_cut_pct"] / hundred).quantize(Decimal("0.01"), rounding=_DOWN))
+            components["free_cut_pct"] = float(rules["free_cut_pct"]) if conditions else None
+        else:
+            band_min, band_max = position_minimum.to_integral_value(rounding=_UP), value
+        band = {"band_min_eur": float(band_min), "band_max_eur": float(band_max),
+                "empty": band_min > band_max, "components": components}
+        if conditions and action == "SELL":
+            # A cut beyond the free limit needs EVERY switched-on mandate condition.
+            band["conditions_required"] = conditions
+        return band
+    cash_minimum = nav * rules["cash_minimum_pct"] / hundred
+    caps = {"cash_above_minimum_eur": (raw_cash - cash_minimum).to_integral_value(rounding=_DOWN),
+            "capacity_eur": values["capacity_eur"].to_integral_value(rounding=_DOWN),
+            "stress_budget_eur": values["stress_budget_eur"].to_integral_value(rounding=_DOWN)}
+    if "sector_remaining_eur" in values:
+        caps["sector_remaining_eur"] = values["sector_remaining_eur"].to_integral_value(rounding=_DOWN)
+    if action == "BUY":
+        held_names = sum(1 for item in (portfolio or {}).get("positions") or []
+                         if (_mandate_number(item.get("quantita")) or 0) > 0)
+        if "max_positions" in rules and held_names >= rules["max_positions"]:
+            reasons.append("il book ha gia' " + str(held_names) + " posizioni, il massimo del mandato ("
+                           + str(rules["max_positions"]) + "): nessun nuovo nome")
+            return None
+        band_min = (nav * rules["new_min_pct"] / hundred).to_integral_value(rounding=_UP)
+        caps["mandate_max_eur"] = (nav * rules["new_max_pct"] / hundred).to_integral_value(rounding=_DOWN)
+        components["mandate_min_eur"] = float(band_min)
+    else:
+        band_min = position_minimum.to_integral_value(rounding=_UP)
+        share = rules["position_cap_pct"] / hundred
+        # Class cap on invested capital after the addition: (v + d) / (I + d) <= cap.
+        caps["mandate_room_eur"] = ((share * invested - position_value) / (1 - share)
+                                    ).to_integral_value(rounding=_DOWN)
+        components["position_value_eur"] = float(position_value.quantize(Decimal("0.01")))
+    if "top3_pct" in rules:
+        top3 = _top3_limits(portfolio, ticker, position_value, invested, rules["top3_pct"], reasons)
+        if top3 is None:
+            return None
+        low, high = top3
+        caps["top3_room_eur"] = high.to_integral_value(rounding=_DOWN)
+        if low > 0:
+            band_min = max(band_min, low.to_integral_value(rounding=_UP))
+            components["top3_min_eur"] = float(low.to_integral_value(rounding=_UP))
+    band_max = min(caps.values())
+    if band_max <= 0:
+        binding = min(caps, key=caps.get)
+        reasons.append("fascia nulla: il limite " + binding + " vale " + str(band_max) + " EUR")
+        return None
+    if band_max < position_minimum:
+        reasons.append("massimo della fascia " + str(band_max) + " EUR sotto la posizione minima del mandato ("
+                       + str(position_minimum.quantize(Decimal(1))) + " EUR)")
+        return None
+    starter = _mandate_number(row.get("suggested_starter_eur"))
+    components.update({key: float(value) for key, value in caps.items()})
+    components.update(cash_eur=float(raw_cash),
+                      cash_minimum_eur=float(cash_minimum.quantize(Decimal("0.01"))),
+                      engine_starter_eur_info=float(starter) if starter is not None else None)
+    if "sector_remaining_eur" not in caps:
+        components["sector_remaining_eur"] = None
+    return {"band_min_eur": float(band_min), "band_max_eur": float(band_max),
+            "empty": band_min > band_max, "components": components}
+
+
+SIZING_BAND_TOLERANCE_EUR = Decimal("0.01")
+
+
+def _band_actions(sizing, ticker):
+    held = any(row.get("ticker") == ticker for row in (sizing or {}).get("positions", []) or []) \
+        if isinstance(sizing, dict) else False
+    return ("ADD", "TRIM", "SELL") if held else ("BUY",)
+
+
+def _sizing_band_block(sizing, portfolio, ticker, mandate):
+    """The /4 Capo message block: the band of each admissible action, or its absence."""
+    bands, missing = {}, {}
+    for action in _band_actions(sizing, ticker):
+        reasons = []
+        band = _sizing_band(sizing, portfolio, ticker, reasons, mandate=mandate, action=action)
+        if band is None:
+            missing[action] = "; ".join(reasons)
+        else:
+            bands[action] = band
+    if not bands:
+        text = "; ".join(missing.values()) if len(missing) == 1 else "; ".join(
+            action + ": " + reason for action, reason in missing.items())
+        return ("SIZING BAND: fascia non disponibile (" + text + "). "
+                "Proposta operativa non ammessa: proposal=null, e spiega nella decisione "
+                "quale misura manca.")
+    notes = ["la fascia vale SOLO per l'azione indicata come chiave: scegli l'azione e copia "
+             "band_min_eur e band_max_eur di quell'azione esattamente in proposal.sizing; "
+             "components sono informativi"]
+    if "BUY" in bands:
+        notes.append("BUY: size nuova posizione e cassa minima del mandato, limitate dai limiti misurati "
+                     "del motore di sizing e dal peso delle prime tre posizioni")
+        if bands["BUY"]["empty"]:
+            notes.append("fascia BUY VUOTA: band_min_eur > band_max_eur, l'unica proposta ammessa e' "
+                         "band_max_eur, sotto il minimo del mandato, con below_starter=true dichiarato in basis")
+    if "ADD" in bands:
+        notes.append("ADD: dalla posizione minima del mandato al minimo fra spazio sotto il peso massimo del "
+                     "mandato (sull'investito), capacita' del motore, cassa sopra la minima, budget di stress "
+                     "e peso delle prime tre posizioni")
+    if "TRIM" in bands:
+        notes.append("TRIM: importo da band_min_eur a meno del valore della posizione, entro il taglio "
+                     "massimo senza condizioni del mandato")
+    if "SELL" in bands:
+        notes.append("SELL: l'intera posizione, amount_eur = band_max_eur (below_starter=true solo se la "
+                     "fascia e' vuota)" + ("; richiede TUTTE le condizioni del mandato " + ", ".join(
+                         bands["SELL"]["conditions_required"]) + ", che il server non verifica: una SELL va "
+                         "in ricerca, dichiarale nel basis" if bands["SELL"].get("conditions_required") else ""))
+    not_applicable = sorted({rule for band in bands.values()
+                             for rule in band["components"].get("rules_not_applicable", ())})
+    if not_applicable:
+        notes.append("regole del mandato non applicabili: " + "; ".join(not_applicable))
+    if missing:
+        notes.append("non ammesse: " + "; ".join(action + " (" + reason + ")" for action, reason in missing.items()))
+    return ("SIZING BAND (server; " + "; ".join(notes) + "):\n"
+            + json.dumps(bands, ensure_ascii=False, separators=(",", ":")))
+
+
+def _proposal_band_action(proposal, sizing):
+    """The action whose band applies: a BUY on a held position is an ADD (as routing does)."""
+    action = proposal.get("action")
+    held = "ADD" in _band_actions(sizing, proposal.get("ticker"))
+    return "ADD" if action == "BUY" and held else action
+
+
+def _sizing_band_reason(result, sizing, portfolio, mandate, accepted_band=None):
+    """None when a /4 proposal matches the server band of its action; else the reason.
+
+    accepted_band (price refresh): the copy is compared with the band accepted by the
+    Capo, while the amount must stay inside the band re-measured now; the PM's 0.5%
+    price tolerance (option A) applies only to the amounts tied to a measured value:
+    the minimum of the band and the amounts equal to its maximum (SELL, empty band).
+    """
+    from bellomberg.core.trade_idea_policy import PRICE_TOLERANCE
+    proposal = result.get("proposal")
+    if not proposal:
+        return "nessuna proposta"
+    copied = proposal.get("sizing")
+    if not isinstance(copied, dict):
+        return "proposta /4 senza fascia copiata dal motore"
+    action = _proposal_band_action(proposal, sizing)
+    if action not in ("BUY", "ADD", "TRIM", "SELL"):
+        return "nessuna fascia del motore per l'azione " + str(action)
+    reasons = []
+    band = _sizing_band(sizing, portfolio, proposal.get("ticker"), reasons, mandate=mandate, action=action)
+    if band is None:
+        return "fascia del motore non disponibile per " + action + ": " + "; ".join(reasons)
+    if band.get("conditions_required"):
+        return ("vendita totale oltre il taglio senza condizioni del mandato: richiede le condizioni "
+                + ", ".join(band["conditions_required"]) + ", non verificabili dal server")
+    reference = accepted_band if accepted_band is not None else band
+    try:
+        values = [Decimal(str(proposal.get("eur_amount"))), Decimal(str(copied.get("amount_eur"))),
+                  Decimal(str(copied.get("band_min_eur"))), Decimal(str(copied.get("band_max_eur"))),
+                  Decimal(str(reference["band_min_eur"])), Decimal(str(reference["band_max_eur"]))]
+    except (TypeError, InvalidOperation, KeyError):
+        return "importo o fascia copiata non numerici"
+    if any(isinstance(item, bool) for item in (proposal.get("eur_amount"), copied.get("amount_eur"))) \
+            or not all(value.is_finite() for value in values):
+        return "importo o fascia copiata non numerici"
+    amount, copied_amount, copied_min, copied_max, reference_min, reference_max = values
+    if (abs(copied_min - reference_min) > SIZING_BAND_TOLERANCE_EUR
+            or abs(copied_max - reference_max) > SIZING_BAND_TOLERANCE_EUR):
+        return ("fascia copiata diversa da quella " + ("accettata" if accepted_band is not None else "del motore")
+                + " (copiata " + str(copied_min) + "-" + str(copied_max) + " EUR, server "
+                + str(reference_min) + "-" + str(reference_max) + " EUR)")
+    band_min, band_max = Decimal(str(band["band_min_eur"])), Decimal(str(band["band_max_eur"]))
+    refresh = accepted_band is not None
+    tolerance = PRICE_TOLERANCE if refresh else Decimal(0)
+    empty = reference["empty"] if refresh else band["empty"]
+
+    def equal_to_max():
+        return abs(amount - band_max) <= max(SIZING_BAND_TOLERANCE_EUR, band_max * tolerance)
+    below = copied.get("below_starter")
+    if below not in (True, False) or amount != copied_amount or amount <= 0:
+        return "importo fuori dalla fascia del motore"
+    if action == "SELL":
+        # The whole position, at the measured value; below_starter only for an empty band.
+        if not equal_to_max() or below is not empty:
+            return "importo fuori dalla fascia del motore"
+        return None
+    if below is True:
+        if action != "BUY" or not empty or not equal_to_max():
+            return "importo fuori dalla fascia del motore"
+        return None
+    # The tolerance never widens the maximum of an ordinary amount.
+    if amount > band_max or (action == "TRIM" and amount >= Decimal(str(
+            band["components"]["position_value_eur"]))):
+        return "importo fuori dalla fascia del motore"
+    if amount < band_min * (1 - tolerance):
+        return "importo fuori dalla fascia del motore"
+    return None
+
+
+def _sizing_valid(result, sizing, portfolio, *, policy=None, mandate=None, accepted_band=None):
     proposal = result.get("proposal")
     if not proposal:
         return False
+    if policy == EXECUTION_POLICY_V4 or "sizing" in proposal:
+        # Only the /4 strict proposal has "sizing": the band check is the whole check
+        # (it contains the measured BUY/ADD limits below).
+        return _sizing_band_reason(result, sizing, portfolio, mandate, accepted_band) is None
     if (not isinstance(sizing, dict) or sizing.get("error")
             or (portfolio or {}).get("fx_incomplete") or (portfolio or {}).get("stale_positions")):
         return False
@@ -3970,32 +4496,16 @@ def _sizing_valid(result, sizing, portfolio):
         return False
     ticker, action = proposal["ticker"], proposal["action"]
     positions = [row for row in sizing.get("positions", []) if row.get("ticker") == ticker]
-    candidates = [row for row in sizing.get("candidates", []) if row.get("ticker") == ticker]
     cash = Decimal(str(sizing["summary"].get("cash_buffer_eur") or 0))
     if action in ("BUY", "ADD"):
-        capacity = (positions[0].get("remaining_capacity_eur") if positions else
-                    candidates[0].get("max_add_eur") if candidates else None)
-        if capacity is None:
+        limits = _buy_limits(sizing, portfolio, ticker, [])
+        if limits is None:
             return False
-        row = positions[0] if positions else candidates[0]
-        if row.get("vol_estimated") or row.get("corr_estimated") or row.get("class_fallback"):
-            return False
-        if not positions:
-            metrics = measurements.get("candidate_metrics") or {}
-            compared = {p.get("ticker") for p in (portfolio or {}).get("positions") or []
-                        if p.get("ticker") != ticker}
-            if (measurements.get("candidate_status") != "measured"
-                    or set(metrics.get("compared_tickers") or []) != compared):
-                return False
-        if not positions and row.get("class") == "single":
-            if not row.get("sector_policy") or row.get("sector_remaining_eur") is None:
-                return False
-            capacity = min(Decimal(str(capacity)), Decimal(str(row["sector_remaining_eur"])))
-        stress_budget = (sizing["summary"].get("stress_var_budget") or {}).get("additional_capacity_eur")
-        if stress_budget is None:
-            return False
-        capacity = min(Decimal(str(capacity)), Decimal(str(stress_budget)))
-        return amount <= min(cash, Decimal(str(capacity)))
+        capacity = limits["capacity"]
+        if limits["sector"] is not None:
+            capacity = min(capacity, limits["sector"])
+        capacity = min(capacity, limits["stress"])
+        return amount <= min(cash, capacity)
     if action in ("TRIM", "SELL") and positions:
         if positions[0].get("vol_estimated") or positions[0].get("corr_estimated") or positions[0].get("class_fallback"):
             return False
@@ -4034,6 +4544,8 @@ def _bound_evidence_details(result, blackboard, ticker, cutoff):
 
     used = {ident for section in result.get("dossier", [])
             for ident in section.get("evidence_ids", [])}
+    if _is_v4_memo(result, blackboard):
+        used |= _v4_field_evidence_ids(result)
     receipts = [row for row in blackboard.tool_receipts if row.get("success")
                 and not row.get("truncated")
                 and isinstance(row.get("input"), dict)
@@ -4105,7 +4617,247 @@ _MONTHS = ("jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|gen|feb|mar|apr|mag|
            "lug|ago|set|ott|nov|dic")
 
 
-def _quantities(text):
+def _is_v4_memo(result, blackboard):
+    """A /4 run's Capo memo; the server incomplete package keeps the historical gate."""
+    return (execution_policy(blackboard) == EXECUTION_POLICY_V4
+            and result.get("result_origin") is None)
+
+
+def _v4_field_evidence_ids(result):
+    ids = set(result.get("summary_evidence_ids") or ()) | set(result.get("pm_view_evidence_ids") or ())
+    for key in ("pillars", "variant_view", "risk_exits", "scenarios", "objections"):
+        for item in result.get(key) or ():
+            ids.update(item.get("evidence_ids") or ())
+    return ids
+
+
+# /4 prose follows the output-language convention (Italian: 1.234,5 and 12,5%), so the
+# token keeps every group separator and its sign instead of splitting "1.234,5" into
+# two numbers; a multiple ("12,9x") or a scale word is part of the token.
+_QUANTITY_LOCAL = re.compile(
+    r"(?<![\w.,])[-+−]?(?:\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?)(?![.,]?\d)"
+    r"(?:\s?(?:%|bps|pp|€|\$|EUR|USD|GBP|GBX|bn|billion|billions|million|millions|mld|mln|"
+    r"miliardi|miliardo|milioni|milione|mila|migliaia|mrd|bilioni|bilione|trilioni|trilione|m|k|x))?(?![\w])",
+    re.I)
+_UNIT_SCALE = {"bn": 9, "billion": 9, "billions": 9, "mld": 9, "miliardi": 9, "miliardo": 9,
+               "million": 6, "millions": 6, "mln": 6, "milioni": 6, "milione": 6, "m": 6,
+               "mila": 3, "migliaia": 3, "k": 3, "mrd": 9,
+               # Italian long scale: bilione = 10^12, trilione = 10^18.
+               "bilioni": 12, "bilione": 12, "trilioni": 18, "trilione": 18}
+# Tool field names that declare their own scale (revenue_eur_m = millions of euro).
+_FIELD_SCALE = ((re.compile(r"(?:^|_)(?:bn|b|mld|billions?)$", re.I), 9),
+                (re.compile(r"(?:^|_)(?:m|mn|mm|mln|millions?)$", re.I), 6),
+                (re.compile(r"(?:^|_)(?:k|thousands?)$", re.I), 3))
+# Text numbers inside receipts: English thousands groups ("1,234.5") stay one number.
+_OUTPUT_TEXT_NUMBER = re.compile(
+    r"(-?\d{1,3}(?:,\d{3})+(?:\.\d+)?(?![\d,])|-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
+    r"(?:\s?(billions?|bn|mld|miliardi|millions?|mln|milioni|thousands?|mila|k)\b)?", re.I)
+_TEXT_SCALE = {"billion": 9, "billions": 9, "bn": 9, "mld": 9, "miliardi": 9, "million": 6, "millions": 6,
+               "mln": 6, "milioni": 6, "thousand": 3, "thousands": 3, "mila": 3, "k": 3}
+
+
+def _local_number_values(token, language):
+    """Every reading of a localized numeric token as (signed value, decimals).
+
+    it (default): '.' groups thousands, ',' is the decimal mark; en: the reverse.
+    The convention of the output language decides ('1.250' is 1250 in Italian); a lone
+    separator that is not a thousands group is a decimal mark ('12.5'); a leading zero
+    group ('0.125') is always decimal.
+    """
+    from decimal import Decimal
+    stripped = token.strip()
+    negative = stripped[:1] in ("-", "−")
+    body = re.match(r"[-+−]?([\d.,]+)", stripped).group(1).rstrip(".,")
+    group, decimal = (",", ".") if language == "en" else (".", ",")
+    readings = set()
+
+    def read(group_mark, decimal_mark):
+        if not re.fullmatch(r"\d{1,3}(?:" + re.escape(group_mark) + r"\d{3})*(?:"
+                            + re.escape(decimal_mark) + r"\d+)?|\d+(?:"
+                            + re.escape(decimal_mark) + r"\d+)?", body):
+            return
+        text = body.replace(group_mark, "").replace(decimal_mark, ".")
+        value = Decimal(text)
+        readings.add((-value if negative else value, len(text.split(".")[1]) if "." in text else 0))
+
+    if re.fullmatch(r"0[.,]\d+", body):
+        read("", body[1])            # '0.125' / '0,125': always a decimal
+        return readings
+    read(group, decimal)
+    separators = body.count(".") + body.count(",")
+    if separators == 1 and not readings:
+        read(decimal, group)        # a lone mark that is not a valid thousands group
+    return readings
+
+
+def _field_scale(key):
+    for pattern, exponent in _FIELD_SCALE:
+        if pattern.search(str(key or "")):
+            return exponent
+    return 0
+
+
+def _output_numbers(text):
+    """Signed numbers of a receipt as (value, scale exponent declared by its field name)."""
+    from decimal import Decimal
+    found = []
+
+    def text_numbers(value, exponent):
+        for raw, word in _OUTPUT_TEXT_NUMBER.findall(str(value)):
+            try:
+                # A scale word written after the number in the receipt text wins.
+                found.append((Decimal(raw.replace(",", "")), _TEXT_SCALE.get(word.lower(), exponent)
+                              if word else exponent))
+            except InvalidOperation:
+                continue
+
+    def visit(node, exponent, depth):
+        if depth > 12:
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                visit(value, _field_scale(key), depth + 1)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value, exponent, depth + 1)
+        elif isinstance(node, bool) or node is None:
+            return
+        elif isinstance(node, (int, float)):
+            number = Decimal(str(node))
+            if number.is_finite():
+                found.append((number, exponent))
+        else:
+            text_numbers(node, exponent)
+    try:
+        visit(json.loads(text), 0, 0)
+    except (TypeError, ValueError):
+        text_numbers(text or "", 0)
+    return found
+
+
+def _number_attested(token, language, numbers):
+    """Rounded, SIGNED comparison of a prose token with receipt numbers.
+
+    A scale word ('1,2 miliardi') is compared only at that scale, with the receipt
+    value brought to units through its field name (revenue_eur_m); a bare token is
+    compared with the receipt value as written; '12,5%' also matches a 0.125 ratio.
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+    unit = re.sub(r"^[-+−]?[\d.,]+\s?", "", token.strip()).lower()
+    group = "," if language == "en" else "."
+    if unit == "%" and group in token:
+        return False                # '41.025%': a grouped percentage is ambiguous, never x100
+    for value, places in _local_number_values(token, language):
+        quantum = Decimal(1).scaleb(-places)
+        for number, exponent in numbers:
+            if unit in _UNIT_SCALE:
+                candidates = [number.scaleb(exponent - _UNIT_SCALE[unit])]
+            else:
+                candidates = [number] + ([number.scaleb(2)] if unit == "%" else [])
+            for candidate in candidates:
+                try:
+                    if candidate.quantize(quantum, rounding=ROUND_HALF_UP) == value:
+                        return True
+                except InvalidOperation:
+                    continue    # beyond decimal precision: not this reading
+    return False
+
+
+_YEAR_UNITS_V4 = (r"\s*%|\s*(?:bps|pp|USD|EUR|GBP|GBX|million|millions|billion|billions|bn|milioni|milione|"
+                  r"mln|miliardi|miliardo|mld|mila)\b|\s*€")
+
+
+def _quantity_spans_v4(text):
+    """/4 numeric tokens with their positions in the ORIGINAL text.
+
+    Same exclusions as _quantities (URLs, dates, FY/CY/Q labels, years, a list number
+    at the start), blanked with spaces of the same length so the spans stay valid; a
+    year-shaped number followed by an Italian or English unit (2050 milioni, 1980 mln,
+    2045 €) is an amount, not a year. Known limits: numbers written in words, a number
+    right after a Q/FY label ("Q 470") and a list number at the start are not read.
+    """
+    source = str(text or "")
+    blank = lambda match: " " * len(match.group())
+    scrubbed = re.sub(r"https?://\S+", blank, source)
+    scrubbed = re.sub(r"\b(?:19|20)\d{2}[-/]\d{1,2}(?:[-/]\d{1,2})?\b", blank, scrubbed)
+    scrubbed = re.sub(r"\b\d{1,2}\s+(?:" + _MONTHS + r")[a-z]*\s+(?:19|20)\d{2}\b", blank, scrubbed, flags=re.I)
+    scrubbed = re.sub(r"\b(?:FY|CY|Q)[ -]?\d{1,4}\b", blank, scrubbed, flags=re.I)
+
+    def year_or_amount(match):
+        before = scrubbed[max(0, match.start() - 8):match.start()]
+        after = scrubbed[match.end():match.end() + 12]
+        if (re.search(r"(?:[$€]|\b(?:USD|EUR|GBP|GBX))\s*$", before, re.I)
+                or re.match(_YEAR_UNITS_V4, after, re.I)):
+            return match.group()
+        return " " * len(match.group())
+    scrubbed = re.sub(r"\b(?:19|20)\d{2}\b", year_or_amount, scrubbed)
+    scrubbed = re.sub(r"^\s*\d+(?:\.\d+)*[.)]\s+", blank, scrubbed)
+    return [(match.group().strip(), match.start(), match.end()) for match in _QUANTITY_LOCAL.finditer(scrubbed)]
+
+
+_CLAUSE_START = re.compile(r"[;:!?\n]|\.\s")
+_FILLER = r"(?:\s+(?:a|ad|di|del|dello|della|dei|degli|delle|il|lo|la|i|gli|le|l'|al|allo|alla|ai|agli|alle|" \
+          r"quota|livello|soglia|target|obiettivo|prezzo|price|the|of|to|than|a|an|level))*\s*"
+# PM 04/10: inside committee criteria only a THRESHOLD or TARGET is exempt.
+_THRESHOLD_BEFORE = re.compile(
+    r"(?:\b(?:sotto|sopra|oltre|al di sotto|al di sopra|fino|entro|almeno|non oltre|meno|piu'|piu|più|"
+    r"super\w*'?|below|above|under|over|at least|up to|beyond|exceed\w*|less|more)|<=|>=|≤|≥|<|>)"
+    + _FILLER + r"$", re.I)
+_EXIT_IF = re.compile(r"\b(?:uscire|esci|ridurre|riduci|rivedere|rivedi|vendere|vendi|exit|reduce|review|sell)\b"
+                      r"[^;:!?\n]*\b(?:se|if|quando|when)\b[^,;:!?\n]*$", re.I)
+_TIME_AFTER = re.compile(
+    r"\s*(?:giorn[oi]|gg|settiman[ae]|mes[ei]|trimestr[ei]|semestr[ei]|ann[oi]|sedut[ae]|tranche|rat[ae]|"
+    r"days?|weeks?|months?|quarters?|years?|sessions?|tranches?|instal+ments?)\b", re.I)
+_ACTION_PCT_BEFORE = re.compile(
+    r"\b(?:ridurre|riduci|vendere|vendi|comprare|compra|acquistare|acquista|aumentare|aumenta|incrementare|"
+    r"eseguire|esegui|tagliare|taglia|reduce|sell|buy|add|trim|increase|execute|cut)\b(?:\s+\S+){0,3}?\s+"
+    r"(?:del|dello|della|di|per|by|of)\s*$", re.I)
+
+
+def _clause_before(text, start):
+    head = text[:start]
+    cut = 0
+    for match in _CLAUSE_START.finditer(head):
+        cut = match.end()
+    return head[cut:]
+
+
+def _is_threshold(text, start):
+    before = _clause_before(text, start)
+    return bool(_THRESHOLD_BEFORE.search(before) or _EXIT_IF.search(before))
+
+
+def _is_plan(text, start, end, token):
+    """A plan figure: a duration, a number of tranches, or the share of an action."""
+    if _TIME_AFTER.match(text, end):
+        return True
+    return token.endswith("%") and bool(_ACTION_PCT_BEFORE.search(_clause_before(text, start)))
+
+
+def _horizon_exempt(label, months):
+    """Spans of horizon.label numbers coherent with horizon.months (18 mesi, 12-24 mesi, 1,5 anni)."""
+    exempt = set()
+    if not isinstance(months, int) or isinstance(months, bool):
+        return exempt
+
+    def in_months(raw, unit):
+        try:
+            value = Decimal(raw.replace(",", "."))
+        except InvalidOperation:
+            return None
+        return value * 12 if unit.lower().startswith(("ann", "year")) else value
+    unit = r"(mes[ei]|months?|ann[oi]|years?)\b"
+    for match in re.finditer(r"(\d+(?:[.,]\d+)?)\s*(?:-|–|a|to)\s*(\d+(?:[.,]\d+)?)\s*" + unit, label, re.I):
+        low, high = in_months(match.group(1), match.group(3)), in_months(match.group(2), match.group(3))
+        if low is not None and high is not None and low <= months <= high:
+            exempt.update((match.start(1), match.start(2)))
+    for match in re.finditer(r"(\d+(?:[.,]\d+)?)\s*" + unit, label, re.I):
+        if in_months(match.group(1), match.group(2)) == months:
+            exempt.add(match.start(1))
+    return exempt
+
+
+def _quantities(text, pattern=None):
     """Detect material numeric tokens, excluding dates and identifiers."""
     scrubbed = re.sub(r"https?://\S+", " ", str(text or ""))
     scrubbed = re.sub(r"\b(?:19|20)\d{2}[-/]\d{1,2}(?:[-/]\d{1,2})?\b", " ", scrubbed)
@@ -4121,12 +4873,184 @@ def _quantities(text):
         return " "
     scrubbed = re.sub(r"\b(?:19|20)\d{2}\b", year_or_amount, scrubbed)
     scrubbed = re.sub(r"^\s*\d+(?:\.\d+)*[.)]\s+", " ", scrubbed)
-    return [match.group().strip() for match in _QUANTITY.finditer(scrubbed)]
+    return [match.group().strip() for match in (pattern or _QUANTITY).finditer(scrubbed)]
 
 
-def _numeric_claim_gaps(result, blackboard, ticker, cutoff, sizing):
+_PROPOSAL_ROW_FIELDS = ("vol_annual_pct", "avg_corr", "avg_corr_assumed", "avg_corr_book", "beta",
+                        "max_position_pct", "current_pct", "current_eur", "max_add_eur",
+                        "remaining_capacity_eur", "suggested_starter_eur")
+
+
+def _proposal_numbers(result, sizing):
+    """Numbers a proposal may quote: its own amount and copied band, the server band
+    components of its action (when the mandate is known) and the labelled engine
+    metrics of THE CANDIDATE only - never the whole engine JSON or other positions."""
+    proposal = result.get("proposal") or {}
+    copied = proposal.get("sizing") or {}
+    numbers = [(value, 0) for value in (_mandate_number(proposal.get("eur_amount")),
+               _mandate_number(copied.get("amount_eur")), _mandate_number(copied.get("band_min_eur")),
+               _mandate_number(copied.get("band_max_eur"))) if value is not None]
+    if not isinstance(sizing, dict) or sizing.get("error"):
+        return numbers
+    ticker = proposal.get("ticker")
+    for row in [*(sizing.get("positions") or []), *(sizing.get("candidates") or [])]:
+        if isinstance(row, dict) and row.get("ticker") == ticker:
+            numbers.extend((value, 0) for value in (_mandate_number(row.get(name))
+                                                    for name in _PROPOSAL_ROW_FIELDS) if value is not None)
+    metrics = ((sizing.get("_trade_idea_measurements") or {}).get("candidate_metrics") or {})
+    numbers.extend((value, 0) for value in (_mandate_number(metrics.get(name))
+                                            for name in ("vol_annual_pct", "avg_corr")) if value is not None)
+    return numbers
+
+
+def _proposal_band_numbers(result, sizing, portfolio, mandate):
+    """The numeric components of the server band of the proposal's action, if measurable."""
+    proposal = result.get("proposal") or {}
+    if not proposal or mandate is None:
+        return []
+    band = _sizing_band(sizing, portfolio, proposal.get("ticker"), [], mandate=mandate,
+                        action=_proposal_band_action(proposal, sizing))
+    if band is None:
+        return []
+    values = [band["band_min_eur"], band["band_max_eur"], *band["components"].values()]
+    return [(number, 0) for number in (_mandate_number(value) for value in values) if number is not None]
+
+
+def _numeric_claim_gaps_v4(result, bound, sizing, language, band_numbers=()):
+    """/4 memo: prose carries no tags; each field is bound through its evidence_ids.
+
+    Field ids plus those of its memo section; numbers normalized from the output
+    language, with sign and declared scale. Committee estimates are exempt ONLY in
+    the fields of the estimate itself (a scenario's analysis/method for its own
+    probability and target, a variant_view rationale for its own committee value).
+    Criteria (falsifiers, exit thresholds, trigger conditions): only a threshold or
+    target ("sotto il 40%", "uscire se ... 600") is exempt; any other number is a claim.
+    Plan fields (proposal.timing, horizon.label, decisive_questions, review_triggers.what,
+    data_gaps) also admit durations, tranches, the share of an action ("ridurre del 30%")
+    and horizon months coherent with horizon.months. review_triggers.price_level is a
+    structured committee choice, not a claim.
+    """
+    sections = {section.get("key"): section for section in result.get("dossier") or []}
+    numbers_by_id = {ident: _output_numbers(row["output"]) for ident, row in bound.items()}
+
+    def own(*values):
+        return [(Decimal(str(value)), 0) for value in values
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+                and Decimal(str(value)).is_finite()]
+    gaps = []
+
+    def numbers_for(ids, section=None):
+        ids = list(ids or ()) + list((sections.get(section) or {}).get("evidence_ids") or ())
+        return [number for ident in ids for number in numbers_by_id.get(ident, ())]
+
+    def check(text, location, ids, section=None, extra=(), mode=None, exempt_starts=()):
+        text = str(text or "")
+        values = []
+        for token, start, end in _quantity_spans_v4(text):
+            if start in exempt_starts:
+                continue
+            if mode in ("criteria", "plan") and _is_threshold(text, start):
+                continue
+            if mode == "plan" and _is_plan(text, start, end, token):
+                continue
+            values.append(token)
+        if not values:
+            return
+        numbers = numbers_for(ids, section)
+        if not numbers and not extra:
+            gaps.append(location + ": cifre senza EvidenceID verificati nel campo o nella sezione")
+            return
+        pool = [*numbers, *extra]
+        for value in values:
+            if not _number_attested(value, language, pool):
+                gaps.append(location + ": valore " + value + " non attestato dalle evidence_ids del campo")
+
+    check(result.get("summary"), "summary", result.get("summary_evidence_ids"), "executive")
+    check(result.get("pm_view_response"), "pm_view_response", result.get("pm_view_evidence_ids"), "pm_view")
+    horizon = result.get("horizon") or {}
+    label = str(horizon.get("label") or "")
+    # Durations in the label are admitted only when coherent with horizon.months.
+    check(label, "horizon.label", (), "executive", mode="criteria",
+          exempt_starts=_horizon_exempt(label, horizon.get("months")))
+    for key, section, mode in (("catalysts", "catalysts", None), ("data_gaps", "decision", "plan"),
+                               ("review_conditions", "decision", None),
+                               ("decisive_questions", "decision", "plan")):
+        for index, value in enumerate(result.get(key) or []):
+            check(value, key + "[" + str(index) + "]", (), section, mode=mode)
+    for index, item in enumerate(result.get("pillars") or []):
+        for field in ("title", "thesis", "evidence", "risk"):
+            check(item.get(field), "pillars[" + str(index) + "]." + field, item.get("evidence_ids"), "executive")
+    for index, item in enumerate(result.get("variant_view") or []):
+        location = "variant_view[" + str(index) + "]"
+        if not item.get("evidence_ids"):
+            gaps.append(location + ": stima del comitato senza evidence_ids")
+        for field in ("metric", "period", "unit"):
+            check(item.get(field), location + "." + field, item.get("evidence_ids"), "valuation")
+        check(item.get("rationale"), location + ".rationale", item.get("evidence_ids"), "valuation",
+              extra=own(item.get("committee")))
+        consensus = item.get("consensus")
+        if consensus is not None:
+            text = format(Decimal(str(consensus)), "f")
+            if language != "en":
+                text = text.replace(".", ",")
+            percent = bool(re.search(r"%|percent|pct|per cento", str(item.get("unit") or ""), re.I))
+            if not _number_attested(text + ("%" if percent else ""), language,
+                                    numbers_for(item.get("evidence_ids"), "valuation")):
+                gaps.append(location + ".consensus: valore " + str(consensus)
+                            + " non attestato dalle evidence_ids della riga")
+    for index, item in enumerate(result.get("scenarios") or []):
+        location = "scenarios[" + str(index) + "]"
+        if not item.get("evidence_ids") or not str(item.get("method") or "").strip():
+            gaps.append(location + ": stima del comitato senza metodo o evidence_ids")
+        estimates = own(item.get("price_target"), item.get("probability_pct"))
+        for field in ("analysis", "method"):
+            check(item.get(field), location + "." + field, item.get("evidence_ids"), "scenarios", extra=estimates)
+        for position, value in enumerate(item.get("drivers") or []):
+            check(value, location + ".drivers[" + str(position) + "]", item.get("evidence_ids"), "scenarios")
+        for position, value in enumerate(item.get("falsifiers") or []):
+            check(value, location + ".falsifiers[" + str(position) + "]", item.get("evidence_ids"),
+                  "scenarios", mode="criteria")
+    for index, item in enumerate(result.get("risk_exits") or []):
+        location = "risk_exits[" + str(index) + "]"
+        check(item.get("risk"), location + ".risk", item.get("evidence_ids"), "portfolio_risk")
+        check(item.get("threshold"), location + ".threshold", item.get("evidence_ids"), "portfolio_risk",
+              mode="criteria")
+    for index, item in enumerate(result.get("review_triggers") or []):
+        location = "review_triggers[" + str(index) + "]"
+        check(item.get("what"), location + ".what", (), "decision", mode="plan")
+        check(item.get("condition"), location + ".condition", (), "decision", mode="criteria")
+    for index, item in enumerate(result.get("objections") or []):
+        for field in ("objection", "response"):
+            check(item.get(field), "objections[" + str(index) + "]." + field,
+                  item.get("evidence_ids"), "red_team")
+    for key, section in sections.items():
+        check(section.get("title"), "dossier." + str(key) + ".title", (), key)
+        for index, paragraph in enumerate(section.get("paragraphs") or []):
+            check(paragraph, "dossier." + str(key) + "[" + str(index) + "]", (), key)
+        for index, table in enumerate(section.get("tables") or []):
+            location = "dossier." + str(key) + ".table[" + str(index) + "]"
+            check(table.get("title"), location + ".title", (), key)
+            for column in table.get("columns") or []:
+                check(str(column), location + ".columns", (), key)
+            for row in table.get("rows") or []:
+                for cell in row:
+                    check(str(cell), location, (), key)
+    proposal = result.get("proposal") or {}
+    if proposal:
+        # Only the numbers pertinent to this proposal (N5), never other positions.
+        extra = [*_proposal_numbers(result, sizing), *band_numbers]
+        check(proposal.get("rationale"), "proposal.rationale", (), "decision", extra=extra)
+        check(proposal.get("timing"), "proposal.timing", (), "decision", extra=extra, mode="plan")
+        check((proposal.get("sizing") or {}).get("basis"), "proposal.sizing.basis", (), "decision", extra=extra)
+    return gaps[:20]
+
+
+def _numeric_claim_gaps(result, blackboard, ticker, cutoff, sizing, *, portfolio=None, mandate=None):
     """Syntactic source gate for DCN; economic/source truth still needs review."""
     bound, _ = _bound_evidence_details(result, blackboard, ticker, cutoff)
+    if _is_v4_memo(result, blackboard):
+        return _numeric_claim_gaps_v4(result, bound, sizing, getattr(blackboard, "language", "it"),
+                                      _proposal_band_numbers(result, sizing, portfolio, mandate))
     by_tool = {}
     for row in bound.values():
         by_tool.setdefault(row["tool"], []).append(row["output"])
@@ -4352,9 +5276,18 @@ def _measure_operational_risk(portfolio, *, risk_loader=None, stress_loader=None
     return risk_data, stress_data
 
 
+def _refresh_accepted_band(run, result, sizing, portfolio, mandate):
+    """/4: the band the Capo copied for its action, measured on the accepted inputs."""
+    proposal = result.get("proposal") or {}
+    if execution_policy(run) != EXECUTION_POLICY_V4 or not proposal:
+        return None
+    return _sizing_band(sizing, portfolio, run["ticker"], [], mandate=mandate,
+                        action=_proposal_band_action(proposal, sizing))
+
+
 def _final_price_refresh_verification(store, run_id, result, *, portfolio_loader=None,
         risk_loader=None, stress_loader=None, mandate, candidate_metrics_loader=None,
-        candidate_quote, default_risk_db_matches=False):
+        candidate_quote, default_risk_db_matches=False, accepted_band=None):
     """Reassess the unchanged proposal on current prices after the Capo's conclusion.
 
     Historical research and the accepted context stay immutable. Failed or
@@ -4387,7 +5320,10 @@ def _final_price_refresh_verification(store, run_id, result, *, portfolio_loader
         measurements["risk_recomputed"] = measured.get("risk_status") == "measured"
         measurements["stress_recomputed"] = measured.get("stress_status") == "measured"
         measurements["sizing_recomputed"] = not sizing.get("error") and bool(measured)
-        measurements["proposal_valid"] = _sizing_valid(result, sizing, portfolio)
+        # /2-/3 call unchanged; a /4 proposal needs the mandate and the accepted band.
+        v4_proposal = "sizing" in (result.get("proposal") or {})
+        measurements["proposal_valid"] = _sizing_valid(result, sizing, portfolio, **(
+            {"mandate": mandate, "accepted_band": accepted_band} if v4_proposal else {}))
         measurements["candidate_price_verified"] = bool(candidate_quote
             and candidate_quote.get("status") == "ready" and candidate_quote.get("ticker") == result["ticker"])
         fx = _fx_receipt(portfolio)
@@ -4408,6 +5344,14 @@ def _final_price_refresh_verification(store, run_id, result, *, portfolio_loader
         receipt["evidence"] = _diagnostic_json_value(receipt["evidence"])
         receipt["evidence_sha256"] = _plan_digest(receipt["evidence"])
     return receipt
+
+
+def _sizing_band_receipt(result, sizing, portfolio, mandate):
+    """/4 routing receipt: ok, or the reason the proposal is not operational."""
+    if not result.get("proposal"):
+        return {"status": "not_applicable", "reason": "nessuna proposta operativa"}
+    reason = _sizing_band_reason(result, sizing, portfolio, mandate)
+    return {"status": "ok", "reason": None} if reason is None else {"status": "rejected", "reason": reason}
 
 
 def _operational_checks(run, result, blackboard, sizing, portfolio, mandate,
@@ -4438,7 +5382,9 @@ def _operational_checks(run, result, blackboard, sizing, portfolio, mandate,
                                   and "CRITICA TRONCATA" not in red.get("report", "")),
         "capo_valid": True,
         "mandate_valid": mandate_valid,
-        "sizing_valid": _sizing_valid(result, sizing, portfolio),
+        "sizing_valid": _sizing_valid(result, sizing, portfolio, policy=execution_policy(run), mandate=mandate),
+        **({"sizing_band": _sizing_band_receipt(result, sizing, portfolio, mandate)}
+           if execution_policy(run) == EXECUTION_POLICY_V4 else {}),
         **({'research_reviewed': research_verified} if is_research_mode(blackboard) else
            {"valuation_checked": bool(verified) and _valuation_refs_match(result, verified)}),
         "history_context_sent": bool(decision_context and decision_context.get("ticker") == run["ticker"]),
@@ -4950,7 +5896,8 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                         from bellomberg.core.trade_idea_contract import validate_result
                         payload = {key: value for key, value in completed_capo["result"].items()
                                    if key not in ("run_id", "run_type", "pm_view")}
-                        result = validate_result(payload, run_id=run_id, ticker=run["ticker"], pm_view=run["view_text"])
+                        result = validate_result(payload, run_id=run_id, ticker=run["ticker"], pm_view=run["view_text"],
+                                                 execution_policy=execution_policy(run))
                     else:
                         result = (capo_runner or run_trade_idea_capo)(
                             blackboard, portfolio=portfolio, mandate=mandate,
@@ -4970,7 +5917,9 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                     raise ValueError("Capo non dichiara i componenti obbligatori mancanti")
                 failures.extend(model_gaps)
                 numeric_gaps = _numeric_claim_gaps(result, blackboard, run["ticker"],
-                    blackboard.data["_data_cutoff"], sizing)
+                    blackboard.data["_data_cutoff"], sizing,
+                    **({"portfolio": portfolio, "mandate": mandate}
+                       if execution_policy(run) == EXECUTION_POLICY_V4 else {}))
                 blackboard.data["_numeric_claim_gaps"] = numeric_gaps
                 if numeric_gaps and len(result["data_gaps"]) < 80:
                     result["data_gaps"].append("Fonti numeriche non attestate per operativita': "
@@ -5015,7 +5964,8 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                         stress_loader=stress_loader, mandate=mandate,
                         candidate_metrics_loader=candidate_metrics_loader,
                         candidate_quote=blackboard.data["_candidate_quote_final"],
-                        default_risk_db_matches=default_risk_db_matches)
+                        default_risk_db_matches=default_risk_db_matches,
+                        accepted_band=_refresh_accepted_band(run, result, sizing, portfolio, mandate))
                     checks["price_refresh_verification"] = refreshed
                     blackboard.data["_price_refresh_verification"] = deepcopy(refreshed)
                     checks["sizing_valid"] = (checks["sizing_valid"] is True

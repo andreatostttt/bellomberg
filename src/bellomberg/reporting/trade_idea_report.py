@@ -26,7 +26,7 @@ from reportlab.platypus import (BaseDocTemplate, Frame, PageTemplate, Paragraph,
     Spacer, Table, TableStyle, PageBreak, NextPageTemplate, Flowable, KeepTogether)
 
 from bellomberg.core.trade_idea_contract import DOSSIER_KEYS
-from bellomberg.core.trade_idea_policy import EXECUTION_POLICY_V2, RESEARCH_POLICIES
+from bellomberg.core.trade_idea_policy import EXECUTION_POLICY_V2, EXECUTION_POLICY_V4, RESEARCH_POLICIES
 from bellomberg.reporting.pdf_institutional import (_register_fonts, _draw_lockup,
     OBSIDIAN, AMBER, AMBER_DEEP)
 
@@ -1221,8 +1221,10 @@ def _localize_prose(value, known):
     return _PROSE_NUMBER.sub(swap, value)
 
 
-def _clean(value, sources, language, *, cell=False, plain=False):
-    """The single display transform. plain=True gives the text a PDF reader extracts."""
+def _clean(value, sources, language, *, cell=False, plain=False, localize_cells=True):
+    """The single display transform. plain=True gives the text a PDF reader extracts.
+    localize_cells=False (policy /4): cells already arrive in the reader's convention
+    and are printed as written, neither swapped as cells nor as prose."""
     value = str(value or "")
 
     def cite(match):
@@ -1237,7 +1239,8 @@ def _clean(value, sources, language, *, cell=False, plain=False):
     for pattern, replacement in _JARGON.get(language, ()):
         value = pattern.sub(replacement, value)
     if cell:
-        value = _localize_cell(value, language)
+        if localize_cells:
+            value = _localize_cell(value, language)
     elif language == "it":
         value = _localize_prose(value, sources.known)
     value = re.sub(r"\(\s*[,;]?\s*(?:[,;]\s*)*\)", "", value)
@@ -1245,9 +1248,9 @@ def _clean(value, sources, language, *, cell=False, plain=False):
     return re.sub(r"[ \t]{2,}", " ", value).strip()
 
 
-def _shown(value, sources, language, *, cell=False):
+def _shown(value, sources, language, *, cell=False, localize_cells=True):
     """Reportlab markup of the display transform."""
-    return _text(_clean(value, sources, language, cell=cell))
+    return _text(_clean(value, sources, language, cell=cell, localize_cells=localize_cells))
 
 
 def _fmt(value, decimals=0, language="it", *, suffix="", scale=1.0):
@@ -1258,6 +1261,10 @@ def _fmt(value, decimals=0, language="it", *, suffix="", scale=1.0):
     # Commercial rounding of the printed decimal (1.565 -> 1,57), not of its binary float.
     exact = Decimal(repr(value)) / Decimal(repr(scale))
     rounded = exact.quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_HALF_UP)
+    if rounded == 0 and exact != 0:
+        # A non-zero value never prints as 0: three significant digits instead (0.0012 -> 0,00120).
+        decimals = max(decimals, -exact.adjusted() + 2)
+        rounded = exact.quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_HALF_UP)
     rendered = f"{rounded:,.{decimals}f}"
     if language == "it":
         rendered = rendered.translate(str.maketrans(",.", ".,"))
@@ -1441,13 +1448,153 @@ def _m_lines(run, result, facts, language):
         "n.d. (nessuna proposta operativa)" if it else "n.d. (no actionable proposal)")
     horizon = str(proposal["timing"]) if proposal.get("timing") else (
         "n.d. (nessuna posizione)" if it else "n.d. (no position)")
+    # Policy /4: conviction, horizon and the engine band are their own fields.
+    if result.get("conviction"):
+        conviction = _M_CONVICTION.get(result["conviction"], (result["conviction"],) * 2)[0 if it else 1]
+    if isinstance(result.get("horizon"), dict):
+        months = result["horizon"].get("months")
+        horizon = (f"{result['horizon'].get('label') or 'n.d.'} ({_fmt(months, 0, language)} "
+                   + (("mese" if months == 1 else "mesi") if it else ("month" if months == 1 else "months")) + ")")
+    sizing = proposal.get("sizing") if isinstance(proposal.get("sizing"), dict) else None
+    extra = []
+    if sizing:
+        band = (f"{_m_sig(sizing.get('band_min_eur'), language, 0)}–{_m_sig(sizing.get('band_max_eur'), language, 0)} EUR")
+        if sizing.get("below_starter"):
+            amount = (f"{_m_sig(sizing.get('amount_eur'), language, 0)} EUR: "
+                      + ("sotto lo starter del motore: fascia vuota" if it else "below the engine starter: empty band")
+                      + f" ({'minimo' if it else 'minimum'} {_m_sig(sizing.get('band_min_eur'), language, 0)}, "
+                      + f"{'massimo' if it else 'maximum'} {_m_sig(sizing.get('band_max_eur'), language, 0)} EUR). {cash}")
+        else:
+            amount = (f"{_m_sig(sizing.get('amount_eur'), language, 0)} EUR "
+                      f"({'fascia del motore' if it else 'engine band'} {band}). {cash}")
+        extra.append(("Base del dimensionamento" if it else "Sizing basis", str(sizing.get("basis") or "n.d.")))
     destination = result.get("destination") or run.get("destination") or {}
     route = {"dcn": ("Proposta in DCN, da approvare dal PM", "DCN proposal pending PM approval"),
              "research": ("In ricerca: nessuna proposta in DCN", "In research: no DCN proposal")}.get(
         destination.get("kind"), ("Nessuna destinazione", "No destination"))[0 if it else 1]
-    return action, [("Azione" if it else "Action", action), ("Importo" if it else "Amount", amount),
+    return action, [("Azione" if it else "Action", action), ("Importo" if it else "Amount", amount), *extra,
                     ("Convinzione" if it else "Conviction", conviction), ("Orizzonte" if it else "Horizon", horizon),
                     ("Destinazione" if it else "Routing", route)]
+
+
+# Policy /4 wire values printed in the reader's language.
+_M_CONVICTION = {"ALTA": ("Alta", "High"), "MEDIA": ("Media", "Medium"), "BASSA": ("Bassa", "Low")}
+_M_SCENARIO = {"bear": ("Pessimistico", "Bear"), "base": ("Base", "Base"), "bull": ("Ottimistico", "Bull")}
+_M_EXIT_ACTION = {"exit": ("Uscire", "Exit"), "reduce": ("Ridurre", "Reduce"), "review": ("Rivedere", "Review")}
+_M_TRIGGER_KIND = {"date": ("Data", "Date"), "price": ("Prezzo", "Price"), "condition": ("Condizione", "Condition")}
+
+
+def _is_memo_v4(result):
+    """Policy /4 branches open only when its fields exist; /2-/3 results never carry them."""
+    return isinstance(result.get("pillars"), list) and bool(result.get("conviction"))
+
+
+def _m_sig(value, language, decimals, *, suffix="", digits=3):
+    """/4 structured number: `decimals` places, but a non-zero value keeps at least `digits`
+    significant digits (0.0012 -> 0,0012; 1.4 EUR -> 1,4), so it is never printed as 0."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        return "n.d."
+    if value != 0 and abs(value) < 10 ** (digits - 1 - decimals):
+        need = digits - 1 - math.floor(math.log10(abs(value)))
+        if need > decimals:
+            whole, _, frac = _fmt(value, need, language).partition("," if language == "it" else ".")
+            frac = frac.rstrip("0").ljust(decimals, "0")
+            return whole + (("," if language == "it" else ".") + frac if frac else "") + suffix
+    return _fmt(value, decimals, language, suffix=suffix)
+
+
+def _m_number(value, language, *, suffix=""):
+    """A committee figure with the decimals it was written with (at most two, more below 1)."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        return "n.d."
+    decimals = 0 if float(value).is_integer() else 1 if round(value, 1) == value else 2
+    return _m_sig(value, language, decimals, suffix=suffix)
+
+
+def _m_pillar_flowables(pillars, number, first_sub, show, st, language):
+    """Section 2 pillars: '2.k Title', then Thesis / Evidence / Risk as labelled prose."""
+    it = language == "it"
+    bold = st["serif_bold"]
+    out = []
+    for offset, pillar in enumerate(pillars or []):
+        out.append(Paragraph(f"{number}.{first_sub + offset} " + show(pillar.get("title")), st["h2"]))
+        for key, labels in (("thesis", ("Tesi.", "Thesis.")), ("evidence", ("Prova.", "Evidence.")),
+                            ("risk", ("Rischio.", "Risk."))):
+            out.append(Paragraph(f'<font name="{bold}">{escape(labels[0 if it else 1])}</font> '
+                                 + show(pillar.get(key)), st["body"]))
+    return out
+
+
+def _m_variant_table(rows, show, st, width, language):
+    """'Our estimates against consensus': the committee value is an estimate, a missing
+    consensus prints n.d. and is never filled."""
+    it = language == "it"
+    head = (("Grandezza", "Periodo", "Consenso", "Comitato (stima)", "Motivazione") if it else
+            ("Metric", "Period", "Consensus", "Committee (estimate)", "Rationale"))
+    data = [[Paragraph(_text(v), st["headr"] if i in (2, 3) else st["head"]) for i, v in enumerate(head)]]
+    for row in rows or []:
+        data.append([Paragraph(show(row.get("metric")) + " (" + show(row.get("unit")) + ")", st["cell"]),
+                     Paragraph(show(row.get("period")), st["cell"]),
+                     Paragraph(_text(_m_number(row.get("consensus"), language)), st["cellr"]),
+                     Paragraph(_text(_m_number(row.get("committee"), language)), st["cellr"]),
+                     Paragraph(show(row.get("rationale")), st["cell"])])
+    table = Table(data, colWidths=[width * .21, width * .10, width * .14, width * .18, width * .37],
+                  repeatRows=1, splitByRow=1, splitInRow=1, hAlign="LEFT")
+    table.setStyle(TableStyle(_M_TABLE))
+    return table
+
+
+def _m_scenario_change(target, price, scenario_currency, quote_currency):
+    """Percent change of a committee target against the run price, computed here; a missing
+    price or a target in another currency gives None (printed n.d.), never a proxy."""
+    finite = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    if not (finite(price) and price > 0 and finite(target)):
+        return None
+    if quote_currency and scenario_currency and quote_currency != scenario_currency:
+        return None
+    return (target / price - 1) * 100
+
+
+def _m_scenario_table(scenarios, facts, show, st, width, language):
+    """Section 3 scenario table (bear/base/bull); probabilities and targets are committee estimates."""
+    it = language == "it"
+    quote = (facts or {}).get("quote") or {}
+    price, quote_currency = quote.get("price"), (facts or {}).get("currency")
+    head = (("Scenario", "Probabilità %", "Prezzo obiettivo", "Variazione %", "Metodo") if it else
+            ("Scenario", "Probability %", "Price target", "Change %", "Method"))
+    data = [[Paragraph(_text(v), st["headr"] if 0 < i < 4 else st["head"]) for i, v in enumerate(head)]]
+    order = {name: index for index, name in enumerate(_M_SCENARIO)}
+    other_currency = False
+    for scenario in sorted(scenarios, key=lambda s: order.get(s.get("name"), 99)):
+        target = scenario.get("price_target")
+        change = _m_scenario_change(target, price, scenario.get("currency"), quote_currency)
+        other_currency |= bool(quote_currency and scenario.get("currency") and quote_currency != scenario.get("currency"))
+        change_text = _m_sig(change, language, 1, suffix="%", digits=2)
+        if change is not None and round(change, 1) > 0:
+            change_text = "+" + change_text
+        data.append([Paragraph(_text(_M_SCENARIO.get(scenario.get("name"), (str(scenario.get("name")),) * 2)
+                                     [0 if it else 1]), st["cellb"]),
+                     Paragraph(_text(_m_number(scenario.get("probability_pct"), language, suffix="%")), st["cellr"]),
+                     Paragraph(_text(_m_sig(target, language, 2) + " " + str(scenario.get("currency") or "")), st["cellr"]),
+                     Paragraph(_text(change_text), st["cellr"]),
+                     Paragraph(show(scenario.get("method")), st["cell"])])
+    table = Table(data, colWidths=[width * .14, width * .14, width * .17, width * .16, width * .39],
+                  repeatRows=1, splitByRow=1, splitInRow=1, hAlign="LEFT")
+    table.setStyle(TableStyle(_M_TABLE))
+    if isinstance(price, (int, float)) and not isinstance(price, bool) and price > 0:
+        date = quote.get("date")
+        basis = ((("Variazione calcolata sul prezzo di " if it else "Change computed on the price of ")
+                  + _m_sig(price, language, 2) + (" " + quote_currency if quote_currency else ""))
+                 + (((" del " if it else " on ") + (_it_date(date) if it else str(date)[:10])) if date else ""))
+        if other_currency:
+            basis += ("; n.d. dove il prezzo obiettivo è in un'altra valuta" if it else
+                      "; n.d. where the target is in another currency")
+    else:
+        basis = ("Variazione n.d.: prezzo di mercato non disponibile nella run" if it else
+                 "Change n.d.: market price not available in the run")
+    note = (("Probabilità e prezzi obiettivo sono stime del comitato, non dati osservati. " if it else
+             "Probabilities and price targets are committee estimates, not observed data. ") + basis + ".")
+    return [table, Paragraph(_text(note), st["note"])]
 
 
 def _m_market_rows(facts, language):
@@ -1558,7 +1705,7 @@ def _it_date(value):
     return f"{text[8:10]}/{text[5:7]}/{text[:4]}" if re.match(r"\d{4}-\d{2}-\d{2}", text) else text[:10]
 
 
-def _render_company_memo(path, run, result, language, partial_reasons):
+def _render_company_memo(path, run, result, language, partial_reasons, *, localize_cells=True):
     """Impianto M (scelta PM 04/10/2026): memo d'investimento a sezioni numerate, lungo ed esaustivo.
     Figures and tables live inside the section that discusses them; sources close each section."""
     import tempfile
@@ -1578,7 +1725,10 @@ def _render_company_memo(path, run, result, language, partial_reasons):
     annex_data = run.get("desk_annex")
     facts = run.get("facts") or None
     sources = _Sources(result, annex_data, language, facts)
-    show_sans = lambda value, cell=False: _shown(value, sources, language, cell=cell)
+    # localize_cells=False (policy /4) is passed explicitly; the /2-/3 call keeps its exact form.
+    show_sans = ((lambda value, cell=False: _shown(value, sources, language, cell=cell)) if localize_cells else
+                 (lambda value, cell=False: _shown(value, sources, language, cell=cell, localize_cells=False)))
+    v4 = _is_memo_v4(result)
     # Inline bold in Georgia prose is Georgia bold; table cells (cell=True) keep the sans bold.
     sans_bold_tag = f'<font name="{_bold_face()}">'
     show = lambda value, cell=False: (show_sans(value, cell) if cell else
@@ -1633,13 +1783,16 @@ def _render_company_memo(path, run, result, language, partial_reasons):
         for index, value in enumerate(values or []):
             story.append(Paragraph(show(value), st[style], bulletText=f"({chr(97 + index) if index < 26 else index + 1})"))
 
-    def sources_line(texts):
+    def sources_line(texts, evidence_ids=()):
         keys = []
         for text in texts:
             for kind, body in _CITE.findall(str(text or "")):
                 for key in _cite_items(kind, body)[0]:
                     if key not in keys:
                         keys.append(key)
+        for evidence_id in evidence_ids:  # policy /4: traceability lives in evidence_ids, not in the prose
+            if "evidence:" + str(evidence_id) not in keys:
+                keys.append("evidence:" + str(evidence_id))
         if keys:
             story.append(Paragraph(_text(("Fonti della sezione: " if it else "Section sources: ")
                                          + "; ".join(sources.label(k) for k in keys) + "."), st["note"]))
@@ -1730,7 +1883,31 @@ def _render_company_memo(path, run, result, language, partial_reasons):
         table = Table(body, colWidths=[width * .26, width * .74])
         table.setStyle(TableStyle(_M_TABLE[:1] + _M_TABLE[2:]))
         story.append(table)
-        sources_line(reviews)
+        triggers = (result.get("review_triggers") or []) if v4 else []
+        if triggers:
+            caption("table", label("Trigger di revisione", "Review triggers"))
+            currency = next((str(s.get("currency")) for s in result.get("scenarios") or [] if s.get("currency")),
+                            (facts or {}).get("currency") or "")
+            rows_t = [[Paragraph(_text(v), st["head"]) for v in (
+                ("Tipo", "Data / livello / condizione", "Cosa avviene") if it else
+                ("Type", "Date / level / condition", "What happens"))]]
+            for trigger in triggers:
+                kind = trigger.get("kind")
+                if kind == "date":
+                    where = Paragraph(_text(_it_date(trigger.get("date")) if it else str(trigger.get("date") or "n.d.")),
+                                      st["cell"])
+                elif kind == "price":
+                    where = Paragraph(_text(_m_sig(trigger.get("price_level"), language, 2)
+                                            + (" " + currency if currency else "")), st["cell"])
+                else:
+                    where = Paragraph(show_sans(trigger.get("condition")), st["cell"])
+                rows_t.append([Paragraph(_text(_M_TRIGGER_KIND.get(kind, (str(kind),) * 2)[0 if it else 1]), st["cellb"]),
+                               where, Paragraph(show_sans(trigger.get("what")), st["cell"])])
+            table = Table(rows_t, colWidths=[width * .16, width * .34, width * .50], repeatRows=1,
+                          splitByRow=1, splitInRow=1, hAlign="LEFT")
+            table.setStyle(TableStyle(_M_TABLE))
+            story.append(table)
+        sources_line([*reviews, *(t.get("condition") for t in triggers), *(t.get("what") for t in triggers)])
 
         # 2. Tesi in sintesi: the Capo's summary in full, then the evidence for and against.
         number = section("thesis", label("Tesi in sintesi", "Thesis in brief"))
@@ -1738,17 +1915,42 @@ def _render_company_memo(path, run, result, language, partial_reasons):
         for block in [b for b in re.split(r"\n\s*\n", str(result.get("summary") or "")) if b.strip()] or [""]:
             sub += 1
             numbered(number, sub, block)
+        pillars = (result.get("pillars") or []) if v4 else []
+        story.extend(_m_pillar_flowables(pillars, number, sub + 1, show, st, language))
+        sub += len(pillars)
         for title, values in ((label("Elementi a favore", "Supporting evidence"), result.get("pros")),
                               (label("Elementi contrari", "Counterarguments"), result.get("cons"))):
             if values:
                 sub += 1
                 story.append(Paragraph(_text(f"{number}.{sub} {title}"), st["h2"]))
                 items(values)
-        sources_line([result.get("summary"), *(result.get("pros") or []), *(result.get("cons") or [])])
+        variant = (result.get("variant_view") or []) if v4 else []
+        if variant:
+            caption("table", label("Le nostre stime contro il consensus", "Our estimates against consensus"))
+            story.append(_m_variant_table(variant, show_sans, st, width, language))
+            story.append(Paragraph(_text(label(
+                "Comitato: stime del comitato, non dati osservati. Consenso n.d.: nessun consenso con fonte.",
+                "Committee: committee estimates, not observed data. Consensus n.d.: no sourced consensus.")), st["note"]))
+        sources_line([result.get("summary"), *(result.get("pros") or []), *(result.get("cons") or [])],
+                     [*(result.get("summary_evidence_ids") or []),
+                      *(i for p in pillars for i in p.get("evidence_ids") or []),
+                      *(i for r in variant for i in r.get("evidence_ids") or [])] if v4 else ())
 
         # 3. Rischi, criteri di uscita e catalizzatori.
         number = section("risks", label("Rischi, criteri di uscita e catalizzatori", "Risks, exit criteria and catalysts"))
         sub = 0
+        exits = (result.get("risk_exits") or []) if v4 else []
+        if exits:
+            caption("table", label("Rischi e criteri di uscita", "Risks and exit criteria"))
+            rows_x = [[Paragraph(_text(v), st["head"]) for v in (
+                ("Rischio", "Soglia", "Azione") if it else ("Risk", "Threshold", "Action"))]]
+            rows_x += [[Paragraph(show_sans(x.get("risk")), st["cell"]), Paragraph(show_sans(x.get("threshold")), st["cell"]),
+                        Paragraph(_text(_M_EXIT_ACTION.get(x.get("action"), (str(x.get("action")),) * 2)[0 if it else 1]),
+                                  st["cellb"])] for x in exits]
+            table = Table(rows_x, colWidths=[width * .46, width * .38, width * .16], repeatRows=1,
+                          splitByRow=1, splitInRow=1, hAlign="LEFT")
+            table.setStyle(TableStyle(_M_TABLE))
+            story.append(table)
         for title, values in ((label("Rischi principali", "Main risks"), result.get("risks")),
                               (label("Criteri di invalidazione", "Invalidation criteria"), result.get("invalidation")),
                               (label("Catalizzatori datati", "Dated catalysts"), result.get("catalysts"))):
@@ -1756,7 +1958,13 @@ def _render_company_memo(path, run, result, language, partial_reasons):
                 sub += 1
                 story.append(Paragraph(_text(f"{number}.{sub} {title}"), st["h2"]))
                 items(values)
-        sources_line([*(result.get("risks") or []), *(result.get("invalidation") or []), *(result.get("catalysts") or [])])
+        scenarios_v4 = [s for s in result.get("scenarios") or [] if "probability_pct" in s] if v4 else []
+        if scenarios_v4:
+            caption("table", label("Scenari", "Scenarios"))
+            story.extend(_m_scenario_table(scenarios_v4, facts, show_sans, st, width, language))
+        sources_line([*(result.get("risks") or []), *(result.get("invalidation") or []), *(result.get("catalysts") or [])],
+                     [*(i for x in exits for i in x.get("evidence_ids") or []),
+                      *(i for s in scenarios_v4 for i in s.get("evidence_ids") or [])] if v4 else ())
 
         # 4..N. The Capo's dossier, each section with its own exhibits.
         for dossier in result.get("dossier", []):
@@ -1776,10 +1984,21 @@ def _render_company_memo(path, run, result, language, partial_reasons):
             if key == "scenarios":
                 for scenario in result.get("scenarios", []):
                     sub += 1
-                    story.append(Paragraph(show(f"{number}.{sub} {scenario['name']}"), st["h2"]))
+                    scenario_v4 = v4 and "probability_pct" in scenario
+                    name = (_M_SCENARIO.get(scenario["name"], (scenario["name"],) * 2)[0 if it else 1]
+                            if scenario_v4 else scenario["name"])
+                    story.append(Paragraph(_text(f"{number}.{sub} ") + show(name), st["h2"]))  # the number is not a decimal
                     story.extend(_rich_flowables(scenario["analysis"], {**styles, "body": st["body"],
                                  "cell": st["annexcell"], "headcell": st["headcell"]}, width, show=show))
                     texts.append(scenario["analysis"])
+                    if scenario_v4:
+                        for title, values in ((label("Fattori", "Drivers"), scenario.get("drivers")),
+                                              (label("Cosa la falsifica", "What would falsify it"),
+                                               scenario.get("falsifiers"))):
+                            if values:
+                                story.append(Paragraph(_text(title), st["caption"]))
+                                items(values)
+                        texts.extend([*(scenario.get("drivers") or []), *(scenario.get("falsifiers") or [])])
             elif key == "red_team" and result.get("objections"):
                 caption("table", label("Registro delle obiezioni del Red Team", "Red Team objection register"))
                 rows = [[Paragraph(_text(v), st["head"]) for v in (
@@ -1823,7 +2042,8 @@ def _render_company_memo(path, run, result, language, partial_reasons):
                         story.append(Paragraph(show(proposal["sizing_source"]), st["small"]))
                     texts.extend([proposal.get("rationale"), proposal.get("sizing_source")])
             for table_data in dossier.get("tables", []):
-                caption("table", _clean(table_data["title"], sources, language, cell=True, plain=True))
+                caption("table", _clean(table_data["title"], sources, language, cell=True, plain=True,
+                                        localize_cells=localize_cells))
                 rows = [[Paragraph(show(value, cell=True), st["head"]) for value in table_data["columns"]]]
                 rows.extend([Paragraph(show(cell, cell=True), st["cell"]) for cell in row] for row in table_data["rows"])
                 count = len(table_data["columns"])
@@ -1836,7 +2056,10 @@ def _render_company_memo(path, run, result, language, partial_reasons):
             if facts:
                 for exhibit_key in _M_EXHIBITS.get(key, []):
                     exhibit(exhibit_key, chart_dir)
-            sources_line(texts)
+            sources_line(texts, [*(dossier.get("evidence_ids") or []),
+                                 *((result.get("pm_view_evidence_ids") or []) if key == "pm_view" else []),
+                                 *((i for s in result.get("scenarios") or [] for i in s.get("evidence_ids") or [])
+                                   if key == "scenarios" else [])] if v4 else ())
 
         # Exhibits whose section the Capo did not write, then the declared data gaps.
         leftovers = [k for keys in _M_EXHIBITS.values() for k in keys
@@ -2061,6 +2284,9 @@ def _content_fragments(result):
                          ("evidence", ("id", "source", "as_of", "summary", "url")), ("history_review", ("response",))):
         for index, row in enumerate(result.get(name, [])):
             for field in fields:
+                # A /4 scenario name is a wire key (bear/base/bull) printed as a translated label.
+                if field == "name" and name == "scenarios" and "probability_pct" in row:
+                    continue
                 if row.get(field):
                     yield f"{name}.{index}.{field}", row[field]
     if result.get("destination", {}).get("reason"):
@@ -2068,6 +2294,93 @@ def _content_fragments(result):
     for field in ("timing", "rationale", "sizing_source"):
         if (result.get("proposal") or {}).get(field):
             yield "proposal."+field, result["proposal"][field]
+    # Policy /4 memo fields: every printed text is verified like the prose (read with .get,
+    # absent from /2-/3 results). Computed numbers (variation, formatted estimates) are not
+    # original text and are covered by the renderer tests.
+    if not _is_memo_v4(result):
+        return
+    if (result.get("horizon") or {}).get("label"):
+        yield "horizon.label", result["horizon"]["label"]
+    for index, pillar in enumerate(result.get("pillars") or []):
+        for field in ("title", "thesis", "evidence", "risk"):
+            if pillar.get(field):
+                yield f"pillars.{index}.{field}", pillar[field]
+    for index, row in enumerate(result.get("variant_view") or []):
+        for field in ("metric", "period", "unit", "rationale"):
+            if row.get(field):
+                yield f"variant_view.{index}.{field}", row[field]
+    for index, scenario in enumerate(result.get("scenarios") or []):
+        for field in ("drivers", "falsifiers"):
+            for item_index, value in enumerate(scenario.get(field) or []):
+                yield f"scenarios.{index}.{field}.{item_index}", value
+        if scenario.get("method"):
+            yield f"scenarios.{index}.method", scenario["method"]
+    for index, row in enumerate(result.get("risk_exits") or []):
+        for field in ("risk", "threshold"):
+            if row.get(field):
+                yield f"risk_exits.{index}.{field}", row[field]
+    for index, trigger in enumerate(result.get("review_triggers") or []):
+        for field in ("condition", "what"):
+            if trigger.get(field):
+                yield f"review_triggers.{index}.{field}", trigger[field]
+    sizing = (result.get("proposal") or {}).get("sizing") or {}
+    if sizing.get("basis"):
+        yield "proposal.sizing.basis", sizing["basis"]
+
+
+def _m_structured_numbers(result):
+    """(name, value) of every /4 structured number printed in sections 1-3."""
+    for index, scenario in enumerate(result.get("scenarios") or []):
+        for field in ("price_target", "probability_pct"):
+            if field in scenario:
+                yield f"scenarios.{index}.{field}", scenario[field]
+    for index, row in enumerate(result.get("variant_view") or []):
+        for field in ("committee", "consensus"):
+            if row.get(field) is not None:
+                yield f"variant_view.{index}.{field}", row[field]
+    for index, trigger in enumerate(result.get("review_triggers") or []):
+        if trigger.get("price_level") is not None:
+            yield f"review_triggers.{index}.price_level", trigger["price_level"]
+    sizing = (result.get("proposal") or {}).get("sizing") or {}
+    for field in ("amount_eur", "band_min_eur", "band_max_eur"):
+        if sizing.get(field) is not None:
+            yield f"proposal.sizing.{field}", sizing[field]
+
+
+def _m_numbers_not_reread(result, pages, section_pages, language):
+    """Names of /4 structured numbers that the PDF text does not carry at their shown rounding.
+
+    Independent of the formatter: every number token of sections 1-3 is parsed back, and
+    each value needs its own token within half a unit of the printed last digit AND within
+    0.5% of the value (a non-zero value printed as 0, or with one significant digit, fails).
+    """
+    start = section_pages.get("recommendation", 1)
+    end = min((section_pages[k] for k in DOSSIER_KEYS if k in section_pages), default=len(pages))
+    text = "\n".join(pages[start - 1:end])
+    if language == "it":
+        pattern, group, point = r"\d{1,3}(?:\.\d{3})+(?:,\d+)?|\d+(?:,\d+)?", ".", ","
+    else:
+        pattern, group, point = r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?", ",", "."
+    tokens = []
+    for raw in re.findall(pattern, text):
+        clean = raw.replace(group, "")
+        decimals = len(clean.partition(point)[2])
+        tokens.append((float(clean.replace(point, ".")), decimals))
+    used, missing = set(), []
+    for name, value in sorted(_m_structured_numbers(result), key=lambda item: abs(item[1])):
+        found = None
+        for index, (parsed, decimals) in enumerate(tokens):
+            if index in used:
+                continue
+            error = abs(parsed - abs(value))
+            if error <= .5 * 10 ** -decimals + 1e-9 and error <= .005 * abs(value) * (1 + 1e-9) + 1e-12:
+                found = index
+                break
+        if found is None:
+            missing.append(name)
+        else:
+            used.add(found)
+    return missing
 
 
 def _normalized_text(value, rendered=False):
@@ -2095,7 +2408,9 @@ def _inspect_company_memo(path, result, section_pages, language, execution_polic
     sources = _Sources(result, annex, language, facts)
     # The PDF shows the single display transform (numbered sources, no hashes, localized
     # cells): the original is compared through the SAME transform, never loosened.
-    shown = lambda name, value: _clean(value, sources, language, cell=".table." in name, plain=True)
+    localize_cells = execution_policy != EXECUTION_POLICY_V4
+    shown = lambda name, value: _clean(value, sources, language, cell=".table." in name, plain=True,
+                                       localize_cells=localize_cells)
     furniture = {"BELLOMBERG", "Ricerca Bellomberg · Documento interno", "Bellomberg Research · Internal document",
                  "ANTEPRIMA · DATI SINTETICI", "PREVIEW · SYNTHETIC DATA", *_M_FOOTER}
     table_heads = {shown(".table.", cell).strip() for section in result.get("dossier", [])
@@ -2111,6 +2426,8 @@ def _inspect_company_memo(path, result, section_pages, language, execution_polic
     lost = sorted({name for name, value in [*_content_fragments(result), *annex_fragments]
                    for printed in [_normalized_text(shown(name, value))]
                    if printed not in normalized and printed not in raw})
+    if _is_memo_v4(result):  # policy /4: structured numbers are read back at their printed rounding
+        lost = sorted({*lost, *_m_numbers_not_reread(result, pages, section_pages, language)})
     sections = result.get("dossier", [])
     keys = [section["key"] for section in sections]
     missing = sorted(set(DOSSIER_KEYS) - set(keys))
@@ -2148,7 +2465,11 @@ def _inspect_company_memo(path, result, section_pages, language, execution_polic
             continue
         if name not in prose and not re.fullmatch(r"(?:pros|cons|risks|catalysts|invalidation|data_gaps|"
                 r"review_conditions|decisive_questions)\.\d+|scenarios\.\d+\.analysis|"
-                r"history_review\.\d+\.response|proposal\.timing", name):
+                r"history_review\.\d+\.response|proposal\.timing|"
+                # Policy /4 printed fields follow the same rule.
+                r"horizon\.label|pillars\.\d+\.(?:title|thesis|evidence|risk)|variant_view\.\d+\.rationale|"
+                r"scenarios\.\d+\.(?:method|drivers\.\d+|falsifiers\.\d+)|risk_exits\.\d+\.(?:risk|threshold)|"
+                r"review_triggers\.\d+\.(?:condition|what)|proposal\.sizing\.basis", name):
             continue
         if unfinished_text(value) and name not in seen_fields:
             unfinished.append(name)
@@ -2250,7 +2571,10 @@ def build_trade_idea_report(run, result, *, output_path, valuations=(), language
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     policy = run.get("execution_policy")
-    render = (lambda reasons: _render_company_memo(path, run, result, language, reasons)) if policy in RESEARCH_POLICIES else (
+    # Policy /4 cells arrive in the reader's number convention: printed as written.
+    localize_cells = policy != EXECUTION_POLICY_V4
+    render = (lambda reasons: _render_company_memo(path, run, result, language, reasons,
+                                                   localize_cells=localize_cells)) if policy in RESEARCH_POLICIES else (
         lambda reasons: _render(path, run, result, valuations, language, reasons))
     sections = render([])
     quality = inspect_research_pdf(path, result, sections, language=language, execution_policy=policy,

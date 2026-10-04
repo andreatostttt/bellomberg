@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Literal
+from datetime import date as _date
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -378,13 +379,35 @@ def parse_capo_json(content):
     return json.loads(body)
 
 
-def validate_result(data, *, run_id: str, ticker: str, pm_view: str = "") -> dict:
+def trade_idea_result_model(execution_policy=None):
+    """The result contract of one accepted policy: /4 has its own memo model.
+
+    None (historical runs) and the earlier research policies keep TradeIdeaResult
+    unchanged; an unknown policy is an error, never a silent downgrade.
+    """
+    from bellomberg.core.trade_idea_policy import EXECUTION_POLICY_V4, RESEARCH_POLICIES
+    if execution_policy == EXECUTION_POLICY_V4:
+        return TradeIdeaResultV4
+    if execution_policy is None or execution_policy in RESEARCH_POLICIES:
+        return TradeIdeaResult
+    raise ValueError("Unknown Trade Idea execution policy: " + str(execution_policy))
+
+
+def trade_idea_result_schema(execution_policy=None):
+    """The wire schema sent as text to the Capo for the same policy."""
+    model = trade_idea_result_model(execution_policy)
+    return TRADE_IDEA_RESULT_SCHEMA_V4 if model is TradeIdeaResultV4 else TRADE_IDEA_RESULT_SCHEMA
+
+
+def validate_result(data, *, run_id: str, ticker: str, pm_view: str = "",
+                    execution_policy: str | None = None) -> dict:
     """Reject cross-ticker output and attach authoritative run identity/view."""
+    model = trade_idea_result_model(execution_policy)
     if isinstance(data, str):
         if len(data) > 900000:
             raise ValueError("Trade Idea result exceeds input limit")
         data = json.loads(data)
-    result = TradeIdeaResult.model_validate(data)
+    result = model.model_validate(data)
     if result.ticker != ticker:
         raise ValueError("Result ticker differs from the accepted run")
     return {**result.model_dump(), "run_id": run_id, "run_type": "trade_idea", "pm_view": pm_view}
@@ -465,3 +488,192 @@ CAPO_RESEARCH_INSTRUCTIONS_V3 = CAPO_RESEARCH_INSTRUCTIONS.replace(
     "Write a dedicated institutional research dossier, not a concatenation of desk reports. Target at least ten substantive analytical A4 pages, naturally 5000-7000 words when supported by the available evidence. The report-quality check requires at least 4000 analytical words; develop the evidence, competing interpretations, limitations and decision conditions, never repeat or invent facts to meet it.",
     'Write the committee\'s institutional research memo as the Capo: not a summary and not a concatenation of desk reports. The six final desk reports and the Red Team review are printed in full in the memo annex, so your job is to DECIDE and to make the PM understand why, without losing any material point of context.\nCAPO DOCTRINE: (1) Decide, do not summarize: every section converges on the judgment and on what would change it; an analysis that changes nothing gets one sentence. (2) Source chain: every number carries an exact citation [src: tool_name] (closing bracket right after the tool name) or [evidence: id], plus date, currency and unit; a number without such a citation does not enter. Use dot decimals inside table cells. (3) Name conflicts: when desks disagree, state both positions, which evidence is stronger and why you side with one; never average them away. (4) Answer the Red Team: for every material objection write "Objection <ID> (<desk>): ... Answer: ... Status: answered/conceded/open", consistent with the authoritative ledger; in objections[] set resolved=true only for answered or conceded. Group minor objections so that no dossier section exceeds 30 paragraphs. (5) Calibrated conviction: ALTA only if you would defend it against the Red Team; otherwise MEDIA/BASSA with named unknowns (proposal.confidence uses exactly ALTA/MEDIA/BASSA). (6) Plain language: first mention of a company = full name and ticker; explain every technical metric in the same sentence; no telegraphic bullets in the body.\nSECTION GRID (indicative length; develop more only when evidence supports it, never pad):\n- executive (300-500 words): judgment in two sentences; the decisive question; a table "Desk | Final view | Decisive evidence | Source" with one row for each desk (a missing desk is stated as missing); what would change the judgment.\n- pm_view (250-400): the PM thesis tested point by point: supported / not supported / not testable, with evidence.\n- business (500-800): what the company sells, to whom, unit economics, competitive advantage and its durability, management track record.\n- financial_quality (600-900): revenue and margin trajectory, earnings versus cash conversion, working capital, debt and dilution, accounting flags; a sourced table where data exists.\n- valuation (500-800): market expectations and analyst consensus as reference, what the price implies; VARIANT VIEW: where and why the committee disagrees with consensus, or an explicit statement that no evidenced variant view exists. No fair value or target unless produced and labeled in this run.\n- scenarios (400-700): bear/base/bull as mutually exclusive narratives with drivers, observable signals and falsifiers; probabilities only if sourced, otherwise qualitative and declared as committee judgment.\n- portfolio_risk (400-600): fit with the real book and mandate (correlation, concentration, liquidity, stress), separating security merit from book compatibility; sizing only from the common engine.\n- catalysts (250-400): dated events with source and what each would confirm or falsify; undated events stated as such.\n- positioning (250-400): price action, positioning, options or implied expectations if sourced; declare missing data.\n- red_team (400-1200): the objection/answer ledger above, plus the strongest unresolved dissent and its consequence for the judgment.\n- decision (300-500): judgment, proposal or null with reason, review conditions, invalidation, data gaps ranked by decision value, decisive questions.\nDo not repeat the same analysis in two sections. Keep summary concise and spend the output on the body. Use the available output for the complete memo rather than redoing the already completed committee research.')
 assert CAPO_RESEARCH_INSTRUCTIONS_V3 != CAPO_RESEARCH_INSTRUCTIONS
+
+
+# ---------------------------------------------------------------------------
+# trade-idea-research/4 (PM, Lotto 2): the investment-memo contract.
+# New subclasses only: TradeIdeaResult, TRADE_IDEA_RESULT_SCHEMA and the /2-/3
+# prompts above stay byte-identical because paid runs are resumed by comparing
+# the request sha256 and parsed == model_dump().
+# Scenario names are the English wire keys bear/base/bull; the renderer shows
+# them as Pessimistico/Base/Ottimistico. Probabilities, price targets and the
+# variant-view "committee" value are COMMITTEE ESTIMATES, never sourced facts.
+# ---------------------------------------------------------------------------
+_EvidenceIds = list[Annotated[str, Field(min_length=1, max_length=100)]]
+_ShortText = Annotated[str, Field(min_length=1, max_length=600)]
+SCENARIO_NAMES_V4 = ("bear", "base", "bull")
+PROBABILITY_SUM_TOLERANCE_V4 = 0.5
+
+
+class DossierSectionV4(DossierSection):
+    """/4 memo: tables only with source/unit/period, never a chart."""
+    charts: list[ResearchChart] = Field(default_factory=list, max_length=0)
+
+
+class HorizonV4(StrictModel):
+    months: int = Field(ge=1, le=60)
+    label: str = Field(min_length=1, max_length=300)
+
+
+class PillarV4(StrictModel):
+    title: str = Field(min_length=1, max_length=200)
+    thesis: str = Field(min_length=1, max_length=6000)
+    evidence: str = Field(min_length=1, max_length=6000)
+    risk: str = Field(min_length=1, max_length=4000)
+    evidence_ids: _EvidenceIds = Field(min_length=1, max_length=50)
+
+
+class VariantViewV4(StrictModel):
+    """consensus is null when no sourced consensus exists; committee is an estimate."""
+    metric: str = Field(min_length=1, max_length=150)
+    period: str = Field(min_length=1, max_length=60)
+    unit: str = Field(min_length=1, max_length=60)
+    consensus: float | None
+    committee: float
+    rationale: str = Field(min_length=1, max_length=4000)
+    evidence_ids: _EvidenceIds = Field(min_length=1, max_length=50)
+
+
+class ScenarioV4(Scenario):
+    """One of exactly three mutually exclusive committee scenarios."""
+    name: Literal["bear", "base", "bull"]
+    probability_pct: float = Field(ge=0, le=100)
+    price_target: float = Field(gt=0)
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    drivers: list[_ShortText] = Field(min_length=1, max_length=6)
+    falsifiers: list[_ShortText] = Field(min_length=1, max_length=6)
+    method: str = Field(min_length=1, max_length=2000)
+
+
+class RiskExitV4(StrictModel):
+    risk: str = Field(min_length=1, max_length=2000)
+    threshold: str = Field(min_length=1, max_length=600)
+    action: Literal["exit", "reduce", "review"]
+    evidence_ids: _EvidenceIds = Field(default_factory=list, max_length=50)
+
+
+class ReviewTriggerV4(StrictModel):
+    """kind=date -> date only; kind=price -> price_level only; kind=condition -> condition only."""
+    kind: Literal["date", "price", "condition"]
+    date: str | None = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    price_level: float | None = Field(gt=0)
+    condition: str | None = Field(min_length=1, max_length=600)
+    what: str = Field(min_length=1, max_length=1500)
+
+    @model_validator(mode="after")
+    def coherent_kind(self):
+        present = {"date": self.date is not None, "price": self.price_level is not None,
+                   "condition": self.condition is not None}
+        if not present[self.kind] or any(on for kind, on in present.items() if kind != self.kind):
+            raise ValueError("Review trigger must fill exactly the field of its kind")
+        if self.date is not None:
+            try:
+                _date.fromisoformat(self.date)
+            except ValueError as exc:
+                raise ValueError("Review trigger date is not a calendar date") from exc
+        return self
+
+
+class SizingV4(StrictModel):
+    """Server sizing band copied by the Capo.
+
+    below_starter=true is admitted ONLY when the band is empty (band_min_eur >
+    band_max_eur): the proposal is then exactly band_max_eur, declared in basis.
+    """
+    amount_eur: float = Field(gt=0)
+    band_min_eur: float = Field(gt=0)
+    band_max_eur: float = Field(gt=0)
+    basis: str = Field(min_length=1, max_length=1500)
+    below_starter: bool
+
+    @model_validator(mode="after")
+    def inside_band(self):
+        if not self.basis.strip():
+            raise ValueError("Sizing basis must explain the amount")
+        if self.amount_eur > self.band_max_eur:
+            raise ValueError("Sizing amount exceeds the server band maximum")
+        if self.below_starter:
+            if self.band_min_eur <= self.band_max_eur:
+                raise ValueError("below_starter is admitted only for an empty sizing band")
+            if self.amount_eur != self.band_max_eur:
+                raise ValueError("below_starter proposal must equal the band maximum")
+        elif not (self.band_min_eur <= self.amount_eur <= self.band_max_eur):
+            raise ValueError("Sizing amount is outside the server band")
+        return self
+
+
+class ProposalV4(Proposal):
+    sizing: SizingV4
+
+    @model_validator(mode="after")
+    def amount_matches_sizing(self):
+        if self.eur_amount is None or self.eur_amount != self.sizing.amount_eur:
+            raise ValueError("Proposal eur_amount must equal sizing.amount_eur")
+        return self
+
+
+class TradeIdeaResultV4(TradeIdeaResult):
+    conviction: Literal["ALTA", "MEDIA", "BASSA"]
+    horizon: HorizonV4
+    summary_evidence_ids: _EvidenceIds = Field(max_length=60)
+    pm_view_evidence_ids: _EvidenceIds = Field(max_length=60)
+    pillars: list[PillarV4] = Field(min_length=2, max_length=5)
+    variant_view: list[VariantViewV4] = Field(max_length=8)
+    risk_exits: list[RiskExitV4] = Field(min_length=1, max_length=12)
+    review_triggers: list[ReviewTriggerV4] = Field(max_length=10)
+    # Narrowed /4 fields: pillars and risk_exits replace the flat lists.
+    pros: list[str] = Field(max_length=0)
+    cons: list[str] = Field(max_length=0)
+    risks: list[str] = Field(max_length=0)
+    invalidation: list[str] = Field(max_length=0)
+    scenarios: list[ScenarioV4] = Field(min_length=3, max_length=3)
+    dossier: list[DossierSectionV4] = Field(min_length=1, max_length=25)
+    proposal: ProposalV4 | None
+
+    @model_validator(mode="after")
+    def integrity_v4(self):
+        ids = {e.id for e in self.evidence}
+        referenced = [*self.summary_evidence_ids, *self.pm_view_evidence_ids]
+        for item in [*self.pillars, *self.variant_view, *self.risk_exits]:
+            referenced.extend(item.evidence_ids)
+        if set(referenced) - ids:
+            raise ValueError("Unresolved evidence reference")
+        if sorted(s.name for s in self.scenarios) != sorted(SCENARIO_NAMES_V4):
+            raise ValueError("Scenarios must be exactly bear, base and bull")
+        if abs(sum(s.probability_pct for s in self.scenarios) - 100) > PROBABILITY_SUM_TOLERANCE_V4:
+            raise ValueError("Scenario probabilities must sum to 100")
+        by_name = {s.name: s for s in self.scenarios}
+        if len({s.currency for s in self.scenarios}) != 1:
+            raise ValueError("Scenario price targets must share one currency")
+        if not (by_name["bear"].price_target <= by_name["base"].price_target <= by_name["bull"].price_target):
+            raise ValueError("Scenario price targets must be ordered bear <= base <= bull")
+        # Proposal.confidence and conviction share the ALTA/MEDIA/BASSA labels.
+        if self.proposal is not None and self.proposal.confidence != self.conviction:
+            raise ValueError("Proposal confidence must equal the memo conviction")
+        if self.judgment == "watch" and not self.review_triggers:
+            raise ValueError("A watch judgment requires at least one review trigger")
+        return self
+
+
+TRADE_IDEA_RESULT_SCHEMA_V4 = _strict_wire_schema(TradeIdeaResultV4.model_json_schema())
+
+# Autonomous text (not a .replace of the base): the base prompt asks to preserve
+# inline source tags, which the /4 memo forbids in prose.
+CAPO_RESEARCH_INSTRUCTIONS_V4 = """Produce the complete investment-memo JSON object matching the supplied schema.
+You are the Capo of the research committee. Write a LONG, DISCURSIVE and EXHAUSTIVE investment memo for the PM: decide, and explain why, without losing any material point of context. The six final desk reports and the Red Team review are printed in full in the memo annex; your memo is the committee's judgment, not a summary or a concatenation of them.
+Assess the accepted candidate independently; the PM thesis is a hypothesis to test, not a financial source. Use the exact sealed research dossier and thesis hashes, all final desk reports and the Red Team objection/reply ledger. Distinguish observed facts, management guidance, analyst consensus, explicit assumptions and your conclusion.
+JUDGMENT AND CONVICTION: judgment is favorable/rejected/watch/incomplete. conviction (ALTA/MEDIA/BASSA) is always required, also without a proposal: ALTA only if you would defend it against the Red Team; otherwise MEDIA or BASSA with the named unknowns. horizon gives the investment horizon in months and a short label.
+PILLARS: two to five investment pillars, each with title, thesis, the evidence that supports it, the risk that would break it and evidence_ids.
+VARIANT VIEW: rows where the committee's estimate differs from consensus, with metric, period and unit. consensus is the sourced market consensus or null when it is missing; never fill a missing consensus. committee is the committee's own estimate and is always described as an estimate in the rationale. An empty list is allowed when no evidenced variant view exists, stated in the valuation section.
+SCENARIOS: exactly three mutually exclusive scenarios named bear, base and bull. probability_pct values sum to 100 and are committee estimates. price_target is in the quotation currency of the instrument (currency, three-letter code), with the method that produced it, one to six drivers, one to six falsifiers, evidence_ids and an analysis of 300-500 words. Never present these estimates as observed data.
+RISK EXITS: one to twelve rows, each with the risk, an observable threshold and the action exit, reduce or review.
+REVIEW TRIGGERS: dated events (kind date, YYYY-MM-DD), price levels (kind price) or named conditions (kind condition), each with what it would confirm or change. A watch judgment requires at least one trigger.
+SIZING: a proposal exists only if judgment is favorable and the server supplied a SIZING BAND. Choose amount_eur inside [band_min_eur, band_max_eur], copying the exact band values; eur_amount equals amount_eur; below_starter is false. If the band is empty (band_min_eur greater than band_max_eur), propose exactly band_max_eur with below_starter true and explain it in basis. Otherwise proposal is null and you explain the information required to decide.
+PROSE: complete analytical paragraphs, no telegraphic bullets in the body. Do not write source tags, citation brackets or evidence markers inside the prose: traceability lives in the evidence_ids of every section, pillar, scenario and row. Every number must appear in the outputs of the evidence_ids of its field or be a declared committee estimate. Never copy hashes, snapshot/thesis/request IDs or file names into the memo. Write numbers in the convention of the output language, also inside table cells (Italian: 12,5% and 1.250). First mention of a company: full name and ticker. Explain every technical metric at its first occurrence.
+CONFLICTS AND RED TEAM: when desks disagree, state both positions, which evidence is stronger and why you side with one; never average them. Answer every material Red Team objection in objections[], with resolved true only for answered or conceded. The red_team section discusses the strongest dissent and its consequence for the judgment without repeating the ledger.
+SECTION KEYS AND INDICATIVE LENGTH (develop more only when the evidence supports it; never pad or repeat): executive 400-600 words, pm_view 300-500, business 700-1000, financial_quality 800-1200, valuation 700-1000, scenarios 300-500, portfolio_risk 500-700, catalysts 300-500, positioning 300-500, red_team 400-800, decision 400-600; summary 250-400 words.
+TABLES only with title, source, unit and period. charts must be []. pros, cons, risks and invalidation must be [] (replaced by pillars and risk_exits).
+Missing consensus or documents may justify a completed judgment watch or rejected with proposal null, with clear limitations. Timeouts, empty required reports and corrupt state remain technical incompleteness: judgment incomplete.
+Explain every supplied historical decision/trade ID in history_review. No workbook is required: valuation_refs must be [] and model_review null.
+This is research and a proposal for the PM's review, never an automatic order or evidence of PM approval.
+"""

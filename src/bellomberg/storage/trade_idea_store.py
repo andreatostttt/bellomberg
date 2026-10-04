@@ -17,8 +17,34 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE, is_research_mode
-from bellomberg.core.trade_idea_policy import (EXECUTION_POLICY_V3, RESEARCH_POLICIES, execution_policy,
-    role_effort, output_cap)
+from bellomberg.core.trade_idea_policy import (EXECUTION_POLICY_V3, EXECUTION_POLICY_V4, RESEARCH_POLICIES,
+    execution_policy, role_effort, output_cap)
+
+# A /4 run whose Capo produced no valid verdict is closed by the server with the
+# historical-shape incomplete package (desk excerpts, no memo fields). The origin is
+# declared structurally on the result, never inferred from a failed /4 validation.
+SERVER_INCOMPLETE_ORIGIN = "server_incomplete"
+
+
+def validate_run_result(source, *, run_id, ticker, pm_view, policy):
+    """The result contract of the run's accepted policy.
+
+    /2-/3 and historical runs: validate_result unchanged (no origin key admitted).
+    /4: the memo model, or - only when result_origin declares it - the server
+    incomplete package on the historical model, which must stay judgment=incomplete
+    without a proposal. A malformed /4 memo is never downgraded to the old model.
+    """
+    from bellomberg.core.trade_idea_contract import validate_result
+    if isinstance(source, dict) and "result_origin" in source:
+        if source["result_origin"] != SERVER_INCOMPLETE_ORIGIN or policy != EXECUTION_POLICY_V4:
+            raise ValueError("Result origin is not admitted for this run policy")
+        body = {key: value for key, value in source.items() if key != "result_origin"}
+        normalized = validate_result(body, run_id=run_id, ticker=ticker, pm_view=pm_view)
+        if normalized["judgment"] != "incomplete" or normalized["proposal"] is not None:
+            raise ValueError("Server incomplete package must stay incomplete without a proposal")
+        return {**normalized, "result_origin": SERVER_INCOMPLETE_ORIGIN}
+    return validate_result(source, run_id=run_id, ticker=ticker, pm_view=pm_view,
+                           execution_policy=policy)
 
 
 SCHEMA = (
@@ -950,10 +976,11 @@ class TradeIdeaStore:
             "source_checkpoint_sha256": progress["checkpoint_sha256"],
             "source_fingerprint": contract["source_fingerprint"], "model": model,
             # Never below the accepted Capo cap: a finalization with less room than the
-            # truncated original would truncate again. /3 keeps its accepted MEDIUM effort;
+            # truncated original would truncate again. /3 and /4 keep their accepted MEDIUM effort;
             # earlier contracts keep LOW so their already-accepted grants stay identical.
             "thinking": {"type": "effort", "effort": (role_effort(accepted, 'capo')
-                         if execution_policy(accepted) == EXECUTION_POLICY_V3 else "low")},
+                         if execution_policy(accepted) in (EXECUTION_POLICY_V3, EXECUTION_POLICY_V4)
+                         else "low")},
             "max_tokens": max(20000, output_cap(accepted, 'capo', 20000)),
             "context_projection": "sealed_all_rounds_red_team_dedup_v1",
             "request_sha256": fingerprint, "response_sha256": receipt["response_sha256"]}
@@ -1560,7 +1587,6 @@ class TradeIdeaStore:
                     raise RunConflict("worker claim lost or run already final")
                 normalized = None
                 if result is not None:
-                    from bellomberg.core.trade_idea_contract import validate_result
                     source = result
                     if isinstance(source, dict):
                         for name, expected in (("run_id", run_id), ("run_type", "trade_idea"),
@@ -1569,8 +1595,9 @@ class TradeIdeaStore:
                                 raise ValueError(f"result {name} differs from accepted run")
                         source = {k: v for k, v in source.items()
                                   if k not in ("run_id", "run_type", "pm_view")}
-                    normalized = validate_result(source, run_id=run_id, ticker=row["ticker"],
-                                                 pm_view=row["view_text"])
+                    normalized = validate_run_result(source, run_id=run_id, ticker=row["ticker"],
+                                                     pm_view=row["view_text"],
+                                                     policy=execution_policy(json.loads(row["request_json"])))
                 if technical_status == "completed" and normalized is None:
                     raise ValueError("completed research requires a structured result")
                 primary = json.loads(row["progress_json"]).get("primary_failure")
@@ -1872,7 +1899,10 @@ class TradeIdeaStore:
                     content = "\n".join(block["text"] for block in response.get("content", [])
                         if isinstance(block, dict) and block.get("type") == "text" and block.get("text"))
                     parsed = parse_capo_json(content)
-                    result = validate_result(parsed, run_id=run_id, ticker=row["ticker"], pm_view=row["view_text"])
+                    # A provider response is always the policy's own model, never the
+                    # server incomplete package: validate_result, not validate_run_result.
+                    result = validate_result(parsed, run_id=run_id, ticker=row["ticker"], pm_view=row["view_text"],
+                                             execution_policy=execution_policy(accepted))
                     if parsed != {key: value for key, value in result.items()
                                   if key not in {"run_id", "run_type", "pm_view"}}:
                         raise ValueError("provider omitted complete contract fields")
@@ -2050,6 +2080,42 @@ class TradeIdeaStore:
         return self._settle_cost(run_id, request_id, "unknown", reason=reason, receipt=receipt)
 
     @staticmethod
+    def _memo_markdown_v4(result, label):
+        """/4 memo fields (only results that carry pillars); /2-/3 text is unchanged."""
+        horizon = result.get("horizon") or {}
+        lines = [f"## {label('Convinzione e orizzonte', 'Conviction and horizon')}", "",
+                 f"{label('Convinzione', 'Conviction')}: {result.get('conviction')} | "
+                 f"{label('Orizzonte', 'Horizon')}: {horizon.get('months')} {label('mesi', 'months')} "
+                 f"({horizon.get('label')})", "",
+                 f"## {label('Pilastri della tesi', 'Investment pillars')}", ""]
+        for item in result["pillars"]:
+            lines.extend((f"### {item['title']}", "", item["thesis"], "",
+                          f"{label('Evidenza', 'Evidence')}: {item['evidence']}", "",
+                          f"{label('Rischio', 'Risk')}: {item['risk']}", ""))
+        if result.get("variant_view"):
+            lines.extend((f"## {label('Stime del comitato contro il consenso', 'Committee estimates versus consensus')}", ""))
+            for item in result["variant_view"]:
+                consensus = (item["consensus"] if item["consensus"] is not None
+                             else label("consenso non disponibile", "consensus unavailable"))
+                lines.extend((f"- {item['metric']} ({item['period']}, {item['unit']}): "
+                              f"{label('consenso', 'consensus')} {consensus}; "
+                              f"{label('stima del comitato', 'committee estimate')} {item['committee']}. "
+                              f"{item['rationale']}", ""))
+        if result.get("risk_exits"):
+            lines.extend((f"## {label('Rischi, soglie e azioni', 'Risks, thresholds and actions')}", ""))
+            actions = {"exit": label("uscire", "exit"), "reduce": label("ridurre", "reduce"),
+                       "review": label("rivedere", "review")}
+            for item in result["risk_exits"]:
+                lines.extend((f"- {item['risk']} | {label('Soglia', 'Threshold')}: {item['threshold']} | "
+                              f"{label('Azione', 'Action')}: {actions.get(item['action'], item['action'])}", ""))
+        if result.get("review_triggers"):
+            lines.extend((f"## {label('Trigger di revisione', 'Review triggers')}", ""))
+            for item in result["review_triggers"]:
+                when = item.get("date") or item.get("price_level") or item.get("condition")
+                lines.extend((f"- {item['kind']}: {when} — {item['what']}", ""))
+        return lines
+
+    @staticmethod
     def _memo_markdown(row, result):
         """Deterministic research text; result_json retains the full structured record."""
         def label(italian, english):
@@ -2063,6 +2129,8 @@ class TradeIdeaStore:
                  f"## {label('View PM e risposta del comitato', 'PM view and committee response')}", "",
                  result.get("pm_view") or label("Nessuna view PM fornita.", "No PM view supplied."), "",
                  result["pm_view_response"], ""]
+        if result.get("pillars"):
+            lines.extend(TradeIdeaStore._memo_markdown_v4(result, label))
         for section in result.get("dossier") or []:
             lines.extend((f"## {section['title']}", ""))
             for paragraph in section["paragraphs"]:
@@ -2088,8 +2156,21 @@ class TradeIdeaStore:
                 lines.append("")
         if result.get("scenarios"):
             lines.extend((f"## {label('Scenari', 'Scenarios')}", ""))
+            names = {"bear": label("Pessimistico", "Bear"), "base": label("Base", "Base"),
+                     "bull": label("Ottimistico", "Bull")}
             for item in result["scenarios"]:
-                lines.extend((f"### {item['name']}", "", item["analysis"], ""))
+                if "probability_pct" not in item:
+                    lines.extend((f"### {item['name']}", "", item["analysis"], ""))
+                    continue
+                # /4: committee estimates, labelled as such.
+                lines.extend((f"### {names.get(item['name'], item['name'])}", "",
+                              f"{label('Probabilita stimata dal comitato', 'Committee probability estimate')}: "
+                              f"{item['probability_pct']}% | {label('Prezzo obiettivo stimato', 'Estimated price target')}: "
+                              f"{item['price_target']} {item['currency']} | {label('Metodo', 'Method')}: {item['method']}",
+                              "", item["analysis"], ""))
+                lines.extend(f"- {label('Driver', 'Driver')}: {value}" for value in item["drivers"])
+                lines.extend(f"- {label('Falsificatore', 'Falsifier')}: {value}" for value in item["falsifiers"])
+                lines.append("")
         if result.get("objections"):
             lines.extend((f"## {label('Obiezioni Red Team', 'Red Team objections')}", ""))
             for item in result["objections"]:
@@ -2185,6 +2266,15 @@ class TradeIdeaStore:
                     if missing_checks:
                         operative = False
                         reasons.append("Operational checks absent or failed: " + ", ".join(missing_checks))
+                    if execution_policy(json.loads(row["request_json"])) == EXECUTION_POLICY_V4:
+                        # /4: the Capo copies the server sizing band; the application
+                        # receipt says whether amount and band match the engine.
+                        band = checks.get("sizing_band")
+                        if not isinstance(band, dict) or band.get("status") != "ok":
+                            operative = False
+                            reasons.append("Sizing /4: " + (str(band.get("reason"))[:500]
+                                if isinstance(band, dict) and band.get("reason")
+                                else "verifica della fascia del motore assente"))
                 if mandate_hash is None or mandate_hash != context["mandate_sha256"]:
                     operative = False
                     reasons.append("PM mandate changed or unavailable" + (f" ({mandate_error})" if mandate_error else ""))
@@ -2253,9 +2343,14 @@ class TradeIdeaStore:
                     elif action in ("TRIM", "SELL") and not held:
                         operative = False
                         reasons.append("Sale or trim requires an existing position")
+                    # /4: the source of the size is the server band itself; an "ok" band
+                    # receipt replaces the free-text sizing_source of /2-/3.
+                    band_source = (execution_policy(json.loads(row["request_json"])) == EXECUTION_POLICY_V4
+                                   and isinstance(checks.get("sizing_band"), dict)
+                                   and checks["sizing_band"].get("status") == "ok")
                     if (not isinstance(amount, (int, float)) or isinstance(amount, bool)
                             or not math.isfinite(amount) or amount <= 0
-                            or not proposal.get("sizing_source")):
+                            or not (proposal.get("sizing_source") or band_source)):
                         operative = False
                         reasons.append("Positive measured EUR size and sizing source required")
                     if proposal.get("ticker") != row["ticker"]:

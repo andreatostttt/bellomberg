@@ -19,11 +19,18 @@ EXECUTION_POLICY_V3 = 'trade-idea-research/3'
 ROLE_EFFORT_V3 = MappingProxyType({
     'specialist': 'medium', 'red_team': 'medium', 'capo': 'medium', 'aux': 'medium'})
 CAPO_OUTPUT_V3 = 128000
+# trade-idea-research/4 (PM, Lotto 2): same efforts and Capo room as /3; what
+# changes is the investment-memo contract (TradeIdeaResultV4 and its prompt).
+EXECUTION_POLICY_V4 = 'trade-idea-research/4'
+ROLE_EFFORT_V4 = MappingProxyType({
+    'specialist': 'medium', 'red_team': 'medium', 'capo': 'medium', 'aux': 'medium'})
+CAPO_OUTPUT_V4 = 128000
 _POLICIES = MappingProxyType({
     EXECUTION_POLICY_V2: (ROLE_EFFORT_V2, CAPO_OUTPUT_V2),
-    EXECUTION_POLICY_V3: (ROLE_EFFORT_V3, CAPO_OUTPUT_V3)})
+    EXECUTION_POLICY_V3: (ROLE_EFFORT_V3, CAPO_OUTPUT_V3),
+    EXECUTION_POLICY_V4: (ROLE_EFFORT_V4, CAPO_OUTPUT_V4)})
 RESEARCH_POLICIES = frozenset(_POLICIES)
-CURRENT_EXECUTION_POLICY = EXECUTION_POLICY_V3
+CURRENT_EXECUTION_POLICY = EXECUTION_POLICY_V4
 
 
 def execution_policy(value):

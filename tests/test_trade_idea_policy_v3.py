@@ -12,7 +12,8 @@ V3 = {'analysis_mode': 'fundamentals_research_v1', 'execution_policy': 'trade-id
 
 def test_v3_raises_only_the_capo_and_v2_stays_as_accepted():
     from bellomberg.core.trade_idea_policy import role_effort, output_cap, CURRENT_EXECUTION_POLICY
-    assert CURRENT_EXECUTION_POLICY == V3['execution_policy']
+    # /4 (PM, Lotto 2) is now current; /3 stays accepted for resumes with these choices.
+    assert CURRENT_EXECUTION_POLICY == 'trade-idea-research/4'
     assert {role: role_effort(V3, role) for role in trade_idea.MODEL_IDS} == {
         'specialist': 'medium', 'red_team': 'medium', 'capo': 'medium', 'aux': 'medium'}
     assert output_cap(V3, 'capo', 0) == 128000 and output_cap(V3, 'specialist', 64000) == 64000
