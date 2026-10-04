@@ -1,5 +1,6 @@
 """Offline, synthetic editorial fixtures: no issuer research or live side effects."""
 from copy import deepcopy
+import re
 import os
 from pathlib import Path
 
@@ -104,7 +105,7 @@ def test_honest_short_research_is_complete_without_page_or_word_target(tmp_path,
     assert artifact["status"] == "ready", artifact["reason"]
     assert artifact["quality"]["analytical_words"] < 4000
     assert artifact["quality"]["total_pages"] < 10
-    text = extract(artifact["path"])
+    text = " ".join(extract(artifact["path"]).split())  # table cells wrap (impianto M, PM 04/10/2026)
     assert "Mancano incassi successivi" in text
     assert "L'incumbency potrebbe essere solo temporanea." in text
     assert "Non sono" in text
@@ -154,8 +155,11 @@ def test_long_paragraph_and_long_table_cell_keep_the_tail_and_all_claims(tmp_pat
     artifact = build_trade_idea_report(run, result, output_path=tmp_path / "long.pdf")
     assert artifact["status"] == "ready", artifact["reason"]
     text = extract(artifact["path"])
+    # Impianto B (PM 04/10/2026): the claim prints whole, its [src:] becomes a numbered source.
     for expected in ("CODA-PARAGRAFO-VERIFICATA", "CODA-CELLA-VERIFICATA", result["cons"][0], result["invalidation"][0]):
+        expected = re.sub(r"\s*\[src:[^\]]*\]", "", expected)
         assert "".join(expected.split()) in "".join(text.split())
+    assert "[src:" not in text
 
 
 def test_real_pdf_text_loss_is_rejected_even_with_all_source_sections(tmp_path):

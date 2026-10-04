@@ -1453,6 +1453,19 @@ def _desk_local_failure(error):
     return isinstance(error, RuntimeError) and any(marker in text for marker in _DESK_LOCAL_MESSAGES)
 
 
+def _memo_facts(checkpoint, cutoff):
+    """Numbers for the memo's tables and charts, read by Python from the tool receipts.
+    A failed extraction is a declared gap in the PDF, never a memo with invented numbers."""
+    import logging
+    from bellomberg.reporting.trade_idea_facts import extract_facts
+    try:
+        return extract_facts(checkpoint, cutoff=cutoff)
+    except Exception as exc:
+        # extract_facts never raises by design: this is a bug, kept visible in the log and the PDF.
+        logging.getLogger(__name__).exception("Trade Idea memo facts extraction failed")
+        return {"gaps": ["Estrazione dei dati numerici fallita: " + type(exc).__name__ + ": " + str(exc)[:300]]}
+
+
 def _desk_annex(data):
     """Complete final desk reports, Red Team review and objection ledger for the memo annex.
 
@@ -4192,7 +4205,9 @@ def _preview_quality(run, result, directory, blackboard):
         "name": run.get("company_name"), "exchange": run.get("exchange"),
         "currency": run.get("currency")},
         "cutoff": blackboard.data.get("_data_cutoff") or run.get("started_at"),
-        "desk_annex": _desk_annex(blackboard.data) if is_research_mode(blackboard) else None}
+        "desk_annex": _desk_annex(blackboard.data) if is_research_mode(blackboard) else None,
+        "facts": (_memo_facts({"tool_receipts": blackboard.tool_receipts, "data": blackboard.data},
+                              blackboard.data.get("_data_cutoff")) if is_research_mode(blackboard) else None)}
     checked = {'valuations': []} if is_research_mode(blackboard) else _candidate_workbooks(run["ticker"], blackboard.valuation_generations,
         blackboard.valuation_attempts, [MODELS_DIR, REPORT_DIR, *getattr(blackboard, "model_roots", ())],
         result.get("valuation_refs") or ())
@@ -4480,7 +4495,10 @@ def _deliver_trade_idea(store, run_id, *, valuation_results=None, valuation_atte
         "currency": run.get("currency")},
         "cutoff": (detail.get("progress") or {}).get("data_cutoff") or run.get("started_at"),
         "desk_annex": (_desk_annex((((detail.get("progress") or {}).get("checkpoint") or {}).get("data")))
-                       if run.get("analysis_mode") == RESEARCH_ANALYSIS_MODE else None)}
+                       if run.get("analysis_mode") == RESEARCH_ANALYSIS_MODE else None),
+        "facts": (_memo_facts(((detail.get("progress") or {}).get("checkpoint") or {}),
+                              (detail.get("progress") or {}).get("data_cutoff"))
+                  if run.get("analysis_mode") == RESEARCH_ANALYSIS_MODE else None)}
     persisted_manifest = detail.get("artifacts") is not None
     if valuation_results is None:
         progress = detail.get("progress") or {}

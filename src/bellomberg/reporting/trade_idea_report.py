@@ -1004,284 +1004,915 @@ def _memo_styles():
     }
 
 
-class _CompanyCover(Flowable):
-    """Weekly-note identity; every bounded excerpt continues in the full body."""
-    def __init__(self, run, result, language, styles, partial_reasons):
-        super().__init__()
-        self.run, self.result, self.language = run, result, language
-        self.styles, self.partial_reasons = styles, partial_reasons
-        self.width, self.height = A4
+# ---------------------------------------------------------------------------
+# Impianto B (scelta PM 04/10/2026): memo per il comitato d'investimento.
+# Il testo del Capo e' mostrato con UNA trasformazione deterministica e dichiarata,
+# applicata identica dal renderer e dal controllo d'integrita':
+#  - [src: x] / [evidence: id] -> numero della fonte (elenco numerato in fondo);
+#  - impronte esadecimali e backtick tolti; gergo tecnico reso in lingua;
+#  - nelle celle delle tabelle del Capo (punto decimale per contratto /2-/3)
+#    i numeri vanno all'italiana.
+# I numeri di pagina 1-2 e dei grafici NON vengono dal testo del modello: li legge
+# Python dalle ricevute dei tool (run["facts"], trade_idea_facts.extract_facts).
 
-    def wrap(self, available_width, available_height):
-        return self.width, self.height
+_CITE = re.compile(r"\[\s*(src|evidence|fonte)\s*:\s*([^\]]*)\]", re.I)
+_CITE_DATE = re.compile(r"^\s*(?:\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2}\S*)\s*$")
+_HEX = r"(?=[0-9a-f]*[a-f])[0-9a-f]"
+_HASH = re.compile(r"(?:\b(?:dossier|tesi|thesis|impronta|fingerprint|sha-?256|hash)\s+)?"
+                   r"\b(?:" + _HEX + r"{32,}\b|" + _HEX + r"{8,}(?:\.\.\.|…))", re.I)
+# Inline code: a backtick pair whose opening is not glued to a word ("in `research_required`,").
+_CODE = re.compile(r"(?<![\w`])`+([^`\n]+?)`+(?![\w`])")
+# Left-over backticks used as apostrophes or accents: "l`azienda", "e` solida", "perche`".
+_BACKTICK_APOSTROPHE = re.compile(r"(?<=[A-Za-zÀ-ÿ])`(?=[A-Za-zÀ-ÿ])|(?<=[aeiouAEIOU])`(?=[\s.,;:!?)]|$)")
+_CELL_NUMBER = re.compile(r"(?<![\w.,])(-?)(\d+)(?:\.(\d+))?(?![.,]?\d)(?![A-Za-z]|\.[A-Za-z])")
+# A dot number in Italian prose: 1-2 or 4+ decimals can never be a thousands group;
+# exactly 3 decimals is ambiguous and is converted only when it IS a tool value read by
+# Python (or its integer part is zero). Tokens of a URL are never touched.
+_PROSE_NUMBER = re.compile(r"(?<![\w.,/])(-?)(\d+)\.(\d+)(?![.,]?\d)")
+_JARGON = {
+    "it": [(re.compile(r"\bproposal\s*=\s*null\b", re.I), "nessuna proposta operativa"),
+           (re.compile(r"\bWATCH\b(?=\s*(?:[,.;:)]|$))", re.M), "OSSERVARE"),
+           (re.compile(r"\bneeds_verification\b"), "da verificare"),
+           (re.compile(r"\bresearch_required\b"), "ricerca richiesta"),
+           (re.compile(r"\bObjection(?=\s+[A-Z0-9][A-Z0-9_.-]*\b)"), "Obiezione"),
+           (re.compile(r"\bAnswer\s*:\s*conceded\b"), "Risposta: concessa"),
+           (re.compile(r"\bAnswer\s*:"), "Risposta:"),
+           (re.compile(r"\bStatus\s*:\s*conceded\b"), "Stato: concessa"),
+           (re.compile(r"\bStatus\s*:\s*answered\b"), "Stato: risposta"),
+           (re.compile(r"\bStatus\s*:\s*open\b"), "Stato: aperta"),
+           (re.compile(r"\bStatus\s*:"), "Stato:")],
+    "en": [(re.compile(r"\bproposal\s*=\s*null\b", re.I), "no actionable proposal"),
+           (re.compile(r"\bneeds_verification\b"), "to be verified"),
+           (re.compile(r"\bresearch_required\b"), "research required")],
+}
 
-    def draw(self):
-        c, (w, h) = self.canv, A4
-        run, result, language = self.run, self.result, self.language
-        band, left = w * .38, 31
-        rw, rx = w - band - 45, band + 18
-        lw = band - 2 * left
-        reg, bold = self.styles["body"].fontName, self.styles["h1"].fontName
-        c.saveState()
-        c.setFillColor(OBSIDIAN)
-        c.rect(0, 0, band, h, fill=1, stroke=0)
-        c.setFillColor(AMBER)
-        c.rect(band-3, 0, 3, h, fill=1, stroke=0)
-        _draw_lockup(c, left, h-65, 21, reg, bold, AMBER, AMBER_DEEP, AMBER, tagline=True)
+# Etichette leggibili delle fonti piu' frequenti; un tool non censito si mostra col suo nome.
+_TOOL_LABELS = {
+    "get_financial_history": ("Bilanci storici (XBRL/ESEF)", "Historical financial statements (XBRL/ESEF)"),
+    "get_fundamentals": ("Fondamentali e multipli di mercato", "Market fundamentals and multiples"),
+    "get_consensus_estimates": ("Consensus degli analisti", "Analyst consensus"),
+    "get_price_live": ("Prezzo e indicatori tecnici giornalieri", "Daily price and technical indicators"),
+    "quant_compute": ("Calcoli quantitativi (rischio, correlazioni)", "Quantitative computations (risk, correlations)"),
+    "compare_assets": ("Confronto di rendimento e volatilita'", "Return and volatility comparison"),
+    "get_portfolio_live": ("Portafoglio reale (NAV e cassa)", "Live portfolio (NAV and cash)"),
+    "get_portfolio_risk": ("Rischio del portafoglio", "Portfolio risk"),
+    "get_sector_exposure": ("Esposizione settoriale del portafoglio", "Portfolio sector exposure"),
+    "get_macro_dashboard": ("Quadro macro (tassi, cambi, materie prime)", "Macro dashboard (rates, FX, commodities)"),
+    "get_yield_curves": ("Curve dei rendimenti", "Yield curves"),
+    "tavily_search": ("Ricerca web (fonte secondaria)", "Web search (secondary source)"),
+    "search_news": ("Notizie (fonte secondaria)", "News (secondary source)"),
+    "read_company_dossier": ("Dossier documentale della societa'", "Company document dossier"),
+    "search_company_sources": ("Fonti ufficiali dell'emittente (navigazione)", "Issuer official sources (navigation)"),
+    "open_company_source": ("Documento dell'emittente", "Issuer document"),
+    "get_guidance": ("Registro guidance", "Guidance register"),
+    "get_earnings_calendar": ("Calendario risultati", "Earnings calendar"),
+    "get_portfolio_montecarlo": ("Simulazione Monte Carlo del portafoglio", "Portfolio Monte Carlo simulation"),
+    "get_var_backtest": ("Backtest del VaR", "VaR backtest"),
+    "get_vix_term_structure": ("Struttura a termine del VIX", "VIX term structure"),
+    "get_position_doctor": ("Diagnosi tecnica della posizione", "Position technical diagnosis"),
+    "get_insider_trades": ("Operazioni degli insider", "Insider transactions"),
+    "get_corporate_events_for_ticker": ("Eventi societari", "Corporate events"),
+    "get_hyperliquid_intel": ("Mercati Hyperliquid", "Hyperliquid markets"),
+    "get_advanced_metrics": ("Metriche avanzate del portafoglio", "Advanced portfolio metrics"),
+    "get_portfolio_factors": ("Fattori di rischio del portafoglio", "Portfolio risk factors"),
+    "get_portfolio_garch": ("Volatilita' GARCH del portafoglio", "Portfolio GARCH volatility"),
+    "get_tearsheet": ("Scheda di performance del portafoglio", "Portfolio tearsheet"),
+    "get_edge_scan": ("Scansione dei segnali", "Signal scan"),
+    "get_cot_positioning": ("Posizionamento COT (CFTC)", "COT positioning (CFTC)"),
+    "get_polymarket_events": ("Mercati predittivi Polymarket", "Polymarket prediction markets"),
+    "get_macro_news_by_topic": ("Notizie macro per tema", "Macro news by topic"),
+    "get_news_briefing": ("Rassegna notizie", "News briefing"),
+    "get_filing_changes": ("Variazioni nei documenti depositati", "Filing changes"),
+    "get_lobbying": ("Attivita' di lobbying", "Lobbying activity"),
+    "get_gov_contracts": ("Contratti pubblici", "Government contracts"),
+    "get_dat_metrics": ("Metriche delle tesorerie in cripto", "Digital asset treasury metrics"),
+    "get_vol_surface_summary": ("Superficie di volatilita' implicita", "Implied volatility surface"),
+    "get_options_data": ("Dati opzioni", "Options data"),
+    "get_option_expirations_polygon": ("Scadenze opzioni (Polygon)", "Option expirations (Polygon)"),
+    "acquire_company_source": ("Acquisizione di documento dell'emittente", "Issuer document acquisition"),
+    "read_blackboard": ("Lavagna condivisa dei desk", "Shared desk blackboard"),
+    "ask_specialist": ("Consultazione fra desk", "Desk consultation"),
+}
 
-        def field(value, x, top, width, height, *, size=9, leading=13, color=INK, heavy=False):
-            style = ParagraphStyle("coverMeasured", fontName=bold if heavy else reg,
-                                   fontSize=size, leading=leading, textColor=color)
-            paragraph = Paragraph(_text(value), style)
-            _, actual = paragraph.wrap(width, height)
-            if actual > height:
-                continuation = Paragraph(_text(_label("full_text", language)),
-                    ParagraphStyle("coverContinuation", parent=style, fontSize=7, leading=10))
-                _, note_height = continuation.wrap(width, height)
-                fragments = paragraph.split(width, max(0, height-note_height-5))
-                if fragments:
-                    first = fragments[0]
-                    _, used = first.wrap(width, height)
-                    first.drawOn(c, x, top-used)
-                    continuation.drawOn(c, x, top-used-note_height-5)
-                return top-height
-            paragraph.drawOn(c, x, top-actual)
-            return top-actual
 
-        light = colors.HexColor("#E1E4EA")
-        dim = colors.HexColor("#9CA5B5")
-        field("Trade Idea", left, h-116, lw, 25, size=15, leading=19, color=light, heavy=True)
-        field("Ricerca societaria" if language == "it" else "Company research", left, h-143, lw, 20,
-              size=9, leading=12, color=dim)
-        cutoff = str(run.get("cutoff") or result.get("cutoff") or run.get("started_at") or "n.d.")
-        field(cutoff[:10], left, h-161, lw, 16, size=8, color=dim)
-        y = h-212
-        for label, value, height in (
-            ("judgment", _label(result["judgment"], language), 48),
-            ("dominant_risk", next(iter(result.get("risks") or []), _label("missing", language)), 113),
-            ("catalyst", next(iter(result.get("catalysts") or []), _label("missing", language)), 113),
-            ("invalidation", next(iter(result.get("invalidation") or []), _label("missing", language)), 113)):
-            field(_label(label, language).upper(), left, y, lw, 18, size=8, leading=10, color=AMBER, heavy=True)
-            field(value, left, y-23, lw, height, size=10.5 if label == "judgment" else 8.7,
-                  leading=13, color=light, heavy=label == "judgment")
-            y -= height+42
-        field(_label("no_order", language), left, 55, lw, 35, size=6.3, leading=8.4, color=dim)
-        identity = run.get("identity") or result.get("identity") or {}
-        title = identity.get("name") or result["ticker"]
-        y = field(title, rx, h-42, rw, 88, size=25, leading=30, heavy=True)-12
-        y = field(" | ".join(str(v) for v in (result["ticker"], identity.get("exchange"), identity.get("currency")) if v),
-                  rx, y, rw, 32, size=8, leading=11, color=MUTED)-24
-        field("LA TESI" if language == "it" else "THE THESIS", rx, y, rw, 16, size=8, color=BRASS, heavy=True)
-        y = field(result.get("summary", ""), rx, y-23, rw, 172, size=10, leading=14)-25
-        # A cover graph is an exact view of a cited table, never inferred metrics.
-        selected = None
-        for key in ("financial_quality", "scenarios", "valuation"):
-            section = next((s for s in result.get("dossier", []) if s["key"] == key), {})
-            for chart in section.get("charts", []):
-                try:
-                    drawing = _chart(section, chart, rw, reg)
-                except (ValueError, IndexError, KeyError):
-                    continue  # Its source table and explicit chart diagnostic remain in the body.
-                table = section["tables"][chart["table_index"]]
-                selected = drawing, table
-                break
-            if selected:
-                break
-        if selected and y > 310:
-            drawing, table = selected
-            c.setFillColor(OBSIDIAN)
-            c.rect(rx, y-35, rw, 35, fill=1, stroke=0)
-            field(table["title"], rx+7, y-7, rw-14, 24, size=8, leading=10, color=AMBER, heavy=True)
-            drawing.drawOn(c, rx, y-247)
-            field(f"{table['unit']} | {table['period']} | {table['source']}", rx, y-255, rw, 42,
-                  size=6.8, leading=9, color=MUTED)
-            if result.get("data_gaps") and y > 490:
-                field("DATI MANCANTI" if language == "it" else "DATA GAPS", rx, y-318, rw, 18,
-                      size=8, leading=10, color=BRASS, heavy=True)
-                field("\n".join(result["data_gaps"]), rx, y-340, rw, min(83, y-470),
-                      size=8.5, leading=12)
+_TOOL_NAME = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
+
+
+def _cite_items(kind, body):
+    """Keys of one citation. A tool-like name is a source; dates and qualifiers after a
+    comma belong to the tool before them; a descriptive citation with no tool
+    ("fatti verificati") is a source in its own words."""
+    keys, dates = [], []
+    for item in re.split(r"[,;]", body):
+        item = re.sub(r"\s+", " ", item.strip())
+        if not item:
+            continue
+        if kind.lower() == "evidence":
+            keys.append("evidence:" + item)
+            continue
+        if _CITE_DATE.match(item) and keys:
+            dates.append((keys[-1], item))
+            continue
+        first = item.split()[0].strip(".:")
+        if _TOOL_NAME.match(first):
+            keys.append(first)
+            rest = item[len(item.split()[0]):].strip()
+            if rest:  # "open_company_source 10-K p. 47": the page reference stays with its source
+                dates.append((first, rest))
+        elif not keys:
+            keys.append(item[:160])
         else:
-            field("Cosa verificare" if language == "it" else "What to verify", rx, y, rw, 20,
-                  size=10, leading=13, heavy=True)
-            field("\n".join(result.get("review_conditions", [])), rx, y-25, rw, min(150, max(25, y-135)),
-                  size=9, leading=13)
-        if self.partial_reasons:
-            field(_label("partial", language) + ": " + "; ".join(self.partial_reasons), rx, 111, rw, 58,
-                  size=7, leading=9, color=BRASS)
-        if run.get("preview"):
-            field("ANTEPRIMA · DATI SINTETICI" if language == "it" else "PREVIEW · SYNTHETIC DATA",
-                  rx, 45, rw, 15, size=8, leading=10, color=BRASS, heavy=True)
-        c.setFont(reg, 6.5)
-        c.setFillColor(MUTED)
-        c.drawRightString(w-27, 18, "Bellomberg Research · 1")
-        c.restoreState()
+            dates.append((keys[-1], item))  # a qualifier after a comma belongs to the source before it
+    return keys, dates
+
+
+def _known_values(value, out=None):
+    """Every finite number in the facts tree, for the 3-decimal prose rule."""
+    out = set() if out is None else out
+    if isinstance(value, dict):
+        for item in value.values():
+            _known_values(item, out)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _known_values(item, out)
+    elif isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        # 2.5 or 2500 must never turn "2.500 dipendenti" into 2,5: only true 3-decimal values count.
+        if abs(float(value) * 100 - round(float(value) * 100)) > 1e-6:
+            out.add(round(float(value), 6))
+    return out
+
+
+class _Sources:
+    """One numbering shared by renderer and integrity check (first appearance order)."""
+    def __init__(self, result, annex, language, facts=None):
+        self.language = language
+        self.known = _known_values(facts or {})
+        self.order, self.dates = [], {}
+        self.evidence = {str(row.get("id")): row for row in result.get("evidence") or []}
+        for _, value in _content_fragments(result):
+            self.scan(value)
+        for _, _, text in _annex_blocks(annex, language):
+            self.scan(text)
+        for key in self.evidence:
+            self.add("evidence:" + key)
+
+    def add(self, key):
+        if key not in self.order:
+            self.order.append(key)
+        return self.order.index(key) + 1
+
+    def scan(self, value):
+        for kind, body in _CITE.findall(str(value or "")):
+            self.numbers(kind, body)
+
+    def numbers(self, kind, body):
+        keys, dates = _cite_items(kind, body)
+        found = sorted({self.add(key) for key in keys})
+        for key, date in dates:
+            if key and date not in self.dates.setdefault(key, []):
+                self.dates[key].append(date)
+        return found
+
+    def label(self, key):
+        if key.startswith("evidence:"):
+            row = self.evidence.get(key[9:])
+            if not row:
+                return key[9:]
+            # Evidence.source is "[src: tool] description" by contract: show the tool by name.
+            source = str(row.get("source") or "")
+            tools = [k for kind, body in _CITE.findall(source) for k in _cite_items(kind, body)[0]]
+            rest = re.sub(r"\s+", " ", _CITE.sub(" ", source)).strip()
+            return "; ".join([*(self.label(t) for t in tools), *([rest] if rest else [])]) or key[9:]
+        pair = _TOOL_LABELS.get(key)
+        return pair[0 if self.language == "it" else 1] if pair else key
+
+
+def _localize_cell(value, language):
+    """Contract /2-/3 cells use dot decimals: print them in the reader's locale."""
+    if language != "it":
+        return value
+
+    def swap(match):
+        sign, whole, decimals = match.groups()
+        if decimals is None and len(whole) == 4 and 1900 <= int(whole) <= 2100:
+            return match.group(0)  # a year, not a quantity
+        if len(whole) > 1 and whole.startswith("0") and decimals is None:
+            return match.group(0)  # a code (0700, CUSIP), not a quantity
+        grouped = f"{int(whole):,}".replace(",", ".") if len(whole) > 3 else whole
+        return sign + grouped + ("," + decimals if decimals is not None else "")
+    return _CELL_NUMBER.sub(swap, value)
+
+
+def _localize_prose(value, known):
+    def swap(match):
+        sign, whole, decimals = match.groups()
+        start, end = match.span()
+        token = value[value.rfind(" ", 0, start) + 1:value.find(" ", end) if value.find(" ", end) >= 0 else len(value)]
+        if "://" in token or "www." in token or "@" in token:
+            return match.group(0)
+        before = value[max(0, start - 14):start].lower()
+        if re.search(r"(?:\bnota|\bnote|\bitem|\bcap\.?|\bcapitolo|\bsezione|\bsection|\bore|\bh|\bversione|"
+                     r"\bversion|\bv|§|\bart\.?|\barticolo|\bparagrafo|\bpar\.?)\s*$", before):
+            return match.group(0)
+        number = float(whole + "." + decimals)
+        if len(decimals) == 3 and whole != "0" and round(number, 6) not in known and round(-number, 6) not in known:
+            return match.group(0)
+        return sign + whole + "," + decimals
+    return _PROSE_NUMBER.sub(swap, value)
+
+
+def _clean(value, sources, language, *, cell=False, plain=False):
+    """The single display transform. plain=True gives the text a PDF reader extracts."""
+    value = str(value or "")
+
+    def cite(match):
+        # Impianto M (PM 04/10/2026): no superscripts; the source is registered for the
+        # section's "Fonti" line and the numbered list in Annex B, and leaves the prose.
+        sources.numbers(match.group(1), match.group(2))
+        return " "
+    value = _CITE.sub(cite, value)
+    value = _HASH.sub("", value)
+    value = _CODE.sub(r"\1", value)
+    value = _BACKTICK_APOSTROPHE.sub("'", value)
+    for pattern, replacement in _JARGON.get(language, ()):
+        value = pattern.sub(replacement, value)
+    if cell:
+        value = _localize_cell(value, language)
+    elif language == "it":
+        value = _localize_prose(value, sources.known)
+    value = re.sub(r"\(\s*[,;]?\s*(?:[,;]\s*)*\)", "", value)
+    value = re.sub(r"[ \t]+([,.;:])", r"\1", value)
+    return re.sub(r"[ \t]{2,}", " ", value).strip()
+
+
+def _shown(value, sources, language, *, cell=False):
+    """Reportlab markup of the display transform."""
+    return _text(_clean(value, sources, language, cell=cell))
+
+
+def _fmt(value, decimals=0, language="it", *, suffix="", scale=1.0):
+    """A missing or non-finite value prints n.d.; never a substitute number."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        return "n.d."
+    from decimal import Decimal, ROUND_HALF_UP
+    # Commercial rounding of the printed decimal (1.565 -> 1,57), not of its binary float.
+    exact = Decimal(repr(value)) / Decimal(repr(scale))
+    rounded = exact.quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_HALF_UP)
+    rendered = f"{rounded:,.{decimals}f}"
+    if language == "it":
+        rendered = rendered.translate(str.maketrans(",.", ".,"))
+    return rendered + suffix
+
+
+def _card_rows(facts, language):
+    it = language == "it"
+    quote, fund = facts.get("quote") or {}, facts.get("fundamentals") or {}
+    cons, risk = facts.get("consensus") or {}, (facts.get("risk") or {}).get("candidate") or {}
+    cur = facts.get("currency") or ""
+    rec = cons.get("recommendations") or {}
+    # One denominator: the recommendation classes themselves (target counts are another sample).
+    classes = [rec.get(k) for k in ("strong_buy", "buy", "hold", "sell", "strong_sell")]
+    known = [v for v in classes if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    positive = (classes[0] + classes[1] if all(isinstance(v, (int, float)) for v in classes[:2])
+                and len(known) == 5 else None)
+    rec_total = sum(known) if len(known) == 5 else None
+    date = str(quote.get("date") or "")[:10]
+    return [
+        (("Prezzo" if it else "Price") + (f" ({date})" if date else ""), _fmt(quote.get("price"), 2, language, suffix=" " + cur)),
+        ("Target medio consensus" if it else "Mean consensus target", _fmt(cons.get("target_mean"), 2, language, suffix=" " + cur)),
+        ("Upside implicito" if it else "Implied upside", _fmt(cons.get("upside_pct"), 1, language, suffix="%")),
+        ("Range target (min-max)" if it else "Target range (min-max)",
+         _fmt(cons.get("target_low"), 0, language) + " - " + _fmt(cons.get("target_high"), 0, language)
+         + (" " + cur if cur else "")),
+        ("Raccomandazioni positive/totale" if it else "Positive/total recommendations",
+         f"{_fmt(positive, 0, language)}/{_fmt(rec_total, 0, language)}" if positive is not None and rec_total
+         else "n.d."),
+        ("Capitalizzazione" if it else "Market cap", _fmt(fund.get("market_cap"), 2, language, scale=1e9,
+         suffix=(" mld " if it else " bn ") + (fund.get("currency") or ("(valuta non dichiarata)" if it
+                                                                        else "(currency not stated)")))),
+        ("EV/EBITDA", _fmt(fund.get("ev_to_ebitda"), 1, language, suffix="x")),
+        ("P/E storico / atteso" if it else "P/E trailing / forward",
+         _fmt(fund.get("pe_trailing"), 1, language, suffix="x") + " / " + _fmt(fund.get("pe_forward"), 1, language, suffix="x")),
+        ("P/B · dividend yield", _fmt(fund.get("price_to_book"), 1, language, suffix="x") + " · "
+         + _fmt(fund.get("dividend_yield"), 2, language, suffix="%")),
+        ("Range 52 settimane" if it else "52-week range",
+         _fmt(quote.get("low_52w"), 2, language) + " - " + _fmt(quote.get("high_52w"), 2, language)),
+        ("Volatilità 1a · beta" if it else "1y volatility · beta",
+         _fmt(risk.get("vol_pct"), 1, language, suffix="%") + " · " + _fmt(risk.get("beta"), 2, language)),
+    ]
+
+
+def _period(period, language):
+    """Provider period codes (0y, +1q) in words, shared with the charts."""
+    from bellomberg.reporting.trade_idea_charts import period_label
+    return period_label(str(period), language)
+
+
+def _annual(period):
+    """Quarterly consensus rows (0q, +1q) belong to the detailed table, not to page one."""
+    return "q" not in str(period).lower()
+
+
+def _consensus_rows(facts, language, *, annual_only=False):
+    it = language == "it"
+    cons = facts.get("consensus") or {}
+    cur = facts.get("currency") or ""
+    rows = [("Target price " + cur, _fmt(cons.get("target_mean"), 2, language) + (" medio · " if it else " mean · ")
+             + _fmt(cons.get("target_median"), 2, language) + (" mediano" if it else " median"))]
+    for item in cons.get("eps") or []:
+        if annual_only and not _annual(item.get("period")):
+            continue
+        rows.append((f"EPS {_period(item.get('period'), language)}", _fmt(item.get("value"), 2, language)
+                     + (f" ({item['analysts']} {'analisti' if it else 'analysts'})" if item.get("analysts") else "")))
+    for item in cons.get("revenue") or []:
+        if annual_only and not _annual(item.get("period")):
+            continue
+        rows.append(((f"Ricavi {_period(item.get('period'), language)} (mld)" if it else
+                      f"Revenue {_period(item.get('period'), language)} (bn)"),
+                     _fmt(item.get("value"), 2, language, scale=1e9)
+                     + (f" ({item['analysts']} {'analisti' if it else 'analysts'})" if item.get("analysts") else "")))
+    return rows
+
+
+_M_NAVY = colors.HexColor("#1F3864")
+_M_GREY = colors.HexColor("#595959")
+_M_RULE = colors.HexColor("#BFC5D2")
+
+_M_TABLE = [("VALIGN", (0, 0), (-1, -1), "TOP"), ("LINEABOVE", (0, 0), (-1, 0), .8, _M_NAVY),
+            ("LINEBELOW", (0, 0), (-1, 0), .6, _M_NAVY), ("LINEBELOW", (0, 1), (-1, -1), .3, _M_RULE),
+            ("LINEBELOW", (0, -1), (-1, -1), .8, _M_NAVY),
+            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4)]
+
+_M_RUNNING = ("Memo d'investimento | ", "Investment memo | ")
+_M_FOOTER = ("Bellomberg | Documento interno riservato al Comitato d'investimento",
+             "Bellomberg | Internal document reserved to the Investment Committee")
+
+
+_SERIF = []
+
+
+def _serif_faces():
+    """Georgia for the memo prose (PM 04/10/2026, chosen over Arial and Cambria on a real memo).
+    Where Georgia is not installed the prose stays in the sans face, with a warning."""
+    if not _SERIF:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        found = None
+        for folder in ("C:/Windows/Fonts/", "/System/Library/Fonts/Supplemental/", "/Library/Fonts/",
+                       "/usr/share/fonts/truetype/msttcorefonts/"):
+            names = (("georgia.ttf", "georgiab.ttf", "georgiai.ttf"),
+                     ("Georgia.ttf", "Georgia Bold.ttf", "Georgia Italic.ttf"))
+            for regular, bold, italic in names:
+                if all(Path(folder + n).is_file() for n in (regular, bold, italic)):
+                    try:
+                        for alias, name in (("BBSerif", regular), ("BBSerifB", bold), ("BBSerifI", italic)):
+                            pdfmetrics.registerFont(TTFont(alias, folder + name))
+                        found = ("BBSerif", "BBSerifB", "BBSerifI")
+                    except Exception:
+                        found = None
+                    break
+            if found:
+                break
+        if not found:
+            import sys
+            print("[trade_idea_report] Georgia non disponibile: testo del memo in carattere sans.", file=sys.stderr)
+        _SERIF.append(found)
+    return _SERIF[0]
+
+
+def _m_styles(styles):
+    """Impianto M (PM 04/10/2026): one column, Georgia prose, Arial tables and headings, navy only."""
+    reg, bold = styles["body"].fontName, styles["h1"].fontName
+    italic = styles["italic"].fontName
+    serif, serif_bold, serif_italic = _serif_faces() or (reg, bold, italic)
+    make = lambda name, **kw: ParagraphStyle(name, **{"fontName": reg, "fontSize": 10, "leading": 14,
+                                                      "textColor": INK, **kw})
+    prose = lambda name, **kw: make(name, **{"fontName": serif, "fontSize": 10.5, "leading": 15.2, **kw})
+    return {
+        "serif_bold": serif_bold,
+        "title": make("mTitle", fontName=bold, fontSize=16, leading=20, textColor=_M_NAVY, spaceAfter=8),
+        "metak": make("mMetaK", fontName=bold, fontSize=9.5, leading=13),
+        "metav": make("mMetaV", fontSize=9.5, leading=13),
+        "h1": make("mH1", fontName=bold, fontSize=13, leading=17, textColor=_M_NAVY, spaceBefore=16,
+                   spaceAfter=6, keepWithNext=True),
+        "h2": make("mH2", fontName=bold, fontSize=10.5, leading=14, spaceBefore=8, spaceAfter=3, keepWithNext=True),
+        "body": prose("mBody", spaceAfter=6, allowWidows=0, allowOrphans=0),
+        "num": prose("mNum", leftIndent=30, bulletIndent=0, bulletFontName=reg, bulletFontSize=9.5,
+                     spaceAfter=6, allowWidows=0, allowOrphans=0),
+        "item": prose("mItem", leftIndent=22, bulletIndent=4, bulletFontName=reg, bulletFontSize=9.5, spaceAfter=3),
+        "quote": prose("mQuote", fontName=serif_italic, leftIndent=22, rightIndent=22, textColor=_M_GREY, spaceAfter=6),
+        "cell": make("mCell", fontSize=9, leading=12),
+        "cellb": make("mCellB", fontName=bold, fontSize=9, leading=12),
+        "cellr": make("mCellR", fontSize=9, leading=12, alignment=2),
+        "head": make("mHead", fontName=bold, fontSize=9, leading=12, textColor=_M_NAVY),
+        "headr": make("mHeadR", fontName=bold, fontSize=9, leading=12, textColor=_M_NAVY, alignment=2),
+        "caption": make("mCaption", fontName=bold, fontSize=9.5, leading=13, spaceBefore=8, spaceAfter=1,
+                        keepWithNext=True),
+        "unit": make("mUnit", fontSize=8, leading=10.5, textColor=_M_GREY, spaceAfter=3, keepWithNext=True),
+        "note": make("mNote", fontSize=8, leading=10.5, textColor=_M_GREY, spaceAfter=4),
+        "reading": prose("mReading", fontSize=9.5, leading=13.5, spaceAfter=8),
+        "small": make("mSmall", fontSize=8, leading=10.5, textColor=_M_GREY, spaceAfter=3),
+        # Annex prose keeps the legacy names used by _rich_flowables.
+        "headcell": make("mHeadCell", fontName=bold, fontSize=8.5, leading=11, textColor=_M_NAVY),
+        "annexcell": make("mAnnexCell", fontSize=8.5, leading=11),
+    }
+
+
+def _m_lines(run, result, facts, language):
+    """Rows of section 1 (Raccomandazione); nothing here is summarised or invented."""
+    it = language == "it"
+    proposal = result.get("proposal") or {}
+    judgment = result.get("judgment")
+    names = {"watch": ("Osservare: nessun acquisto in questa run", "Watch: no purchase in this run"),
+             "rejected": ("Respinta: nessuna posizione", "Rejected: no position"),
+             "incomplete": ("Incompleta: ricerca da completare", "Incomplete: research to complete"),
+             "favorable": ("Favorevole", "Favourable")}
+    action = names.get(judgment, (str(judgment), str(judgment)))[0 if it else 1]
+    if proposal:
+        action = f"{str(proposal.get('action', '')).capitalize()} · {action}"
+    portfolio = (facts or {}).get("portfolio") or {}
+    cash = (f"{'Cassa del book' if it else 'Book cash'} {_fmt(portfolio.get('cash'), 2, language)} EUR "
+            f"({_fmt(portfolio.get('cash_pct'), 2, language, suffix='%')} {'del NAV' if it else 'of NAV'})"
+            if portfolio.get("cash") is not None else ("Cassa del book: n.d." if it else "Book cash: n.d."))
+    amount = (f"{_fmt(proposal['eur_amount'], 0, language)} EUR. {cash}" if proposal.get("eur_amount") is not None
+              else ("0 EUR: nessun importo proposto. " if it else "0 EUR: no amount proposed. ") + cash)
+    conviction = str(proposal["confidence"]) if proposal.get("confidence") else (
+        "n.d. (nessuna proposta operativa)" if it else "n.d. (no actionable proposal)")
+    horizon = str(proposal["timing"]) if proposal.get("timing") else (
+        "n.d. (nessuna posizione)" if it else "n.d. (no position)")
+    destination = result.get("destination") or run.get("destination") or {}
+    route = {"dcn": ("Proposta in DCN, da approvare dal PM", "DCN proposal pending PM approval"),
+             "research": ("In ricerca: nessuna proposta in DCN", "In research: no DCN proposal")}.get(
+        destination.get("kind"), ("Nessuna destinazione", "No destination"))[0 if it else 1]
+    return action, [("Azione" if it else "Action", action), ("Importo" if it else "Amount", amount),
+                    ("Convinzione" if it else "Conviction", conviction), ("Orizzonte" if it else "Horizon", horizon),
+                    ("Destinazione" if it else "Routing", route)]
+
+
+def _m_market_rows(facts, language):
+    """Market, multiples and consensus table rows read from the tool receipts."""
+    return _card_rows(facts, language)
+
+
+def _history_table(facts, language, st, width):
+    """Financial history in millions, exactly as extracted; missing cells print n.d."""
+    it = language == "it"
+    history = facts.get("history") or {}
+    series = history.get("series") or {}
+    revenue = series.get("revenue") or {}
+    # A year with no revenue (e.g. equity only, as an opening balance) is not a fiscal column.
+    years = [y for y in (history.get("years") or []) if revenue.get(y, revenue.get(str(y))) is not None]
+    cons = facts.get("consensus") or {}
+    est_rev = {str(i.get("period")): i.get("value") for i in cons.get("revenue") or [] if _annual(i.get("period"))}
+    est_eps = {str(i.get("period")): i.get("value") for i in cons.get("eps") or [] if _annual(i.get("period"))}
+    periods = [p for p in dict.fromkeys([*est_rev, *est_eps])]
+    if not years and not periods:
+        return None, None
+    rows_def = [("revenue", "Ricavi", "Revenue", 1e6, 0), ("operating_income", "Utile operativo", "Operating income", 1e6, 0),
+                ("net_income", "Utile netto", "Net income", 1e6, 0), ("cfo", "Flusso di cassa operativo", "Operating cash flow", 1e6, 0),
+                ("capex", "Investimenti (capex)", "Capex", 1e6, 0), ("fcf", "Flusso di cassa libero", "Free cash flow", 1e6, 0),
+                ("cash", "Cassa", "Cash", 1e6, 0), ("long_term_debt", "Debito a lungo termine", "Long-term debt", 1e6, 0),
+                ("goodwill", "Avviamento", "Goodwill", 1e6, 0), ("equity", "Patrimonio netto", "Equity", 1e6, 0),
+                ("eps_diluted", "Utile per azione diluito", "Diluted EPS", 1, 2)]
+    head = [Paragraph(("Milioni di " if it else "Millions of ") + (facts.get("currency") or "n.d."), st["head"])]
+    head += [Paragraph(str(y), st["headr"]) for y in years]
+    head += [Paragraph(_text(_period(p, language) + (" (stima)" if it else " (est.)")), st["headr"]) for p in periods]
+    rows = [head]
+
+    def get(name, year):
+        values = series.get(name) or {}
+        return values.get(year, values.get(str(year)))
+    for key, it_label, en_label, scale, dec in rows_def:
+        if not any(get(key, y) is not None for y in years) and not (
+                (key == "revenue" and est_rev) or (key == "eps_diluted" and est_eps)):
+            continue
+        label = (it_label if it else en_label) + (" (per azione)" if key == "eps_diluted" and it else
+                                                  " (per share)" if key == "eps_diluted" else "")
+        row = [Paragraph(_text(label), st["cell"])]
+        row += [Paragraph(_fmt(get(key, y), dec, language, scale=scale), st["cellr"]) for y in years]
+        estimates = est_rev if key == "revenue" else est_eps if key == "eps_diluted" else {}
+        row += [Paragraph(_fmt(estimates.get(p), dec, language, scale=scale), st["cellr"]) for p in periods]
+        rows.append(row)
+        if key == "operating_income":
+            margin = [Paragraph(_text("  " + ("Margine operativo" if it else "Operating margin")), st["cell"])]
+            for y in years:
+                rev, op = get("revenue", y), get("operating_income", y)
+                margin.append(Paragraph(_fmt(op / rev * 100 if rev and op is not None else None, 1, language,
+                                             suffix="%"), st["cellr"]))
+            margin += [Paragraph("", st["cellr"]) for _ in periods]
+            rows.append(margin)
+    count = len(years) + len(periods)
+    first = width * .3
+    table = Table(rows, colWidths=[first] + [(width - first) / max(count, 1)] * count, repeatRows=1)
+    table.setStyle(TableStyle(_M_TABLE))
+    note = ((f"Fonti: storico {history.get('source') or 'n.d.'}" + (f"; stime {cons.get('source') or 'n.d.'}, "
+             "periodo come dichiarato dal fornitore" if periods else "") + ".") if it else
+            (f"Sources: history {history.get('source') or 'n.d.'}" + (f"; estimates {cons.get('source') or 'n.d.'}"
+             if periods else "") + "."))
+    return table, note
+
+
+def _consensus_table(facts, language, st, width):
+    it = language == "it"
+    cons = facts.get("consensus") or {}
+    if not cons:
+        return None, None
+    rows = [[Paragraph(_text(h), st["head"]) for h in (("Voce", "Valore") if it else ("Item", "Value"))]]
+    rows += [[Paragraph(_text(a), st["cell"]), Paragraph(_text(b), st["cell"])] for a, b in _consensus_rows(facts, language)]
+    for item in cons.get("eps_revisions") or []:
+        rows.append([Paragraph(_text(("Revisioni EPS, " if it else "EPS revisions, ") + _period(item.get("period"), language)),
+                               st["cell"]),
+                     Paragraph(_text(("30 giorni " if it else "30 days ") + _fmt(item.get("change_30d_pct"), 2, language, suffix="%")
+                                     + (" · 90 giorni " if it else " · 90 days ")
+                                     + _fmt(item.get("change_90d_pct"), 2, language, suffix="%")), st["cell"])])
+    names = (("strong_buy", "acquisto forte"), ("buy", "acquisto"), ("hold", "mantenere"), ("sell", "vendita"),
+             ("strong_sell", "vendita forte"))
+    for key, title in (("recommendations", ("Raccomandazioni, mese corrente", "Recommendations, current month")),
+                       ("recommendations_prev", ("Raccomandazioni, rilevazione precedente", "Recommendations, earlier"))):
+        rec = cons.get(key)
+        if rec:
+            rows.append([Paragraph(_text(title[0 if it else 1]), st["cell"]),
+                         Paragraph(_text(" · ".join(f"{(name if it else k.replace('_', ' '))} {_fmt(rec.get(k), 0, language)}"
+                                                    for k, name in names)), st["cell"])])
+    table = Table(rows, colWidths=[width * .38, width * .62], repeatRows=1)
+    table.setStyle(TableStyle(_M_TABLE))
+    note = (("Fonte: " if it else "Source: ") + str(cons.get("source") or "n.d.")
+            + ((" · data di osservazione non dichiarata dal fornitore" if it else " · observation date not stated")
+               if not cons.get("as_of") else "") + ".")
+    return table, note
+
+
+# Where each deterministic exhibit is discussed: the figures sit inside that section.
+_M_EXHIBITS = {
+    "financial_quality": ["table:history", "revenue_margin", "revenue_path", "margins", "cash", "capital_allocation", "balance"],
+    "valuation": ["table:market", "table:consensus", "price_targets", "eps_path", "recommendations"],
+    "portfolio_risk": ["risk", "tail_risk"],
+    "positioning": ["returns"],
+}
+
+
+def _it_date(value):
+    """2026-10-02 -> 02/10/2026; anything else is printed as given."""
+    text = str(value or "")
+    return f"{text[8:10]}/{text[5:7]}/{text[:4]}" if re.match(r"\d{4}-\d{2}-\d{2}", text) else text[:10]
 
 
 def _render_company_memo(path, run, result, language, partial_reasons):
-    """Versioned company note. The historical renderer and weekly note stay unchanged."""
+    """Impianto M (scelta PM 04/10/2026): memo d'investimento a sezioni numerate, lungo ed esaustivo.
+    Figures and tables live inside the section that discusses them; sources close each section."""
+    import tempfile
+    from reportlab.platypus import Image
     styles = _memo_styles()
+    st = _m_styles(styles)
     reg, bold = styles["body"].fontName, styles["h1"].fontName
     w, h = A4
-    margin, bottom, top = 56.7, 51, 65.2
+    margin, bottom, top = 64, 56, 58
     width = w - 2*margin
     ticker = result["ticker"]
+    it = language == "it"
+    label = lambda it_text, en_text: it_text if it else en_text
     cutoff = str(run.get("cutoff") or result.get("cutoff") or run.get("started_at") or "n.d.")
+    identity = run.get("identity") or {}
+    name = identity.get("name") or ticker
+    annex_data = run.get("desk_annex")
+    facts = run.get("facts") or None
+    sources = _Sources(result, annex_data, language, facts)
+    show_sans = lambda value, cell=False: _shown(value, sources, language, cell=cell)
+    # Inline bold in Georgia prose is Georgia bold; table cells (cell=True) keep the sans bold.
+    sans_bold_tag = f'<font name="{_bold_face()}">'
+    show = lambda value, cell=False: (show_sans(value, cell) if cell else
+                                      show_sans(value).replace(sans_bold_tag, f'<font name="{st["serif_bold"]}">'))
+    date_label = cutoff[8:10] + "/" + cutoff[5:7] + "/" + cutoff[:4] if re.match(r"\d{4}-\d{2}-\d{2}", cutoff) else cutoff[:10]
     doc = _ResearchDoc(str(path), pagesize=A4, leftMargin=margin, rightMargin=margin,
-        topMargin=top, bottomMargin=bottom, title=f"Trade Idea | {ticker}", author="Bellomberg Research", allowSplitting=1)
-    doc.section, doc.section_pages, doc.header_sections = "Trade Idea", {}, {}
-    header_text = f"TRADE IDEA | {ticker} | {cutoff[:10]}"
+        topMargin=top, bottomMargin=bottom, title=f"Memo d'investimento | {name}", author="Bellomberg", allowSplitting=1)
+    doc.section, doc.section_pages, doc.header_sections = "Memo", {}, {}
+    running = _M_RUNNING[0 if it else 1] + f"{name} ({ticker}) | {date_label}"
 
     def body_page(canvas, document):
         canvas.saveState()
-        _draw_lockup(canvas, margin, h-40, 12, reg, bold, OBSIDIAN, MUTED, AMBER, tagline=False)
-        canvas.setFillColor(MUTED)
-        canvas.setFont(reg, 7)
-        canvas.drawRightString(w-margin, h-39, header_text)
-        canvas.setStrokeColor(OBSIDIAN)
-        canvas.setLineWidth(.7)
-        canvas.line(margin, h-50, w-margin, h-50)
-        canvas.setStrokeColor(RULE)
+        if document.page > 1:
+            canvas.setFont(reg, 7.5)
+            canvas.setFillColor(_M_GREY)
+            canvas.drawString(margin, h-38, running)
+            canvas.setStrokeColor(_M_NAVY)
+            canvas.setLineWidth(.6)
+            canvas.line(margin, h-43, w-margin, h-43)
+        canvas.setStrokeColor(_M_RULE)
         canvas.setLineWidth(.5)
-        canvas.line(margin, 42.5, w-margin, 42.5)
-        footer = "Ricerca Bellomberg · Documento interno" if language == "it" else "Bellomberg Research · Internal document"
+        canvas.line(margin, 44, w-margin, 44)
+        canvas.setFillColor(_M_GREY)
+        canvas.setFont(reg, 7.5)
+        footer = _M_FOOTER[0 if it else 1]
         if run.get("preview"):
-            footer = "ANTEPRIMA · DATI SINTETICI" if language == "it" else "PREVIEW · SYNTHETIC DATA"
+            footer = "ANTEPRIMA · DATI SINTETICI" if it else "PREVIEW · SYNTHETIC DATA"
         canvas.drawString(margin, 32, footer)
-        canvas.drawRightString(w-margin, 32, ("Pagina " if language == "it" else "Page ") + str(document.page))
+        canvas.drawRightString(w-margin, 32, ("Pagina " if it else "Page ") + str(document.page))
         canvas.restoreState()
 
-    doc.addPageTemplates([
-        PageTemplate(id="cover", frames=[Frame(0, 0, w, h, leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)]),
-        PageTemplate(id="body", frames=[Frame(margin, bottom, width, h-top-bottom,
-            leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)], onPage=body_page),
-    ])
-    p = lambda text, style="body": Paragraph(_text(text), styles[style])
-    story = [_CompanyCover(run, result, language, styles, partial_reasons), NextPageTemplate("body"), PageBreak()]
+    doc.addPageTemplates([PageTemplate(id="body", frames=[Frame(margin, bottom, width, h-top-bottom,
+        leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)], onPage=body_page)])
+    story = []
+    counters = {"section": 0, "figure": 0, "table": 0}
 
-    def label(it, en):
-        return it if language == "it" else en
+    def section(key, title):
+        counters["section"] += 1
+        heading = f"{counters['section']}. {title}"
+        story.extend([_Section(key, heading), Paragraph(_text(heading), st["h1"])])
+        return counters["section"]
 
-    def group(title, values):
-        if values:
-            story.append(p(title, "h2"))
-            story.extend(p(value) for value in values)
+    def numbered(number, sub, value, style="num"):
+        """One Capo paragraph (or list item) with its hanging number; tables inside stay tables."""
+        flows = _rich_flowables(value, {**styles, "body": st[style], "cell": st["annexcell"],
+                                        "headcell": st["headcell"]}, width, show=show)
+        if flows and isinstance(flows[0], Paragraph):
+            flows[0] = Paragraph(flows[0].text, st[style], bulletText=f"{number}.{sub}")
+        story.extend(flows)
 
-    for section in result.get("dossier", []):
-        key = section["key"]
-        story.extend([_Section(key, section["title"]), _SectionTitle(section["title"], styles["h1"], width)])
-        if key == "executive":
-            story.extend([p(_label("judgment", language) + ": " + _label(result["judgment"], language), "h2"), p(result.get("summary", ""))])
-            if partial_reasons:
-                group(_label("partial", language), partial_reasons)
-        elif key == "pm_view":
-            story.extend([p(_label("pm_view", language), "h2"),
-                          p(result.get("pm_view") or run.get("pm_view") or _label("no_view", language)),
-                          p(label("Risposta del comitato", "Committee response"), "h2"), p(result.get("pm_view_response", ""))])
-        for paragraph in section.get("paragraphs", []):
-            story.extend(_rich_flowables(paragraph, styles, width))
-        if key == "executive":
-            group(label("Elementi a favore", "Supporting evidence"), result.get("pros"))
-            group(label("Elementi contrari", "Counterarguments"), result.get("cons"))
-        elif key == "portfolio_risk":
-            group(label("Rischi da presidiare", "Risks to monitor"), result.get("risks"))
-        elif key == "catalysts":
-            group(label("Eventi da seguire", "Events to monitor"), result.get("catalysts"))
-        elif key == "scenarios":
-            for scenario in result.get("scenarios", []):
-                group(scenario["name"], [scenario["analysis"]])
-        elif key == "red_team":
-            for index, objection in enumerate(result.get("objections", []), 1):
-                group(label(f"Obiezione {index}", f"Objection {index}"), [objection["objection"], objection["response"]])
-                story.append(p(label("Risolta" if objection["resolved"] else "Obiezione aperta",
-                                     "Resolved" if objection["resolved"] else "Open objection"), "small"))
-        elif key == "decision":
-            group(label("Condizioni di revisione", "Review conditions"), result.get("review_conditions"))
-            group(label("Cosa invalida la tesi", "Thesis invalidation"), result.get("invalidation"))
-            group(label("Dati mancanti e limiti", "Data gaps and limitations"), result.get("data_gaps"))
-            group(label("Domande decisive", "Decisive questions"), result.get("decisive_questions"))
-            destination = result.get("destination") or run.get("destination") or {}
-            if destination.get("reason"):
-                group(label("Destinazione della ricerca", "Research disposition"), [destination["reason"]])
-            proposal = result.get("proposal")
-            if proposal:
-                group(label("Proposta da valutare dal PM", "Proposal for PM review"), [
-                    f"{proposal['action']} | {proposal['ticker']} | {proposal['confidence']}",
-                    proposal["timing"], proposal["rationale"]])
-                if proposal.get("eur_amount") is not None:
-                    story.append(p(f"EUR {proposal['eur_amount']}"))
-                if proposal.get("sizing_source"):
-                    story.append(p(proposal["sizing_source"], "small"))
-        for index, table in enumerate(section.get("tables", [])):
-            story.append(p(table["title"], "h2"))
-            rows = [[p(value, "headcell") for value in table["columns"]]]
-            rows.extend([p(cell, "cell") for cell in row] for row in table["rows"])
-            count = len(table["columns"])
-            widths = [width] if count == 1 else [width*.32] + [width*.68/(count-1)]*(count-1)
-            rendered = Table(rows, colWidths=widths, repeatRows=1, splitByRow=1, splitInRow=1, hAlign="LEFT")
-            rendered.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), OBSIDIAN),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [PAPER, PALE]), ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                ("LEFTPADDING", (0, 0), (-1, -1), 7), ("RIGHTPADDING", (0, 0), (-1, -1), 7),
-                ("LINEBELOW", (0, 0), (-1, 0), .8, AMBER)]))
-            story.extend([rendered, Spacer(1, 4), p(f"{table['unit']} | {table['period']} | {table['source']}", "small")])
-            for chart in section.get("charts", []):
-                if chart["table_index"] == index:
-                    try:
-                        drawing = _chart(section, chart, width, reg)
-                    except ValueError as exc:
-                        story.append(p(_label("missing", language) + ": " + str(exc), "small"))
-                    else:
-                        story.append(KeepTogether([drawing, p(f"{table['title']} | {table['unit']} | {table['period']} | {table['source']}", "small")]))
+    def items(values, style="item"):
+        for index, value in enumerate(values or []):
+            story.append(Paragraph(show(value), st[style], bulletText=f"({chr(97 + index) if index < 26 else index + 1})"))
 
-    annex = _annex_blocks(run.get("desk_annex"), language)
-    if annex:
-        title = ("Complete desk and Red Team analysis" if language != "it" else
-                 "Analisi integrale dei desk e del Red Team")
-        story.extend([PageBreak(), _Section("annex", title), _SectionTitle(title, styles["h1"], width),
-            p(("Full final reports the Capo deliberated on; nothing is cut." if language != "it" else
-               "Testo integrale dei report finali su cui ha deliberato il Capo; nessun taglio."), "small")])
-        for _, heading, block in annex:
-            if heading:
-                story.append(p(heading, "h2"))
-            story.extend(_rich_flowables(block, styles, width))
-    story.extend([PageBreak(), _Section("sources", _label("sources", language)),
-        _SectionTitle(_label("sources", language), styles["h1"], width), p(_label("scope", language), "small")])
-    for evidence in result.get("evidence", []):
-        group(f"{evidence['source']} | {evidence['as_of']}", [evidence["summary"]])
-        story.append(p(f"Riferimento: {evidence['id']}", "small"))
-        if evidence.get("url"):
-            url = escape(evidence["url"], quote=True)
-            story.append(Paragraph(f'<link href="{url}" color="#606973">{url}</link>', styles["small"]))
-    story.append(p(label("Tracciabilità delle evidenze", "Evidence references"), "h2"))
-    for section in result.get("dossier", []):
-        if section.get("evidence_ids"):
-            story.append(p(section["title"] + ": " + ", ".join(section["evidence_ids"]), "small"))
-    for scenario in result.get("scenarios", []):
-        if scenario.get("evidence_ids"):
-            story.append(p(label("Scenario: ", "Scenario: ") + scenario["name"] + " | " + ", ".join(scenario["evidence_ids"]), "small"))
-    for index, objection in enumerate(result.get("objections", []), 1):
-        if objection.get("evidence_ids"):
-            story.append(p(label(f"Obiezione {index}: ", f"Objection {index}: ") + ", ".join(objection["evidence_ids"]), "small"))
-    if result.get("history_review"):
-        story.append(p(label("Confronto con le decisioni precedenti", "Review of earlier decisions"), "h2"))
-        for review in result["history_review"]:
-            story.extend([p(f"{review['kind']} {review['id']}", "small"), p(review["response"])])
-    story.append(p(label("Provenienza del documento", "Document provenance"), "h2"))
-    story.append(p(f"Cutoff: {cutoff}\nRun: {run.get('id') or run.get('run_id') or result.get('run_id') or 'n.d.'}", "small"))
-    models = run.get("models") or result.get("models") or {}
-    for role, model in (models.items() if isinstance(models, dict) else enumerate(models)):
-        story.append(p(f"{role}: {model}", "small"))
-    doc.build(story)
+    def sources_line(texts):
+        keys = []
+        for text in texts:
+            for kind, body in _CITE.findall(str(text or "")):
+                for key in _cite_items(kind, body)[0]:
+                    if key not in keys:
+                        keys.append(key)
+        if keys:
+            story.append(Paragraph(_text(("Fonti della sezione: " if it else "Section sources: ")
+                                         + "; ".join(sources.label(k) for k in keys) + "."), st["note"]))
+
+    def caption(kind, title, unit=None):
+        counters[kind] += 1
+        word = {"figure": ("Figura", "Figure"), "table": ("Tabella", "Table")}[kind][0 if it else 1]
+        story.append(Paragraph(_text(f"{word} {counters[kind]}. {title}"), st["caption"]))
+        if unit:
+            story.append(Paragraph(_text(unit), st["unit"]))
+
+    charts, missing = {}, []
+
+    def exhibit(key, chart_dir):
+        if key == "table:history":
+            table, note = _history_table(facts, language, st, width)
+            if table is not None:
+                caption("table", label("Storico di bilancio e stime del consenso", "Financial history and consensus estimates"))
+                story.extend([table, Paragraph(_text(note), st["note"])])
+        elif key == "table:market":
+            rows = [[Paragraph(_text(h), st["head"]), Paragraph(_text(v), st["headr"])]
+                    for h, v in [(label("Voce", "Item"), label("Valore", "Value"))]]
+            rows += [[Paragraph(_text(a), st["cell"]), Paragraph(_text(b), st["cellr"])] for a, b in _m_market_rows(facts, language)]
+            table = Table(rows, colWidths=[width * .55, width * .45], repeatRows=1)
+            table.setStyle(TableStyle(_M_TABLE))
+            caption("table", label("Prezzo, multipli e consenso degli analisti", "Price, multiples and analyst consensus"))
+            tools = [sources.label(t) for t in dict.fromkeys(
+                (facts.get(b) or {}).get("tool") for b in ("quote", "fundamentals", "consensus")) if t]
+            risk_tool = ((facts.get("risk") or {}).get("candidate") or {}).get("tool")
+            if risk_tool:
+                tools.append(sources.label(risk_tool))
+            story.extend([table, Paragraph(_text(label("Fonti: ", "Sources: ") + "; ".join(dict.fromkeys(tools)) + "."),
+                                           st["note"])])
+        elif key == "table:consensus":
+            table, note = _consensus_table(facts, language, st, width)
+            if table is not None:
+                caption("table", label("Consenso degli analisti in dettaglio", "Analyst consensus in detail"))
+                story.extend([table, Paragraph(_text(note), st["note"])])
+        elif key in charts:
+            chart = charts.pop(key)
+            caption("figure", chart["title"], chart.get("subtitle"))
+            aspect = float(chart.get("aspect") or .55)
+            image = Image(chart["path"], width=width, height=width * aspect)
+            image.hAlign = "LEFT"
+            story.extend([image, Paragraph(_text(label("Fonte: ", "Source: ") + str(chart.get("source") or "n.d.")), st["note"])])
+            if chart.get("notes"):
+                story.append(Paragraph("<b>" + escape(label("Lettura.", "Reading.")) + "</b> "
+                                       + " ".join(_text(n) for n in chart["notes"]), st["reading"]))
+
+    with tempfile.TemporaryDirectory(prefix="bb-ti-charts-") as chart_dir:
+        if facts:
+            from bellomberg.reporting.trade_idea_charts import build_charts
+            for chart in build_charts(facts, chart_dir, language=language, ticker=ticker):
+                if chart.get("missing"):
+                    missing.append(chart)
+                else:
+                    charts[chart["key"]] = chart
+
+        # Intestazione del memo.
+        story.append(Paragraph(_text(label("MEMO D'INVESTIMENTO", "INVESTMENT MEMO") + f" — {name} ({ticker})"), st["title"]))
+        action, rows = _m_lines(run, result, facts, language)
+        quote = (facts or {}).get("quote") or {}
+        meta = [(label("Destinatario", "To"), label("Comitato d'investimento", "Investment Committee")),
+                (label("Data", "Date"), date_label + (label("; prezzi di chiusura al ", "; closing prices as of ")
+                                                       + _it_date(quote.get("date")) if quote.get("date") else "")),
+                (label("Oggetto", "Subject"), label("Valutazione di un investimento in ", "Assessment of an investment in ")
+                 + name + " (" + ", ".join(str(v) for v in (identity.get("exchange"), identity.get("currency")) if v) + ")"),
+                (label("Raccomandazione", "Recommendation"), action)]
+        table = Table([[Paragraph(_text(k), st["metak"]), Paragraph(show_sans(v), st["metav"] if k != meta[-1][0] else st["metak"])]
+                       for k, v in meta], colWidths=[width * .24, width * .76])
+        table.setStyle(TableStyle([("LINEABOVE", (0, 0), (-1, 0), .8, _M_NAVY), ("LINEBELOW", (0, -1), (-1, -1), .8, _M_NAVY),
+                                   ("VALIGN", (0, 0), (-1, -1), "TOP"), ("TOPPADDING", (0, 0), (-1, -1), 2),
+                                   ("BOTTOMPADDING", (0, 0), (-1, -1), 2), ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
+        story.append(table)
+        if partial_reasons:
+            story.append(Paragraph(_text(_label("partial", language) + ": " + "; ".join(partial_reasons)), st["note"]))
+        if run.get("preview"):
+            story.append(Paragraph(_text("ANTEPRIMA · DATI SINTETICI" if it else "PREVIEW · SYNTHETIC DATA"), st["note"]))
+
+        # 1. Raccomandazione.
+        section("recommendation", label("Raccomandazione", "Recommendation"))
+        reviews = result.get("review_conditions") or []
+        body = [[Paragraph(_text(k), st["cellb"]), Paragraph(show_sans(v), st["cell"])] for k, v in rows]
+        if reviews:
+            body.append([Paragraph(_text(label("Condizioni per rivedere", "Conditions to revisit")), st["cellb"]),
+                         [Paragraph(show_sans(v), st["cell"], bulletText=f"({chr(97 + i) if i < 26 else i + 1})")
+                          for i, v in enumerate(reviews)]])
+        table = Table(body, colWidths=[width * .26, width * .74])
+        table.setStyle(TableStyle(_M_TABLE[:1] + _M_TABLE[2:]))
+        story.append(table)
+        sources_line(reviews)
+
+        # 2. Tesi in sintesi: the Capo's summary in full, then the evidence for and against.
+        number = section("thesis", label("Tesi in sintesi", "Thesis in brief"))
+        sub = 0
+        for block in [b for b in re.split(r"\n\s*\n", str(result.get("summary") or "")) if b.strip()] or [""]:
+            sub += 1
+            numbered(number, sub, block)
+        for title, values in ((label("Elementi a favore", "Supporting evidence"), result.get("pros")),
+                              (label("Elementi contrari", "Counterarguments"), result.get("cons"))):
+            if values:
+                sub += 1
+                story.append(Paragraph(_text(f"{number}.{sub} {title}"), st["h2"]))
+                items(values)
+        sources_line([result.get("summary"), *(result.get("pros") or []), *(result.get("cons") or [])])
+
+        # 3. Rischi, criteri di uscita e catalizzatori.
+        number = section("risks", label("Rischi, criteri di uscita e catalizzatori", "Risks, exit criteria and catalysts"))
+        sub = 0
+        for title, values in ((label("Rischi principali", "Main risks"), result.get("risks")),
+                              (label("Criteri di invalidazione", "Invalidation criteria"), result.get("invalidation")),
+                              (label("Catalizzatori datati", "Dated catalysts"), result.get("catalysts"))):
+            if values:
+                sub += 1
+                story.append(Paragraph(_text(f"{number}.{sub} {title}"), st["h2"]))
+                items(values)
+        sources_line([*(result.get("risks") or []), *(result.get("invalidation") or []), *(result.get("catalysts") or [])])
+
+        # 4..N. The Capo's dossier, each section with its own exhibits.
+        for dossier in result.get("dossier", []):
+            key = dossier["key"]
+            number = section(key, _clean(dossier["title"], sources, language, plain=True))
+            sub, texts = 0, list(dossier.get("paragraphs", []))
+            if key == "pm_view":
+                story.append(Paragraph(_text(_label("pm_view", language)), st["h2"]))
+                story.append(Paragraph(show(result.get("pm_view") or run.get("pm_view") or _label("no_view", language)),
+                                       st["quote"]))
+                story.append(Paragraph(_text(label("Risposta del comitato", "Committee response")), st["h2"]))
+                story.append(Paragraph(show(result.get("pm_view_response", "")), st["body"]))
+                texts.append(result.get("pm_view_response"))
+            for paragraph in dossier.get("paragraphs", []):
+                sub += 1
+                numbered(number, sub, paragraph)
+            if key == "scenarios":
+                for scenario in result.get("scenarios", []):
+                    sub += 1
+                    story.append(Paragraph(show(f"{number}.{sub} {scenario['name']}"), st["h2"]))
+                    story.extend(_rich_flowables(scenario["analysis"], {**styles, "body": st["body"],
+                                 "cell": st["annexcell"], "headcell": st["headcell"]}, width, show=show))
+                    texts.append(scenario["analysis"])
+            elif key == "red_team" and result.get("objections"):
+                caption("table", label("Registro delle obiezioni del Red Team", "Red Team objection register"))
+                rows = [[Paragraph(_text(v), st["head"]) for v in (
+                    ("N.", "Obiezione", "Risposta del comitato", "Esito") if it else
+                    ("No.", "Objection", "Committee response", "Outcome"))]]
+                for index, objection in enumerate(result["objections"], 1):
+                    rows.append([Paragraph(str(index), st["cell"]), Paragraph(show_sans(objection["objection"]), st["cell"]),
+                                 Paragraph(show_sans(objection["response"]), st["cell"]),
+                                 Paragraph(_text(label("Risolta", "Resolved") if objection["resolved"]
+                                                 else label("Aperta", "Open")), st["cellb"])])
+                    texts.extend([objection["objection"], objection["response"]])
+                table = Table(rows, colWidths=[22, (width - 80) * .5, (width - 80) * .5, 58], repeatRows=1,
+                              splitByRow=1, splitInRow=1)
+                table.setStyle(TableStyle(_M_TABLE))
+                story.append(table)
+            elif key == "decision":
+                for title, values in ((label("Dati mancanti e limiti", "Data gaps and limitations"), result.get("data_gaps")),
+                                      (label("Domande decisive", "Decisive questions"), result.get("decisive_questions"))):
+                    if values:
+                        sub += 1
+                        story.append(Paragraph(_text(f"{number}.{sub} {title}"), st["h2"]))
+                        items(values)
+                        texts.extend(values)
+                destination = result.get("destination") or run.get("destination") or {}
+                if destination.get("reason"):
+                    sub += 1
+                    story.append(Paragraph(_text(f"{number}.{sub} " + label("Destinazione della ricerca", "Research disposition")),
+                                           st["h2"]))
+                    story.append(Paragraph(show(destination["reason"]), st["body"]))
+                proposal = result.get("proposal")
+                if proposal:
+                    sub += 1
+                    story.append(Paragraph(_text(f"{number}.{sub} " + label("Proposta da valutare dal PM", "Proposal for PM review")),
+                                           st["h2"]))
+                    for value in (f"{proposal['action']} | {proposal['ticker']} | {proposal['confidence']}",
+                                  proposal["timing"], proposal["rationale"]):
+                        story.append(Paragraph(show(value), st["body"]))
+                    if proposal.get("eur_amount") is not None:
+                        story.append(Paragraph(_text("EUR " + _fmt(proposal["eur_amount"], 2, language)), st["body"]))
+                    if proposal.get("sizing_source"):
+                        story.append(Paragraph(show(proposal["sizing_source"]), st["small"]))
+                    texts.extend([proposal.get("rationale"), proposal.get("sizing_source")])
+            for table_data in dossier.get("tables", []):
+                caption("table", _clean(table_data["title"], sources, language, cell=True, plain=True))
+                rows = [[Paragraph(show(value, cell=True), st["head"]) for value in table_data["columns"]]]
+                rows.extend([Paragraph(show(cell, cell=True), st["cell"]) for cell in row] for row in table_data["rows"])
+                count = len(table_data["columns"])
+                widths = [width] if count == 1 else [width*.3] + [width*.7/(count-1)]*(count-1)
+                rendered = Table(rows, colWidths=widths, repeatRows=1, splitByRow=1, splitInRow=1, hAlign="LEFT")
+                rendered.setStyle(TableStyle(_M_TABLE))
+                story.extend([rendered, Paragraph(show(f"{table_data['unit']} | {table_data['period']} | "
+                                                       f"{table_data['source']}", cell=True), st["note"])])
+                texts.append(table_data["source"])
+            if facts:
+                for exhibit_key in _M_EXHIBITS.get(key, []):
+                    exhibit(exhibit_key, chart_dir)
+            sources_line(texts)
+
+        # Exhibits whose section the Capo did not write, then the declared data gaps.
+        leftovers = [k for keys in _M_EXHIBITS.values() for k in keys
+                     if k in charts or (k.startswith("table:") and not any(
+                         d["key"] in [s for s, ks in _M_EXHIBITS.items() if k in ks] for d in result.get("dossier", [])))]
+        gaps = [*((facts or {}).get("gaps") or []), *(f"{c['title']}: {c['missing']}" for c in missing)]
+        if leftovers or gaps or not facts:
+            number = section("data_notes", label("Nota sui dati della run", "Note on the run data"))
+            for exhibit_key in leftovers:
+                exhibit(exhibit_key, chart_dir)
+            if not facts:
+                story.append(Paragraph(_text(label("Dati numerici della run non disponibili: tabelle e figure deterministiche "
+                                                   "non prodotte.", "Run numeric data not available: no deterministic "
+                                                   "tables or figures.")), st["body"]))
+            if gaps:
+                story.append(Paragraph(_text(f"{number}.1 " + label("Dati che la run non ha procurato",
+                                                                    "Data the run did not obtain")), st["h2"]))
+                for index, gap in enumerate(gaps):
+                    story.append(Paragraph(_text(gap), st["item"], bulletText=f"({chr(97 + index) if index < 26 else index + 1})"))
+
+        # Allegati.
+        annex = _annex_blocks(annex_data, language)
+        if annex:
+            title = label("Allegato A — Analisi integrale dei desk e del Red Team",
+                          "Annex A — Complete desk and Red Team analysis")
+            story.extend([PageBreak(), _Section("annex", title), Paragraph(_text(title), st["h1"]),
+                Paragraph(_text(label("Testo integrale dei report finali su cui ha deliberato il Capo; nessun taglio.",
+                                      "Full final reports the Capo deliberated on; nothing is cut.")), st["small"])])
+            for _, heading, block in annex:
+                if heading:
+                    story.append(Paragraph(_text(heading), st["h2"]))
+                story.extend(_rich_flowables(block, {**styles, "body": st["body"], "cell": st["annexcell"],
+                                                     "headcell": st["headcell"]}, width, show=show))
+        title = label("Allegato B — Fonti, copertura e metodologia", "Annex B — Sources, coverage and methodology")
+        story.extend([PageBreak(), _Section("sources", title), Paragraph(_text(title), st["h1"]),
+                      Paragraph(show(_label("scope", language)), st["small"])])
+        for index, key in enumerate(sources.order, 1):
+            if key.startswith("evidence:"):
+                row = sources.evidence.get(key[9:])
+                if row:
+                    story.append(Paragraph(f"{index}. " + show(f"{row['source']} | {row['as_of']}"), st["body"]))
+                    story.append(Paragraph(show(row["summary"]), st["item"]))
+                    story.append(Paragraph(show(label("Riferimento: ", "Reference: ") + str(row["id"])), st["small"]))
+                    if row.get("url"):
+                        url = escape(row["url"], quote=True)
+                        story.append(Paragraph(f'<link href="{url}" color="#595959">'
+                                               f'{escape(_clean(row["url"], sources, language))}</link>', st["small"]))
+                    continue
+            dates = sources.dates.get(key) or []
+            story.append(Paragraph(f"{index}. " + _text(sources.label(key) + (" · " + ", ".join(dates) if dates else "")),
+                                   st["item"]))
+        if result.get("history_review"):
+            story.append(Paragraph(_text(label("Confronto con le decisioni precedenti", "Review of earlier decisions")), st["h2"]))
+            for review in result["history_review"]:
+                story.extend([Paragraph(_text(f"{review['kind']} {review['id']}"), st["small"]),
+                              Paragraph(show(review["response"]), st["body"])])
+        story.append(Paragraph(_text(label("Provenienza del documento", "Document provenance")), st["h2"]))
+        story.append(Paragraph(_text(f"Cutoff: {cutoff}\nRun: {run.get('id') or run.get('run_id') or result.get('run_id') or 'n.d.'}"),
+                               st["small"]))
+        models = run.get("models") or result.get("models") or {}
+        for role, model in (models.items() if isinstance(models, dict) else enumerate(models)):
+            if isinstance(model, dict):
+                model = " · ".join(str(model[k]) for k in ("model", "effort", "max_tokens") if model.get(k) is not None) or "n.d."
+            story.append(Paragraph(_text(f"{role}: {model}"), st["small"]))
+        doc.build(story)
     return doc.section_pages
 
 
-def _rich_flowables(text, styles, width):
+def _rich_flowables(text, styles, width, show=None):
     """Paragraphs for prose, a real table for a run of markdown pipe rows."""
+    show = show or _text
     lines, out, prose, rows = str(text).split("\n"), [], [], []
 
     def flush_prose():
         if prose and "\n".join(prose).strip():
-            out.append(Paragraph(_text("\n".join(prose)), styles["body"]))
+            out.append(Paragraph(show("\n".join(prose)), styles["body"]))
         prose.clear()
 
     def flush_rows():
@@ -1290,7 +1921,7 @@ def _rich_flowables(text, styles, width):
         if len(cells) >= 2:
             count = max(len(row) for row in cells)
             cells = [row + [""] * (count - len(row)) for row in cells]
-            data = [[Paragraph(_text(cell), styles["headcell" if index == 0 else "cell"]) for cell in row]
+            data = [[Paragraph(show(cell), styles["headcell" if index == 0 else "cell"]) for cell in row]
                     for index, row in enumerate(cells)]
             table = Table(data, colWidths=[width / count] * count, repeatRows=1, splitByRow=1, hAlign="LEFT")
             table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), OBSIDIAN),
@@ -1446,6 +2077,8 @@ def _normalized_text(value, rendered=False):
     value = _printable(value)
     if rendered:
         value = re.sub(r"(?m)^\s*\u2022\s+", "", value)
+        # Impianto M paragraph numbers ("2.1", "(a)") are drawn bullets, not content.
+        value = re.sub(r"(?m)^\s*(?:\d{1,2}\.\d{1,2}|\([a-z]\))\s+", "", value)
     else:
         rules = _md_rules_apply(value)
         value = "\n".join(line for line in value.split("\n") if not (rules and _MD_RULE.match(line)))
@@ -1455,23 +2088,29 @@ def _normalized_text(value, rendered=False):
 
 
 def _inspect_company_memo(path, result, section_pages, language, execution_policy=EXECUTION_POLICY_V2,
-                          annex=None):
+                          annex=None, facts=None):
     reader = PdfReader(str(path))
     pages = [page.extract_text() or "" for page in reader.pages]
     # Page furniture and repeated table headings can interrupt a split paragraph/cell.
+    sources = _Sources(result, annex, language, facts)
+    # The PDF shows the single display transform (numbered sources, no hashes, localized
+    # cells): the original is compared through the SAME transform, never loosened.
+    shown = lambda name, value: _clean(value, sources, language, cell=".table." in name, plain=True)
     furniture = {"BELLOMBERG", "Ricerca Bellomberg · Documento interno", "Bellomberg Research · Internal document",
-                 "ANTEPRIMA · DATI SINTETICI", "PREVIEW · SYNTHETIC DATA"}
-    table_heads = {cell.strip() for section in result.get("dossier", []) for table in section.get("tables", []) for cell in table["columns"]}
+                 "ANTEPRIMA · DATI SINTETICI", "PREVIEW · SYNTHETIC DATA", *_M_FOOTER}
+    table_heads = {shown(".table.", cell).strip() for section in result.get("dossier", [])
+                   for table in section.get("tables", []) for cell in table["columns"]}
     body = "\n".join(line for text in pages for line in text.splitlines()
         if line.strip() not in furniture | table_heads and not re.fullmatch(r"(?:Pagina|Page) \d+", line.strip())
-        and not line.startswith("TRADE IDEA | "))
+        and "TRADE IDEA | " not in line and not line.strip().startswith(_M_RUNNING))
     # Headers themselves are also verified against the unfiltered document.
     normalized, raw = _normalized_text(body, rendered=True), _normalized_text("\n".join(pages), rendered=True)
     annex_fragments = [(name if len(pieces) == 1 else f"{name}.{index}", piece)
                        for name, _, text in _annex_blocks(annex, language)
                        for pieces in [_integrity_pieces(text)] for index, piece in enumerate(pieces)]
     lost = sorted({name for name, value in [*_content_fragments(result), *annex_fragments]
-                   if _normalized_text(value) not in normalized and _normalized_text(value) not in raw})
+                   for printed in [_normalized_text(shown(name, value))]
+                   if printed not in normalized and printed not in raw})
     sections = result.get("dossier", [])
     keys = [section["key"] for section in sections]
     missing = sorted(set(DOSSIER_KEYS) - set(keys))
@@ -1538,6 +2177,11 @@ def _inspect_company_memo(path, result, section_pages, language, execution_polic
                            (lost, "Testo originale non integro nel PDF", "Original text missing from PDF")):
         if values:
             reasons.append((it if language == "it" else en) + ": " + ", ".join(values))
+    # Extra text is not lost text: a raw source marker in print is caught on its own.
+    raw_markers = len(re.findall(r"\[\s*(?:src|evidence)\s*:", "\n".join(pages), re.I))
+    if raw_markers:
+        reasons.append(f"Marcatori di fonte crudi nel PDF: {raw_markers}" if language == "it" else
+                       f"Raw source markers in the PDF: {raw_markers}")
     if recycled:
         reasons.append(f"Frasi lunghe ripetute piu' di due volte: {recycled}" if language == "it" else
                        f"Long sentences repeated more than twice: {recycled}")
@@ -1559,10 +2203,11 @@ def _inspect_company_memo(path, result, section_pages, language, execution_polic
                     if unprintable else [])}
 
 
-def inspect_research_pdf(path, result, section_pages, *, language="it", execution_policy=None, annex=None):
+def inspect_research_pdf(path, result, section_pages, *, language="it", execution_policy=None, annex=None,
+                         facts=None):
     """Measure actual selectable text; cover/bibliography/PM quotes do not qualify."""
     if execution_policy in RESEARCH_POLICIES:
-        return _inspect_company_memo(path, result, section_pages, language, execution_policy, annex)
+        return _inspect_company_memo(path, result, section_pages, language, execution_policy, annex, facts)
     if execution_policy is not None:
         raise ValueError("Unknown Trade Idea report execution policy")
     reader = PdfReader(str(path))
@@ -1609,11 +2254,11 @@ def build_trade_idea_report(run, result, *, output_path, valuations=(), language
         lambda reasons: _render(path, run, result, valuations, language, reasons))
     sections = render([])
     quality = inspect_research_pdf(path, result, sections, language=language, execution_policy=policy,
-                                   annex=run.get("desk_annex"))
+                                   annex=run.get("desk_annex"), facts=run.get("facts"))
     if quality["status"] != "ready":
         sections = render(quality["reasons"])
         quality = inspect_research_pdf(path, result, sections, language=language, execution_policy=policy,
-                                   annex=run.get("desk_annex"))
+                                   annex=run.get("desk_annex"), facts=run.get("facts"))
     return {"path": str(path.resolve()), "sha256": sha256(path.read_bytes()).hexdigest(),
             "quality": quality, "status": quality["status"], "reason": "; ".join(quality["reasons"])}
 
