@@ -58,9 +58,9 @@ def test_tool_registry_and_committee_bounds(tmp_path, monkeypatch):
     assert "get_filing_changes" in names
     payload = chat_tools.dispatch("get_filing_changes", {"ticker": "TEST"})
     assert payload["data"]["scope"] == "storico"
-    block = committee_filing_context(["TEST", "MISSING"], db_path=path, max_tickers=1)
-    assert "TEST" in block and "TICKER NON INCLUSI" in block
-    assert "MISSING" not in block
+    block = committee_filing_context(["TEST", "MISSING"], db_path=path)
+    assert "TEST · " in block and "MISSING · non disponibile" in block
+    assert block.splitlines()[-1].startswith("TRONCAMENTI:")
 
 
 def test_schema_missing_is_not_silent(tmp_path):
@@ -94,3 +94,39 @@ def test_filing_priming_reaches_each_specialist_round_without_fake_report():
     for round_n in (0, 1, 2):
         assert "ARCHIVIO FILING TEST, storico e stale" in specialist._build_round_context(round_n)
     assert "filing_context" not in board.data
+
+
+def test_dispatch_filing_changes_parametri_llm_non_validi_non_sollevano(tmp_path, monkeypatch):
+    path = _archive(tmp_path)
+    monkeypatch.setattr("bellomberg.agents.filing_context.SQLITE_PATH", path)
+    for extra in ({"da": "abc"}, {"da": 0}, {"da": -3}, {"variante": "mensile"}):
+        payload = chat_tools.dispatch("get_filing_changes", {"ticker": "TEST", **extra})
+        assert payload["data"]["status"] == "errore", extra
+    assert chat_tools.dispatch("get_filing_changes", {"ticker": "TEST", "da": "3"})["data"]["first_shown"] == 3
+    assert chat_tools.dispatch("get_filing_changes", {"ticker": "TEST", "da": 8})["data"]["changes_shown"] == 1
+
+
+def test_dispatch_filing_changes_max_changes(tmp_path, monkeypatch):
+    path = _archive(tmp_path)
+    monkeypatch.setattr("bellomberg.agents.filing_context.SQLITE_PATH", path)
+    schema = next(t for t in chat_tools.TOOL_DEFINITIONS if t["name"] == "get_filing_changes")
+    mc = schema["input_schema"]["properties"]["max_changes"]
+    assert (mc["type"], mc["minimum"], mc["maximum"], mc["default"]) == ("integer", 1, 20, 5)
+    assert chat_tools.dispatch("get_filing_changes", {"ticker": "TEST"})["data"]["changes_shown"] == 5
+    assert chat_tools.dispatch("get_filing_changes", {"ticker": "TEST", "max_changes": 20})["data"]["changes_shown"] == 8
+    assert chat_tools.dispatch("get_filing_changes", {"ticker": "TEST", "max_changes": "7"})["data"]["changes_shown"] == 7
+    for bad in (0, 21, -1, "abc", 2.5, True, None):
+        payload = chat_tools.dispatch("get_filing_changes", {"ticker": "TEST", "max_changes": bad})
+        if bad is None:
+            assert payload["data"]["changes_shown"] == 5
+        else:
+            assert payload["data"]["status"] == "errore", bad
+
+
+def test_dispatch_filing_changes_ordine(tmp_path, monkeypatch):
+    path = _archive(tmp_path)
+    monkeypatch.setattr("bellomberg.agents.filing_context.SQLITE_PATH", path)
+    schema = next(t for t in chat_tools.TOOL_DEFINITIONS if t["name"] == "get_filing_changes")
+    assert schema["input_schema"]["properties"]["ordine"]["enum"] == ["documento", "punteggio"]
+    assert chat_tools.dispatch("get_filing_changes", {"ticker": "TEST", "ordine": "punteggio"})["data"]["order"] == "punteggio"
+    assert chat_tools.dispatch("get_filing_changes", {"ticker": "TEST", "ordine": "boh"})["data"]["status"] == "errore"

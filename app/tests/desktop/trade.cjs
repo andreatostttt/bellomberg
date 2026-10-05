@@ -183,6 +183,8 @@ async function runner() {
     assert.ok(requests.some(item => item.route === '/portfolio'), 'real renderer read synthetic portfolio');
     assert.ok(requests.every(item => item.method === 'GET'
       || item.method === 'PUT' && item.route === '/preferences'
+      // the shell's background price refresh (Layout → lib/price-refresh), not the trade page
+      || item.method === 'POST' && item.route === '/prices/update'
       || item.method === 'POST' && ['/trade', '/trade/preview', '/positions/opening', '/positions/opening/preview'].includes(item.route)),
     'no unexpected application mutations');
     const counts = { preview: requests.filter(item => item.route === '/trade/preview').length,
@@ -261,7 +263,7 @@ async function renderer(config) {
     await new Promise(resolve => { w.webContents.once('did-finish-load', resolve); w.webContents.reload(); });
     await waitFor(() => document.querySelector('#f7-decisione option[value="31"]')
       || document.querySelector('#f7-decisione') && document.querySelector('[aria-label="Usa SYNTH nel tagliando"]'), 'loaded form');
-    await waitFor(() => !document.querySelector('.f7c [aria-busy="true"]'), 'completed form reads');
+    await waitFor(() => !document.querySelector('.te-page [aria-busy="true"]'), 'completed form reads');
   };
   const fill = async (day = DAY, selection = 'none') => {
     await field('f7-tk', 'SYNTH');
@@ -298,13 +300,13 @@ async function renderer(config) {
     assert.match(unverified, /Cassa non disponibile/);
     assert.match(unverified, /SYNTHETIC_CASH_SOURCE_UNAVAILABLE/);
     assert.match(unverified, /NAV non disponibile/);
-    assert.equal(await js(() => document.querySelector('.f7c .binario') === null), true);
+    assert.equal(await js(() => document.querySelector('.f7c .te-cashbar') === null), true);
     await counts(0, 0);
     scenarios.push('unverified numeric cash produces no cash bar, coverage or NAV forecast; source reason retained');
 
     await open('success', '?decision=31');
     assert.equal(await js(() => document.querySelector('#f7-tk').value), 'SYNTH');
-    assert.equal(await js(() => document.querySelector('[role="radio"][aria-checked="true"]').textContent), 'ADD');
+    assert.equal(await js(() => document.querySelector('[role="radio"][aria-checked="true"]').textContent), 'Add');
     assert.equal(await js(() => document.querySelector('#f7-decisione').value), '31');
     assert.match(await js(() => document.querySelector('#f7-decisione option:checked').textContent), /PARTIAL.*eseguito/);
     await fill(DAY, '31');
@@ -332,8 +334,8 @@ async function renderer(config) {
       data: DAY, senza_decisione: false, linked_decision_id: 31 });
     // A later quote and even live form edits cannot change the confirmed body.
     await control({ fx: 1.25 });
-    await js(() => document.querySelector('.f7c button[aria-busy]').click());
-    await waitFor(() => document.querySelector('#f7-vl').parentElement.textContent.includes('1,250000'), 'changed current FX');
+    await js(() => document.querySelector('.te-page button[aria-busy]').click());
+    await waitFor(() => document.querySelector('#f7-vl').closest('.te-field').textContent.includes('1,250000'), 'changed current FX');
     await field('f7-qt', '9');
     await field('f7-data', '2024-02-05');
     await field('f7-nt', 'Non confermata');
@@ -389,7 +391,9 @@ async function renderer(config) {
 
     await open('success', '?decision=31'); await fill(DAY, '31'); await field('f7-tk', 'OTHER');
     await submit();
-    await waitFor(() => document.body.innerText.includes('Decisione non disponibile o incompatibile'), 'incompatible selection');
+    // A broker ticker different from the decision's needs the ISIN verification first
+    // (identity check added after this scenario): the request is still blocked locally.
+    await waitFor(() => document.body.innerText.includes('Per ticker diversi, registra ISIN'), 'incompatible selection');
     assert.equal(await js(() => document.querySelector('#f7-decisione').value), '31');
     await counts(0, 0);
     scenarios.push('changing query-selected ticker preserves explicit selection and blocks incompatible request');
@@ -434,8 +438,14 @@ async function renderer(config) {
       await waitFor(() => document.querySelector('[data-opening-entry] [aria-busy="false"]'), 'opening register');
       // Form readiness does not await Layout's independent initial FX request.
       // Measure the baseline after that response is rendered, before user actions.
-      await waitFor(() => [...document.querySelectorAll('span')].some(node => node.textContent === 'USD/EUR'), 'shell FX loaded');
-      shellFxReads = (await control()).requests.filter(r => r.route === '/fx').length;
+      // The shell no longer prints a USD/EUR label: wait for its /fx read to arrive and settle.
+      const fxReads = async () => (await control()).requests.filter(r => r.route === '/fx').length;
+      for (let tries = 0, last = -1; tries < 50; tries++) {
+        const now = await fxReads();
+        if (now > 0 && now === last) break;
+        last = now; await new Promise(resolve => setTimeout(resolve, 200));
+      }
+      shellFxReads = await fxReads();
     };
     const fillBalance = async (language = 'it') => {
       for (const [id, value] of [['ticker', 'SYNTHOPEN'], ['qty', language === 'it' ? '2,5' : '2.5'],
@@ -474,7 +484,7 @@ async function renderer(config) {
       const written = after.requests.find(r => r.route === '/positions/opening' && r.method === 'POST');
       assert.deepEqual(written.body, { ...source, preview_id: after.latestPreview.preview_id });
       assert.equal(written.language, language);
-      await js(() => [...document.querySelectorAll('[data-opening-entry] button')].find(b => /RILEGGI IL TICKER|READ BACK THE TICKER/.test(b.textContent)).click());
+      await js(() => [...document.querySelectorAll('[data-opening-entry] button')].find(b => /Rileggi .* dal registro|Read .* back from the register/.test(b.textContent)).click());
       await waitFor(() => /Saldo riletto dal registro|Balance read back from the register/.test(document.body.innerText), 'opening readback');
       assert.match(await js(() => document.querySelector('[data-opening-receipt]').innerText), /Original broker statement/);
       await js(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
@@ -534,17 +544,17 @@ async function renderer(config) {
     assert.equal(await js(() => document.getElementById('f7-qt').value), '2,5');
     assert.equal(await js(() => document.getElementById('f7-pz').value), '30,50');
     assert.equal(await js(() => document.getElementById('f7-rz').value), 'Bozza invariata / unchanged draft');
-    assert.match(await js(() => document.querySelector('#f7-tk').closest('.rq').innerText), /TRADE TICKET/);
+    assert.match(await js(() => document.querySelector('#f7-tk').closest('.te-ticket').innerText), /New order/);
     // 13/09: a field keeps the grammar it was written in until it is cleared (useNumericDraft and
     // tests/i18n/trade-draft.test.cjs, both b81e113). Clearing first makes the new value English.
     await field('f7-qt', ''); await field('f7-qt', '1,234'); await submit();
-    await waitFor(() => document.querySelector('#f7-tk').closest('.rq').innerText.includes('ambiguous'), 'English numeric ambiguity');
+    await waitFor(() => document.querySelector('#f7-tk').closest('.te-ticket').innerText.includes('ambiguous'), 'English numeric ambiguity');
     assert.equal((await control()).requests.filter(r => r.route === '/trade/preview').length, 0);
     await setLanguage('it');
     assert.equal(await js(() => document.getElementById('f7-qt').value), '1,234');
-    assert.match(await js(() => document.querySelector('#f7-tk').closest('.rq').innerText), /IL TAGLIANDO/);
+    assert.match(await js(() => document.querySelector('#f7-tk').closest('.te-ticket').innerText), /Nuovo ordine/);
     await setLanguage('en');
-    assert.match(await js(() => document.querySelector('#f7-tk').closest('.rq').innerText), /ambiguous/);
+    assert.match(await js(() => document.querySelector('#f7-tk').closest('.te-ticket').innerText), /ambiguous/);
     await field('f7-qt', '2.5'); await field('f7-pz', '30.50'); await submit(); await dialog();
     const enRequest = (await control()).requests.find(r => r.route === '/trade/preview');
     assert.equal(enRequest.body.quantita, 2.5); assert.equal(enRequest.body.prezzo, 30.5);
@@ -555,7 +565,7 @@ async function renderer(config) {
 
     await js(() => document.getElementById('f7-mode-opening').click());
     assert.equal(await js(() => document.getElementById('f7-op-qty').value), '2,5');
-    assert.match(await js(() => document.querySelector('[data-opening-entry]').innerText), /DOCUMENTED OPENING POSITION/);
+    assert.match(await js(() => document.querySelector('[data-opening-entry]').innerText), /Documented opening balance/);
     await field('f7-op-precision', 'second');
     await field('f7-op-time', '09:15:42'); await submitBalance(); await dialog();
     assert.equal(await row('Balance known as of'), DAY + ' 09:15:42');
@@ -567,7 +577,7 @@ async function renderer(config) {
     await setLanguage('it');
     assert.equal(await js(() => document.getElementById('f7-op-time').value), '09:15:42');
     assert.equal(await js(() => document.getElementById('f7-op-source').value), 'Original broker statement');
-    assert.match(await js(() => document.querySelector('[data-opening-entry]').innerText), /POSIZIONE INIZIALE DOCUMENTATA/);
+    assert.match(await js(() => document.querySelector('[data-opening-entry]').innerText), /Saldo iniziale documentato/);
     await setLanguage('en');
     const preferenceWrites = (await control()).requests.filter(r => r.method === 'PUT' && r.route === '/preferences');
     assert.equal(preferenceWrites.length, 5);

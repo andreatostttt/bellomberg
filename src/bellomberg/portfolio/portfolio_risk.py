@@ -36,6 +36,8 @@ from bellomberg.core.presentation import message as _message, render_payload
 
 
 CACHE_TTL_SEC = 300
+# Giorni comuni portafoglio/SPY sotto cui il beta e' dichiarato «indicativo» (review RV-R 04/10)
+BETA_OBS_AFFIDABILE = 60
 _CACHE: Dict[str, Any] = {"ts": 0, "data": None}
 
 # I ticker che yfinance non gestisce (crypto custom, etc.) stanno nel NEGOZIO PRIVATO dei
@@ -298,6 +300,63 @@ def _ledoit_wolf_cc(returns_matrix: "np.ndarray"):
     return sigma, float(average_cor), float(shrink)
 
 
+def _benchmark_block(port_r: "pd.Series", spy_r: "pd.Series") -> Optional[Dict[str, Any]]:
+    """Le stesse metriche del portafoglio, calcolate su SPY (EUR) negli STESSI giorni.
+
+    Serve al confronto in dashboard: stessa formula (VaR storico, Sharpe rf=0,
+    DD sul cumulato) e stessa finestra, altrimenti il confronto mente."""
+    common_idx = port_r.index.intersection(spy_r.dropna().index)
+    if len(common_idx) <= 20:
+        return None
+    r = spy_r.loc[common_idx]
+    std = float(r.std())
+    cum = (1 + r).cumprod()
+    dd = (cum - cum.expanding().max()) / cum.expanding().max()
+    return {
+        "ticker": "SPY",
+        "vol_annual_pct": round(std * np.sqrt(252) * 100, 2),
+        "sharpe": round(float(r.mean() / std * np.sqrt(252)), 2) if std > 0 else 0.0,
+        "var_95_1d_pct": round(float(np.percentile(r, 5) * 100), 2),
+        "var_99_1d_pct": round(float(np.percentile(r, 1) * 100), 2),
+        "beta_vs_spy": 1.0,
+        "max_dd_1y_pct": round(float(dd.min() * 100), 2),
+        "n_obs": int(len(common_idx)),
+    }
+
+
+def _beta_basis(fx_meta: Dict[str, Any]) -> str:
+    """La base del beta DICHIARATA con la stessa regola della valuta del blocco SPY."""
+    if "SPY" in (fx_meta.get("converted") or []):
+        return _message('portafoglio EUR vs SPY convertito in EUR (fix 22/07; prima SPY era in USD)', 'EUR portfolio vs SPY converted to EUR (fix 22/07; SPY was previously in USD)')
+    return _message('portafoglio EUR vs SPY in USD NON convertito (FX EUR/USD non applicato): il beta include la componente cambio',
+                    'EUR portfolio vs SPY in USD NOT converted (EUR/USD FX not applied): beta includes the currency component')
+
+
+def _benchmark_con_motivo(port_r: "pd.Series", returns: "pd.DataFrame",
+                          fx_meta: Dict[str, Any]):
+    """(blocco SPY, motivo). Il blocco assente porta SEMPRE il motivo (review
+    04/10: `null` non distingueva SPY n.d. da storico corto), e il blocco
+    presente DICHIARA la valuta: se il cambio USD manca, SPY resta in USD."""
+    if "SPY" not in returns.columns or returns["SPY"].dropna().empty:
+        return None, _message("SPY n.d.: nessuna serie storica scaricata",
+                              "SPY unavailable: no historical series downloaded")
+    block = _benchmark_block(port_r, returns["SPY"])
+    if block is None:
+        n = len(port_r.index.intersection(returns["SPY"].dropna().index))
+        return None, _message(
+            "storico comune portafoglio/SPY troppo corto: {v0} osservazioni (minimo 21)",
+            "Common portfolio/SPY history too short: {v0} observations (minimum 21)", v0=n)
+    if "SPY" in (fx_meta.get("converted") or []):
+        block["valuta"] = "EUR"
+        block["fx_nota"] = None
+    else:
+        block["valuta"] = "USD"
+        block["fx_nota"] = _message(
+            "cambio USD/EUR non disponibile: SPY in USD, confronto con il portafoglio EUR non omogeneo",
+            "USD/EUR rate unavailable: SPY in USD, comparison with the EUR portfolio not like-for-like")
+    return block, None
+
+
 def compute_portfolio_risk(force: bool = False, *, strict_eur: bool = False) -> Dict[str, Any]:
     """Returns dict con risk metrics correnti. Cached 5 min."""
     # Il negozio PRIMA della cache (review 05/09): la chiave di cache non lo contiene, quindi
@@ -465,17 +524,44 @@ def compute_portfolio_risk(force: bool = False, *, strict_eur: bool = False) -> 
     dd_port = (cum_port - rolling_max_port) / rolling_max_port
     max_dd_port = float(dd_port.min() * 100) if len(dd_port) > 0 else 0.0
 
-    # Beta vs SPY
-    beta_spy = 0.0
-    if "SPY" in returns.columns:
-        spy_r = returns["SPY"].dropna()
+    benchmark, benchmark_motivo = _benchmark_con_motivo(port_r, returns, fx_meta)
+    # Beta vs SPY — fix 04/10 (A7, Opus 5.5): niente piu' default 0.0 zitto (regola PM
+    # 14/07). Nella run Trade Idea del 04/10 SPY non era arrivato dal download e il beta del
+    # book usciva 0.00 come se fosse misurato. Ora: beta None + motivo in beta_error quando
+    # il benchmark manca, la sovrapposizione e' corta o la sua varianza e' nulla.
+    beta_spy: Optional[float] = None
+    beta_error: Optional[str] = None
+    beta_obs = 0
+    beta_note: Optional[str] = None
+    spy_r = returns["SPY"].dropna() if "SPY" in returns.columns else None
+    if spy_r is None or spy_r.empty:
+        beta_error = _message("SPY non disponibile: il download del benchmark non ha restituito prezzi, beta del book non misurato",
+                              "SPY unavailable: the benchmark download returned no prices, book beta not measured")
+    else:
         common_idx = port_r.index.intersection(spy_r.index)
-        if len(common_idx) > 20:
+        beta_obs = int(len(common_idx))
+        if beta_obs <= 20:
+            beta_error = _message("SPY insufficiente: {n} giorni in comune col portafoglio (ne servono più di 20), beta del book non misurato",
+                                  "SPY insufficient: {n} days in common with the portfolio (more than 20 required), book beta not measured", n=beta_obs)
+        else:
             pr = port_r.loc[common_idx]
             sr = spy_r.loc[common_idx]
             cov = float(pr.cov(sr))
             var_spy = float(sr.var())
-            beta_spy = cov / var_spy if var_spy > 0 else 0.0
+            if var_spy > 0 and np.isfinite(cov) and np.isfinite(var_spy):
+                beta_spy = cov / var_spy
+                # review RV-R 04/10: >20 giorni basta per calcolarlo, non per fidarsene —
+                # sotto BETA_OBS_AFFIDABILE il numero esce con la riserva DICHIARATA.
+                if beta_obs < BETA_OBS_AFFIDABILE:
+                    beta_note = _message("beta su {n} giorni comuni: indicativo (sotto {soglia} giorni la stima è instabile)",
+                                         "beta over {n} common days: indicative (below {soglia} days the estimate is unstable)",
+                                         n=beta_obs, soglia=BETA_OBS_AFFIDABILE)
+            else:
+                beta_error = _message("SPY con varianza nulla o non finita su {n} giorni: beta del book non calcolabile",
+                                      "SPY with zero or non-finite variance over {n} days: book beta cannot be computed", n=beta_obs)
+    # La base dichiarata deve dire il vero: se l'FX EUR/USD non e' stato applicato a SPY
+    # (conversione fallita, serie in valuta locale) il beta e' contro SPY in USD.
+    beta_basis = _beta_basis(fx_meta)   # stessa regola della valuta del blocco SPY (G4, R-6)
 
     # Correlation matrix top 8 — con Ledoit-Wolf shrinkage (fix 14/07: la sample
     # cov 1y e' rumore; target a correlazione costante, varianze preservate)
@@ -514,7 +600,7 @@ def compute_portfolio_risk(force: bool = False, *, strict_eur: bool = False) -> 
             "level": "med", "metric": "VaR 95% 1d",
             "message": _message('VaR 95% 1d elevato: {v0:.2f}%', 'High 1-day VaR95: {v0:.2f}%', v0=port_var95_pct),
         })
-    if abs(beta_spy) > 1.3:
+    if beta_spy is not None and abs(beta_spy) > 1.3:
         alerts.append({
             "level": "med", "metric": "Beta",
             "message": _message('Beta vs SPY elevato: {v0:.2f}', 'High beta vs SPY: {v0:.2f}', v0=beta_spy),
@@ -557,11 +643,20 @@ def compute_portfolio_risk(force: bool = False, *, strict_eur: bool = False) -> 
             "var_99_1d_pct": round(port_var99_pct, 2),
             "var_95_1d_eur": round(port_var95_eur, 0),
             "var_99_1d_eur": round(port_var99_eur, 0),
-            "beta_vs_spy": round(beta_spy, 2),
+            "beta_vs_spy": round(beta_spy, 2) if beta_spy is not None else None,
             "max_dd_1y_pct": round(max_dd_port, 2),
         },
+        # stesse metriche su SPY (EUR), stessi giorni; None = SPY n.d. (dichiarato)
+        "benchmark": benchmark,
+        "benchmark_motivo": benchmark_motivo,
         # review quant 22/07: convenzioni DICHIARATE accanto ai numeri
-        "beta_basis": _message('portafoglio EUR vs SPY convertito in EUR (fix 22/07; prima SPY era in USD)', 'EUR portfolio vs SPY converted to EUR (fix 22/07; SPY was previously in USD)'),
+        # 04/10 (revisione R-6): coerente con la valuta dichiarata del benchmark
+        "beta_basis": beta_basis,
+        # fix 04/10 (A7): beta_vs_spy None => beta_error dice perche'; None quando misurato
+        "beta_error": beta_error,
+        "beta_obs": beta_obs,
+        # riserva su beta misurato ma con pochi giorni (None se >= BETA_OBS_AFFIDABILE o non misurato)
+        "beta_note": beta_note,
         "risk_free_used": 0.0,
         "sharpe_note": (_message("Sharpe con rf=0 (non excess return); lo Sharpe ufficiale con rf live e' in advanced_metrics (risk_free_used dichiarato li')", 'Sharpe with rf=0 (not excess return); official Sharpe with live rf is in advanced_metrics (risk_free_used declared there)')),
         "nav_basis": (_message('perimetro ANALIZZATO (posizioni SKIP/non-yfinance escluse): i VaR EUR scalano su questa base', 'ANALYZED scope (SKIP/non-yfinance positions excluded): EUR VaR scales on this basis')),
@@ -592,7 +687,8 @@ def compute_portfolio_risk(force: bool = False, *, strict_eur: bool = False) -> 
     if not strict_eur:
         _CACHE["ts"] = time.time()
         _CACHE["data"] = result
-    _log(f"computed risk: VaR95={port_var95_pct:.2f}% Sharpe={port_sharpe:.2f} Beta={beta_spy:.2f} DD={max_dd_port:.1f}% alerts={len(alerts)}")
+    _beta_log = f"{beta_spy:.2f}" if beta_spy is not None else f"n.d. ({beta_error})"
+    _log(f"computed risk: VaR95={port_var95_pct:.2f}% Sharpe={port_sharpe:.2f} Beta={_beta_log} DD={max_dd_port:.1f}% alerts={len(alerts)}")
     return render_payload(result)
 
 

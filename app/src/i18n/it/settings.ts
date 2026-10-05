@@ -157,6 +157,7 @@ export const settings = {
   "prices_updated": "PREZZI AGGIORNATI",
   "feed_updating": "AGGIORNAMENTO NOTIZIE...",
   "feed_updated": "NOTIZIE AGGIORNATE",
+  "feed_running": "NOTIZIE: GIRO IN CORSO",
   "nav_updating": "RICALCOLO NAV...",
   "nav_updated": "NAV RICALCOLATO",
   "backup_created_command": "BACKUP CREATO",

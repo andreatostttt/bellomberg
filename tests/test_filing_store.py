@@ -104,3 +104,84 @@ def test_profile_rejects_local_document_hosts(tmp_path, url):
 def test_invalid_interval_rejected(tmp_path, hours):
     with pytest.raises(ValueError):
         store(tmp_path).set_profile("ABC", profile(), interval_hours=hours)
+
+
+# --- prova reale fase D: run in errore o orfani riprovano dopo 2 h, non dopo l'intervallo ---
+
+def _retrodata(s, ore):
+    from datetime import datetime, timedelta, timezone
+    from bellomberg.storage.filing_store import SCHEMA
+    guardia = next(x for x in SCHEMA if "filing_runs_final_immutable" in x)
+    quando = (datetime.now(timezone.utc) - timedelta(hours=ore)).isoformat()
+    with sqlite3.connect(s.db_path) as conn:
+        conn.execute("DROP TRIGGER filing_runs_final_immutable")
+        conn.execute("UPDATE filing_runs SET started_at=?", (quando,))
+        conn.execute(guardia)
+    return quando
+
+
+def test_run_in_errore_riprova_dopo_due_ore(tmp_path):
+    from datetime import datetime, timedelta
+    s = store(tmp_path)
+    s.set_profile("ABC", profile(), interval_hours=24)
+    row = s.start_run("ABC", "scheduled")
+    s.finish_run(row["id"], status="errore", reason="network")
+    inizio = datetime.fromisoformat(s.get_run(row["id"])["started_at"])
+    assert s.next_due(now=inizio + timedelta(hours=1, minutes=59)) == []
+    assert [d["ticker"] for d in s.next_due(now=inizio + timedelta(hours=2))] == ["ABC"]
+    assert s.next_due_at("ABC") == (inizio + timedelta(hours=2)).isoformat()
+    _retrodata(s, 3)
+    assert s.start_run("ABC", "scheduled")["status"] == "queued"
+
+
+def test_orfano_recuperato_e_subito_dovuto(tmp_path):
+    s = store(tmp_path)
+    s.set_profile("ABC", profile(), interval_hours=24)
+    row = s.start_run("ABC", "scheduled")
+    _retrodata(s, 3)  # queued da 3 h: processo morto
+    s.recover_run(row["id"], "run orfano oltre 2 h (processo terminato)")
+    assert [d["ticker"] for d in s.next_due()] == ["ABC"]
+
+
+@pytest.mark.parametrize("stato", ["ok", "parziale", "skipped", "non_disponibile"])
+def test_run_concluso_senza_errore_mantiene_l_intervallo(tmp_path, stato):
+    from datetime import datetime, timedelta
+    s = store(tmp_path)
+    s.set_profile("ABC", profile(), interval_hours=24)
+    row = s.start_run("ABC", "scheduled")
+    s.finish_run(row["id"], status=stato, reason="x")
+    inizio = datetime.fromisoformat(s.get_run(row["id"])["started_at"])
+    assert s.next_due(now=inizio + timedelta(hours=3)) == []
+    assert [d["ticker"] for d in s.next_due(now=inizio + timedelta(hours=24))] == ["ABC"]
+    _retrodata(s, 3)
+    with pytest.raises(RunNotDue):
+        s.start_run("ABC", "scheduled")
+
+
+def test_intervallo_breve_resta_piu_breve_del_ritentativo(tmp_path):
+    from datetime import datetime, timedelta
+    s = store(tmp_path)
+    s.set_profile("ABC", profile(), interval_hours=1)
+    row = s.start_run("ABC", "scheduled")
+    s.finish_run(row["id"], status="errore", reason="network")
+    inizio = datetime.fromisoformat(s.get_run(row["id"])["started_at"])
+    assert [d["ticker"] for d in s.next_due(now=inizio + timedelta(hours=1))] == ["ABC"]
+
+
+def test_errori_consecutivi_attesa_crescente_fino_all_intervallo(tmp_path):
+    from datetime import datetime, timedelta
+    s = store(tmp_path)
+    s.set_profile("ABC", profile(), interval_hours=24)
+    attese = []
+    for _ in range(5):
+        _retrodata(s, 48)  # ogni tentativo e' dovuto
+        row = s.start_run("ABC", "scheduled")
+        s.finish_run(row["id"], status="errore", reason="network")
+        inizio = datetime.fromisoformat(s.get_run(row["id"])["started_at"])
+        attese.append((datetime.fromisoformat(s.next_due_at("ABC")) - inizio) / timedelta(hours=1))
+    assert attese == [2, 4, 8, 16, 24]
+    _retrodata(s, 48)
+    ok = s.start_run("ABC", "scheduled")
+    s.finish_run(ok["id"], status="ok")
+    inizio = datetime.fromisoformat(s.get_run(ok["id"])["started_at"])
+    assert (datetime.fromisoformat(s.next_due_at("ABC")) - inizio) / timedelta(hours=1) == 24

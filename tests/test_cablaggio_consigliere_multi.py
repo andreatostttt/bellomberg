@@ -106,6 +106,9 @@ def run_offline(monkeypatch, tmp_path):
     monkeypatch.setattr(memory_db, "SQLITE_PATH", str(tmp_path / "cablaggio.db"))
     memory_db.MemoryDB()  # Existing, deliberately empty test book before the paid-run prerequisite.
     monkeypatch.setattr("bellomberg.agents.filing_context.SQLITE_PATH", str(tmp_path / "cablaggio.db"))
+    def _archivio_filing_assente():
+        raise FileNotFoundError("archivio filing di prova assente")   # mai l'archivio di produzione
+    monkeypatch.setattr(cm, "_filing_service", _archivio_filing_assente)
     monkeypatch.setattr(memory_db.MemoryDB, "get_portfolio_summary",
                         lambda self: {"n_positions": 0, "positions": []})
     monkeypatch.setattr(memory_db.MemoryDB, "extract_and_save_decisions",
@@ -366,3 +369,115 @@ def test_run_invalid_policy_is_visible_without_enabling_preparation(run_offline,
     bb = run_offline.catturato["bb"]
     assert bb.valuation_preparer is None and bb.data["_valuation_preparation"]["status"] == "error"
     assert "valuation authorization" in run_offline.catturato["sizing_context"]
+
+
+def test_run_sintetica_contesto_filing_tre_fonti_e_un_titolo_lento(run_offline, monkeypatch, tmp_path):
+    """Criterio di successo della fase D: la run aggiorna i profili scaduti prima del passo
+    filing, entro la scadenza assoluta; il titolo lento è dichiarato NON AGGIORNATO."""
+    import sqlite3
+    import threading
+    import time
+    from bellomberg.market_data.filing_service import FilingService
+    from bellomberg.storage.filing_store import FilingStore, ensure_schema
+    db = tmp_path / "cablaggio.db"
+    with sqlite3.connect(db) as conn:
+        ensure_schema(conn)
+    store = FilingStore(db)
+    base = {"lingua": "en", "perimetro": "consolidato",
+            "verifica": {"lingua": "English", "tipo": "annual", "perimetro": "consolidated"},
+            "sezioni": {"rischi": {"inizio": "Risk Factors", "fine": "Properties"}}}
+    profili = {
+        "NOVA.DE": {**base, "tipo": "trimestrale", "cik": "0009990001", "emittente_id": "CIK:0009990001",
+                    "varianti": [{"tipo": "trimestrale", "forme_sec": ["10-Q"]}]},
+        "KORE.MI": {**base, "tipo": "annuale", "cik": "0009990002", "emittente_id": "CIK:0009990002",
+                    "varianti": [{"tipo": "annuale", "forme_sec": ["20-F"]}, {"tipo": "semestrale", "forme_sec": ["6-K"]}]},
+        "ACME.PA": {**base, "tipo": "annuale", "lei": "999900ACMEPA0000001", "emittente_id": "LEI:999900ACMEPA0000001"},
+        "LENTO.MI": {**base, "tipo": "annuale", "cik": "0009990004", "emittente_id": "CIK:0009990004"},
+    }
+    for t, p in profili.items():
+        store.set_profile(t, {**p, "ticker": t}, interval_hours=24)
+
+    def cit(t, s="rischi"):
+        return {"url": "https://www.sec.gov/Archives/x.htm", "sha256": "b" * 64, "sezione": s,
+                "inizio": 0, "fine": len(t), "pagine_fisiche": [], "testo": t}
+
+    def pipeline(profilo, archivio):
+        if profilo["ticker"] == "LENTO.MI":
+            time.sleep(3)
+        meta = lambda d: {"metadati": {"periodo_fine": d}}
+        return {"stato": "ok", "motivi": [], "variante": profilo.get("tipo"),
+                "coppia": {"prima": meta("2025-06-30"), "dopo": meta("2026-06-30")},
+                "numeri": {"stato": "ok", "voci": [{"voce": "ricavi", "delta_pct": 8.5}]},
+                "confronto_corrente": {"stato": "ok", "cambiamenti": [
+                    {"tipo": "aggiunto", "dopo": cit(f"{profilo['ticker']} new risk " * 20)}]}}
+
+    monkeypatch.setattr(cm, "_filing_service", lambda: FilingService(
+        store, tmp_path / "arch", pipeline=pipeline, indexer=lambda *a: {"status": "skipped"}))
+    monkeypatch.setattr(cm, "FILING_ATTESA_MAX_S", 1.0)
+    monkeypatch.setattr(memory_db.MemoryDB, "get_portfolio_summary", lambda self: {
+        "n_positions": 4, "positions": [{"ticker": t} for t in profili]})
+    # Il portafoglio sintetico (solo ticker) farebbe partire get_valuation per ogni titolo e la
+    # matrice di correlazione (fonti esterne): passi estranei al filing, stubbati qui.
+    monkeypatch.setattr(cm, "_ensure_portfolio_valuations", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "_try_correlation_matrix", lambda *a, **k: None)
+    cm.run_multi_agent()
+    ctx = run_offline.catturato["bb"].data["_filing_context"]
+    try:
+        for t in ("NOVA.DE", "KORE.MI", "ACME.PA"):
+            riga = next(l for l in ctx.splitlines() if l.startswith(t + " · "))
+            assert "aggiornato" in riga and "NON AGGIORNATO" not in riga
+        assert "NOVA.DE · SEC 10-Q CIK 0009990001" in ctx
+        assert "ACME.PA · ESEF LEI 999900ACMEPA0000001" in ctx
+        assert "numeri ricavi +8,5%" in ctx and "[C1-dopo]" in ctx
+        lento = next(l for l in ctx.splitlines() if l.startswith("LENTO.MI · "))
+        assert "NON AGGIORNATO: aggiornamento oltre 1 s (in corso)" in lento
+        assert ctx.splitlines()[-1].startswith("TRONCAMENTI:")
+    finally:
+        # I thread del pool non sono daemon: si attende LENTO.MI per non lasciarlo al test successivo.
+        for th in threading.enumerate():
+            if th.name.startswith("filing-prerun"):
+                th.join(timeout=10)
+    # il run lento si conclude dopo la run, nell'archivio (nessun secondo run)
+    assert [r["status"] for r in store.list_runs("LENTO.MI")] == ["ok"]
+    print("\n--- _filing_context (run sintetica) ---\n" + ctx)
+
+
+def test_servizio_filing_rotto_non_blocca_la_run(run_offline, monkeypatch):
+    """Errore nel costruire il servizio: la run prosegue, la freschezza viene dall'archivio."""
+    def _rotto():
+        raise RuntimeError("archivio filing assente (finto)")
+    monkeypatch.setattr(cm, "_filing_service", _rotto)
+    monkeypatch.setattr(memory_db.MemoryDB, "get_portfolio_summary", lambda self: {
+        "n_positions": 1, "positions": [{"ticker": "NOVA.DE"}]})
+    monkeypatch.setattr(cm, "_ensure_portfolio_valuations", lambda *a, **k: None)  # v. test precedente
+    monkeypatch.setattr(cm, "_try_correlation_matrix", lambda *a, **k: None)
+    cm.run_multi_agent()
+    ctx = run_offline.catturato["bb"].data["_filing_context"]
+    assert ctx.splitlines()[1].startswith("NOVA.DE · ")
+
+
+def test_fine_run_chiude_il_pool_del_pre_run(run_offline, monkeypatch):
+    """Revisione finale M8: a fine run i lavori pre-run non partiti si annullano."""
+    from bellomberg.market_data import filing_prerun
+    eventi = []
+
+    class _Finto:
+        def __init__(self, service, tickers, **kw):
+            eventi.append("init")
+
+        def avvia(self):
+            eventi.append("avvia")
+
+        def esiti(self):
+            return {}
+
+        def chiudi(self):
+            eventi.append("chiudi")
+    monkeypatch.setattr(filing_prerun, "AggiornamentoPreRun", _Finto)
+    monkeypatch.setattr(cm, "_filing_service", lambda: object())
+    monkeypatch.setattr(memory_db.MemoryDB, "get_portfolio_summary", lambda self: {
+        "n_positions": 1, "positions": [{"ticker": "NOVA.DE"}]})
+    monkeypatch.setattr(cm, "_ensure_portfolio_valuations", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "_try_correlation_matrix", lambda *a, **k: None)
+    cm.run_multi_agent()
+    assert eventi == ["init", "avvia", "chiudi"]

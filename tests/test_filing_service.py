@@ -1,6 +1,7 @@
 import sqlite3
+from datetime import datetime, timezone
 
-from bellomberg.market_data.filing_service import FilingService, default_indexer
+from bellomberg.market_data.filing_service import SOLO_PULSANTE, FilingService, default_indexer
 from bellomberg.storage.filing_store import FilingStore, ensure_schema
 
 
@@ -209,3 +210,104 @@ def test_two_runs_share_immutable_snapshot_from_real_downloader(tmp_path, monkey
     assert paths[0].stat().st_mtime_ns == before
     assert len(list((tmp_path / "archive" / "ABC" / "documents").iterdir())) == 1
     assert first["result"]["confronto_corrente"]["cambiamenti"][0]["dopo"]["sha256"] == second["result"]["confronto_corrente"]["cambiamenti"][0]["dopo"]["sha256"]
+
+
+def test_index_limited_only_keeps_run_ok_and_states_the_limit(tmp_path):
+    # Osservato sul DB reale (10-Q con 716 estratti): l'indice ausiliario ne tiene 200.
+    # Il confronto e' completo in SQLite: il run resta ok e il limite e' dichiarato.
+    limited = {"status": "parziale", "count": 200, "total_chunks": 716,
+               "reason": "indice limitato: chunk o testi troncati; SQLite conserva contenuto intero"}
+    store, svc = setup(tmp_path, lambda *a, **k: result(), indexer=lambda *a: limited,
+                       judge=lambda _: {"status": "skipped", "findings": [], "reason": "stub"})
+    row = svc.run("ABC")
+    assert row["status"] == "ok" and row["index"]["status"] == "parziale"
+    assert "indice limitato" in row["reason"]
+
+
+def test_versione_del_giudizio_cambia_con_l_abbinamento_dei_modificati(monkeypatch):
+    # Il nuovo abbinamento (buchi tra blocchi uguali) rinumera le citazioni dei run nuovi:
+    # un giudizio dei run precedenti non va riusato con C-id che ora indicano altro.
+    from bellomberg.market_data import filing_service as fs
+    run = {"profile_sha256": "p" * 64, "profile_version": 1, "profile": {"lingua": "en"},
+           "judgment_language": "it"}
+    assert fs.VERSIONE_GIUDIZIO == 2
+    attuale = fs._evidence_key(run, result())
+    monkeypatch.setattr(fs, "VERSIONE_GIUDIZIO", 1)
+    assert fs._evidence_key(run, result()) != attuale
+
+
+def _giudice_con_sentinella():
+    stato = {"consentito": True, "chiamate": 0}
+    def judge(_):
+        stato["chiamate"] += 1
+        if not stato["consentito"]:
+            raise AssertionError("il giudice a pagamento non va chiamato dai run programmati")
+        return {"status": "ok", "findings": [{"category": "risk", "assessment": "Rischio aumentato",
+                                                "citations": ["C1-dopo"]}], "model": "stub", "usage": {"input_tokens": 1}}
+    return judge, stato
+
+
+def test_run_programmato_riusa_il_giudizio_manuale_senza_chiamare_il_giudice(tmp_path, monkeypatch):
+    judge, stato = _giudice_con_sentinella()
+    store, svc = setup(tmp_path, lambda *a, **k: result(), judge)
+    manuale = svc.run("ABC")
+    assert manuale["judgment"]["status"] == "ok" and stato["chiamate"] == 1
+    stato["consentito"] = False
+    monkeypatch.setattr("bellomberg.storage.filing_store._scadenza",
+                        lambda *a: datetime(2020, 1, 1, tzinfo=timezone.utc))  # il run programmato e' dovuto
+    programmato = svc.execute(svc.queue("ABC", "scheduled")["id"])
+    assert programmato["status"] == "ok"
+    assert programmato["judgment"]["reused_from_run"] == manuale["id"]
+    assert programmato["evidence_key"] == manuale["evidence_key"]
+    assert stato["chiamate"] == 1
+
+
+def test_run_programmato_senza_giudizio_precedente_resta_skipped(tmp_path):
+    judge, stato = _giudice_con_sentinella()
+    stato["consentito"] = False
+    store, svc = setup(tmp_path, lambda *a, **k: result(), judge)
+    programmato = svc.execute(svc.queue("ABC", "scheduled")["id"])
+    assert programmato["judgment"]["status"] == "skipped"
+    assert programmato["judgment"]["reason"] == SOLO_PULSANTE
+    assert "reused_from_run" not in programmato["judgment"]
+    assert stato["chiamate"] == 0
+
+
+def test_run_programmato_non_riusa_un_giudizio_con_citazione_assente(tmp_path, monkeypatch):
+    stato = {"consentito": True}
+    def judge(_):
+        if not stato["consentito"]:
+            raise AssertionError("giudice chiamato")
+        return {"status": "ok", "findings": [{"category": "risk", "assessment": "x", "citations": ["C1-dopo"]}],
+                "model": "stub", "usage": None}
+    store, svc = setup(tmp_path, lambda *a, **k: result(), judge)
+    svc.run("ABC")
+    stato["consentito"] = False
+    monkeypatch.setattr("bellomberg.storage.filing_store._scadenza",
+                        lambda *a: datetime(2020, 1, 1, tzinfo=timezone.utc))
+    monkeypatch.setattr("bellomberg.market_data.filing_service.citation_catalog", lambda r: {"C9-dopo"})
+    programmato = svc.execute(svc.queue("ABC", "scheduled")["id"])
+    assert programmato["judgment"]["status"] == "skipped" and programmato["judgment"]["reason"] == SOLO_PULSANTE
+    assert "reused_from_run" not in programmato["judgment"]
+
+
+def test_run_programmato_identita_del_giudice_predefinito(tmp_path, monkeypatch):
+    from bellomberg.market_data import filing_service as fs
+    monkeypatch.setenv("ACTION_EXTRACTOR_MODEL", "vendor/modello-x")
+    calls = []
+    def fake(res, model=None, language=None):
+        calls.append(model)
+        return {"status": "ok", "findings": [{"category": "risk", "assessment": "x", "citations": ["C1-dopo"]}],
+                "model": model, "usage": None}
+    monkeypatch.setattr(fs, "judge_filing", fake)
+    store, svc = setup(tmp_path, lambda *a, **k: result(), None)
+    assert svc._default_judge
+    manuale = svc.run("ABC")
+    assert calls == ["vendor/modello-x"]
+    monkeypatch.setattr("bellomberg.storage.filing_store._scadenza",
+                        lambda *a: datetime(2020, 1, 1, tzinfo=timezone.utc))
+    p = svc.execute(svc.queue("ABC", "scheduled")["id"])
+    assert p["judgment"]["reused_from_run"] == manuale["id"] and calls == ["vendor/modello-x"]
+    monkeypatch.setenv("ACTION_EXTRACTOR_MODEL", "vendor/modello-y")
+    p2 = svc.execute(svc.queue("ABC", "scheduled")["id"])
+    assert p2["judgment"]["status"] == "skipped" and calls == ["vendor/modello-x"]

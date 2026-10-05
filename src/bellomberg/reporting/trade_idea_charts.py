@@ -1,4 +1,4 @@
-"""trade_idea_charts.py - Grafici del memo Trade Idea, impianto B (approvato dal PM).
+"""trade_idea_charts.py - Grafici del memo Trade Idea, impianto M (memo d'investimento a sezioni numerate, scelta PM 04/10/2026).
 
 Dodici grafici PNG (matplotlib, backend Agg, DPI 220) dal dict ``facts`` di
 ``trade_idea_facts.extract_facts``, nell'ordine di ``KEYS``:

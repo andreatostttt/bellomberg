@@ -47,7 +47,7 @@ from bellomberg.portfolio.portfolio_sectors import get_sector_map, econ_bucket_f
 _CACHE: Dict[str, Any] = {}
 CACHE_TTL_SEC = 600  # 10 min, come le analytics
 
-PERIODS = ("MTD", "YTD", "30D", "INCEPTION")
+PERIODS = ("MTD", "YTD", "30D", "1W", "3M", "INCEPTION")
 
 
 def _log(msg: str):
@@ -75,6 +75,12 @@ def _period_start(period: str, end_iso: str, first_trade_iso: str) -> str:
     if period == "30D":
         d = datetime.strptime(end_iso, "%Y-%m-%d") - timedelta(days=29)
         return d.strftime("%Y-%m-%d")   # finestra di 30 giorni di calendario
+    if period == "1W":
+        d = datetime.strptime(end_iso, "%Y-%m-%d") - timedelta(days=6)
+        return d.strftime("%Y-%m-%d")   # 7 giorni di calendario
+    if period == "3M":
+        d = datetime.strptime(end_iso, "%Y-%m-%d") - timedelta(days=89)
+        return d.strftime("%Y-%m-%d")   # 90 giorni di calendario
     return first_trade_iso  # INCEPTION (same-day del primo BUY non attribuito)
 
 

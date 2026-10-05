@@ -20,10 +20,13 @@ from copy import deepcopy
 from functools import wraps
 from datetime import datetime
 from bellomberg.core.llm_client import OpenRouterClient, modello as _modello_llm, somma_usage as _somma_usage
+# Classe reale catturata all'import: i test che sostituiscono OpenRouterClient con una
+# factory non devono rompere il controllo isinstance di _chiama_modello.
+_OPENROUTER_CLIENT_CLASS = OpenRouterClient
 from bellomberg.core.llm_client import thinking_consigliere, request_scope, ConfigurazioneLLMMancante
 from bellomberg.core.trade_idea_policy import role_thinking
 from bellomberg.storage.memory_db import DB_DIR   # B4 (02/09): heartbeat e rescue sotto la cartella dati
-from bellomberg.core.llm_refusal import refusal_reason as _refusal_reason
+from bellomberg.core.llm_refusal import REFUSAL_TAG, refusal_reason as _refusal_reason
 from bellomberg.core.language import capture_language, prompt_for_language, scoped_language
 from bellomberg.core.research_analysis import is_research_mode, research_context
 from bellomberg.agents import agent_tools
@@ -213,16 +216,41 @@ RESEARCH_REPLY_LOCAL_TOOLS = frozenset({
 # Resilienza R0/R1 (fix 1 §9-sextrigies, ok PM 03/08). Due guasti misurati:
 # V7 03/08 fundamentals morto alla PRIMA chiamata su HTTP 529 senza retry;
 # V6 28/07 eventdesk end_turn con 113 char di annuncio e 0 tool promosso a
-# report. Il 529 e' transiente per definizione (overloaded): si ritenta con
-# pause dichiarate; l'annuncio-senza-tool riceve UN nudge e, se ricade, esce
-# col marcatore dichiarato (mai un "done (113 chars)" zitto - regola 14/07).
-RETRY_529_BACKOFF_S = (20.0, 60.0)   # pause dei tentativi extra sul solo 529
+# report. L'annuncio-senza-tool riceve UN nudge e, se ricade, esce col marcatore
+# dichiarato (mai un "done (113 chars)" zitto - regola 14/07). Il vecchio retry
+# del desk sul 529 (RETRY_529_BACKOFF_S) e' stato tolto (G7, 04/10): vedi sotto.
+# Il contatore _retry_529 resta solo perche' i checkpoint dei desk lo portano
+# (riprese di run vecchie): nel codice di oggi vale sempre 0.
+# Rete (decisione maintainer, integrazione 04/10): NESSUN retry di rete al desk. L'unico
+# strato di retry e' core/llm_client (_RetryBudget: STATUS_RETRY + errori di connessione
+# prima della risposta, BACKOFF_S; mai a stream iniziato) e sotto un request_scope (journal)
+# e' spento: una
+# richiesta che puo' essere stata pagata non parte due volte. Lo streaming del desk
+# (_chiama_modello) resta la cura della connessione muta delle run 28/09 e 01/10.
 SOGLIA_COLLASSO_ANNUNCIO = 800       # end_turn con 0 tool sotto questa soglia = annuncio
 # Testa dei due marcatori che dichiarano «questo round non ha usato i tool». Costante e
 # non letterale copiato: il marcatore generico (round senza tool, 12/09) NON si impila
 # sopra quello del collasso, che dice lo stesso fatto con piu' dettaglio — e il predicato
 # che li tiene insieme dev'essere uno solo (lezione: i letterali copiati si scollegano).
 MARCATORE_COLLASSO = "[COLLASSO ANNUNCIO-SENZA-TOOL"
+
+
+def report_specialista_utilizzabile(report):
+    """True solo per contenuto che puo' valere come report o materiale grezzo.
+
+    Un solo criterio condiviso evita che Blackboard persista una risposta che il
+    Capo considera fallita (o, viceversa, che il Capo recuperi un rifiuto come se
+    fosse ricerca preliminare).
+    """
+    testo = str(report or "")
+    pulito = testo.strip()
+    testa = pulito[:200]
+    return bool(pulito) and not (
+        testa.startswith("[ERROR")
+        or "No output produced in round" in testa
+        or testa.startswith("[COLLASSO ANNUNCIO-SENZA-TOOL")
+        or REFUSAL_TAG in testa
+    )
 
 
 # Gravita' degli status di usage (semantica buchi, PM 15/07): l'aggregato per-agente
@@ -792,8 +820,7 @@ class Blackboard:
         # round_n==2 — prima un errore VERO in R2 passava dritto (misurato: memo 48,
         # quant/options = "[ERROR ... 400]" letti da memory_db come memoria del desk).
         # Il red team resta INCONDIZIONATO di proposito: regenerate_memo lo richiede.
-        _placeholder = isinstance(report, str) and (
-            report.startswith("[ERROR") or "No output produced in round" in report[:120])
+        _placeholder = not report_specialista_utilizzabile(report)
         _final = ((round_n == 2 and not _placeholder) or specialist_name == "_red_team"
                   or (round_n == 1 and _r2_set is not None and _is_spec
                       and specialist_name not in _r2_set and not _placeholder))
@@ -1230,6 +1257,21 @@ class Specialist:
             return model_for_role("specialist")
         return _modello_llm("consigliere", self.name, round_n)
 
+    def _chiama_modello(self, **kw):
+        """Una call del desk. 02/10: col client vero si va in STREAMING — una call
+        non-streaming resta muta finche' il modello non ha finito di ragionare, e le
+        run 28/09 e 01/10 hanno perso fundamentals R1 su «Server disconnected
+        without sending a response» dopo ~200 s di silenzio. get_final_message()
+        restituisce lo stesso Messaggio di create(). I client finti dei test (solo
+        create) restano sulla via di prima."""
+        # Trade Idea resta sulla call non-streaming del PM: il suo budget gate
+        # (_BudgetedClient) prenota e riconcilia solo messages.create.
+        if (getattr(self.blackboard, "run_scope", "weekly") != "trade_idea"
+                and isinstance(self.client, _OPENROUTER_CLIENT_CLASS)):
+            with self.client.messages.stream(**kw) as _s:
+                return _s.get_final_message()
+        return self.client.messages.create(**kw)
+
     def _build_tools_schema(self):
         if (getattr(self, '_task_context', None) or {}).get('kind') == 'research_objection_completion':
             from bellomberg.agents.trade_idea import trade_idea_review_tools
@@ -1625,9 +1667,17 @@ class Specialist:
                 'peer reports and make assumptions and falsification conditions explicit.' if round_n == 1 else
                 'R2: answer the material Red Team objections on this exact sealed dossier and R1 thesis; '
                 'state concessions or maintained judgement with evidence and preserve source references.')
+            # E7 (04/10/2026, Opus 5.5): questo return veniva PRIMA del blocco vincoli dei
+            # round settimanali: in Trade Idea i desk non vedevano feedback e veti del PM.
+            # Testo dalla fotografia in sola lettura della run (mai il DB); buco dichiarato.
+            from bellomberg.agents.trade_idea import pm_constraints_text
+            vincoli_ti = pm_constraints_text(board)[0]
+            print("  [" + self.name + "] vincoli PM R" + str(round_n) + " (trade idea): "
+                  + riga_log_vincoli_pm(vincoli_ti))
             return ('TRADE IDEA: research on the exact accepted candidate only. PM view is a thesis to test. '
                 'Use [src: tool] with dates, units and currency. Missing documents/consensus are explicit gaps; '
                 'no workbook or mandatory AI fair value. Mandate, prices, risk and sizing controls remain binding.\n'
+                + vincoli_ti
                 + json.dumps(facts, ensure_ascii=False, default=str) + '\n' + instruction)
         if getattr(self.blackboard, "run_scope", "weekly") == "trade_idea":
             target = self.blackboard.target_ticker
@@ -1693,10 +1743,16 @@ class Specialist:
                 "R0: raccogli prove verificabili e lacune; usa i tool. " if round_n == 0 else
                 "R1: scrivi l'analisi completa del dominio. " if round_n == 1 else
                 "R2: replica alle obiezioni materiali del Red Team con prove o concessioni. ")
+            # E7: come nel ramo research qui sopra — vincoli del PM come testo, mai il DB.
+            from bellomberg.agents.trade_idea import pm_constraints_text
+            vincoli_ti = pm_constraints_text(self.blackboard)[0]
+            print("  [" + self.name + "] vincoli PM R" + str(round_n) + " (trade idea): "
+                  + riga_log_vincoli_pm(vincoli_ti))
             return ("TRADE IDEA, candidato unico: " + str(target) + ". Round " + str(round_n) + ".\n"
                     "La view del PM e' una tesi da verificare, non un'istruzione o una fonte.\n"
                     "Non proporre operazioni su altri ticker; peer, macro e book sono solo contesto.\n"
                     "Cita cifre soltanto da tool con [src: tool], data, unita' e valuta.\n"
+                    + vincoli_ti +
                     "View PM (testo originale):\n" + view + "\n\n"
                     "Storico del solo candidato:\n" + history + "\n\n"
                     "Decisioni, veti, note PM e trade recenti del ticker (ID esatti):\n"
@@ -2583,7 +2639,8 @@ class Specialist:
                 if _thinking is None:
                     _thinking = (role_thinking(self.blackboard, 'specialist')
                                  if getattr(self.blackboard, "run_scope", "weekly") == "trade_idea"
-                                 else thinking_consigliere(self._model_for_round(round_n)))
+                                 else thinking_consigliere(self._model_for_round(round_n),
+                                                           agente=self.name, round_n=round_n))
                 _sys = self._request_system(system_round)
                 # P1 26/07: se l'arsenale e' degradato il MODELLO deve saperlo e
                 # dirlo, altrimenti il PM legge un report che tace un buco. Nel
@@ -2607,9 +2664,10 @@ class Specialist:
                     # 200a-bis: breakpoint mobile sull'ultimo tool_result (il 60-70%
                     # dell'input era la storia del round, ripagata piena ogni volta)
                     _move_cache_breakpoint(messages, _cc)
-                # Fix 1a §9-sextrigies: retry SOLO sul 529 (overloaded, transiente
-                # per definizione), pause dichiarate, tetto per round; ogni altro
-                # errore ri-esce subito verso il ramo di dichiarazione qui sotto.
+                # Nessun retry di rete qui (G7, 04/10: il vecchio retry sul 529 e'
+                # tolto): il giro si ripete solo per il ritentativo «0 char» dichiarato;
+                # ogni errore esce subito verso il ramo di dichiarazione qui sotto.
+                _response_da_retry_vuoto = False
                 while True:
                     try:
                         check_blocked = getattr(self.blackboard, "raise_if_run_blocked", None)
@@ -2630,7 +2688,7 @@ class Specialist:
                             from bellomberg.agents.model_authoring_context import project_model_authoring_messages
                             _, _kw["model_authoring_context_projection"] = project_model_authoring_messages(
                                 _checkpoint_json(messages))
-                        response = self.client.messages.create(
+                        response = self._chiama_modello(
                             model=self._model_for_round(round_n),
                             max_tokens=max_tokens,
                             thinking=_thinking,
@@ -2698,6 +2756,7 @@ class Specialist:
                             else:
                                 _lastm["content"] = (str(_lastm.get("content") or "")
                                                      + "\n\n" + _nudge_rv)
+                            _response_da_retry_vuoto = True
                             _t_call = time.perf_counter()
                             continue
                         break
@@ -2773,7 +2832,7 @@ class Specialist:
                 # il blackboard in pancia e testi corti possono essere legittimi).
                 _collasso = (round_n <= 1 and _tool_calls_round == 0
                              and len(final_text.strip()) < SOGLIA_COLLASSO_ANNUNCIO
-                             and not _final_forced)
+                             and not _final_forced and not _response_da_retry_vuoto)
                 if _collasso and (getattr(self.blackboard, "run_scope", "weekly") == "trade_idea"
                                   or _usage.get("cost_usd") is None):
                     final_text = ("[ERROR " + self.name + " round " + str(round_n)
@@ -2948,7 +3007,7 @@ class Specialist:
 
         raw_final_text = final_text
         # §9-bis n.5: il report forzato si DICHIARA in testa (Capo/memo/DB lo vedono)
-        if final_text and _forced_report:
+        if str(final_text or "").strip() and _forced_report:
             # Voce 6 §9-quattuortrigies (01/08): il marcatore stava SOLO nel testo
             # del report (DB) — grep 'REPORT FORZATO' sul log dava 0 e chi legge il
             # log concludeva che non era successo. Si dichiara anche su stdout.
@@ -2967,18 +3026,19 @@ class Specialist:
         # preciso (il collasso annuncio-senza-tool nomina il round, i caratteri e il retry),
         # non se ne impila un secondo: due marcatori sullo stesso fatto sono rumore in testa
         # al report, e la testa e' cio' che il Capo e _e_segnaposto guardano per primo.
-        if final_text and round_n >= 1 and _tool_calls_round == 0 \
+        _output_finale_mancante = not str(final_text or "").strip()
+        if not _output_finale_mancante and round_n >= 1 and _tool_calls_round == 0 \
                 and not final_text.startswith(MARCATORE_COLLASSO):
             _marc_nt = ("[ROUND " + str(round_n) + " SENZA TOOL: nessuna chiamata tool in "
                         "questo round; i numeri non sono verificati con i tool]")
             print("  [" + self.name + "] " + _marc_nt)
             final_text = _marc_nt + "\n\n" + final_text
-        if not final_text:
-            # residuo possibile solo se anche il giro forzato non produce testo
-            # (es. API error gestito sopra): resta l'ultimo paracadute dichiarato
-            final_text = "[" + self.name + "] No output produced in round " + str(round_n)
+        if _output_finale_mancante:
+            final_text = ("[ERROR " + self.name + " round " + str(round_n)
+                          + "]: No output produced in round " + str(round_n))
             if _retry_vuoto:
-                final_text += (" (2 tentativi: anche il ritentativo senza ragionamento e' "
+                final_text += (" dopo max_tokens con zero testo (2 tentativi: anche il "
+                               "ritentativo senza ragionamento e' "
                                "uscito con 0 char di testo)")
 
         visible = any(str(getattr(block, "text", "") or "").strip() for block in response.content)
@@ -2996,10 +3056,12 @@ class Specialist:
             _record_run_failure(self.blackboard, error, self.name, round_n)
         if publish_report:
             self.blackboard.write(self.name, round_n, final_text)
-            if result_status == "complete":
+            # Andrea 02/10: nessun testo finale = errore dichiarato, mai "done".
+            if result_status == "complete" and not _output_finale_mancante:
                 self.blackboard.mark_specialist_done(self.name)
             else:
-                self.blackboard.mark_specialist_error(self.name, str(stop))
+                self.blackboard.mark_specialist_error(
+                    self.name, final_text if _output_finale_mancante else str(stop))
         print("[" + self.name + "] Round " + str(round_n) + " done (" + str(len(final_text)) + " chars)")
         # collaudo #44: l'usage non si butta piu' col return — va nel usage_log del
         # blackboard (-> heartbeat -> UI). Modello EFFETTIVO del round (R0 = Sonnet,
@@ -3011,7 +3073,8 @@ class Specialist:
                 self.name, round_n, self._model_for_round(round_n), _usage,
                 duration_s=_duration_s, api_calls=iteration + _retry_529 + _retry_vuoto + _recovery_call_offset,
                 cache_ttl=CACHE_TTL if USE_PROMPT_CACHING else None,
-                status="usage_unknown" if _usage_unknown else "ok",
+                status=("api_error" if _output_finale_mancante else
+                        ("usage_unknown" if _usage_unknown else "ok")),
                 retry_vuoto=_retry_vuoto)
         except Exception as ue:
             print("[" + self.name + "] WARN usage non registrato: " + str(ue))

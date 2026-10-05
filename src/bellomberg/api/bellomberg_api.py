@@ -41,6 +41,10 @@ from datetime import datetime
 from typing import Optional, List, Dict, Tuple
 from contextlib import asynccontextmanager
 
+from bellomberg.api.news_refresh_manager import NewsRefreshManager
+from bellomberg.market_data.filing_refresh import FilingRefreshManager
+from bellomberg.reporting.email_sender import EmailOutboxWorker
+
 try:
     sys.stdout.reconfigure(encoding='utf-8')
 except Exception:
@@ -159,6 +163,20 @@ run_state = RunState()
 # PYDANTIC MODELS
 # ============================================================
 
+class TradeIdentityIn(BaseModel):
+    """ISIN verification confirmed together with the trade (the proposed ticker
+    comes from the decision on the server, never from the client)."""
+    isin: str
+    source: str
+    verified_at: str
+    reason: str
+
+
+class TradeDivergenceIn(BaseModel):
+    decision_id: int
+    reason: str
+
+
 class TradeIn(BaseModel):
     ticker: str
     action: str  # BUY/SELL/TRIM/ADD/DIVIDEND
@@ -171,6 +189,15 @@ class TradeIn(BaseModel):
     data: Optional[str] = None
     senza_decisione: bool = False
     preview_id: Optional[str] = None
+    # Written in the SAME transaction as the trade, only after the PM confirms
+    # the preview: the two tables are append-only, a cancelled preview writes nothing.
+    instrument_identity: Optional[TradeIdentityIn] = None
+    manual_divergence: Optional[TradeDivergenceIn] = None
+
+
+class ManualTradeDivergenceIn(BaseModel):
+    trade_id: int
+    reason: str
 
 
 class OpeningPositionIn(BaseModel):
@@ -327,17 +354,33 @@ _THROTTLE_S = {
     "/prices/update": 30,       # quota provider (Polygon/Tiingo)
     "/news/feed/refresh": 30,   # quota provider (Marketaux/Tiingo)
     "/db/backup": 30,           # distruttivo-adjacent: stop al doppio-click
+    # 02/10: sintesi AI di un articolo (crediti OpenRouter): stop al doppio-click. Chiave =
+    # template della rotta, quindi un intervallo unico per tutte le notizie.
+    "/news/{news_id}/article-summary": 3,
+    "/market/news/translate": 2,
 }
 _LAST_CALL: Dict[str, float] = {}   # {path: epoch ultima chiamata ammessa}
+
+
+def _throttle_key(request: "Request") -> str:
+    """Path concreto; per le rotte con parametri, il loro template se e' in _THROTTLE_S."""
+    path = request.url.path
+    if path in _THROTTLE_S:
+        return path
+    scope = getattr(request, "scope", None) or {}
+    route_path = getattr(scope.get("route"), "path", None)
+    return route_path if route_path in _THROTTLE_S else path
+
 
 def throttle(request: "Request"):
     """Dependency A-M3: 429+Retry-After se lo stesso path oneroso viene
     richiamato entro _THROTTLE_S[path]. Esente lo scheduler interno censito."""
-    min_interval_s = _THROTTLE_S.get(request.url.path)
+    key = _throttle_key(request)
+    min_interval_s = _THROTTLE_S.get(key)
     if min_interval_s is None or _is_scheduler_call(request):
         return
     now = time.time()
-    last = _LAST_CALL.get(request.url.path)
+    last = _LAST_CALL.get(key)
     if last is not None and (now - last) < min_interval_s:
         retry_in = max(1, int(min_interval_s - (now - last)) + 1)
         raise HTTPException(
@@ -345,13 +388,13 @@ def throttle(request: "Request"):
             _api_text(f'Richiesta troppo frequente su {request.url.path}: riprova tra {retry_in}s (throttle anti-abuso A-M3).', f'Request too frequent for {request.url.path}: try again in {retry_in}s (A-M3 abuse prevention).'),
             headers={"Retry-After": str(retry_in)},
         )
-    _LAST_CALL[request.url.path] = now
+    _LAST_CALL[key] = now
     request.state.throttle_timestamp = now
 
 
 def _refund_throttle(request: "Request"):
     """Rimuove solo il consumo fatto da questa richiesta, mai quello di una successiva."""
-    path = request.url.path
+    path = _throttle_key(request)
     proprio = getattr(request.state, "throttle_timestamp", None)
     if proprio is not None and _LAST_CALL.get(path) == proprio:
         _LAST_CALL.pop(path, None)
@@ -398,27 +441,49 @@ async def lifespan(app):
         print("[SECURITY][A-M1] BELLOMBERG_PIN assente o == '1234': LOGIN BLOCCATO (fail-closed).")
         print("  Imposta un PIN forte nel .env  ->  BELLOMBERG_PIN=<il-tuo-pin>  e riavvia.")
         print("!" * 60)
-    from bellomberg.valuation.valuation_automation_installation import start_installation
-    app.state.valuation_automation = start_installation(SQLITE_PATH)
-    from bellomberg.api.trade_idea_routes import recover_orphan_runs
     try:
-        app.state.trade_idea_recovery = recover_orphan_runs(SQLITE_PATH)
-    except Exception as exc:
-        app.state.trade_idea_recovery = {"status": "error",
-            "reason": type(exc).__name__ + ": " + str(exc)[:350]}
-    if app.state.trade_idea_recovery.get("status") != "ready" or any(
-            app.state.trade_idea_recovery.get(key) for key in
-            ("interrupted", "recovered", "unknown_liveness", "errors")):
-        print("[trade-idea recovery] " + str(app.state.trade_idea_recovery), flush=True)
-    from bellomberg.market_data.fund_market_worker import start_market_updates
-    app.state.fund_market_worker = start_market_updates(SQLITE_PATH, os.path.join(DB_DIR, 'consensus_cache'))
-    try:
+        from bellomberg.valuation.valuation_automation_installation import start_installation
+        app.state.valuation_automation = start_installation(SQLITE_PATH)
+        from bellomberg.api.trade_idea_routes import recover_orphan_runs
+        try:
+            app.state.trade_idea_recovery = recover_orphan_runs(SQLITE_PATH)
+        except Exception as exc:
+            app.state.trade_idea_recovery = {"status": "error",
+                "reason": type(exc).__name__ + ": " + str(exc)[:350]}
+        if app.state.trade_idea_recovery.get("status") != "ready" or any(
+                app.state.trade_idea_recovery.get(key) for key in
+                ("interrupted", "recovered", "unknown_liveness", "errors")):
+            print("[trade-idea recovery] " + str(app.state.trade_idea_recovery), flush=True)
+        from bellomberg.market_data.fund_market_worker import start_market_updates
+        app.state.fund_market_worker = start_market_updates(SQLITE_PATH, os.path.join(DB_DIR, 'consensus_cache'))
+        news_refresh_manager.start()   # G3: nessun giro all'avvio, pausa notte/weekend (PM 04/10)
+        # Interruttore della pagina Filing: scelta salvata (env esplicitamente falsa vince).
+        # Primo giro FILING_AUTO_REFRESH_DELAY_S dopo l'avvio (default 10 min, decisione PM 04/10).
+        filing_refresh_manager.applica_preferenza()
+        filing_refresh_manager.start()   # G2b: primo giro ritardato, non immediato
+        # Una variabile EMAIL_* non valida non ferma il backend: il worker resta spento
+        # e lo dichiara (log + app.state.email_outbox, con il nome della variabile).
+        app.state.email_outbox = email_outbox_worker.start()
         yield
     finally:
-        app.state.fund_market_worker.stop()
-        runner = app.state.valuation_automation["runner"]
+        fund_market_worker = getattr(app.state, "fund_market_worker", None)
+        if fund_market_worker is not None:
+            fund_market_worker.stop()
+        automation = getattr(app.state, "valuation_automation", None)
+        runner = automation.get("runner") if isinstance(automation, dict) else None
         if runner is not None:
             runner.stop()
+        email_outbox_worker.stop()
+        filing_refresh_manager.stop()
+        news_refresh_manager.stop()
+
+
+# One backend-owned coordinator for both scheduled and manual News pulls.  It is
+# deliberately outside NewsPage: the feed keeps refreshing while the user navigates.
+news_refresh_manager = NewsRefreshManager()
+# Controllo orario dei profili filing scaduti + recupero run orfani (thread backend).
+filing_refresh_manager = FilingRefreshManager()
+email_outbox_worker = EmailOutboxWorker()
 
 
 def _hardcoded_economic_calendar(today, days_ahead: int):
@@ -482,7 +547,7 @@ def _hardcoded_economic_calendar(today, days_ahead: int):
                            "title": _api_text('Riunione OPEC+ (decisione produzione)', 'OPEC+ Meeting (production decision)'),
                            "importance": 4, "country": "OPEC"})
 
-    # Recurring monthly/weekly releases
+    # Release a data ESATTA: NFP primo venerdi', claims ogni giovedi', PMI Cina il 1.
     cursor = today
     while cursor <= end:
         wd = cursor.weekday()  # 0=Mon
@@ -497,53 +562,91 @@ def _hardcoded_economic_calendar(today, days_ahead: int):
             events.append({"date": d_iso, "time": "14:30 CET", "type": "US Macro",
                            "title": _api_text('USA: nuove richieste sussidio disoccupazione (settimanali)', 'US Initial Jobless Claims (weekly)'),
                            "importance": 3, "country": "US"})
-        # CPI US: ~10-15 del mese, tue-thu
-        if 10 <= cursor.day <= 15 and wd in (1, 2, 3):
-            events.append({"date": d_iso, "time": "14:30 CET", "type": "US Macro",
-                           "title": _api_text('USA: pubblicazione CPI / CPI core', 'US CPI / Core CPI Release'),
-                           "importance": 5, "country": "US"})
-        # PPI US: 1-2 giorni dopo CPI
-        if 11 <= cursor.day <= 16 and wd in (1, 2, 3, 4):
-            # Solo se il giorno dopo a un possibile CPI
-            events.append({"date": d_iso, "time": "14:30 CET", "type": "US Macro",
-                           "title": _api_text('USA: pubblicazione PPI', 'US PPI Release'),
-                           "importance": 3, "country": "US"})
-        # Retail Sales: mid-month
-        if 14 <= cursor.day <= 17 and wd in (1, 2, 3, 4):
-            events.append({"date": d_iso, "time": "14:30 CET", "type": "US Macro",
-                           "title": _api_text('USA: vendite al dettaglio mensili', 'US Retail Sales MoM'),
-                           "importance": 4, "country": "US"})
-        # ISM Manufacturing PMI: 1st business day
-        if wd in (0, 1) and cursor.day <= 3:
-            events.append({"date": d_iso, "time": "16:00 CET", "type": "US Macro",
-                           "title": _api_text('PMI manifatturiero ISM', 'ISM Manufacturing PMI'),
-                           "importance": 4, "country": "US"})
-        # ISM Services PMI: 3rd business day
-        if wd in (1, 2, 3) and 3 <= cursor.day <= 5:
-            events.append({"date": d_iso, "time": "16:00 CET", "type": "US Macro",
-                           "title": _api_text('PMI servizi ISM', 'ISM Services PMI'),
-                           "importance": 4, "country": "US"})
-        # EU HICP Flash: end of month
-        if cursor.day >= 28 and wd in (1, 2, 3, 4):
-            events.append({"date": d_iso, "time": "11:00 CET", "type": "EU Macro",
-                           "title": _api_text('Eurozona: stima preliminare inflazione IPCA', 'Eurozone HICP Flash Estimate'),
-                           "importance": 4, "country": "EU"})
-        # Germany IFO: ~25 del mese
-        if 24 <= cursor.day <= 26 and wd in (0, 1, 2, 3, 4):
-            events.append({"date": d_iso, "time": "10:00 CET", "type": "EU Macro",
-                           "title": _api_text('Germania: clima economico IFO', 'Germany IFO Business Climate'),
-                           "importance": 3, "country": "DE"})
         # China PMI: 1st of month
         if cursor.day == 1:
             events.append({"date": d_iso, "time": "02:30 CET", "type": "China Macro",
                            "title": _api_text('Cina: PMI manifatturiero NBS', 'China NBS Manufacturing PMI'),
                            "importance": 4, "country": "CN"})
-        # US GDP advance: end of January, April, July, October
-        if cursor.month in (1, 4, 7, 10) and 26 <= cursor.day <= 30 and wd in (1, 2, 3):
-            events.append({"date": d_iso, "time": "14:30 CET", "type": "US Macro",
-                           "title": _api_text(f"USA: stima preliminare PIL Q{(cursor.month-1)//3 or 4}", f"US GDP Q{(cursor.month-1)//3 or 4} Advance Estimate"),
-                           "importance": 5, "country": "US"})
         cursor += _td(days=1)
+
+    # Release a FINESTRA (02/10/2026): la data vera non e' cablata, solo una
+    # regola plausibile sul mese. Prima ogni giorno della finestra emetteva
+    # l'evento (CPI il 13, 14 e 15/10). Ora UNA occorrenza per mese, calcolata
+    # sul mese intero — se gia' passata non esce, invece di slittare a oggi —
+    # e dichiarata `date_estimated`. Festivita' non modellate.
+    def _primo(mese, regola):
+        """Primo giorno del mese che soddisfa la regola, o None."""
+        giorno = mese
+        while giorno.month == mese.month:
+            if regola(giorno):
+                return giorno
+            giorno += _td(days=1)
+        return None
+
+    def _lavorativo(mese, n):
+        """N-esimo giorno lavorativo (lun-ven) del mese."""
+        giorno = mese - _td(days=1)
+        while n:
+            giorno += _td(days=1)
+            if giorno.weekday() < 5:
+                n -= 1
+        return giorno
+
+    def _cpi(mese):
+        # CPI US: ~10-15 del mese, tue-thu
+        return _primo(mese, lambda d: 10 <= d.day <= 15 and d.weekday() in (1, 2, 3))
+
+    def _ppi(mese):
+        # PPI US: il giorno lavorativo dopo il CPI (prima: finestra propria, stesso giorno del CPI)
+        cpi = _cpi(mese)
+        if cpi is None:
+            return None
+        giorno = cpi + _td(days=1)
+        while giorno.weekday() >= 5:
+            giorno += _td(days=1)
+        return giorno
+
+    def _gdp_title(d):
+        q = (d.month - 1) // 3 or 4
+        return _api_text(f"USA: stima preliminare PIL Q{q}", f"US GDP Q{q} Advance Estimate")
+
+    def _fisso(testo_it, testo_en):
+        return lambda d: _api_text(testo_it, testo_en)
+
+    finestre = [
+        # (data(mese) -> date|None, ora, tipo, titolo(d), importanza, paese)
+        (_cpi, "14:30 CET", "US Macro",
+         _fisso('USA: pubblicazione CPI / CPI core', 'US CPI / Core CPI Release'), 5, "US"),
+        (_ppi, "14:30 CET", "US Macro",
+         _fisso('USA: pubblicazione PPI', 'US PPI Release'), 3, "US"),
+        # Retail Sales: mid-month
+        (lambda m: _primo(m, lambda d: 14 <= d.day <= 17 and d.weekday() in (1, 2, 3, 4)), "14:30 CET", "US Macro",
+         _fisso('USA: vendite al dettaglio mensili', 'US Retail Sales MoM'), 4, "US"),
+        # ISM Manufacturing PMI: 1st business day (prima: solo lun/mar dei giorni 1-3, saltava mesi interi)
+        (lambda m: _lavorativo(m, 1), "16:00 CET", "US Macro",
+         _fisso('PMI manifatturiero ISM', 'ISM Manufacturing PMI'), 4, "US"),
+        # ISM Services PMI: 3rd business day (prima: solo mar-gio dei giorni 3-5)
+        (lambda m: _lavorativo(m, 3), "16:00 CET", "US Macro",
+         _fisso('PMI servizi ISM', 'ISM Services PMI'), 4, "US"),
+        # EU HICP Flash: end of month
+        (lambda m: _primo(m, lambda d: d.day >= 28 and d.weekday() in (1, 2, 3, 4)), "11:00 CET", "EU Macro",
+         _fisso('Eurozona: stima preliminare inflazione IPCA', 'Eurozone HICP Flash Estimate'), 4, "EU"),
+        # Germany IFO: ~25 del mese
+        (lambda m: _primo(m, lambda d: 24 <= d.day <= 26 and d.weekday() < 5), "10:00 CET", "EU Macro",
+         _fisso('Germania: clima economico IFO', 'Germany IFO Business Climate'), 3, "DE"),
+        # US GDP advance: end of January, April, July, October
+        (lambda m: _primo(m, lambda d: d.month in (1, 4, 7, 10) and 26 <= d.day <= 30 and d.weekday() in (1, 2, 3)),
+         "14:30 CET", "US Macro", _gdp_title, 5, "US"),
+    ]
+    mese = today.replace(day=1)
+    while mese <= end:
+        for data, ora, tipo, titolo, importanza, paese in finestre:
+            giorno = data(mese)
+            if giorno is not None and today <= giorno <= end:
+                events.append({"date": giorno.isoformat(), "time": ora, "type": tipo,
+                               "title": titolo(giorno), "importance": importanza,
+                               "country": paese, "date_estimated": True})
+        mese = (mese + _td(days=32)).replace(day=1)
 
     # Deduplica e sort by date+time
     seen = set()
@@ -562,30 +665,98 @@ _TIPI_CON_EARNINGS = {"operating", "bank", "dat", "holding"}
 
 
 def _tickers_earnings_da_negozio(positions, negozio):
-    """Ticker US con natura societaria dichiarata; non deduce la natura dal simbolo."""
+    """Ticker Finnhub con natura societaria dichiarata; non deduce natura o alias."""
     origine = negozio.get("origine")
     if origine in {"assente", "illeggibile"}:
         return [], "negozio dei veicoli %s: %s" % (
             origine, negozio.get("motivo") or "causa non dichiarata")
+    try:
+        from bellomberg.storage.negozi_privati import carica_alias
+        esito_alias = carica_alias()
+        alias_finnhub = (esito_alias["alias"]["finnhub"]
+                         if esito_alias["origine"] not in {"assente", "illeggibile"}
+                         else {})
+    except Exception as exc:
+        esito_alias = {"origine": "illeggibile",
+                       "motivo": "%s: %s" % (type(exc).__name__, exc)}
+        alias_finnhub = {}
     tickers = []
     senza_natura = []
+    senza_alias = []
     voci = negozio.get("veicoli", {})
     for posizione in positions:
         ticker = (posizione.get("ticker") or "").strip().upper()
-        if not ticker or "." in ticker:
+        if not ticker:
             continue
         voce = voci.get(ticker)
         tipo = voce.get("tipo") if isinstance(voce, dict) else None
         if tipo in _TIPI_CON_EARNINGS:
-            tickers.append(ticker)
+            if "." in ticker and ticker not in alias_finnhub:
+                senza_alias.append(ticker)
+            else:
+                tickers.append(ticker)
         elif tipo in {"cef", "etf", "etn", "commodity", "crypto"}:
             continue
         else:
             senza_natura.append(ticker)
-    nota = None
+    note = []
+    if senza_alias:
+        stato_alias = esito_alias.get("origine")
+        prefisso = ""
+        if stato_alias in {"assente", "illeggibile"}:
+            prefisso = "alias_fonti %s: %s; " % (
+                stato_alias, esito_alias.get("motivo") or "causa non dichiarata")
+        note.append(
+            prefisso + "alias Finnhub mancante per %d ticker esteri (%s): esclusi dal "
+            "calendario senza dedurre il simbolo USA" %
+            (len(senza_alias), ", ".join(senza_alias)))
     if senza_natura:
-        nota = (_api_text('natura non dichiarata per %d ticker US: esclusi dal calendario earnings senza inventare il tipo', 'Nature not declared for %d US tickers: excluded from the earnings calendar without inventing their type') % len(senza_natura))
-    return tickers, nota
+        note.append(_api_text(
+            "natura non dichiarata per %d ticker: esclusi dal calendario earnings "
+            "senza inventare il tipo",
+            "Nature not declared for %d tickers: excluded from the earnings calendar "
+            "without inventing their type",
+        ) % len(senza_natura))
+    return tickers, "; ".join(note) or None
+
+
+def _tickers_earnings_con_riserva(positions, negozio):
+    """Come `_tickers_earnings_da_negozio`, ma i titoli societari che Finnhub gratuito non
+    copre (simbolo non USA: alias assente o alias con suffisso di borsa, che risponde 403)
+    non vengono scartati: vanno alla riserva yfinance. Torna (finnhub, yfinance, nota)."""
+    finnhub, nota = _tickers_earnings_da_negozio(positions, negozio)
+    alias_rotto = None
+    try:
+        from bellomberg.storage.negozi_privati import carica_alias
+        esito_alias = carica_alias()
+        alias = (esito_alias["alias"]
+                 if esito_alias["origine"] not in {"assente", "illeggibile"} else {})
+    except Exception as exc:  # G8: dichiarato in nota, non ingoiato
+        alias = {}
+        alias_rotto = "alias_fonti illeggibile: %s: %s" % (type(exc).__name__, exc)
+    alias_finnhub = alias.get("finnhub", {}) if isinstance(alias, dict) else {}
+    voci = negozio.get("veicoli", {}) if negozio.get("origine") not in {"assente", "illeggibile"} else {}
+    riserva = []
+    for posizione in positions:
+        ticker = (posizione.get("ticker") or "").strip().upper()
+        voce = voci.get(ticker)
+        if not ticker or not isinstance(voce, dict) or voce.get("tipo") not in _TIPI_CON_EARNINGS:
+            continue
+        simbolo_fh = alias_finnhub.get(ticker) or (ticker if "." not in ticker else None)
+        if simbolo_fh is None or "." in simbolo_fh:
+            if ticker not in riserva:
+                riserva.append(ticker)
+    finnhub = [t for t in finnhub if t not in riserva]
+    # la nota «alias Finnhub mancante» non vale per chi ha la riserva: resta solo il resto.
+    # G8 (04/10/2026, Opus 5.5): lo stato «alias_fonti assente/illeggibile» invece RESTA:
+    # con il file rotto tutti i titoli esteri vanno a yfinance col simbolo grezzo, e il PM
+    # deve saperlo. Il titolo che yfinance non data e' dichiarato dall'endpoint.
+    if nota:
+        parti = [p for p in nota.split("; ") if "alias Finnhub mancante" not in p]
+        nota = "; ".join(parti) or None
+    if alias_rotto and not (nota and "alias_fonti " in nota):
+        nota = "; ".join(x for x in (nota, alias_rotto) if x)
+    return finnhub, riserva, nota
 
 
 def _avviso_provider_bloccati(muti, coda_it, coda_en):
@@ -700,7 +871,9 @@ if FASTAPI_OK:
     app.include_router(create_agent_progress_router(require_session))
     app.include_router(create_options_router(require_session))
     app.include_router(create_language_router(require_session))
-    app.include_router(create_filing_router(require_session))
+    app.include_router(create_filing_router(
+        require_session, avvia_aggiornamento=filing_refresh_manager.trigger,
+        stato_aggiornamento=filing_refresh_manager.status, imposta_auto=filing_refresh_manager.imposta_auto))
     def _fund_market_refresh_state():
         runner = getattr(app.state, 'fund_market_worker', None)
         return runner.status() if runner is not None else {'status': 'stopped',
@@ -724,8 +897,12 @@ if FASTAPI_OK:
 
     @app.get("/health")
     def health():
+        # Review G5 R7: un worker email spento (es. variabile EMAIL_* non valida) si vede qui,
+        # non solo nel log: running + reason col nome della variabile.
+        outbox = getattr(app.state, "email_outbox", None) or {"running": False, "reason": "not_started"}
         return {"status": "ok", "brand": BRAND_NAME, "version": VERSION,
-                "timestamp": datetime.now().isoformat()}
+                "timestamp": datetime.now().isoformat(),
+                "email_outbox": {"running": bool(outbox.get("running")), "reason": outbox.get("reason")}}
 
     @app.get("/valuation/automation/status", dependencies=[Depends(require_session)])
     def valuation_automation_status():
@@ -1150,6 +1327,19 @@ if FASTAPI_OK:
         except Exception as e:
             raise _err500(e, "market_search")
 
+    @app.get("/market/logos")
+    def market_logos(tickers: str = ""):
+        """Loghi dei titoli come `data:` URL (la CSP non ammette immagini da 127.0.0.1).
+        Risolti a runtime dal profilo dell'emittente (Finnhub, poi icona del suo sito),
+        scaricati una volta e tenuti in data/loghi/. Risposta: `logos` {T: url|null},
+        `motivi` {T: perche' manca} (la UI mostra l'iniziale), `fonti` {T: origine}."""
+        try:
+            from bellomberg.market_data.loghi_titoli import loghi
+            richiesti = [t for t in tickers.split(",") if t.strip()][:40]
+            return loghi(richiesti)
+        except Exception as e:
+            raise _err500(e, "market_logos")
+
     @app.get("/market/quote")
     def market_quote(ticker: str):
         """UI v3 T3: scheda titolo per QUALSIASI ticker globale (yfinance info+fast_info, cache 5 min)."""
@@ -1208,14 +1398,25 @@ if FASTAPI_OK:
         except Exception as e:
             raise _err500(e, "market_quote")
 
+    # Simboli del cruscotto Mercati globali (Yahoo). Indici: 10 per area, nell'ordine
+    # Americhe, Europa, Asia e Pacifico (il frontend li raggruppa per simbolo).
+    # Materie prime: metalli, energia, agricoli. Azioni: dallo screener, per paese.
     OVERVIEW_GLOBAL = {
-        "indici": [("^GSPC", "S&P 500"), ("^IXIC", "Nasdaq"), ("^DJI", "Dow Jones"),
-                   ("^STOXX50E", "Euro Stoxx 50"), ("^FTSE", "FTSE 100"), ("^GDAXI", "DAX"),
-                   ("^FCHI", "CAC 40"), ("FTSEMIB.MI", "FTSE MIB"), ("^N225", "Nikkei 225"),
-                   ("^HSI", "Hang Seng"), ("000001.SS", "Shanghai"), ("^BSESN", "Sensex"),
-                   ("^BVSP", "Bovespa"), ("^VIX", "VIX")],
-        "commodities": [("GC=F", "Oro"), ("SI=F", "Argento"), ("CL=F", "Petrolio WTI"),
-                        ("BZ=F", "Brent"), ("NG=F", "Gas Naturale"), ("HG=F", "Rame")],
+        "indici": [("^GSPC", "S&P 500"), ("^IXIC", "Nasdaq"), ("^DJI", "Dow Jones"), ("^RUT", "Russell 2000"),
+                   ("^NYA", "NYSE Composite"), ("^GSPTSE", "S&P/TSX"), ("^BVSP", "Bovespa"), ("^MXX", "IPC Messico"),
+                   ("^MERV", "Merval"), ("^VIX", "VIX"),
+                   ("^STOXX50E", "Euro Stoxx 50"), ("^STOXX", "Stoxx 600"), ("^FTSE", "FTSE 100"), ("^GDAXI", "DAX"),
+                   ("^FCHI", "CAC 40"), ("FTSEMIB.MI", "FTSE MIB"), ("^IBEX", "IBEX 35"), ("^AEX", "AEX"),
+                   ("^SSMI", "SMI"), ("^BFX", "BEL 20"),
+                   ("^N225", "Nikkei 225"), ("^HSI", "Hang Seng"), ("000001.SS", "Shanghai"), ("399001.SZ", "Shenzhen"),
+                   ("^BSESN", "Sensex"), ("^KS11", "KOSPI"), ("^TWII", "Taiwan"),
+                   ("^AXJO", "ASX 200"), ("^STI", "Straits Times")],
+        "commodities": [("GC=F", "Oro"), ("SI=F", "Argento"), ("PL=F", "Platino"), ("PA=F", "Palladio"),
+                        ("HG=F", "Rame"), ("ALI=F", "Alluminio"),
+                        ("CL=F", "Petrolio WTI"), ("BZ=F", "Brent"), ("NG=F", "Gas Naturale"),
+                        ("HO=F", "Gasolio"), ("RB=F", "Benzina"),
+                        ("ZC=F", "Mais"), ("ZW=F", "Frumento"), ("ZS=F", "Soia"), ("KC=F", "Caffè"),
+                        ("CC=F", "Cacao"), ("SB=F", "Zucchero"), ("CT=F", "Cotone"), ("LE=F", "Bestiame")],
         "valute": [("EURUSD=X", "EUR/USD"), ("GBPUSD=X", "GBP/USD"), ("USDJPY=X", "USD/JPY"),
                    ("EURCHF=X", "EUR/CHF"), ("EURGBP=X", "EUR/GBP"), ("BTC-USD", "Bitcoin"),
                    ("ETH-USD", "Ethereum")],
@@ -1224,92 +1425,113 @@ if FASTAPI_OK:
         "futures": [("ES=F", "S&P 500 Future"), ("NQ=F", "Nasdaq 100 Future"),
                     ("YM=F", "Dow Future"), ("RTY=F", "Russell 2000 Future")],
     }
-    OVERVIEW_COUNTRIES = {
-        "US": [("AAPL", "Apple"), ("MSFT", "Microsoft"), ("NVDA", "NVIDIA"), ("AMZN", "Amazon"),
-               ("GOOGL", "Alphabet"), ("META", "Meta"), ("TSLA", "Tesla"), ("JPM", "JPMorgan"),
-               ("LLY", "Eli Lilly"), ("BRK-B", "Berkshire H.")],
-        "IT": [("ENI.MI", "Eni"), ("ISP.MI", "Intesa Sanpaolo"), ("UCG.MI", "UniCredit"),
-               ("ENEL.MI", "Enel"), ("RACE.MI", "Ferrari"), ("STLAM.MI", "Stellantis"),
-               ("G.MI", "Generali"), ("STMMI.MI", "STMicro"), ("LDO.MI", "Leonardo"), ("BMPS.MI", "MPS")],
-        "DE": [("SAP.DE", "SAP"), ("SIE.DE", "Siemens"), ("ALV.DE", "Allianz"), ("DTE.DE", "Deutsche Telekom"),
-               ("MBG.DE", "Mercedes-Benz"), ("BMW.DE", "BMW"), ("BAS.DE", "BASF"), ("MUV2.DE", "Munich Re"),
-               ("RHM.DE", "Rheinmetall"), ("VOW3.DE", "Volkswagen")],
-        "FR": [("MC.PA", "LVMH"), ("OR.PA", "L'Oreal"), ("TTE.PA", "TotalEnergies"), ("SAN.PA", "Sanofi"),
-               ("AIR.PA", "Airbus"), ("SU.PA", "Schneider El."), ("BNP.PA", "BNP Paribas"),
-               ("AI.PA", "Air Liquide"), ("CS.PA", "AXA"), ("DG.PA", "Vinci")],
-        "UK": [("AZN.L", "AstraZeneca"), ("SHEL.L", "Shell"), ("HSBA.L", "HSBC"), ("ULVR.L", "Unilever"),
-               ("BP.L", "BP"), ("GSK.L", "GSK"), ("RIO.L", "Rio Tinto"), ("BARC.L", "Barclays"),
-               ("VOD.L", "Vodafone"), ("LSEG.L", "LSE Group")],
-        "JP": [("7203.T", "Toyota"), ("6758.T", "Sony"), ("8306.T", "MUFG"), ("6861.T", "Keyence"),
-               ("9984.T", "SoftBank"), ("8035.T", "Tokyo Electron"), ("9983.T", "Fast Retailing"),
-               ("6098.T", "Recruit"), ("7974.T", "Nintendo"), ("8058.T", "Mitsubishi Corp")],
-        "CN": [("0700.HK", "Tencent"), ("9988.HK", "Alibaba"), ("3690.HK", "Meituan"), ("1810.HK", "Xiaomi"),
-               ("9618.HK", "JD.com"), ("0939.HK", "China Constr. Bank"), ("1299.HK", "AIA"),
-               ("2318.HK", "Ping An"), ("0941.HK", "China Mobile"), ("1211.HK", "BYD")],
-        "IN": [("RELIANCE.NS", "Reliance"), ("TCS.NS", "TCS"), ("HDFCBANK.NS", "HDFC Bank"),
-               ("INFY.NS", "Infosys"), ("ICICIBANK.NS", "ICICI Bank"), ("BHARTIARTL.NS", "Bharti Airtel"),
-               ("SBIN.NS", "State Bank India"), ("ITC.NS", "ITC"), ("LT.NS", "Larsen & Toubro"),
-               ("HINDUNILVR.NS", "Hind. Unilever")],
-        "BR": [("PETR4.SA", "Petrobras"), ("VALE3.SA", "Vale"), ("ITUB4.SA", "Itau Unibanco"),
-               ("BBDC4.SA", "Bradesco"), ("B3SA3.SA", "B3"), ("ABEV3.SA", "Ambev"), ("WEGE3.SA", "WEG"),
-               ("BBAS3.SA", "Banco do Brasil"), ("ELET3.SA", "Eletrobras"), ("RENT3.SA", "Localiza")],
-    }
+    # Le azioni per paese NON sono un elenco nel codice (04/10/2026, decisione del
+    # maintainer: un elenco fisso di titoli puo' far intuire il portafoglio): arrivano a
+    # runtime dallo screener del provider, vedi market_data/universo_mercati.py.
+
+    def _ultime_chiusure(syms):
+        """Ultimo prezzo e variazione sulla chiusura precedente per piu' simboli:
+        UNA chiamata yfinance batch (5 giorni). I simboli senza dati restano fuori."""
+        quotes = {}
+        try:
+            import yfinance as yf
+            raw = yf.download(syms, period="5d", progress=False, threads=True, group_by="ticker")
+            lvl0 = set(raw.columns.get_level_values(0)) if hasattr(raw.columns, "get_level_values") else set()
+            for s in syms:
+                try:
+                    if s not in lvl0:
+                        continue
+                    col = raw[s]["Close"].dropna()
+                    if len(col) == 0:
+                        continue
+                    last = float(col.iloc[-1])
+                    # G8 (04/10/2026, Opus 5.5): una sola chiusura (o la precedente a zero)
+                    # non da' una variazione: None con motivo, mai uno 0.0 inventato.
+                    prev = float(col.iloc[-2]) if len(col) >= 2 else None
+                    if not prev:
+                        quotes[s] = {"price": round(last, 4), "change_pct": None,
+                                     "motivo": _api_text(
+                                         "variazione n.d.: nessuna chiusura precedente valida nei 5 giorni",
+                                         "change n/a: no valid previous close in the last 5 days")}
+                        continue
+                    chg = ((last / prev) - 1) * 100
+                    quotes[s] = {"price": round(last, 4), "change_pct": round(chg, 2)}
+                except Exception:
+                    continue
+        except Exception as e:
+            # audit/11 §4: il vecchio guard `if "_log" in dir()` era SEMPRE falso
+            # (_log non esiste nel modulo): errore yf sparito senza traccia.
+            # G8: solo il tipo (il testo puo' portare l'URL con la querystring)
+            _safe_print(f"[overview] yf error: {type(e).__name__}")
+        return quotes
 
     @app.get("/market/overview")
     def market_overview(country: str = "US"):
         """Cruscotto di mercato stile investing.com: indici, azioni per paese, commodities,
         valute, obbligazioni, futures. UNA sola chiamata yfinance batch (cache 120s)."""
         try:
+            from bellomberg.market_data import universo_mercati
             cc = (country or "US").strip().upper()
-            if cc not in OVERVIEW_COUNTRIES:
+            if cc not in universo_mercati.REGIONI:
                 cc = "US"
             key = "ovw|" + cc
             c = _mkt_cached(key, 120)
             if c:
                 return c
             cats = dict(OVERVIEW_GLOBAL)
-            cats["azioni"] = OVERVIEW_COUNTRIES[cc]
             sym_name = {}
             for lst in cats.values():
                 for s, n in lst:
                     sym_name[s] = n
             syms = list(sym_name.keys())
-            quotes = {}
-            try:
-                import yfinance as yf
-                raw = yf.download(syms, period="5d", progress=False, threads=True, group_by="ticker")
-                lvl0 = set(raw.columns.get_level_values(0)) if hasattr(raw.columns, "get_level_values") else set()
-                for s in syms:
-                    try:
-                        if s not in lvl0:
-                            continue
-                        col = raw[s]["Close"].dropna()
-                        if len(col) == 0:
-                            continue
-                        last = float(col.iloc[-1])
-                        prev = float(col.iloc[-2]) if len(col) >= 2 else last
-                        chg = ((last / prev) - 1) * 100 if prev else 0.0
-                        quotes[s] = {"price": round(last, 4), "change_pct": round(chg, 2)}
-                    except Exception:
-                        continue
-            except Exception as e:
-                # audit/11 §4: il vecchio guard `if "_log" in dir()` era SEMPRE falso
-                # (_log non esiste nel modulo): errore yf sparito senza traccia.
-                _safe_print(f"[overview] yf error: {e}")
+            quotes = _ultime_chiusure(syms)
+            azioni = universo_mercati.azioni_paese(cc)
             def _build(lst):
-                return [{"ticker": s, "name": n,
-                         "price": quotes.get(s, {}).get("price"),
-                         "change_pct": quotes.get(s, {}).get("change_pct")} for s, n in lst]
-            out = {"country": cc, "countries": sorted(OVERVIEW_COUNTRIES.keys()),
-                   "indici": _build(cats["indici"]), "azioni": _build(cats["azioni"]),
+                righe = []
+                for s, n in lst:
+                    riga = {"ticker": s, "name": n,
+                            "price": quotes.get(s, {}).get("price"),
+                            "change_pct": quotes.get(s, {}).get("change_pct")}
+                    if quotes.get(s, {}).get("motivo"):
+                        riga["motivo"] = quotes[s]["motivo"]
+                    righe.append(riga)
+                return righe
+            out = {"country": cc, "countries": sorted(universo_mercati.REGIONI),
+                   "indici": _build(cats["indici"]), "azioni": azioni["azioni"],
+                   "azioni_fonte": {"stato": azioni["stato"], "motivo": azioni["motivo"],
+                                    "fonte": azioni["fonte"]},
                    "commodities": _build(cats["commodities"]), "valute": _build(cats["valute"]),
                    "obbligazioni": _build(cats["obbligazioni"]), "futures": _build(cats["futures"]),
                    "_timestamp": datetime.now().isoformat(timespec="seconds")}
-            if quotes:  # audit/11 §4: mai cachare 120s un overview tutto-None da yf fallito
+            # audit/11 §4: mai cachare 120s un overview tutto-None da yf fallito, ne' uno
+            # senza azioni (screener giu'): al prossimo giro si riprova.
+            if quotes and azioni["stato"] == "ok":
                 _MKT_CACHE[key] = (time.time(), out)
             return out
         except Exception as e:
             raise _err500(e, "market_overview")
+
+    @app.get("/market/movers")
+    def market_movers():
+        """Mercati globali: variazione di oggi delle azioni di TUTTI i paesi del cruscotto,
+        per la classifica dei titoli piu' mossi. L'insieme arriva a runtime dallo screener
+        del provider (una richiesta per paese); un paese che non risponde e' dichiarato in
+        `paesi`, e se non risponde nessuno `azioni` e' vuoto con `motivo`. Cache 120s."""
+        try:
+            c = _mkt_cached("movers", 120)
+            if c:
+                return c
+            from bellomberg.market_data import universo_mercati
+            esito = universo_mercati.universo()
+            out = {"azioni": esito["azioni"], "paesi": esito["paesi"], "fonte": esito["fonte"],
+                   "motivo": esito["motivo"],
+                   "_timestamp": datetime.now().isoformat(timespec="seconds")}
+            # come l'overview: mai cachare un risultato senza variazioni
+            if any(r.get("change_pct") is not None for r in out["azioni"]):
+                _MKT_CACHE["movers"] = (time.time(), out)
+            return out
+        except Exception as e:
+            raise _err500(e, "market_movers")
 
     @app.get("/market/news")
     def market_news(ticker: str):
@@ -1324,10 +1546,25 @@ if FASTAPI_OK:
                 return c
             import yfinance as yf
             from bellomberg.cli.price_updater import data_ticker
+            # G8 (04/10/2026, Opus 5.5): ogni via che cade e' DICHIARATA in `errori`, e ogni
+            # item dice da dove viene (`source`) e come e' stato agganciato (`match`):
+            # prima tre vie finivano nello stesso array e un errore era un elenco vuoto.
+            errori, vie_cadute = [], 0
             try:
-                raw = yf.Ticker(data_ticker(t)).news or []
-            except Exception:
-                raw = []
+                sym = data_ticker(t)
+            except Exception as exc:  # alias non leggibile: si cerca col ticker com'e', DICHIARATO
+                sym = t
+                errori.append(_api_text(
+                    "alias yfinance di %s non leggibile (%s: %s): ricerca col ticker com'e'",
+                    "yfinance alias for %s unreadable (%s: %s): searched with the raw ticker")
+                    % (t, type(exc).__name__, exc))
+            try:
+                raw = yf.Ticker(sym).news or []
+            except Exception as exc:
+                raw, vie_cadute = [], vie_cadute + 1
+                # solo il tipo: il testo di un'eccezione di rete porta l'URL con la querystring
+                errori.append(_api_text("notizie Yahoo del simbolo %s: %s",
+                                        "Yahoo news for symbol %s: %s") % (sym, type(exc).__name__))
             items = []
             for it in raw[:20]:
                 content = it.get("content") if isinstance(it.get("content"), dict) else it
@@ -1342,14 +1579,66 @@ if FASTAPI_OK:
                 prov = (content or {}).get("provider")
                 pub = prov.get("displayName") if isinstance(prov, dict) else it.get("publisher")
                 ts = (content or {}).get("pubDate") or it.get("providerPublishTime")
-                items.append({"title": title, "link": link, "publisher": pub, "published": ts})
-            res = {"ticker": t, "items": items}
-            _MKT_CACHE[key] = (time.time(), res)
+                items.append({"title": title, "link": link, "publisher": pub, "published": ts,
+                              "source": "yahoo_ticker_news", "match": "simbolo"})
+            if not items:
+                # Da ottobre 2026 yf.Ticker(...).news torna vuoto per ogni titolo; la ricerca
+                # di Yahoo restituisce ancora le notizie collegate al simbolo. Per i titoli
+                # fuori dagli USA (es. ACME.MI, 9999.T) il simbolo non porta notizie: si cerca
+                # col nome della societa' che la stessa ricerca restituisce.
+                # La ricerca per NOME puo' agganciare un'altra societa' dal nome simile:
+                # quegli item portano `match: "nome"` e `match_query`, e la UI li marca.
+                found, match, name = [], "simbolo", None
+                try:
+                    found_search = yf.Search(sym, news_count=15, max_results=1)
+                    found = found_search.news or []
+                    if not found:
+                        quotes = getattr(found_search, "quotes", None) or []
+                        name = (quotes[0].get("longname") or quotes[0].get("shortname")) if quotes else None
+                        if name:
+                            match = "nome"
+                            found = yf.Search(name, news_count=15, max_results=1).news or []
+                except Exception as exc:
+                    found, vie_cadute = [], vie_cadute + 1
+                    errori.append(_api_text("ricerca Yahoo (%s): %s", "Yahoo search (%s): %s")
+                                  % (name if match == "nome" else sym, type(exc).__name__))
+                for it in found:
+                    if it.get("title"):
+                        voce = {"title": it.get("title"), "link": it.get("link"),
+                                "publisher": it.get("publisher"), "published": it.get("providerPublishTime"),
+                                "source": "yahoo_search", "match": match}
+                        if match == "nome":
+                            voce["match_query"] = name
+                        items.append(voce)
+            res = {"ticker": t, "symbol": sym, "items": items, "errori": errori or None}
+            # un elenco vuoto o con una via di rete caduta non si tiene in cache: al prossimo
+            # giro si riprova (l'alias illeggibile resta dichiarato anche dalla cache)
+            if items and not vie_cadute:
+                _MKT_CACHE[key] = (time.time(), res)
             return res
         except HTTPException:
             raise
         except Exception as e:
             raise _err500(e, "market_news")
+
+    @app.post("/market/news/translate", dependencies=[Depends(require_session), Depends(throttle)])
+    def market_news_translate(request: Request, corpo=Body(...)):
+        """Traduce nella lingua dell'app i titoli delle notizie di un titolo. SOLO dal pulsante
+        della scheda (costa una chiamata al modello delle sintesi); i titoli gia' tradotti
+        restano in memoria e non si ripagano."""
+        titles = corpo.get("titles") if isinstance(corpo, dict) else None
+        if not isinstance(titles, list) or not titles or not all(isinstance(t, str) for t in titles):
+            _refund_throttle(request)
+            raise HTTPException(400, _api_text("Servono i titoli da tradurre", "Titles to translate are required"))
+        try:
+            from bellomberg.market_data.headline_translation import translate_headlines
+            result = translate_headlines(titles)
+        except Exception as e:
+            _refund_throttle(request)
+            raise _err500(e, "market_news_translate")
+        if result.get("cached") or result.get("status") == "not_configured":
+            _refund_throttle(request)
+        return result
 
     @app.get("/market/financials")
     def market_financials(ticker: str):
@@ -1500,13 +1789,16 @@ if FASTAPI_OK:
         return str(PROJECT_ROOT / p)
 
     @app.get("/memos")
-    def list_memos(limit: int = 20, include_empty: bool = False):
+    def list_memos(limit: int = 20, include_empty: bool = False, include_trade_ideas: bool = True):
         """Lista memo. Bugfix #169: aggiunge pdf_available/appendix_available
         (path valorizzato E file esistente su disco) e nasconde i memo vuoti
-        (run falliti/test, markdown < 100 char) salvo include_empty=true."""
+        (run falliti/test, markdown < 100 char) salvo include_empty=true.
+        Archivio (decisione PM 04/10): i memo Trade Idea sono inclusi di default con
+        kind/label/trade_idea_run_id (campi ADDITIVI); include_trade_ideas=false
+        restituisce la lista di prima (solo Consigliere)."""
         db = get_db()
         out = []
-        for m in db.get_recent_memos(n=limit):
+        for m in db.get_archive_memos(limit=limit, include_trade_ideas=include_trade_ideas):
             md_len = len(m.get("full_markdown") or "")
             pdf_abs = _resolve_memo_path(m.get("pdf_path"))
             app_abs = _resolve_memo_path(m.get("appendix_path"))
@@ -2005,10 +2297,55 @@ if FASTAPI_OK:
             for offset in range(0, len(rows), 1000):
                 provenance.update(idea_store.lookup_decisions(
                     [row["id"] for row in rows[offset:offset + 1000]]))
+        # 04/10 (W2, Opus 5.5): voci RESEARCH nate da un trigger watch Trade Idea
+        # (origin 'trade_idea_trigger'), unite nella stessa chiave 'trade_idea'. Schema
+        # watch assente o illeggibile = provenienza trigger n.d. DICHIARATA, mai 500.
+        watch_error = None
+        try:
+            from bellomberg.storage.trade_idea_watch_store import TradeIdeaWatchStore
+            watch_store = TradeIdeaWatchStore(db.db_path)
+            for offset in range(0, len(rows), 1000):
+                for _id, _item in watch_store.lookup_decisions(
+                        [row["id"] for row in rows[offset:offset + 1000]]).items():
+                    if _id in provenance:   # due origini per una voce: non si sceglie in silenzio
+                        watch_error = _api_text('provenienza doppia per la voce #%s: tenuta quella Trade Idea', 'Duplicate provenance for entry #%s: Trade Idea one kept') % _id
+                    else:
+                        provenance[_id] = _item
+        except Exception as e:
+            # il solo testo dichiarato dallo store (SCHEMA_MISSING); altro = solo il tipo
+            _det = str(e) if isinstance(e, RuntimeError) and str(e).startswith("schema watch assente") else type(e).__name__
+            watch_error = _api_text('provenienza trigger n.d.: %s', 'Trigger provenance n/a: %s') % _det
         for d in rows:
             d["esecuzione"] = executions.get(d["id"])
             d["trade_idea"] = provenance.get(d["id"])
-        return {"decisions": rows}
+            d["manual_divergences"] = db.get_manual_trade_divergences(d["id"])
+        return {"decisions": rows, "watch_provenance_error": watch_error}
+
+    @app.get("/decisions/{decision_id}/events")
+    def decision_events(decision_id: int):
+        db = get_db()
+        with db._conn() as conn:
+            if not conn.execute("SELECT 1 FROM decisions WHERE id=?", (decision_id,)).fetchone():
+                raise HTTPException(404, _api_text(f'Decisione {decision_id} non trovata', f'Decision {decision_id} not found'))
+            events = [dict(row) for row in conn.execute(
+                "SELECT * FROM decision_events WHERE decision_id=? ORDER BY id", (decision_id,))]
+        return {"events": events}
+
+    # POST /instrument-identities/verify RIMOSSO (REV_G9a R2, decisione del
+    # coordinatore): scriveva una riga append-only fuori da ogni trade e da quel
+    # momento abilitava legami cross-ticker senza riconferma del PM. La verifica
+    # ISIN viaggia ora solo col trade (TradeIn.instrument_identity) e si scrive
+    # nella sua transazione, dopo la conferma.
+
+    @app.post("/decisions/{decision_id}/manual-divergence", dependencies=[Depends(require_session)])
+    def record_manual_trade_divergence(decision_id: int, body: ManualTradeDivergenceIn):
+        db = get_db()
+        try:
+            event = db.record_manual_trade_divergence(
+                decision_id, body.trade_id, body.reason, actor="PM")
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+        return {"ok": True, "event": event}
 
     @app.post("/decisions/{decision_id}/archive", dependencies=[Depends(require_session)])
     def set_decision_archive(decision_id: int, body: dict):
@@ -2088,7 +2425,10 @@ if FASTAPI_OK:
         kwargs = body.dict(exclude_none=True)
         if not kwargs:
             raise HTTPException(400, _api_text('Nessun campo da aggiornare', 'Nothing to update'))
-        ok = db.update_decision(decision_id, **kwargs)
+        try:
+            ok = db.update_decision(decision_id, **kwargs)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
         if not ok:
             raise HTTPException(404, _api_text(f'Decisione {decision_id} non trovata o nessuna modifica', f'Decision {decision_id} not found or no changes'))
         return {"ok": True, "decision_id": decision_id}
@@ -2157,12 +2497,44 @@ if FASTAPI_OK:
                  "valuta": body.valuta.strip().upper(), "note": body.note, "pm_rationale": body.pm_rationale,
                  "linked_decision_id": body.linked_decision_id, "data": trade_date,
                  "ora_convenzionale": conventional, "link_origin": origin}
-        context = db.trade_context(ticker, body.linked_decision_id)
+        # Verifica d'identita' e divergenza: qui SOLO lettura e validazione.
+        # Si scrivono in execute_trade, nella transazione del trade confermato.
+        if body.manual_divergence is not None and origin != "none":
+            raise ValueError(_api_text('la divergenza manuale richiede un trade senza decisione collegata', 'A manual divergence requires a trade without a linked decision'))
+        identity_target = None
+        target_id = (body.linked_decision_id if body.linked_decision_id is not None
+                     else body.manual_divergence.decision_id if body.manual_divergence is not None else None)
+        if target_id is not None:
+            with db._conn() as conn:
+                target = conn.execute("SELECT ticker, proposal_ticker FROM decisions WHERE id=?",
+                                      (target_id,)).fetchone()
+            if target is not None:
+                identity_target = (target["ticker"] if body.linked_decision_id is not None
+                                   else target["proposal_ticker"] or target["ticker"])
+                identity_target = str(identity_target or "").strip().upper() or None
+        pending_identity = None
+        if body.instrument_identity is not None:
+            if identity_target is None or identity_target == ticker:
+                raise ValueError(_api_text('verifica ISIN non richiesta: il ticker eseguito coincide con quello della proposta o manca la proposta', 'ISIN verification not required: the executed ticker matches the proposal or there is no proposal'))
+            pending_identity = db._normalized_identity(
+                identity_target, ticker, body.instrument_identity.isin, body.instrument_identity.source,
+                body.instrument_identity.verified_at, body.instrument_identity.reason, verified_by="PM")
+        context = db.trade_context(ticker, body.linked_decision_id, pending_identity=pending_identity)
         db._assert_trade_after_opening(trade, context.get("opening"))
         retroactive = any(r["data"] > trade_date for r in context["trades"])
         if context["cash"] is None:
             raise CashNotInitialized(_api_text('saldo cassa non inizializzato: registra prima il saldo iniziale', 'Cash balance not initialized: register the opening cash balance first'))
         decision = db._validate_trade_decision(trade, context)
+        divergence, divergence_view = None, None
+        if body.manual_divergence is not None:
+            reason = (body.manual_divergence.reason or "").strip()
+            if not reason:
+                raise ValueError(_api_text('il motivo della divergenza manuale è obbligatorio', 'The manual divergence reason is required'))
+            with db._conn() as conn:
+                details = db.manual_divergence_details(conn, body.manual_divergence.decision_id,
+                                                       trade, pending_identity)
+            divergence = {"decision_id": body.manual_divergence.decision_id, "reason": reason}
+            divergence_view = {**divergence, **details}
         # Validazione ticker (bugfix #164, trade fantasma PSHP):
         # SELL/TRIM/ADD/DIVIDEND richiedono una posizione attiva esistente.
         # BUY resta libero (apre nuove posizioni). Dal 01/08 la lettura serve a
@@ -2260,8 +2632,10 @@ if FASTAPI_OK:
                     "cash_source": "sqlite:cash_state", "cash_note": rounding_note,
                     "guardia_note": guardia_note, "data": trade_date, "ora_convenzionale": bool(conventional),
                     "link_origin": origin, "decisione": decision, "fx": fx, "ricalcolo": plan,
-                    "cassa_nota": cash_note}
+                    "cassa_nota": cash_note, "instrument_identity": pending_identity,
+                    "manual_divergence": divergence_view}
             return {"trade": trade, "response": response, "expected_context": context["fingerprint"],
+                    "instrument_identity": pending_identity, "manual_divergence": divergence,
                     "cash_delta_cents": delta_cents, "realized_fx": rates, "db_path": os.path.realpath(db.db_path)}
         except HTTPException:
             raise
@@ -2272,10 +2646,18 @@ if FASTAPI_OK:
     _TRADE_PREVIEWS = {}
     _TRADE_PREVIEW_LOCK = threading.Lock()
 
+    def _db_busy(exc):
+        import sqlite3
+        text = str(exc).lower()
+        return isinstance(exc, sqlite3.OperationalError) and ("locked" in text or "busy" in text)
+
     def _trade_error(exc):
         from bellomberg.storage.memory_db import CashNotInitialized, RicalcoloImpossibile
         if isinstance(exc, HTTPException):
             raise exc
+        if _db_busy(exc):
+            # Lock transitorio, nulla scritto (rollback): 503, non un errore del client.
+            raise HTTPException(503, _api_text("archivio occupato da un'altra scrittura: nulla registrato, riprova la conferma fra qualche secondo", 'Database busy with another write: nothing recorded, retry the confirmation in a few seconds'))
         raise HTTPException(503 if isinstance(exc, CashNotInitialized) else
                             409 if isinstance(exc, RicalcoloImpossibile) else 400, str(exc))
 
@@ -2312,9 +2694,24 @@ if FASTAPI_OK:
                     raise HTTPException(409, _api_text("archivio cambiato: ripeti l'anteprima", 'Database changed: request a new preview'))
             else:
                 prepared = _prepare_trade(body)
-            result = db.execute_trade(cash_delta_cents=prepared["cash_delta_cents"],
-                                      expected_context=prepared["expected_context"],
-                                      realized_fx=prepared["realized_fx"], **prepared["trade"])
+            try:
+                result = db.execute_trade(cash_delta_cents=prepared["cash_delta_cents"],
+                                          expected_context=prepared["expected_context"],
+                                          realized_fx=prepared["realized_fx"],
+                                          instrument_identity=prepared["instrument_identity"],
+                                          manual_divergence=prepared["manual_divergence"],
+                                          **prepared["trade"])
+            except Exception as exc:
+                # DB occupato: rollback, nulla scritto -> l'anteprima resta valida
+                # (stessa scadenza) e il PM puo' riconfermare senza rifarla.
+                if body.preview_id is not None and _db_busy(exc):
+                    with _TRADE_PREVIEW_LOCK:
+                        _TRADE_PREVIEWS[body.preview_id] = preview
+                raise
+            committed_divergence = None
+            if result.get("manual_divergence") is not None:
+                committed_divergence = {**(prepared["response"].get("manual_divergence") or {}),
+                                        "event_id": result["manual_divergence"]["id"]}
             performance_note = None
             try:
                 from bellomberg.portfolio import twr_engine
@@ -2325,6 +2722,8 @@ if FASTAPI_OK:
                 performance_note = _api_text(f'Trade registrato; cache performance non aggiornata ({type(exc).__name__}).', f'Trade recorded; performance cache not updated ({type(exc).__name__}).')
             return {**prepared["response"], "trade_id": result["trade_id"],
                     "cash_disponibile_eur": result["cash_eur"], "ricalcolo": result["ricalcolo"],
+                    "instrument_identity": result.get("instrument_identity"),
+                    "manual_divergence": committed_divergence,
                     "performance_note": performance_note,
                     "valuation_automation": _notify_model_tracking(db.db_path, prepared["trade"]["ticker"], "portfolio")}
         except Exception as exc:
@@ -2600,8 +2999,16 @@ if FASTAPI_OK:
             selected = [part.strip() for part in expiries.split(",")] if expiries is not None else None
             if selected is not None and not all(selected):
                 raise HTTPException(422, _api_text('Seleziona almeno una scadenza valida', 'Select at least one valid expiry'))
-            r = build_vol_surface(ticker, max_expiries=max_expiries, max_days=max_days,
-                                  expiries=selected, include_context=include_context)
+            # 04/10 (W2, Opus 5.5): opzioni non USA (es. IDEM) = errore dichiarato PRIMA
+            # di Polygon, con la convenzione di questa rotta per l'errore (200 senza
+            # contesto, 502 col contesto); senza chiave diceva «chiave mancante».
+            from bellomberg.market_data.copertura import copertura_opzioni, risposta_non_coperta
+            _cop = copertura_opzioni(ticker)
+            if _cop["stato"] == "non_coperto":
+                r = risposta_non_coperta(_cop, "polygon chains multi-expiry -> IV surface (composite OTM)")
+            else:
+                r = build_vol_surface(ticker, max_expiries=max_expiries, max_days=max_days,
+                                      expiries=selected, include_context=include_context)
             if not include_context:
                 return r  # Coverage remains visible even when no slice could be loaded.
             if r.get("error"):
@@ -2655,7 +3062,14 @@ if FASTAPI_OK:
         vere = 500. Ticker della lista IV_TICKERS ((39), estendibile)."""
         try:
             from bellomberg.portfolio.vol_cone import compute_vol_cone
-            return compute_vol_cone(ticker, force=force)
+            r = compute_vol_cone(ticker, force=force)
+            # 04/10 (W2, Opus 5.5): la parte realized resta (chiusure, non opzioni); la
+            # implied di un'opzione non USA e' «non coperto», non un guasto Polygon.
+            from bellomberg.market_data.copertura import copertura_opzioni, risposta_non_coperta
+            _cop = copertura_opzioni(ticker)
+            if _cop["stato"] == "non_coperto" and isinstance(r, dict) and isinstance(r.get("implied"), dict):
+                r["implied"] = risposta_non_coperta(_cop, "vol_surface (Polygon chains)")
+            return r
         except Exception as e:
             raise _err500(e, "get_vol_cone")
 
@@ -2675,6 +3089,18 @@ if FASTAPI_OK:
             return compute_portfolio_risk(force=force)
         except Exception as e:
             raise _err500(e, "get_portfolio_risk")
+
+    @app.get("/portfolio/gap_days")
+    def get_portfolio_gap_days(force: bool = False):
+        """Scomposizione della finestra multi-seduta per seduta di borsa.
+
+        Sedute chiuse: chiusure ufficiali Yahoo NON rettificate; seduta in
+        formazione: live snapshot vs ultima chiusura. Vedi gap_days.py."""
+        try:
+            from bellomberg.portfolio.gap_days import reconstruct
+            return reconstruct(force=force)
+        except Exception as e:
+            raise _err500(e, "get_portfolio_gap_days")
 
     @app.get("/portfolio/factors")
     def get_portfolio_factors(period: str = "1y", force: bool = False):
@@ -2708,15 +3134,20 @@ if FASTAPI_OK:
         (marketaux/tiingo/yfinance/rss) restano fuori misura, dichiarato in `nota`.
         """
         try:
-            from bellomberg.market_data.news_aggregator import providers_blocked, NEWS_PROVIDER_LIMITS, stato_ultimo_giro
+            from bellomberg.market_data.news_aggregator import providers_blocked, providers_budget, NEWS_PROVIDER_LIMITS, stato_ultimo_giro, fonti_spente
             _muti = providers_blocked()
             return {"fonti_mute": _muti or None,
+                    # 04/10 (W2, Opus 5.5): fonti tolte PER DECISIONE (Reddit), non guaste
+                    "fonti_spente": fonti_spente(),
                     "avviso": _avviso_provider_bloccati(_muti, ' — poche/zero news NON significano quiete', ' — few/no news items do NOT imply calm'),
                     "providers_contingentati": sorted(NEWS_PROVIDER_LIMITS),
                     # P2 (12/08): freschezza del feed — chiave SEMPRE presente,
                     # n.d./illeggibile dichiarati (pattern 25). La "prossima
                     # esecuzione" NON sta qui: e' NextRunTime di /tasks/scheduled.
                     "ultimo_giro": stato_ultimo_giro(),
+                    "refresh_job": news_refresh_manager.status(),
+                    # 02/10/2026: consumo del budget e dosaggio, dallo stato del limiter (zero rete)
+                    "budget": providers_budget(),
                     "nota": (_api_text('solo cause globali del limiter; esito reale delle chiamate e provider non contingentati non misurati qui', 'Global limiter causes only; actual call outcomes and providers without a quota are not measured here')),
                     "timestamp": datetime.now().isoformat()}
         except Exception as e:
@@ -2778,19 +3209,70 @@ if FASTAPI_OK:
             from bellomberg.market_data.news_aggregator import get_feed
             items = get_feed(limit=limit, min_relevance=min_relevance,
                               ticker=ticker, sentiment=sentiment)
+            # G3 (04/10): notizie salvate senza classificazione (sentiment/relevance null)
             return {"count": len(items), "items": items,
+                    "not_classified": sum(1 for i in items if i.get("classification_status") == "not_classified"),
                     "timestamp": datetime.now().isoformat()}
         except Exception as e:
             raise _err500(e, "get_news_feed_endpoint")
 
     @app.post("/news/feed/refresh", dependencies=[Depends(require_session), Depends(throttle)])
     def post_news_feed_refresh(days: int = 1, classify: bool = True):
-        """Trigger manuale auto_pull_feed (normalmente scheduled). Slow (~30-60s con classify)."""
+        """Accetta un refresh manuale e osserva il job condiviso col timer."""
+        # Keep the historical query parameters for backwards compatibility.  The
+        # coordinator owns the canonical pull settings (one-day lookback + classify).
+        # G3: durante un giro NON ne parte un secondo: torna lo stesso job con
+        # accepted=false e reason=already_running; l'esito si legge col GET sotto.
+        del days, classify
+        return news_refresh_manager.trigger("manual")
+
+    @app.get("/news/feed/refresh")
+    def get_news_feed_refresh(job_id: Optional[str] = None):
+        """Stato di un giro notizie (G3, 04/10): senza job_id l'ultimo, con job_id quello
+        (ultimi 20). Esito in job.result (saved, fetched, classification_failed, degraded...),
+        job.error e job.duration_s; scheduler = configurazione e pausa notte/weekend."""
+        stato = news_refresh_manager.status()
+        if job_id is None:
+            job = {k: v for k, v in stato.items() if k != "scheduler"}
+        else:
+            job = news_refresh_manager.job(job_id)
+            if job is None:
+                raise HTTPException(404, _api_text(
+                    'giro notizie %s sconosciuto (si conservano gli ultimi 20)',
+                    'unknown news refresh %s (the last 20 are kept)') % job_id)
+        return {"job": job, "scheduler": stato.get("scheduler"),
+                "timestamp": datetime.now().isoformat()}
+
+    # 02/10: sintesi AI di UN articolo, solo su richiesta esplicita (costa crediti).
+    # GET legge la cache della lingua della richiesta (mai rete, mai modello);
+    # POST scarica l'articolo e chiama NEWS_SUMMARY_MODEL (contratto in article_summary.py).
+    @app.get("/news/{news_id}/article-summary")
+    def get_news_article_summary(news_id: int):
         try:
-            from bellomberg.market_data.news_aggregator import auto_pull_feed
-            return auto_pull_feed(days=days, classify=classify)
+            from bellomberg.market_data.article_summary import read_cached_article_summary
+            result = read_cached_article_summary(news_id)
         except Exception as e:
-            raise _err500(e, "post_news_feed_refresh")
+            raise _err500(e, "get_news_article_summary")
+        if result.get("status") == "missing":
+            raise HTTPException(404, _api_text(f"Notizia {news_id} non trovata", f"News item {news_id} not found"))
+        return result
+
+    @app.post("/news/{news_id}/article-summary",
+              dependencies=[Depends(require_session), Depends(throttle)])
+    def post_news_article_summary(news_id: int, request: Request, regenerate: bool = False):
+        try:
+            from bellomberg.market_data.article_summary import summarize_news_article
+            result = summarize_news_article(news_id, regenerate=regenerate)
+        except Exception as e:
+            _refund_throttle(request)
+            raise _err500(e, "post_news_article_summary")
+        if result.get("status") == "missing":
+            _refund_throttle(request)
+            raise HTTPException(404, _api_text(f"Notizia {news_id} non trovata", f"News item {news_id} not found"))
+        # Nessuna spesa (cache, non configurato, articolo illeggibile): il throttle si restituisce.
+        if result.get("cached") or result.get("status") in ("not_configured", "unreadable"):
+            _refund_throttle(request)
+        return result
 
     @app.get("/news/catalysts")
     def get_news_catalysts(days: int = 7, limit: int = 20):
@@ -2809,8 +3291,7 @@ if FASTAPI_OK:
     def get_news_macro(categories: Optional[str] = None,
                         min_importance: int = 3,
                         days: int = 2,
-                        max_per_topic: int = 4,
-                        include_reddit: bool = True):
+                        max_per_topic: int = 4):
         """News macro/geo/politica/EM/crypto aggregate per topic.
         - categories: CSV di {rates,inflation,geopolitics,politics,em,commodities,crypto,corporate}
                       (vuoto = tutte)
@@ -2818,19 +3299,20 @@ if FASTAPI_OK:
         - days: lookback in giorni
         """
         try:
-            from bellomberg.market_data.news_aggregator import fetch_macro_news, providers_blocked
+            from bellomberg.market_data.news_aggregator import fetch_macro_news, providers_blocked, fonti_spente
             cats = [c.strip() for c in categories.split(",")] if categories else None
             items = fetch_macro_news(
                 categories=cats,
                 min_importance=min_importance,
                 days=days,
                 max_per_topic=max_per_topic,
-                include_reddit=include_reddit,
+                include_reddit=False,   # 04/10 (W2): Reddit SPENTA, dichiarata in fonti_spente
             )
             _muti = providers_blocked()   # pattern voce (25) — richiesta ponte F8 (F5)
             return {"count": len(items), "items": items,
                     "categories_requested": cats,
                     "fonti_mute": _muti or None,
+                    "fonti_spente": fonti_spente(),
                     "avviso": _avviso_provider_bloccati(_muti, ' — pochi/zero item macro NON significano quiete', ' — few/no macro items do NOT imply calm'),
                     "timestamp": datetime.now().isoformat()}
         except Exception as e:
@@ -2879,13 +3361,13 @@ if FASTAPI_OK:
             raise _err500(e, "post_briefing_refresh")
 
     @app.get("/news/economic-calendar")
-    def get_economic_calendar(days_ahead: int = 14):
+    def get_economic_calendar(days_ahead: int = 14, earnings_days_ahead: Optional[int] = None):
         """Calendar eventi macro + earnings calendar via Finnhub (se key configurata).
         Combina: hardcoded baseline (FOMC/ECB/NFP/CPI) + Finnhub economic calendar
         (con previous/estimate/actual) + Finnhub earnings for portfolio tickers.
         """
         try:
-            from datetime import datetime as _dt
+            from datetime import datetime as _dt, timedelta as _td
             today = _dt.now().date()
             events = _hardcoded_economic_calendar(today, days_ahead)
             # 27/08 (seconda meta' Finnhub, C1 del ponte): ogni fonte Finnhub
@@ -2896,6 +3378,9 @@ if FASTAPI_OK:
             # arrivava vuoto come se fosse quiete — la baseline cablata restava
             # sola senza dirlo.
             _mute = {"/calendar/economic": [], "/calendar/earnings": []}
+            _mute_yf: list = []
+            # le trimestrali del portafoglio possono guardare piu' avanti dei dati macro
+            giorni_earnings = max(days_ahead, earnings_days_ahead or 0)
             # Aggiungi economic calendar Finnhub con prev/est/actual
             try:
                 from bellomberg.market_data.finnhub_news import fetch_economic_calendar
@@ -2919,21 +3404,24 @@ if FASTAPI_OK:
                 _mute["/calendar/economic"].append(f"eccezione: {type(fx).__name__}: {fx}")
             # Aggiungi earnings calendar da Finnhub (filtro portfolio tickers)
             try:
+                from bellomberg.market_data.earnings_yf import paese_da_suffisso
                 from bellomberg.market_data.finnhub_news import fetch_earnings_for_portfolio
                 from bellomberg.storage.memory_db import MemoryDB
                 from bellomberg.storage.classificazione import carica_veicoli
                 db = MemoryDB()
                 snap = db.get_portfolio_summary()
                 negozio = carica_veicoli()
-                tickers, nota_natura = _tickers_earnings_da_negozio(
+                tickers, riserva_yf, nota_natura = _tickers_earnings_con_riserva(
                     snap.get("positions", []), negozio)
                 if nota_natura:
                     _mute["/calendar/earnings"].append(nota_natura)
                 if negozio.get("origine") in {"assente", "illeggibile"}:
                     earnings = []
+                elif not tickers:
+                    earnings = []
                 else:
                     earnings = fetch_earnings_for_portfolio(
-                        tickers, days_ahead=days_ahead,
+                        tickers, days_ahead=giorni_earnings,
                         motivo=_mute["/calendar/earnings"])
                 for e in earnings:
                     hour_label = {"bmo": "Pre-market", "amc": "After-close", "dmh": "During market"}.get(
@@ -2946,14 +3434,59 @@ if FASTAPI_OK:
                         "type": "Earnings",
                         "title": f"{e.get('symbol', '')} Earnings Q{e.get('quarter','?')} {e.get('year','')} {est_label}".strip(),
                         "importance": 4,
-                        "country": "US" if e.get("symbol", "") and "." not in e.get("symbol", "") else "EU",
+                        "country": paese_da_suffisso(e.get("symbol", "")) if e.get("symbol") else "?",
+                        "ticker": e.get("symbol", ""),
+                        "source": "finnhub",
                     })
+                # riserva yfinance per i titoli europei senza ADR (Finnhub gratuito: 403)
+                if riserva_yf:
+                    from bellomberg.market_data.earnings_yf import prossima_trimestrale
+                    try:
+                        from bellomberg.storage.negozi_privati import carica_alias
+                        _ea = carica_alias()
+                        alias_yf = (_ea["alias"].get("yfinance", {})
+                                    if _ea["origine"] not in {"assente", "illeggibile"} else {})
+                        if _ea["origine"] == "illeggibile":
+                            _mute_yf.append(_api_text(
+                                "alias_fonti illeggibile (%s): simboli yfinance usati come sono",
+                                "alias_fonti unreadable (%s): yfinance symbols used as they are")
+                                % (_ea.get("motivo") or "causa non dichiarata"))
+                    except Exception as exc:  # G8: dichiarato, non ingoiato
+                        alias_yf = {}
+                        _mute_yf.append(_api_text(
+                            "alias_fonti illeggibile (%s: %s): simboli yfinance usati come sono",
+                            "alias_fonti unreadable (%s: %s): yfinance symbols used as they are")
+                            % (type(exc).__name__, exc))
+                    limite = (today + _td(days=giorni_earnings)).isoformat()
+                    for ticker in riserva_yf:
+                        simbolo_yf = alias_yf.get(ticker, ticker)
+                        prima = len(_mute_yf)
+                        trovata = prossima_trimestrale(simbolo_yf, today, motivo=_mute_yf)
+                        if not trovata and len(_mute_yf) == prima:
+                            # G8: Finnhub non interrogato (nessun simbolo USA) e yfinance senza
+                            # data: prima il titolo spariva dal calendario senza alcuna voce
+                            _mute_yf.append(_api_text(
+                                "%s: nessuna prossima trimestrale da yfinance (simbolo %s) e nessun "
+                                "simbolo USA per Finnhub: assente dal calendario",
+                                "%s: no upcoming earnings date from yfinance (symbol %s) and no US "
+                                "symbol for Finnhub: missing from the calendar") % (ticker, simbolo_yf))
+                        if not trovata or trovata["date"] > limite:
+                            continue
+                        events.append({
+                            "date": trovata["date"], "time": "TBD", "type": "Earnings",
+                            "title": f"{ticker} Earnings", "importance": 4,
+                            "country": paese_da_suffisso(ticker),
+                            "ticker": ticker, "source": "yfinance",
+                            "date_estimated": trovata["stimata"],
+                        })
             except Exception as fx:
                 _safe_print(f"[CAL] finnhub earnings skipped: {fx}")
                 _mute["/calendar/earnings"].append(f"eccezione: {type(fx).__name__}: {fx}")
             # Sort by date
             events.sort(key=lambda x: (x.get("date", ""), x.get("time", "")))
             fonti_mute = {"finnhub " + k: "; ".join(v) for k, v in _mute.items() if v}
+            if _mute_yf:
+                fonti_mute["yfinance earnings"] = "; ".join(_mute_yf)
             return {"count": len(events), "items": events,
                     "timestamp": _dt.now().isoformat(),
                     "fonti_mute": fonti_mute or None,
@@ -2972,19 +3505,48 @@ if FASTAPI_OK:
             raise _err500(e, "get_finnhub_intel")
 
     @app.get("/news/insider-trades/{ticker}")
-    def get_insider_trades_endpoint(ticker: str, days: int = 30):
-        """Insider Form 4 real-time per un ticker (via Finnhub, fallback SEC EDGAR)."""
+    def get_insider_trades_endpoint(ticker: str, days: int = 30, valuta: Optional[str] = None):
+        """Insider Form 4 real-time per un ticker (via Finnhub, fallback SEC EDGAR).
+        04/10 (W2, Opus 5.5): Form 4 copre solo emittenti USA. `.MI` -> internal dealing
+        eMarket SDIR con lo stato della fonte (KO/STALE/non_coperto dichiarati); altri
+        mercati, crypto o copertura indeterminata -> errore dichiarato in 200, nessuna
+        chiamata (mai il suffisso tolto: aggancerebbe un omonimo USA)."""
         try:
+            from bellomberg.market_data.copertura import copertura_usa, risposta_non_coperta
+            if str(ticker or "").strip().upper().endswith(".MI"):
+                from bellomberg.market_data.emarket_sdir import get_internal_dealing
+                idl = get_internal_dealing(ticker, giorni=days)
+                return {"ticker": idl.get("ticker"), "source": "emarket_sdir", "stato": idl.get("stato"),
+                        "error": None if idl.get("stato") in ("ok", "vuoto_misurato") else (idl.get("motivo") or idl.get("errore") or idl.get("stato")),
+                        "count": len(idl.get("comunicazioni") or []), "internal_dealing": idl}
+            # senza ?valuta= la valuta e' quella della posizione nel book (sola lettura);
+            # fuori dal book la presunzione USA dal simbolo e' DICHIARATA in copertura_nota
+            _nota = None
+            if valuta is None:   # helper comune (W1, copertura.py): una logica sola
+                from bellomberg.market_data.copertura import valuta_dal_book
+                _vb = valuta_dal_book(ticker, db_path=get_db().db_path)
+                valuta, _nota = _vb["valuta"], _vb["nota"]
+            _cop = copertura_usa(ticker, "insider Form 4 (Finnhub/SEC)", valuta)
+            if _cop["stato"] != "coperto":
+                return {**risposta_non_coperta(_cop, "insider Form 4 (Finnhub/SEC)"), "copertura_nota": _nota}
+            _muti, _mot = {}, []
             try:
                 from bellomberg.market_data.finnhub_news import fetch_insider_trades as fn_insider
-                trades = fn_insider(ticker, days=days)
+                trades = fn_insider(ticker, days=days, motivo=_mot)
                 if trades:
-                    return {"ticker": ticker, "source": "finnhub", "count": len(trades), "trades": trades}
-            except Exception:
-                pass
+                    return {"ticker": ticker, "source": "finnhub", "count": len(trades), "trades": trades,
+                            "fonti_mute": None, "copertura_nota": _nota}
+                if _mot:
+                    _muti["finnhub"] = "; ".join(str(m) for m in _mot)
+            except Exception as e:   # dichiarato prima di passare a SEC: solo il tipo
+                _muti["finnhub"] = type(e).__name__
             from bellomberg.market_data.sec_edgar import get_insider_trades as sec_insider
-            trades = sec_insider(ticker, days=days)
-            return {"ticker": ticker, "source": "sec_edgar", "count": len(trades), "trades": trades}
+            _mot = []
+            trades = sec_insider(ticker, days=days, motivo=_mot)
+            if _mot:
+                _muti["sec_edgar"] = "; ".join(str(m) for m in _mot)
+            return {"ticker": ticker, "source": "sec_edgar", "count": len(trades), "trades": trades,
+                    "fonti_mute": _muti or None, "copertura_nota": _nota}
         except Exception as e:
             raise _err500(e, "get_insider_trades_endpoint")
 
@@ -3333,9 +3895,9 @@ if FASTAPI_OK:
     @app.post("/prices/update", dependencies=[Depends(require_session), Depends(throttle)])
     def update_prices_endpoint():
         try:
-            from bellomberg.cli.price_updater import update_all_prices
+            from bellomberg.cli.price_updater import AUTOMATIC_PRICE_SOURCES, update_all_prices
             db = get_db()
-            result = update_all_prices(db, source_order=("polygon", "ibkr", "yfinance", "coingecko"),
+            result = update_all_prices(db, source_order=AUTOMATIC_PRICE_SOURCES,
                                          verbose=False)
             return result
         except Exception as e:
@@ -3433,6 +3995,9 @@ if FASTAPI_OK:
                     argv.append('--authorize-new-ai')
                 if not options.send_email:
                     argv.append('--no-email')
+                if getattr(options, 'acknowledge_uncertain_email', False):
+                    # Conferma esplicita del PM: re-invio di un'email dall'esito incerto (Opus 5.5, 05/10).
+                    argv.append('--acknowledge-uncertain-email')
                 proc = subprocess.Popen(
                     argv,
                     stdout=(log_f if log_f else subprocess.DEVNULL),

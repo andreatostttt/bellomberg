@@ -111,8 +111,9 @@ function retainedPage(seed = {}) {
       return [at in seed ? seed[at] : typeof initial === 'function' ? initial() : initial, () => {}];
     } },
     'react-router-dom': { useNavigate: () => () => {} },
-    '@/lib/api': { Bellomberg: {} }, '@/lib/useBox': { useBox: () => [{ current: null }, { w: 1000, h: 650 }] },
-    '@/components/SkyCanvas': () => null, '@/components/RunConfirmDialog': () => null,
+    // gotcha SSR: il loader di /filings riscriverebbe lo stato seminato, quindi lo stub restituisce il seed
+    '@/lib/api': { Bellomberg: { filingOverview: async () => seed[17] ?? null } }, '@/lib/useBox': { useBox: () => [{ current: null }, { w: 1000, h: 650 }] },
+    '@/components/RunConfirmDialog': () => null,
   } });
   const language = carica('i18n/lingua.ts'), Page = carica('pages/AgentsLive.tsx').default;
   return selected => {
@@ -122,20 +123,25 @@ function retainedPage(seed = {}) {
 }
 const pageInLanguage = (selected, seed = {}) => retainedPage(seed)(selected);
 
+// 02/10/2026 (redesign Nuova): il quadrante, la tabella delle cifre e il nastro a colonne fisse non
+// ci sono piu'; questi test chiedono le stesse garanzie (n.d. mai zero, nessuna «nessuna run» su un
+// heartbeat illeggibile, KO e dettagli originali conservati, singolare/plurale) al markup nuovo.
 test('unreadable or absent first heartbeat never asserts that no run is active', () => {
   for (const selected of ['it', 'en']) {
     const html = pageInLanguage(selected, { 4: 'original heartbeat failure' });
     assert.match(html, /original heartbeat failure/);
-    assert.doesNotMatch(html, /NESSUNA RUN IN CORSO|NO RUN IN PROGRESS/);
-    assert.match(html, selected === 'it' ? /STATO N.D./ : /STATE N\/A/);
+    assert.doesNotMatch(html, /Nessuna run in corso|No run in progress|Lancia il comitato|Launch the committee/);
+    assert.match(html, selected === 'it' ? /Stato non disponibile/ : /State unavailable/);
+    assert.match(html, /data-vista="cieco"/);
   }
 });
 
 test('missing total cost does not claim a complete total in either language', () => {
   for (const selected of ['it', 'en']) {
-    const html = pageInLanguage(selected, { 3: { running: false } });
-    assert.doesNotMatch(html, /totale non parziale|non-partial total/);
-    assert.match(html, selected === 'it' ? /costo totale non disponibile/ : /total cost unavailable/);
+    const html = pageInLanguage(selected, { 3: { running: false, start_time: '2026-09-12T10:00:00', completed_at: '2026-09-12T10:02:00' } });
+    assert.doesNotMatch(html, /totale completo|complete total|Completo<|Complete</);
+    assert.match(html, selected === 'it' ? /costo non disponibile/ : /cost unavailable/);
+    assert.doesNotMatch(html, /0,00\s€|€0\.00/);
   }
 });
 
@@ -148,11 +154,12 @@ test('agent costs and domain verdicts translate without replacing zero, KO or ra
   };
   const roster = [{ id: 'quant', name: 'QUANT', role: 'Original role', color: '#29D3F2' }];
   const it = pageInLanguage('it', { 0: roster, 3: fixture }), en = pageInLanguage('en', { 0: roster, 3: fixture });
-  assert.match(it, /ECONOMIA DELLA RUN/); assert.match(en, /RUN ECONOMICS/);
+  assert.match(it, /Costi della run/); assert.match(en, /Run costs/);
   assert.match(it, /1\.234,50/); assert.match(en, /1,234\.50/);
   assert.match(it, /0,00/); assert.match(en, /0\.00/);
   assert.match(it, /MINIMO/); assert.match(en, /LOWER BOUND/);
   assert.match(en, /agent failed the API call/);
+  assert.match(it, /Errore API dichiarato/); assert.match(en, /API error declared/);
   for (const html of [it, en]) {
     assert.match(html, /original aggregation failure/);
     assert.match(html, /get_synthetic_data/);
@@ -161,17 +168,18 @@ test('agent costs and domain verdicts translate without replacing zero, KO or ra
   }
 });
 
-test('a retained run memo switches labels and preserves its original language, timeline and cost evidence', () => {
+test('a retained run memo switches labels and preserves its original language and stage times', () => {
   const fixture = { language: 'it', running: false, start_time: '2026-09-12T10:00:00', completed_at: '2026-09-12T10:02:00',
     tool_log: [{ time: '10:00:05', specialist: 'quant', round: 1, tool: 'get_synthetic_data', input: 'Original synthetic input' }],
   };
   const render = retainedPage({ 3: fixture });
   const it = render('it'), en = render('en'), again = render('it');
-  assert.match(it, /un giro/); assert.match(en, /one revolution/);
+  assert.match(it, /Ultima run/); assert.match(en, /Last run/);
   assert.match(en, /Original run · Italian/);
-  // Text label boxes may grow with translation; orbital arcs must keep the same timeline.
-  const geometry = html => [...html.matchAll(/<path\b[^>]*\bd="([^"]* A[^"]*)"[^>]*>/g)].map(m => m[1]);
-  assert.deepEqual(geometry(en), geometry(it));
+  // le tappe portano gli stessi tempi in tutte e due le lingue
+  const steps = html => [...html.matchAll(/data-tappa="([^"]+)" data-stato="([^"]+)"/g)].map(m => m[1] + ':' + m[2]);
+  assert.deepEqual(steps(en), steps(it));
+  assert.ok(steps(it).includes('r1:done'), steps(it).join(' '));
   assert.equal(it, again);
 });
 
@@ -188,51 +196,25 @@ const tapeFixture = (tools = ['get_synthetic_a', 'get_synthetic_a', 'get_synthet
 });
 const tapeRoster = [{ id: 'quant', name: 'QUANT', role: 'Original role', color: '#29D3F2' }, { id: 'macro', name: 'MACRO', role: 'Original role', color: '#FFA51E' }];
 
-test('the calls tape keeps its round CSS class in both languages and its round header fits the 20px column', () => {
+test('the calls tape keeps its round label and the original call input in both languages', () => {
   const it = pageInLanguage('it', { 0: tapeRoster, 3: tapeFixture() }), en = pageInLanguage('en', { 0: tapeRoster, 3: tapeFixture() });
   for (const html of [it, en]) {
     assert.match(html, /<span class="rd">R1<\/span>/);
     assert.doesNotMatch(html, /class="(?:round|rnd)"/);
+    assert.match(html, /<code>get_synthetic_b<\/code>/);
+    assert.match(html, /Synthetic input 2/);
   }
-  assert.match(it, /<span>T\+<\/span><span>desk<\/span><span>rd<\/span><span>strumento<\/span><span>input<\/span>/);
-  assert.match(en, /<span>T\+<\/span><span>desk<\/span><span>rnd<\/span><span>tool<\/span><span>input<\/span>/);
+  assert.match(it, /dalla più recente/); assert.match(en, /newest first/);
 });
 
-test('the figures table header, legend and footnote read in each language', () => {
+test('desk cards read their report, calls and verdict in each language', () => {
   const it = pageInLanguage('it', { 0: tapeRoster, 3: tapeFixture() }), en = pageInLanguage('en', { 0: tapeRoster, 3: tapeFixture() });
-  assert.match(it, /<i>durata<\/i><i>chiam\.<\/i><i>strum<\/i><i>api<\/i><i>costo<\/i><i class="ce">esito<\/i>/);
-  assert.match(en, /<i>dur\.<\/i><i>calls<\/i><i>tool<\/i><i>api<\/i><i>cost<\/i><i class="ce">state<\/i>/);
-  assert.match(it, /<b>strum<\/b> = strumenti <b>distinti<\/b> di quel desk\./);
-  assert.match(en, /<b>tool<\/b> = <b>distinct<\/b> tools used by that desk\./);
-  assert.match(it, / \* i 2 strumenti della run non sono la somma della colonna \(3\): gli stessi strumenti li usano desk diversi\./);
-  assert.match(en, / \* the 2 tools in the run are not the sum of the column \(3\): different desks use the same tools\./);
-  const one = tapeFixture(['get_synthetic_a', 'get_synthetic_a']);
-  assert.match(pageInLanguage('it', { 0: tapeRoster, 3: one }), / \* l&#x27;unico strumento della run non è la somma della colonna \(2\): lo stesso strumento lo usano desk diversi\./);
-  assert.match(pageInLanguage('en', { 0: tapeRoster, 3: one }), / \* the only tool in the run is not the sum of the column \(2\): different desks use the same tool\./);
-  assert.doesNotMatch(en, / \* i /);
-});
-
-test('fixed-width headers of the figures table and of the tape stay inside their columns in both languages', () => {
-  // JetBrains Mono: 0,6 em di avanzamento; testate maiuscole con letter-spacing .1em (agents-plancia.css).
-  // Misurato in Chrome il 13/09 sul markup SSR vero: 6,3 px a carattere a 9px, 5,6 px a 8px.
-  const css = fs.readFileSync(path.resolve(__dirname, '../../src/pages/agents-plancia.css'), 'utf8');
-  const columns = selector => {
-    const at = css.indexOf(selector); assert.ok(at >= 0, selector);
-    const m = /grid-template-columns:([^;]+);gap:(\d+)px/.exec(css.slice(at, at + 400)); assert.ok(m, selector);
-    return { widths: m[1].trim().split(/\s+/).map(w => (w.endsWith('px') ? Number(w.slice(0, -2)) : null)), gap: Number(m[2]) };
-  };
-  const cif = columns('.f4p .cif .hd,.f4p .cif .r,.f4p .cif .tot{display:grid;'), tape = columns('.f4p .lr{display:grid;');
-  for (const selected of ['it', 'en']) {
-    const html = pageInLanguage(selected, { 0: tapeRoster, 3: tapeFixture() });
-    const head = /<div class="hd"><span>[^<]*<\/span>((?:<i[^>]*>[^<]*<\/i>){6})<\/div>/.exec(html); assert.ok(head, selected);
-    const labels = [...head[1].matchAll(/<i[^>]*>([^<]*)<\/i>/g)].map(m => m[1]);
-    labels.forEach((label, i) => {
-      const width = label.length * 6.3, cell = cif.widths[i + 1], last = i === labels.length - 1;
-      assert.ok(width <= cell + (last ? 0 : cif.gap), `${selected} «${label}» ${width.toFixed(1)}px in ${cell}px`);
-    });
-    const round = new RegExp('<span>desk</span><span>([^<]*)</span>').exec(html); assert.ok(round, selected);
-    assert.ok(round[1].length * 5.6 <= tape.widths[2], `${selected} «${round[1]}» in ${tape.widths[2]}px`);
-  }
+  assert.match(it, /<b>Quant<\/b><span>Original role<\/span>/);
+  assert.match(it, /Errore API<\/span>/); assert.match(en, /API error<\/span>/);
+  assert.match(it, /<span>1 chiamata<\/span>/); assert.match(en, /<span>1 call<\/span>/);
+  assert.match(it, /<span>2 chiamate<\/span>/); assert.match(en, /<span>2 calls<\/span>/);
+  assert.match(it, /strumenti distinti · 2 chiamate API/); assert.match(en, /distinct tools · 2 API calls/);
+  assert.doesNotMatch(en, /chiamat/);
 });
 
 test('heartbeat message quotes, desk conjunction, FX source hole and token tooltip follow the language', () => {
@@ -244,51 +226,56 @@ test('heartbeat message quotes, desk conjunction, FX source hole and token toolt
   const noMsg = { 5: { msg: null, da: 1, al: 1 } };
   assert.match(pageInLanguage('it', seed(noMsg)), /\(«heartbeat illeggibile»\) — /);
   assert.match(pageInLanguage('en', seed(noMsg)), /\(“unreadable heartbeat”\) — /);
-  assert.match(it, /<span>quant e macro dichiarano/);
-  assert.match(en, /<span>quant and macro report/);
-  assert.match(it, /FX USD\/EUR <b class="amc">n\.d\.<\/b>/);
-  assert.match(en, /FX USD\/EUR <b class="amc">n\/a<\/b>/);
+  assert.match(it, /<span>Quant e Macro dichiarano/);
+  assert.match(en, /<span>Quant and Macro report/);
+  assert.match(it, /FX USD\/EUR <b class="is-warn">n\.d\.<\/b>/);
+  assert.match(en, /FX USD\/EUR <b class="is-warn">n\/a<\/b>/);
   const declaredHole = { 3: tapeFixture(undefined, { fx_source: 'n.d.' }) };
-  assert.match(pageInLanguage('en', seed(declaredHole)), /FX USD\/EUR <b class="amc">n\/a<\/b>/);
+  assert.match(pageInLanguage('en', seed(declaredHole)), /FX USD\/EUR <b class="is-warn">n\/a<\/b>/);
   const live = { 3: tapeFixture(undefined, { fx_source: 'live' }) };
-  for (const selected of ['it', 'en']) assert.match(pageInLanguage(selected, seed(live)), /FX USD\/EUR <b class="okc">live<\/b>/);
+  for (const selected of ['it', 'en']) assert.match(pageInLanguage(selected, seed(live)), /FX USD\/EUR <b class="is-live">live<\/b>/);
   assert.match(it, /title="1\.000 token"/);
   assert.match(en, /title="1,000 tokens"/);
 });
 
 // 13/09 (Claude Opus 5, lotto C2 P3): singolare con conteggio 1, plurale con 2, nelle due lingue.
-// Frasi attese congelate qui, non lette dai cataloghi sotto prova. Prima leggevamo
-// «1 DESKS OUT OF 1 HAVE», «quant report», «1 calls made», «1 desks working», «1 tokens»
-// e in italiano «1 DESK SU 1 HANNO», «quant dichiarano», «1 chiamate fatte», «spesi dai 1 desk».
 test('one desk in API error takes the singular and two desks keep the plural, in both languages', () => {
   const one = tapeFixture(['get_synthetic_a'], { error_agents: ['quant'] });
   const oneIt = pageInLanguage('it', { 0: tapeRoster, 3: one }), oneEn = pageInLanguage('en', { 0: tapeRoster, 3: one });
-  assert.match(oneIt, /<b>1 DESK SU 1 HA SBATTUTO CONTRO L&#x27;API<\/b>/);
-  assert.match(oneIt, /<span>quant dichiara <b>status api_error<\/b> e ha comunque consegnato il report<\/span>/);
+  assert.match(oneIt, /<b>1 desk su 2 ha sbattuto contro l’API\.<\/b>/);
+  assert.match(oneIt, /<span>Quant dichiara <b>status api_error<\/b> e ha comunque consegnato il report<\/span>/);
   assert.match(oneIt, /\(50%\) spesi da quel desk<\/span>/);
-  assert.match(oneIt, /Dentro ci sono 1,00\s€ spesi da 1 desk in <b>api_error<\/b>\./);
-  assert.match(oneEn, /<b>1 DESK OUT OF 1 HAS ENCOUNTERED API ERRORS<\/b>/);
-  assert.match(oneEn, /<span>quant reports <b>status api_error<\/b> and still delivered the report<\/span>/);
+  assert.match(oneIt, /Dentro ci sono 1,00\s€ spesi da 1 desk con status api_error\./);
+  assert.match(oneEn, /<b>1 desk out of 2 hit API errors\.<\/b>/);
+  assert.match(oneEn, /<span>Quant reports <b>status api_error<\/b> and still delivered the report<\/span>/);
   assert.match(oneEn, /\(50%\) spent by that desk<\/span>/);
-  assert.match(oneEn, /This includes €1\.00 spent by 1 desk with <b>api_error<\/b>\./);
+  assert.match(oneEn, /This includes €1\.00 spent by 1 desk with status api_error\./);
   const twoIt = pageInLanguage('it', { 0: tapeRoster, 3: tapeFixture() }), twoEn = pageInLanguage('en', { 0: tapeRoster, 3: tapeFixture() });
-  assert.match(twoIt, /<b>2 DESK SU 2 HANNO SBATTUTO CONTRO L&#x27;API<\/b>/);
-  assert.match(twoIt, /<span>quant e macro dichiarano <b>status api_error<\/b> e hanno comunque consegnato il report<\/span>/);
+  assert.match(twoIt, /<b>2 desk su 2 hanno sbattuto contro l’API\.<\/b>/);
+  assert.match(twoIt, /<span>Quant e Macro dichiarano <b>status api_error<\/b> e hanno comunque consegnato il report<\/span>/);
   assert.match(twoIt, /\(100%\) spesi da loro<\/span>/);
-  assert.match(twoIt, /Dentro ci sono 2,00\s€ spesi dai 2 desk in <b>api_error<\/b>\./);
-  assert.match(twoEn, /<b>2 DESKS OUT OF 2 HAVE ENCOUNTERED API ERRORS<\/b>/);
-  assert.match(twoEn, /<span>quant and macro report <b>status api_error<\/b> and still delivered the report<\/span>/);
+  assert.match(twoIt, /Dentro ci sono 2,00\s€ spesi da 2 desk con status api_error\./);
+  assert.match(twoEn, /<b>2 desks out of 2 hit API errors\.<\/b>/);
+  assert.match(twoEn, /<span>Quant and Macro report <b>status api_error<\/b> and still delivered the report<\/span>/);
   assert.match(twoEn, /\(100%\) spent by them<\/span>/);
-  assert.match(twoEn, /This includes €2\.00 spent by the 2 desks with <b>api_error<\/b>\./);
+  assert.match(twoEn, /This includes €2\.00 spent by 2 desks with status api_error\./);
 });
 
-test('the readout footer agrees with one call made and one desk working, in both languages', () => {
-  // seed 8 = cursore in secondi dallo start: a 5 s la prima delle due chiamate e' fatta.
-  const calls = tapeFixture(['get_synthetic_a', 'get_synthetic_b']);
-  assert.match(pageInLanguage('it', { 0: tapeRoster, 3: calls, 8: 5 }), /<div class="ft"><b>1<\/b> chiamata fatta su 2 \(50%\) · <b>1<\/b> desk al lavoro · /);
-  assert.match(pageInLanguage('en', { 0: tapeRoster, 3: calls, 8: 5 }), /<div class="ft"><b>1<\/b> call made out of 2 \(50%\) · <b>1<\/b> desk working · /);
-  assert.match(pageInLanguage('it', { 0: tapeRoster, 3: calls, 8: 20 }), /<div class="ft"><b>2<\/b> chiamate fatte su 2 \(100%\) · <b>0<\/b> desk al lavoro · /);
-  assert.match(pageInLanguage('en', { 0: tapeRoster, 3: calls, 8: 20 }), /<div class="ft"><b>2<\/b> calls made out of 2 \(100%\) · <b>0<\/b> desks working · /);
+test('a live round says how many desks work out of how many, with one or two, in both languages', () => {
+  // seed 7 = l'orologio (now): la run viva dura 5 minuti; seed 3 = l'heartbeat dichiarato.
+  const start = Date.parse('2026-09-12T10:00:00');
+  const live = running => ({ running: true, start_time: '2026-09-12T10:00:00', current_round: 1, updated_at: '2026-09-12T10:04:58',
+    specialist_status: Object.fromEntries(['quant', 'macro'].map(id => [id, running.includes(id) ? 'running' : 'done'])),
+    tool_log: [{ time: '10:04:50', specialist: 'quant', round: 1, tool: 'get_synthetic_a', input: '{}' },
+      { time: '10:03:00', specialist: 'macro', round: 1, tool: 'get_synthetic_b', input: '{}' }] });
+  const one = { 0: tapeRoster, 3: live(['quant']), 7: start + 300000 }, two = { 0: tapeRoster, 3: live(['quant', 'macro']), 7: start + 300000 };
+  assert.match(pageInLanguage('it', one), /<b>Round 1 in corso<\/b> · 1 desk su 2 al lavoro, 1 ha consegnato/);
+  assert.match(pageInLanguage('en', one), /<b>Round 1 in progress<\/b> · 1 of 2 desks working, 1 delivered/);
+  assert.match(pageInLanguage('it', two), /<b>Round 1 in corso<\/b> · 2 desk su 2 al lavoro</);
+  assert.match(pageInLanguage('en', two), /<b>Round 1 in progress<\/b> · 2 of 2 desks working</);
+  // il desk che ha appena chiamato uno strumento lo mostra; l'altro ragiona dall'ultima chiamata
+  assert.match(pageInLanguage('it', two), /<code>get_synthetic_a<\/code>/);
+  assert.match(pageInLanguage('it', two), /Ragiona da 2&#x27;00&quot;/);
 });
 
 test('the token tooltip of the run economics reads one token with a count of 1', () => {
@@ -330,4 +317,121 @@ test('the chat output token chip reads one token with a count of 1 and keeps the
   assert.match(one('en'), /<span class="chip n">one token<\/span>/);
   assert.match(two('it'), /<span class="chip n">2 token<\/span>/);
   assert.match(two('en'), /<span class="chip n">2 tokens<\/span>/);
+});
+
+// 03/10/2026 (filing fase D, task 8): copertura filing nella card della run e nella scheda «Filing» del pannello.
+// Indici di useState in coda: 15 = scheda, 17 = panoramica /filings, 18 = errore, 19 = attivazione in corso, 20 = esito.
+const filingOverview = (senza = 5) => ({
+  titoli: [['NOVA', 0, true], ['KORE', 1, true], ['ACME', 2, true], ['NOVB', 2, true], ['KORB', 1, true], ['ACMB', 2, true], ['NOVC', 2, true],
+    ...['KORC', 'ACMC', 'NOVD', 'KORD', 'ACMD'].slice(0, senza).map(t => [t, 3, false])]
+    // forma reale della riga di stato (filing_context.scheda_da_run): «TICKER · fonte · …»
+    .map(([ticker, gruppo, profilo]) => ({ ticker, gruppo,
+      stato_riga: profilo ? `${ticker} · SEC 10-K/10-Q CIK 0009990001 · anno al 31/12/2026 vs 31/12/2025 · confronto del 02/10 · run 12 · Synthetic status`
+        : `${ticker} · non disponibile: nessun profilo (attivabile dalla pagina Filing)`,
+      fonte: profilo ? 'SEC 10-K/10-Q CIK 0009990001' : null, ultimo_confronto: profilo ? '2026-10-02T08:00:00' : null,
+      run_id: profilo ? 12 : null, novita: gruppo === 0, profilo, escluso: false })),
+  copertura: { totale: 7 + senza, con_confronto: 7, aggiornati: 5, non_aggiornati: 2, senza_confronto: 0, senza_profilo: senza, esclusi: 0 },
+  contesto: { caratteri: 9840, budget: 14000, omessi_totali: 0 }, aggiornamento: null,
+});
+
+test('filing words exist in both languages with the coverage and result phrases', () => {
+  const p = load('pages/agents/parole.ts');
+  for (const selected of ['it', 'en']) {
+    language.impostaLinguaCorrente(selected);
+    const w = p.parole();
+    assert.equal(typeof w.filingTitle, 'string');
+    assert.equal(typeof w.filingCoverage, 'function');
+    assert.equal(typeof w.filingResult, 'function');
+  }
+  language.impostaLinguaCorrente('it');
+  assert.equal(p.parole().filingTitle, 'Filing per il Comitato');
+  assert.equal(p.parole().filingCoverage(7, 12), '7 di 12 titoli con confronto');
+  assert.equal(p.parole().filingResult(3, 1, 1), '3 attivati · 1 da confermare · 1 senza fonte');
+  assert.equal(p.parole().filingResult(1, 0, 0), '1 attivato · 0 da confermare · 0 senza fonte');
+  language.impostaLinguaCorrente('en');
+  assert.equal(p.parole().filingTitle, 'Filings for the committee');
+  assert.equal(p.parole().filingCoverage(7, 12), '7 of 12 holdings with a comparison');
+  assert.equal(p.parole().filingResult(3, 1, 1), '3 activated · 1 to confirm · 1 without a source');
+});
+
+test('the run card carries the compact filing line and the filing tab shows coverage, context and the bulk action', () => {
+  const it = pageInLanguage('it', { 15: 'filing', 17: filingOverview() }), en = pageInLanguage('en', { 15: 'filing', 17: filingOverview() });
+  assert.match(it, /Filing: 7\/12 con confronto · 5 da attivare/);
+  assert.match(en, /Filings: 7\/12 with a comparison · 5 to activate/);
+  assert.match(it, /Filing per il Comitato/); assert.match(en, /Filings for the committee/);
+  assert.match(it, /7 di 12 titoli con confronto/);
+  assert.match(it, /5 aggiornati/); assert.match(it, /2 non aggiornati/); assert.match(it, /5 senza profilo/);
+  assert.match(it, /9\.840 \/ 14\.000 caratteri/); assert.match(en, /9,840 \/ 14,000 characters/);
+  assert.match(it, /aria-pressed="true"[^>]*>Filing</);
+  for (const html of [it, en]) {
+    assert.match(html, /data-filing-activate="1"/);
+    assert.doesNotMatch(html, /data-filing-activate="1"[^>]*disabled/);
+    assert.match(html, /run 12 · Synthetic status/);
+  }
+  assert.match(it, />Attiva i mancanti</); assert.match(en, />Activate missing</);
+  assert.doesNotMatch(en.replace(/<[^>]*>/g, ' '), /mancanti|con confronto|caratteri/);
+});
+
+test('a holding row shows the source once and the status without repeating ticker and source', () => {
+  for (const selected of ['it', 'en']) {
+    const html = pageInLanguage(selected, { 15: 'filing', 17: filingOverview() });
+    // fase E (03/10/2026): le righe sono pulsanti che aprono la pagina Filing sul titolo
+    assert.match(html, /<button type="button" class="ag-filing-tk is-link" data-filing-ticker="NOVA"/);
+    assert.match(html, /data-filing-pagina="1"/);
+    const riga = html.match(/data-filing-ticker="NOVA"[^>]*>([\s\S]*?)<\/button>/)[1].replace(/<[^>]*>/g, ' ');
+    assert.equal(riga.split('SEC 10-K/10-Q CIK 0009990001').length - 1, 1, riga);
+    assert.equal(riga.split('NOVA').length - 1, 1, riga);
+    assert.match(riga, /SEC 10-K\/10-Q CIK 0009990001 · anno al 31\/12\/2026/);
+    const senza = html.match(/data-filing-ticker="KORC"[^>]*>([\s\S]*?)<\/button>/)[1].replace(/<[^>]*>/g, ' ');
+    assert.equal(senza.split('KORC').length - 1, 1, senza);
+    assert.match(senza, /non disponibile: nessun profilo/);
+  }
+});
+
+test('holdings with a profile but no comparison yet get their own legend entry', () => {
+  const dati = filingOverview();
+  dati.copertura = { ...dati.copertura, aggiornati: 4, senza_confronto: 1 };
+  assert.match(pageInLanguage('it', { 15: 'filing', 17: dati }), /1 senza confronto/);
+  assert.match(pageInLanguage('en', { 15: 'filing', 17: dati }), /1 without a comparison/);
+  assert.doesNotMatch(pageInLanguage('it', { 15: 'filing', 17: filingOverview() }), /senza confronto</);
+});
+
+test('the bulk action is disabled with nothing missing, during a run, and when the archive is unavailable', () => {
+  const disabled = html => /<button[^>]*data-filing-activate="1"[^>]*disabled/.test(html) || /<button[^>]*disabled[^>]*data-filing-activate="1"/.test(html);
+  for (const selected of ['it', 'en']) {
+    assert.ok(disabled(pageInLanguage(selected, { 15: 'filing', 17: filingOverview(0) })), 'nothing missing');
+    const live = { running: true, start_time: '2026-09-12T10:00:00' };
+    assert.ok(disabled(pageInLanguage(selected, { 3: live, 15: 'filing', 17: filingOverview() })), 'run active');
+    const down = pageInLanguage(selected, { 15: 'filing', 17: null, 18: { stato: 503, msg: 'Synthetic archive fault' } });
+    assert.ok(disabled(down), 'archive unavailable');
+    assert.match(down, selected === 'it' ? /Archivio filing non disponibile/ : /Filing archive unavailable/);
+    assert.match(down, /Synthetic archive fault/);
+  }
+  assert.match(pageInLanguage('it', { 15: 'filing', 17: filingOverview(0) }), /Filing: 7\/7 con confronto · nessuno da attivare/);
+});
+
+test('after the bulk activation the tab summarises the outcome and lists the holdings to confirm', () => {
+  const esito = { attivati: ['KORC', 'ACMC', 'NOVD'], da_confermare: ['KORD'], senza_fonte: ['ACMD'], esclusi: [], gia_attivi: [], errori: [{ ticker: 'NOVX', motivo: 'Synthetic failure' }],
+    aggiornamento: 'in coda: subito dopo il controllo in corso' };
+  const it = pageInLanguage('it', { 15: 'filing', 17: filingOverview(), 20: esito }), en = pageInLanguage('en', { 15: 'filing', 17: filingOverview(), 20: esito });
+  assert.match(it, /3 attivati · 1 da confermare · 1 senza fonte/);
+  assert.match(en, /3 activated · 1 to confirm · 1 without a source/);
+  for (const html of [it, en]) {
+    assert.match(html, /data-filing-confirm="KORD"/);
+    assert.match(html, /NOVX/); assert.match(html, /Synthetic failure/);
+  }
+  assert.match(it, /partono appena finisce il controllo in corso/); assert.match(en, /start as soon as the current check ends/);
+});
+
+// Revisione G9b (08b S13): costo di un agente non dichiarato = n.d., mai 0 nella somma.
+test('agent cost missing is n/a in the KO share and the agent sum, never counted as 0', () => {
+  const fixture = { running: false, start_time: '2026-09-12T10:00:00', completed_at: '2026-09-12T10:02:00',
+    usage_total: { cost_eur: 10, partial: true, error_agents: ['quant'], in: 1, out: 1, cache_read: 0, cache_write: 0 },
+    usage_by_specialist: { quant: { status: 'api_error', cost_eur: null, duration_s: 60, in: 1, out: 1 },
+      macro: { status: 'ok', cost_eur: 10, duration_s: 60, in: 1, out: 1 } },
+    specialist_status: { quant: 'done', macro: 'done' }, tool_log: [] };
+  const roster = [{ id: 'quant', name: 'QUANT', role: 'r', color: '#29D3F2' }, { id: 'macro', name: 'MACRO', role: 'r', color: '#29D3F2' }];
+  const html = pageInLanguage('it', { 0: roster, 3: fixture });
+  assert.match(html, /1 senza costo dichiarato \(n\.d\., non contati come 0\)/);
+  assert.doesNotMatch(html, /Somma degli agenti 10,00\s€ uguale|coincide/);
 });

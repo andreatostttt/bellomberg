@@ -5,13 +5,16 @@ export type Destination = {
   id: string; to: string; short: string; label: string; group: string;
   key: string; kind: 'page' | 'settings';
 };
-const destinations = [
+// Sesto campo opzionale: tasto fisso. Filing (fase E, 03/10/2026) sta in Ricerca ma prende F20,
+// cosi' i tasti delle pagine gia' esistenti non cambiano.
+const destinations: ReadonlyArray<readonly [string, string, string, string, string, string?]> = [
   ['dashboard', '/dashboard', 'DASH', 'Command Center', 'Portafoglio'],
   ['performance', '/performance', 'PERF', 'Performance', 'Portafoglio'],
   ['watchlist', '/watchlist', 'FAVS', 'Watchlist', 'Portafoglio'],
   ['market', '/market', 'MKT', 'Global Markets', 'Ricerca'],
   ['news', '/news', 'NEWS', 'News Desk', 'Ricerca'],
   ['fundamentals', '/fundamentals', 'FUND', 'Fundamentals', 'Ricerca'],
+  ['filing', '/filing', 'FILE', 'Filings', 'Ricerca', 'F20'],
   ['factors', '/factors', 'FCTR', 'Factor Lab', 'Rischio'],
   ['montecarlo', '/backtest', 'MTC', 'Monte Carlo', 'Rischio'],
   ['vol', '/vol', 'VOLS', 'Vol Deck', 'Rischio'],
@@ -26,8 +29,9 @@ const destinations = [
   ['mandato', '/mandato', 'MNDT', 'Mandato e Diario', 'Mandato'],
   ['settings', '/settings', 'CONFIG', 'Impostazioni', 'Sistema'],
 ];
-export const NAVIGATION: readonly Destination[] = destinations.map(([id, to, short, label, group], index) => ({
-  id, to, short, label, group, key: `F${index + 1}`, kind: id === 'settings' ? 'settings' : 'page',
+let progressivo = 0;
+export const NAVIGATION: readonly Destination[] = destinations.map(([id, to, short, label, group, fisso]) => ({
+  id, to, short, label, group, key: fisso ?? `F${++progressivo}`, kind: id === 'settings' ? 'settings' : 'page',
 }));
 export const PAGE_DESTINATIONS = NAVIGATION.filter(entry => entry.kind === 'page');
 export const SETTINGS_DESTINATION = NAVIGATION.find(entry => entry.kind === 'settings')!;

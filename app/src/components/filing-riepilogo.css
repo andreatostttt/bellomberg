@@ -1,0 +1,9 @@
+/* Riepilogo di una riga del filing (fase E): Mercati e Fondamentali. */
+.filing-riepilogo { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; padding: 10px 14px; border-radius: 14px;
+  background: var(--bbn-raised, #f6f6f8); color: var(--bbn-text, inherit); font-size: 13px; font-weight: 600; line-height: 1.4; }
+.filing-riepilogo > svg { flex: 0 0 auto; color: var(--bbn-muted, #62626b); }
+.filing-riepilogo b { font-weight: 800; }
+.filing-riepilogo-t { flex: 1 1 200px; min-width: 0; color: var(--bbn-muted, #62626b); overflow-wrap: anywhere; }
+.filing-riepilogo[data-stato="bad"] .filing-riepilogo-t { color: var(--bbn-bad, #d42a3a); }
+.filing-riepilogo-link { color: var(--bbn-accent, #1d56f0); font-weight: 700; text-decoration: none; white-space: nowrap; }
+.filing-riepilogo-link:hover { text-decoration: underline; }

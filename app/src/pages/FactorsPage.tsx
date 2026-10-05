@@ -2,6 +2,7 @@ import { useT } from '@/i18n/provider';
 import { localizePayload } from '@/lib/api-presentation';
 import { leggiDetail, dataIt } from '@/lib/quota';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import ModernPage from '@/components/ModernPage';
 import { Bellomberg } from '@/lib/api';
 import type { PortfolioSnapshot, AdvancedMetrics, PortfolioRisk } from '@/lib/api';
 import {
@@ -14,6 +15,7 @@ import type {
   PayloadFattori, PayloadRiconciliazione, Lancetta, RigaAlpha, Intervallo,
 } from '@/lib/fattori';
 import './factor-riconciliazione.css';
+import './risk-modern.css';
 
 /* ============================================================================
    F6 FACTOR LAB — "RICONCILIAZIONE" (Opus 5, 27/07)
@@ -284,6 +286,7 @@ export default function FactorsPage() {
   const attiva: Lancetta | null = cal.lancette[scelta] || null;
 
   return (
+    <ModernPage page="factors" render={() => (
     <div className="f6r">
 
       {/* ══ TESTATA ══════════════════════════════════════════════════════ */}
@@ -728,6 +731,7 @@ export default function FactorsPage() {
         </div>
       </div>
     </div>
+    )} />
   );
 }
 

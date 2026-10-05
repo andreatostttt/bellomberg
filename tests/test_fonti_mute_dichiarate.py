@@ -30,6 +30,10 @@ def _limiter_pulito(tmp_path, monkeypatch):
     """Stato del rate-limiter mai scritto (fail-open documentato): niente budget, niente
     auto-disable — qui si misurano solo chiavi e negozio."""
     monkeypatch.setattr(na, "_NEWS_RATE_PATH", str(tmp_path / "news_rate_state.json"))
+    # 04/10 (B2): esiti Tiingo/Finnhub di altri test fuori da providers_blocked()
+    from bellomberg.market_data import tiingo_news
+    tiingo_news.reset_status()
+    na.reset_esiti_fonti()
 
 
 def _chiavi(monkeypatch, presenti: bool, tiingo: bool):

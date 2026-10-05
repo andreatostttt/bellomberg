@@ -157,6 +157,7 @@ export const settings = {
   "prices_updated": "PRICES UPDATED",
   "feed_updating": "UPDATING NEWS...",
   "feed_updated": "NEWS UPDATED",
+  "feed_running": "NEWS: ROUND IN PROGRESS",
   "nav_updating": "RECALCULATING NAV...",
   "nav_updated": "NAV RECALCULATED",
   "backup_created_command": "BACKUP CREATED",

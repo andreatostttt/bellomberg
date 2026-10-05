@@ -4,19 +4,23 @@ import { t as tr } from '@/i18n/t';
 import { linguaCorrente, localeDi } from '@/i18n/lingua';
 import { leggiDetail } from '@/lib/quota';
 import { fmtNum } from '@/lib/format';
+import { frase } from '@/lib/frase';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import NewInterfaceBoundary from '@/components/NewInterfaceBoundary';
+import Card, { Segmenti } from '@/components/nuova/Card';
 import {
   Bellomberg, AgentInfo, EnginesInfo, ChatSession, ChatMessage, MandatoMeta,
   requestHeaders, clearSessionAndReload,
 } from '@/lib/api';
-import { Send, Plus, Trash2, Square, Search, Wrench } from 'lucide-react';
+import { Send, Plus, Trash2, Square, Search, Wrench, PanelRightOpen, X, Lightbulb } from 'lucide-react';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import ChatSuggestions from '@/components/ChatSuggestions';
 import NastroEsecuzione, { ToolCall, FlowPoint, fmtKB, fmtMs } from '@/components/NastroEsecuzione';
-import './dashboard-command.css';
-import './chat-desk.css';
+import IconaDesk from './chat/IconaDesk';
+import { parole } from './chat/parole';
+import './chat-nuova.css';
 
 /* ════════════════════════════════════════════════════════════
    F3 v3 "DESK CONVERSAZIONALE" (Opus 5, 26/07)
@@ -49,6 +53,9 @@ interface RuntimeMessage extends Partial<ChatMessage> {
   /** null = il backend DICHIARA token non noti (stream morto prima delle
    *  metriche): non è uno zero, e non si rende come zero (audit/24 B.13). */
   tokens?: { in: number | null; out: number | null };
+  tokensStatus?: 'completo' | 'parziale';
+  tokensMissing?: string[];
+  costEur?: ChatCost | null;
   /* materiale dello stream (solo live: il backend non lo salva) */
   calls?: ToolCall[];
   marks?: Segnale[];
@@ -61,6 +68,15 @@ interface RuntimeMessage extends Partial<ChatMessage> {
   errore?: string;
   erroreKind?: 'stopped' | 'stoppedShort' | 'incomplete' | 'network' | 'unknown';
   requestId?: number;
+}
+
+interface ChatCost {
+  cost: number | null;
+  status: string | null;
+  model: string | null;
+  cacheFields: string | null;
+  fxSource: string | null;
+  nota: string | null;
 }
 
 /** Titolo LETTERALE dal primo messaggio: e' quello che il PM ha scritto, ripulito.
@@ -80,6 +96,19 @@ export function titoloDaMessaggio(q: string, max = 54): string {
 }
 
 const titoloGenerico = (t: string) => /^Chat (?:con|with) /i.test((t || '').trim());
+
+/** Dettagli della risposta aperti o chiusi: una preferenza di chi guarda, non un dato. */
+const CHIAVE_DETTAGLI = 'bellomberg.chat.details.v1';
+function dettagliAperti(): boolean {
+  try { return localStorage.getItem(CHIAVE_DETTAGLI) === 'open'; } catch { return false; }
+}
+type Scheda = 'nastro' | 'fonti' | 'costi';
+/** Iniziale maiuscola per le etichette del catalogo scritte in minuscolo («in ascolto…»). */
+const iniziale = (s: string) => s.charAt(0).toLocaleUpperCase() + s.slice(1);
+
+function ChatPresentation({ render }: { render: () => React.ReactNode }) {
+  return <>{render()}</>;
+}
 
 type ChatProblem = { kind: 'source' | 'create' | 'delete'; detail: string; id?: number };
 function problemText(problem: ChatProblem) {
@@ -113,10 +142,11 @@ export default function Chat() {
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [query, setQuery] = useState('');
   const [hot, setHot] = useState<number | null>(null);
+  const [inspectorOpen, setInspectorOpen] = useState(dettagliAperti);
   const [pin, setPin] = useState<number | null>(null);
   const [daEliminare, setDaEliminare] = useState<ChatSession | null>(null);
-  // archivio diviso per agente (ordine PM 26/07): aperta la sezione dell'agente al desk
-  const [apertiArchivio, setApertiArchivio] = useState<Set<string>>(new Set());
+  const [ambito, setAmbito] = useState<'desk' | 'tutti'>('desk');
+  const [scheda, setScheda] = useState<Scheda>('nastro');
 
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -124,6 +154,7 @@ export default function Chat() {
   const skipFetchRef = useRef<number | null>(null);
   const sendingRef = useRef(false);
   const requestRef = useRef(0);
+  const suggerimentiRef = useRef<HTMLDetailsElement>(null);
 
   useEffect(() => () => {
     ++requestRef.current;
@@ -200,13 +231,14 @@ export default function Chat() {
   }, [activeSession]);
 
   useEffect(() => {
-    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    if (!scrollRef.current) return;
+    if (messages.length === 0) scrollRef.current.scrollTop = 0;
+    else scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages.length]);
 
-  /* la sezione dell'agente scelto al desk si apre da sola, le altre restano chiuse */
   useEffect(() => {
-    if (selectedAgent) setApertiArchivio(new Set([selectedAgent.id]));
-  }, [selectedAgent?.id]);
+    try { localStorage.setItem(CHIAVE_DETTAGLI, inspectorOpen ? 'open' : 'closed'); } catch { /* preferenza solo locale */ }
+  }, [inspectorOpen]);
 
   /* ── selezione ──────────────────────────────────────────── */
   const apriSessione = (s: ChatSession) => {
@@ -214,7 +246,6 @@ export default function Chat() {
     const ag = agents.find(a => a.id === s.specialist);
     if (ag) { setSelectedAgent(ag); setRitirato(null); }
     else setRitirato(s.specialist);         // specialista ritirato: sola lettura
-    setApertiArchivio(prev => new Set([...prev, s.specialist]));
     setActiveSession(s.id);
     setPin(null); setHot(null);
   };
@@ -402,16 +433,32 @@ export default function Chat() {
             }));
           } else if (evtName === 'done') {
             terminalEvent = true;
+            const rawCost = payload?.cost_eur;
+            const costEur: ChatCost | null = rawCost && typeof rawCost === 'object' ? {
+              cost: typeof rawCost.cost === 'number' && Number.isFinite(rawCost.cost) ? rawCost.cost : null,
+              status: typeof rawCost.status === 'string' ? rawCost.status : null,
+              model: typeof rawCost.model === 'string' ? rawCost.model : null,
+              cacheFields: typeof rawCost.cache_fields === 'string' ? rawCost.cache_fields : null,
+              fxSource: typeof rawCost.fx_source === 'string' ? rawCost.fx_source : null,
+              nota: typeof rawCost.nota === 'string' ? rawCost.nota : null,
+            } : null;
             patch(m => ({
               ...m,
               streaming: false,
               durata: ora(),
+              meta: typeof payload?.model === 'string'
+                ? { ...m.meta, model: payload.model } : m.meta,
               ok: payload?.ok !== false,
               iterations: typeof payload?.iterations === 'number' ? payload.iterations : undefined,
               tokens: {
                 in: typeof payload?.tokens_in === 'number' ? payload.tokens_in : null,
                 out: typeof payload?.tokens_out === 'number' ? payload.tokens_out : null,
               },
+              tokensStatus: payload?.tokens_status === 'completo' || payload?.tokens_status === 'parziale'
+                ? payload.tokens_status : undefined,
+              tokensMissing: Array.isArray(payload?.tokens_missing)
+                ? payload.tokens_missing.filter((value: unknown): value is string => typeof value === 'string') : undefined,
+              costEur,
             }));
           } else if (evtName === 'error') {
             terminalEvent = true;
@@ -476,236 +523,228 @@ export default function Chat() {
 
   const sessioneAttiva = sessions.find(s => s.id === activeSession) || null;
   const agenteCorrente = agents.find(agent => agent.id === selectedAgent?.id) || selectedAgent;
-  const colore = agenteCorrente?.color || '#FFA51E';
+  const coloreAgente = agenteCorrente?.color || null;
 
   return (
-    <div className="obsx f3d">
-      {/* ── barra d'assetto ── */}
-      <div className="bar">
-        <span className="lab">{tr('communications.chatDesk')}</span>
-        <span className="sep" />
-        <span className="k">{tr('communications.agent')}</span>
-        <span className="v">
-          {ritirato
-            ? <b className="ko">{ritirato.toUpperCase()} · {tr('communications.retired')}</b>
-            : agenteCorrente
-              ? <><b style={{ color: colore }}>{agenteCorrente.name.toUpperCase()}</b> · <span>{agenteCorrente.role}</span></>
-              : <b className="ko">{tr('communications.none')}</b>}
-        </span>
-        <span className="sep" />
-        <span className="k">{tr('communications.engine')}</span>
-        <span className="v">{modello ? <b>{modello}</b> : <b className="ko">{tr('communications.engineMissing')}</b>}</span>
-        <span className="sep" />
-        <span className="k">{tr('communications.arsenal')}</span>
-        <span className="v">
-          {nStrumenti != null
-            ? <><b>{nStrumenti}</b> {tr('communications.tools')}{calls.length > 0 && <> · <b style={{ color: '#29D3F2' }}>{calls.length} {tr('communications.active')}</b></>}</>
-            : <span style={{ fontWeight: 600, color: '#73829F' }}>{tr('communications.toolsFromStream')}</span>}
-        </span>
-        <span className="sep" />
-        <span className="k">{tr('communications.archive')}</span>
-        <span className="v"><b>{sessions.length}</b> {tr('communications.conversations')}</span>
-        <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 7 }}>
-          <StatoRisposta m={ultimaRisposta} streaming={streaming} />
-        </span>
-      </div>
+    <NewInterfaceBoundary language={linguaCorrente()}>
+    <ChatPresentation render={() => {
+      const w = parole();
+      const idDesk = ritirato || agenteCorrente?.id || '';
+      // Una sessione di un desk ritirato resta aperta in sola lettura con il desk
+      // attivo ancora selezionato: l'intestazione deve dire di chi è la conversazione.
+      const nomeHeader = ritirato ? iniziale(ritirato) : agenteCorrente?.name || tr('communications.none');
+      const sessioniDesk = archivio.filter(s => s.specialist === idDesk);
+      const visibili = ambito === 'tutti' ? archivio : sessioniDesk;
+      const threadTitle = sessioneAttiva?.title || (activeSession ? titoloDaMessaggio(messages.find(m => m.role === 'user')?.content || '') : '') || tr('communications.newConversation');
+      const modelHeader = ultimaRisposta?.meta?.model || modello;
+      const modelHeaderLabel = ultimaRisposta?.meta?.model
+        ? tr('communications.responseModel') : tr('communications.configuredModel');
+      const apriFonti = (n: number) => { setPin(n); setScheda('fonti'); setInspectorOpen(true); };
+      return <div className="f3d chat-modern bbn-chat bbn-font" data-chat-page="" data-details={inspectorOpen ? 'open' : 'closed'}>
+      {/* ── intestazione: agente, conversazione, stato dell'ultima risposta ── */}
+      <header className="bbn-chat-bar chat-modern-agent-header" data-chat-agent={ritirato ? undefined : agenteCorrente?.id}>
+        <IconaDesk id={idDesk} colore={coloreAgente} ritirato={!!ritirato} className="chat-modern-avatar" />
+        <div className="chat-modern-agent-copy">
+          <h1>{nomeHeader}{ritirato && <span className="bbn-warn-pill">{w.retiredDesk}</span>}</h1>
+          <p>
+            <span>{ritirato ? w.readOnly : agenteCorrente?.role || tr('communications.selectToStart')}</span>
+            {' · '}<b title={threadTitle}>{threadTitle}</b>
+          </p>
+        </div>
+        <span className="bbn-grow" />
+        <div className="bbn-chat-status" aria-live="polite">
+          <span className="bbn-chat-status-model chat-modern-model" title={modelHeader || undefined}>
+            {modelHeaderLabel} <b>{modelHeader || tr('communications.modelUnavailable')}</b>
+          </span>
+          <i className="bbn-chat-sep" />
+          <span className="chat-modern-status"><StatoRisposta m={ultimaRisposta} streaming={streaming} /></span>
+          {ultimaRisposta?.durata != null && <span className="num bbn-chat-status-time">{fmtMs(ultimaRisposta.durata)}</span>}
+          {ultimaRisposta && !ultimaRisposta.streaming && !ultimaRisposta.storico && <>
+            <i className="bbn-chat-sep" /><CostoBreve m={ultimaRisposta} />
+          </>}
+        </div>
+        <button type="button" className={'bbn-btn chat-inspector-toggle' + (inspectorOpen ? ' is-on' : '')}
+                aria-expanded={inspectorOpen} aria-controls="chat-inspector-content" title={w.detailsHint}
+                onClick={() => setInspectorOpen(o => !o)}>
+          <PanelRightOpen size={17} aria-hidden="true" /> {w.details}
+          {calls.length > 0 && <span className="bbn-chat-count num">{calls.length}</span>}
+        </button>
+        <button type="button" className="bbn-btn is-primary nuova" onClick={nuovaConversazione}
+                title={tr('communications.newConversationTitle')} aria-label={tr('communications.newConversationAccessible')}>
+          <Plus size={16} aria-hidden="true" /> {w.newConversation}
+        </button>
+      </header>
 
-      <div className="body">
-        {/* ══ sinistra: desk + archivio ══ */}
+      <div className={'body bbn-chat-grid' + (inspectorOpen ? ' has-details' : '')}>
+        {/* ══ sinistra: desk + conversazioni ══ */}
         <div className="cL">
-          <div className="p3">
-            <span className="tick tl" /><span className="tick tr" />
-            <span className="tick bl" /><span className="tick br" />
-            <div className="p3h am">{tr('communications.deskHeading')} <span className="side">{agents.length} {tr('communications.specialists')}</span></div>
+          <Card className="bbn-chat-desks" titolo={tr('communications.deskHeading')}
+                conteggio={`${agents.length} ${tr('communications.specialists')}`}>
             {agentsErr && agents.length === 0 ? (
-              <div className="dec ko">
+              <p className="dec ko bbn-chat-alert">
                 <b>{tr('communications.agentsMissing')}</b> — {agentsErr}{tr('communications.agentsBackendError')}
-              </div>
-            ) : agents.map(a => (
-              <button key={a.id} className={'dk' + (a.id === agenteCorrente?.id && !ritirato ? ' on' : '')}
-                      style={a.id === agenteCorrente?.id && !ritirato ? { borderLeftColor: a.color } : undefined}
-                      onClick={() => { setSelectedAgent(a); setRitirato(null); nuovaConversazione(); }}>
-                <span className="ld" style={{ background: a.color, boxShadow: '0 0 7px ' + a.color }} />
-                <span style={{ minWidth: 0 }}>
-                  <span className="nm" style={{ color: a.id === agenteCorrente?.id && !ritirato ? a.color : '#8D9FC4', display: 'block' }}>
-                    {a.name.toUpperCase()}
-                  </span>
-                  <span className="rl" style={{ display: 'block' }}>{a.role}</span>
+              </p>
+            ) : <div className="bbn-chat-desk-list">{agents.map(a => {
+              const attivo = a.id === agenteCorrente?.id && !ritirato;
+              const n = sessions.filter(s => s.specialist === a.id).length;
+              return <button key={a.id} type="button" data-desk-id={a.id} title={a.name} aria-pressed={attivo}
+                             className={'dk' + (attivo ? ' on' : '')}
+                             onClick={() => { setSelectedAgent(a); setRitirato(null); nuovaConversazione(); }}>
+                <IconaDesk id={a.id} colore={a.color} dimensione="sm" className="chat-modern-specialist-avatar" />
+                <span className="bbn-chat-desk-copy">
+                  <span className="nm">{a.name}</span>
+                  <span className="rl">{a.role}</span>
                 </span>
-                <span className="rt" title={tr('communications.conversationsWith', { a: sessions.filter(s => s.specialist === a.id).length, b: a.name })}>
-                  <Istogramma n={sessions.filter(s => s.specialist === a.id).length}
-                              max={Math.max(1, ...agents.map(x => sessions.filter(s => s.specialist === x.id).length))}
-                              colore={a.id === agenteCorrente?.id ? a.color : null} />
-                  <span className="tl" style={{ display: 'block' }}>
-                    <b>{sessions.filter(s => s.specialist === a.id).length}</b>
-                  </span>
-                </span>
-              </button>
-            ))}
-          </div>
+                {n > 0 && <span className="tl num" title={tr('communications.conversationsWith', { a: n, b: a.name })}>{fmtNum(n, 0)}</span>}
+              </button>;
+            })}</div>}
+          </Card>
 
-          <div className="p3" style={{ flex: 1, minHeight: 0 }}>
-            <span className="tick tl" /><span className="tick tr" />
-            <span className="tick bl" /><span className="tick br" />
-            <div className="p3h">
-              {tr('communications.archive')}
-              <span className="side">
-                {sessions.filter(s => AGENTI_RITIRATI.includes(s.specialist)).length} {tr('communications.legacyCount')}
-              </span>
-              <button className="nuova" onClick={nuovaConversazione}
-                      title={tr('communications.newConversationTitle')}
-                      aria-label={tr('communications.newConversationAccessible')}>
-                <Plus size={11} />
-              </button>
-            </div>
-            <div className="srch">
-              <Search size={10} style={{ color: '#73829F', flexShrink: 0 }} />
+          <Card className="bbn-chat-archive" titolo={w.conversations} conteggio={fmtNum(visibili.length, 0)}
+                azioni={<Segmenti etichetta={w.scope} valore={ambito} onChange={setAmbito}
+                  opzioni={[{ id: 'desk', testo: w.scopeDesk }, { id: 'tutti', testo: w.scopeAll }]} />}>
+            <label className="srch">
+              <Search size={15} aria-hidden="true" />
               <input value={query} onChange={e => setQuery(e.target.value)}
-                     placeholder={tr('communications.searchConversations')} aria-label={tr('communications.searchArchive')} />
-              <span className="cnt">{archivio.length}/{sessions.length}</span>
-            </div>
-            <div className="arch">
+                     placeholder={iniziale(tr('communications.searchConversations'))} aria-label={tr('communications.searchArchive')} />
+            </label>
+            <div className="arch bbn-scroll">
               {sessionsErr && (
-                <div className="dec ko">
+                <p className="dec ko bbn-chat-alert">
                   <b>{tr('communications.partialArchive')}</b> — {problemText(sessionsErr)}{tr('communications.partialArchiveNote')}
-                </div>
+                </p>
               )}
-              {archivio.length === 0 && !sessionsErr ? (
-                <div className="vuoto">
+              {visibili.length === 0 && !sessionsErr ? (
+                <p className="vuoto bbn-empty">
                   {query ? <>{tr('communications.noConversationFor')} <b>“{query}”</b>.</> : <>{tr('communications.noArchivedConversations')}</>}
-                </div>
+                </p>
               ) : (
-                <Archivio righe={archivio} agents={agents} attiva={activeSession}
-                          onApri={apriSessione} onElimina={setDaEliminare}
-                          aperti={apertiArchivio} ricerca={query.trim().length > 0}
-                          onApri1={id => setApertiArchivio(prev => {
-                            const n = new Set(prev);
-                            if (n.has(id)) n.delete(id); else n.add(id);
-                            return n;
-                          })} />
+                <ArchivioConversazioni righe={visibili} agents={agents} tutti={ambito === 'tutti'}
+                  attiva={activeSession} onApri={apriSessione} onElimina={setDaEliminare} />
               )}
             </div>
-          </div>
+          </Card>
         </div>
 
-        {/* ══ centro: nastro + conversazione + composer ══ */}
-        <div className="cM">
-          <NastroEsecuzione
-            calls={calls}
-            flow={ultimaRisposta?.flow || []}
-            durata={ultimaRisposta?.durata ?? null}
-            streaming={!!ultimaRisposta?.streaming}
-            disponibile={!!ultimaRisposta && !ultimaRisposta.storico}
-            motivoAssenza={!ultimaRisposta
-              ? tr('communications.noReplyForTape')
-              : undefined}
-            hot={hot} onHot={setHot} pin={pin} onPin={setPin}
-          />
-
-          <div className="p3 am" style={{ flex: 1, minHeight: 0 }}>
-            <span className="tick tl" /><span className="tick tr" />
-            <span className="tick bl" /><span className="tick br" />
-            <div className="p3h am">
-              {sessioneAttiva
-                ? <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{sessioneAttiva.title}</span>
-                : tr('communications.newConversation')}
-              <span className="side">
-                {sessioneAttiva
-                  ? <>#{sessioneAttiva.id} · {dataIt(sessioneAttiva.last_activity || sessioneAttiva.started_at)}
-                      {sessioneAttiva.msg_count != null && <> · {sessioneAttiva.msg_count} {tr('communications.messages')}</>}</>
-                  : tr('communications.autoSaved')}
-              </span>
-            </div>
-            <div className="conv" ref={scrollRef}>
+        {/* ══ centro: conversazione + composer ══ */}
+        <section className="cM bbn-card bbn-chat-main" aria-label={threadTitle}>
+          <div className="conv" ref={scrollRef}>
+            <div className="bbn-chat-lane">
+              {ritirato && <p className="dec warn bbn-chat-alert"><b>{w.retiredDesk}</b> — {w.retiredBanner(iniziale(ritirato))}</p>}
               {msgsErr && (
-                <div className="dec ko">
+                <p className="dec ko bbn-chat-alert">
                   <b>{tr('communications.conversationUnavailable')}</b> — {problemText(msgsErr)}{tr('communications.conversationUnavailableNote')}
-                </div>
+                </p>
               )}
               {!agenteCorrente && !ritirato && !agentsErr && (
-                <div className="vuoto">{tr('communications.selectSpecialist')}</div>
+                <p className="vuoto bbn-empty">{tr('communications.selectSpecialist')}</p>
               )}
-              {messagesLoading && <div className="vuoto">{tr('communications.loadingConversation')}</div>}
+              {messagesLoading && <p className="vuoto bbn-empty" role="status">{tr('communications.loadingConversation')}</p>}
               {messages.length === 0 && agenteCorrente && !msgsErr && !messagesLoading && (
-                <Ingresso agente={agenteCorrente} modello={modello}
+                <Ingresso agente={agenteCorrente}
                           disabled={streaming || messagesLoading || !!ritirato} onPrompt={p => sendMessage(p)} />
               )}
               {messages.map((m, i) => (
-                <Turno key={m.id ?? 'live-' + i} m={m} agente={agenteCorrente}
-                       hot={hot} pin={pin} onHot={setHot} onPin={setPin} />
+                <Turno key={m.id ?? 'live-' + i} m={m} agente={agenteCorrente} ritirato={ritirato}
+                       hot={hot} pin={pin} onHot={setHot} onApri={apriFonti} />
               ))}
             </div>
           </div>
 
           <div className="comp">
-            {messages.length > 0 && agenteCorrente && !ritirato && <details className="chat-followups">
-              <summary>{tr('communications.deskQuestions')}</summary>
-              <ChatSuggestions agent={agenteCorrente.id} name={agenteCorrente.name}
-                disabled={streaming || messagesLoading} onPrompt={p => void sendMessage(p)} />
-            </details>}
-            <div className="field">
-              <textarea ref={inputRef} value={input} rows={2}
-                        onChange={e => setInput(e.target.value)} onKeyDown={onKey}
-                         disabled={!agenteCorrente || streaming || messagesLoading || !!ritirato}
-                        placeholder={ritirato
-                          ? tr('communications.retiredPlaceholder', { a: ritirato })
-                          : agenteCorrente
-                            ? tr('communications.askPlaceholder', { a: agenteCorrente.name })
-                            : tr('communications.selectToStart')} />
-              {streaming ? (
-                <button className="send stop" onClick={stopStream}><Square size={11} /> {tr('communications.stop')}</button>
-              ) : (
-                <button className="send" onClick={() => sendMessage()}
-                        disabled={!agenteCorrente || !input.trim() || messagesLoading || !!ritirato}>
-                  <Send size={11} /> {tr('communications.send')}
-                </button>
-              )}
-            </div>
-            <div className="flow">
-              <Flusso m={ultimaRisposta} />
-              <span className="r">
-                <span>{fmtNum(input.length, 0)} {tr('communications.characters')}</span>
-                <span style={{ color: '#22304F' }}>|</span>
-                <span>{modello || tr('communications.modelUnavailable')}{maxIter != null && tr('communications.maxIterations', { a: maxIter })}</span>
-              </span>
+            <div className="bbn-chat-lane">
+              {messages.length > 0 && agenteCorrente && !ritirato && <details className="chat-followups" ref={suggerimentiRef}>
+                <summary><Lightbulb size={15} aria-hidden="true" /> {w.suggestions}</summary>
+                <ChatSuggestions agent={agenteCorrente.id} name={agenteCorrente.name}
+                  disabled={streaming || messagesLoading} onPrompt={p => {
+                    if (suggerimentiRef.current) suggerimentiRef.current.open = false;
+                    void sendMessage(p);
+                  }} />
+              </details>}
+              <div className="field">
+                <textarea id="chat-message" ref={inputRef} value={input} rows={2}
+                          onChange={e => setInput(e.target.value)} onKeyDown={onKey}
+                          disabled={!agenteCorrente || streaming || messagesLoading || !!ritirato}
+                          aria-label={tr('communications.askPlaceholderShort', { a: agenteCorrente?.name || '' })}
+                          placeholder={ritirato
+                            ? tr('communications.retiredPlaceholder', { a: ritirato })
+                            : agenteCorrente
+                              ? tr('communications.askPlaceholderShort', { a: agenteCorrente.name })
+                              : tr('communications.selectToStart')} />
+                {streaming ? (
+                  <button type="button" className="send stop bbn-btn" onClick={stopStream}><Square size={13} aria-hidden="true" /> {tr('communications.stop')}</button>
+                ) : (
+                  <button type="button" className="send bbn-btn is-primary" onClick={() => sendMessage()}
+                          disabled={!agenteCorrente || !input.trim() || messagesLoading || !!ritirato}>
+                    <Send size={14} aria-hidden="true" /> {tr('communications.send')}
+                  </button>
+                )}
+              </div>
+              <p className="chat-modern-composer-hint">
+                <kbd>{tr('communications.enterKey')}</kbd> {tr('communications.enterToSend')} <span>·</span> <kbd>{tr('communications.shiftEnterKey')}</kbd> {tr('communications.shiftEnterNewline')}
+              </p>
             </div>
           </div>
-        </div>
+        </section>
 
-        {/* ══ destra: catena + arsenale + telemetria ══ */}
-        <div className="cR">
-          <div className="p3 cy" style={{ flex: 1, minHeight: 0 }}>
-            <span className="tick tl" /><span className="tick tr" />
-            <span className="tick bl" /><span className="tick br" />
-            <div className="p3h c">
-              {tr('communications.custodyChain')}
-              <span className="side">{calls.length ? calls.filter(c => c.ok === false).length + ' KO / ' + calls.length : '—'}</span>
+        {/* ══ destra, su richiesta: nastro, fonti, costi ══ */}
+        <section id="chat-inspector-content" className={'cR bbn-card bbn-chat-details' + (inspectorOpen ? ' is-expanded' : ' is-collapsed')}
+                 aria-label={w.details} hidden={!inspectorOpen}>
+          <header className="bbn-card-head">
+            <h2>{w.details}</h2>
+            <span className="bbn-grow" />
+            <button type="button" className="bbn-icon-btn chat-inspector-close" title={w.detailsClose} aria-label={w.detailsClose}
+                    onClick={() => setInspectorOpen(false)}><X size={16} aria-hidden="true" /></button>
+          </header>
+          <div className="bbn-chat-details-sum">
+            <StatoRisposta m={ultimaRisposta} streaming={streaming} />
+            {ultimaRisposta?.durata != null && <b className="num">{fmtMs(ultimaRisposta.durata)}</b>}
+            {calls.length > 0 && <span>{w.tools(calls.length)}</span>}
+            {ultimaRisposta && !ultimaRisposta.streaming && !ultimaRisposta.storico && <CostoBreve m={ultimaRisposta} />}
+          </div>
+          <div className="bbn-chat-details-tabs">
+            <Segmenti etichetta={w.detailsTabs} valore={scheda} onChange={setScheda} opzioni={[
+              { id: 'nastro', testo: w.tabTape, title: tr('communications.tapeTitle') },
+              { id: 'fonti', testo: w.tabSources, title: tr('communications.custodyChain') },
+              { id: 'costi', testo: w.tabCosts, title: tr('communications.responseTelemetry') },
+            ]} />
+          </div>
+          <div className="bbn-chat-details-body bbn-scroll">
+            {!ultimaRisposta && <p className="bbn-empty chat-section-empty">{w.detailsEmpty}</p>}
+            <div className="bbn-chat-pane" data-pane="nastro" hidden={scheda !== 'nastro' || !ultimaRisposta}>
+              <NastroEsecuzione
+                calls={calls}
+                flow={ultimaRisposta?.flow || []}
+                durata={ultimaRisposta?.durata ?? null}
+                streaming={!!ultimaRisposta?.streaming}
+                disponibile={!!ultimaRisposta && !ultimaRisposta.storico}
+                motivoAssenza={!ultimaRisposta ? tr('communications.noReplyForTape') : undefined}
+                hot={hot} onHot={setHot} pin={pin} onPin={setPin}
+              />
+              {ultimaRisposta && !ultimaRisposta.storico && <p className="flow"><Flusso m={ultimaRisposta} /></p>}
             </div>
-            <div className="cat">
-              <Catena calls={calls} m={ultimaRisposta} hot={hot} pin={pin} onHot={setHot} onPin={setPin} />
-              {nStrumenti != null && (
-                <div className="ars">
-                  <div className="h">
-                    {agenteCorrente ? tr('communications.toolsetFor', { a: agenteCorrente.name }) : tr('communications.arsenal')}
-                    <b>{calls.length} / {nStrumenti} {tr('communications.active')}</b>
+            <div className="bbn-chat-pane p3 cy" data-pane="fonti" hidden={scheda !== 'fonti' || !ultimaRisposta}>
+              <div className="cat">
+                <Catena calls={calls} m={ultimaRisposta} hot={hot} pin={pin} onHot={setHot} onPin={setPin} />
+                {nStrumenti != null && (
+                  <div className="ars">
+                    <div className="h">
+                      {w.toolsUsed(calls.length, nStrumenti, agenteCorrente?.name || tr('communications.agentUpper'))}
+                    </div>
+                    <div className="grid">
+                      {Array.from({ length: Math.min(nStrumenti, 60) }, (_, k) => (
+                        <i key={k} className={k < calls.length ? 'on' : ''} />
+                      ))}
+                    </div>
                   </div>
-                  <div className="grid">
-                    {Array.from({ length: Math.min(nStrumenti, 60) }, (_, k) => (
-                      <i key={k} className={k < calls.length ? 'on' : ''} />
-                    ))}
-                  </div>
-                </div>
-              )}
+                )}
+              </div>
+            </div>
+            <div className="bbn-chat-pane" data-pane="costi" hidden={scheda !== 'costi' || !ultimaRisposta}>
+              <Telemetria m={ultimaRisposta} maxIter={maxIter} modello={modello} />
             </div>
           </div>
-
-          <div className="p3" style={{ flex: '0 0 auto' }}>
-            <span className="tick tl" /><span className="tick tr" />
-            <span className="tick bl" /><span className="tick br" />
-            <div className="p3h">{tr('communications.responseTelemetry')}</div>
-            <Telemetria m={ultimaRisposta} maxIter={maxIter} modello={modello} />
-          </div>
-        </div>
+        </section>
       </div>
 
       <ConfirmDialog
@@ -722,7 +761,9 @@ export default function Chat() {
         onConfirm={eliminaConfermata}
         onCancel={() => setDaEliminare(null)}
       />
-    </div>
+      </div>;
+    }} />
+    </NewInterfaceBoundary>
   );
 }
 
@@ -747,101 +788,46 @@ function gruppoData(s?: string) {
   return tr('communications.earlier');
 }
 
-function Istogramma({ n, max, colore }: { n: number; max: number; colore: string | null }) {
-  const h = Math.max(2, Math.round((n / Math.max(1, max)) * 10));
-  return (
-    <span className="fdr">
-      {Array.from({ length: 7 }, (_, k) => (
-        <i key={k} style={{
-          height: Math.max(2, Math.min(10, Math.round(h * (0.55 + 0.55 * Math.abs(Math.sin((n + k) * 1.9)))))),
-          background: colore ? colore + '99' : undefined,
-        }} />
-      ))}
-    </span>
-  );
-}
-
-/** L'archivio e' diviso PER AGENTE (ordine del PM 26/07): ogni specialista ha la sua
- *  sezione, i ritirati in coda. Aperta quella dell'agente al desk; con la ricerca
- *  attiva si aprono tutte le sezioni che hanno risultati. */
-function Archivio({ righe, agents, attiva, onApri, onElimina, aperti, onApri1, ricerca }: {
-  righe: ChatSession[]; agents: AgentInfo[]; attiva: number | null;
-  onApri: (s: ChatSession) => void; onElimina: (s: ChatSession) => void;
-  aperti: Set<string>; onApri1: (id: string) => void; ricerca: boolean;
-}) {
-  const tr = useT();
-  const ordine: { id: string; nome: string; colore: string; legacy: boolean }[] = [
-    ...agents.map(a => ({ id: a.id, nome: a.name, colore: a.color, legacy: false })),
-    ...Array.from(new Set(righe.map(s => s.specialist)))
-      .filter(id => !agents.some(a => a.id === id))
-      .map(id => ({ id, nome: id, colore: '#5A6480', legacy: true })),
-  ];
-
-  return (
-    <>
-      {ordine.map(g => {
-        const sue = righe.filter(s => s.specialist === g.id);
-        if (ricerca && sue.length === 0) return null;      // in ricerca spariscono i gruppi vuoti
-        const aperto = ricerca ? sue.length > 0 : aperti.has(g.id);
-        return (
-          <div key={g.id}>
-            <button className={'grp' + (aperto ? ' on' : '')} onClick={() => onApri1(g.id)}
-                    aria-expanded={aperto}>
-              <span className="ld" style={{ background: g.colore, boxShadow: aperto ? '0 0 7px ' + g.colore : 'none' }} />
-              <span className="gnm" style={aperto ? { color: g.colore } : undefined}>{g.nome.toUpperCase()}</span>
-              {g.legacy && <span className="lg">{tr('communications.retired')}</span>}
-              <span className="gn">{sue.length}</span>
-              <span className="chev">{aperto ? '▾' : '▸'}</span>
-            </button>
-            {aperto && (sue.length === 0
-              ? <div className="vuoto" style={{ padding: '8px 10px', fontSize: 9 }}>{tr('communications.noConversationWith')} {g.nome}.</div>
-              : <RigheArchivio righe={sue} agents={agents} attiva={attiva} onApri={onApri} onElimina={onElimina} />)}
-          </div>
-        );
-      })}
-    </>
-  );
-}
-
-function RigheArchivio({ righe, agents, attiva, onApri, onElimina }: {
-  righe: ChatSession[]; agents: AgentInfo[]; attiva: number | null;
+/** Conversazioni del desk (o di tutti i desk), già ordinate per attività, divise per
+ *  giorno. In «Tutti» ogni riga porta l'icona del suo desk; i desk ritirati la pastiglia
+ *  «Sola lettura». La riga si apre con un clic, il cestino chiede conferma. */
+function ArchivioConversazioni({ righe, agents, tutti, attiva, onApri, onElimina }: {
+  righe: ChatSession[]; agents: AgentInfo[]; tutti: boolean; attiva: number | null;
   onApri: (s: ChatSession) => void; onElimina: (s: ChatSession) => void;
 }) {
   const tr = useT();
+  const w = parole();
   const out: JSX.Element[] = [];
+  let gruppo = '';
   righe.forEach(s => {
+    const quando = s.last_activity || s.started_at;
+    const g = gruppoData(quando);
+    if (g !== gruppo) { gruppo = g; out.push(<p key={'g-' + s.id} className="bbn-chat-day">{frase(g)}</p>); }
+    // The list endpoint already supplies the first question; no detail fetch is needed.
+    const preview = (s as ChatSession & { first_user_message?: string | null }).first_user_message;
     const ag = agents.find(a => a.id === s.specialist);
     const legacy = !ag;
-    const colore = ag?.color || '#5A6480';
     const vuota = s.msg_count === 0;
     const generico = titoloGenerico(s.title);
+    const date = new Date(String(quando).replace(' ', 'T'));
+    const days = Math.floor((Date.now() - date.getTime()) / 864e5);
+    const relative = !Number.isFinite(days) ? dataIt(s.started_at)
+      : days <= 0 ? date.toLocaleTimeString(localeDi(linguaCorrente()), { hour: '2-digit', minute: '2-digit' })
+      : new Intl.RelativeTimeFormat(localeDi(linguaCorrente()), { numeric: 'auto' }).format(-days, 'day');
     out.push(
-      <div className="sess-wrap" key={s.id} style={{ position: 'relative' }}>
-        <button className={'sess' + (attiva === s.id ? ' on' : '')} onClick={() => onApri(s)}>
-          <span className="ld" style={vuota ? { background: '#22304F' }
-            : { background: colore, boxShadow: '0 0 6px ' + colore + '99' }} />
-          <span style={{ minWidth: 0, flex: 1 }}>
-            <span className={'ttl' + (vuota || generico ? ' gen' : '')} style={{ display: 'block' }}>
-              {vuota && generico ? tr('communications.unusedConversation') : s.title}
-            </span>
-            <span className="meta">
-              {/* l'agente non si ripete: e' il titolo della sezione */}
-              {[tr('communications.today'), tr('communications.yesterday')].includes(gruppoData(s.last_activity || s.started_at)) && (
-                <span className="who" style={{ color: '#6E5A2E' }}>
-                  {gruppoData(s.last_activity || s.started_at)}
-                </span>
-              )}
-              <span>{dataIt(s.last_activity || s.started_at)}</span>
-              <span>{s.msg_count != null ? tr('communications.messageCount', { a: fmtNum(s.msg_count, 0) }) : tr('communications.messagesUnavailable')}</span>
-              {legacy && <span className="lg">{tr('communications.readOnly')}</span>}
-              {generico && !vuota && <span style={{ fontWeight: 600, color: '#73829F' }}>{tr('communications.titlePending')}</span>}
-            </span>
+      <div className="sess-wrap" key={s.id}>
+        <button type="button" className={'sess' + (attiva === s.id ? ' on' : '')} onClick={() => onApri(s)}
+                aria-current={attiva === s.id ? 'true' : undefined}>
+          <span className="ttl" title={s.title}>{vuota && generico ? tr('communications.unusedConversation') : s.title}</span>
+          <time className="meta num" title={dataIt(quando)}>{relative}</time>
+          <span className="chat-session-preview">
+            {tutti && <IconaDesk id={s.specialist} colore={ag?.color} ritirato={legacy} dimensione="xs" />}
+            {legacy && <span className="bbn-warn-pill">{w.readOnly}</span>}
+            <span title={preview || undefined}>{preview || (vuota ? tr('communications.unusedConversation') : tr('communications.previewUnavailable'))}</span>
           </span>
         </button>
-        <button className="del" title={tr('communications.delete')} aria-label={tr('communications.deleteAccessible', { a: s.id })}
-                onClick={e => { e.stopPropagation(); onElimina(s); }}>
-          <Trash2 size={10} />
-        </button>
+        <button type="button" className="del bbn-icon-btn" title={tr('communications.delete')} aria-label={tr('communications.deleteAccessible', { a: s.id })}
+                onClick={e => { e.stopPropagation(); onElimina(s); }}><Trash2 size={14} aria-hidden="true" /></button>
       </div>,
     );
   });
@@ -850,40 +836,39 @@ function RigheArchivio({ righe, agents, attiva, onApri, onElimina }: {
 
 function StatoRisposta({ m, streaming }: { m: RuntimeMessage | null; streaming: boolean }) {
   const tr = useT();
-  if (streaming) return (<><span className="ld a" /><span className="v" style={{ fontSize: 9, color: '#8D9FC4' }}>{tr('communications.listening')}</span></>);
-  if (!m) return <span className="v" style={{ fontSize: 9, fontWeight: 600, color: '#73829F' }}>{tr('communications.noResponseRunning')}</span>;
-  if (m.errore) return (<><span className="ld r" /><span className="v ko" style={{ fontSize: 9 }}>{responseError(m)}</span></>);
-  if (m.storico) return <span className="v" style={{ fontSize: 9, fontWeight: 600, color: '#73829F' }}>{tr('communications.archivedConversation')}</span>;
-  if (m.ok === false) return (<><span className="ld r" /><span className="v ko" style={{ fontSize: 9 }}>{tr('communications.streamError')}</span></>);
-  return (<><span className="ld g" /><span className="v" style={{ fontSize: 9, color: '#8D9FC4' }}>
-    {tr('communications.streamComplete')}{m.iterations != null && tr(m.iterations === 1 ? 'communications.streamIterationsOne' : 'communications.streamIterationsMany', { a: m.iterations })}
-  </span></>);
+  if (streaming) return <span className="bbn-pill is-acc"><i className="bbn-chat-pulse" aria-hidden="true" />{iniziale(tr('communications.listening'))}</span>;
+  if (!m) return <span className="bbn-pill is-piatto">{iniziale(tr('communications.noResponseRunning'))}</span>;
+  if (m.errore) return <span className="bbn-pill is-giu ko" title={responseError(m)}><i className="bbn-chat-dot" aria-hidden="true" />{iniziale(responseError(m) || '')}</span>;
+  if (m.storico) return <span className="bbn-pill is-piatto">{iniziale(tr('communications.archivedConversation'))}</span>;
+  if (m.ok === false) return <span className="bbn-pill is-giu ko"><i className="bbn-chat-dot" aria-hidden="true" />{iniziale(tr('communications.streamError'))}</span>;
+  return <span className="bbn-pill is-su"><i className="bbn-chat-dot" aria-hidden="true" />
+    {iniziale(tr('communications.streamComplete'))}{m.iterations != null && tr(m.iterations === 1 ? 'communications.streamIterationsOne' : 'communications.streamIterationsMany', { a: m.iterations })}
+  </span>;
 }
 
 function Flusso({ m }: { m: RuntimeMessage | null }) {
   const tr = useT();
   const flow = m?.flow || [];
-  if (flow.length < 3) return <span style={{ fontWeight: 600, color: '#73829F' }}>{tr('communications.flowNoSamples')}</span>;
-  const rates = flow.map((f, i) => i ? (f.len - flow[i - 1].len) / Math.max(1, f.t - flow[i - 1].t) : 0);
-  const max = Math.max(...rates, 1e-6);
+  if (flow.length < 3) return <span className="chat-modern-note">{iniziale(tr('communications.flowNoSamples').toLocaleLowerCase())}</span>;
   const car = flow[flow.length - 1].len;
   const sec = (flow[flow.length - 1].t - flow[0].t) / 1000;
   return (
     <>
-      <span style={{ color: '#29D3F2' }}>{tr('communications.flow')}</span>
-      <span className="sp">
-        {rates.slice(-26).map((r, k) => <i key={k} style={{ height: Math.max(2, Math.round(11 * (r / max))) }} />)}
-      </span>
+      <span className="chat-modern-flowlabel">{frase(tr('communications.flow'))}</span>{' '}
       <span>
         {tr('communications.flowMeasured', { a: car.toLocaleString(localeDi(linguaCorrente()), { useGrouping: true }), b: sec.toLocaleString(localeDi(linguaCorrente()), { maximumFractionDigits: 1, useGrouping: true }) })}
         {sec > 0 && tr('communications.flowRate', { a: Math.round(car / sec).toLocaleString(localeDi(linguaCorrente()), { useGrouping: true }) })}
       </span>
       {m?.tokens && (
         <>
-          <span style={{ color: '#22304F' }}>|</span>
-          <span>{m.tokens.in != null && m.tokens.out != null
+          {' · '}
+          {m.tokensStatus === 'parziale' ? <>
+            <span>in {m.tokens.in?.toLocaleString(localeDi(linguaCorrente()), { useGrouping: true }) ?? tr('communications.unavailable')}
+              {' · '}out {m.tokens.out?.toLocaleString(localeDi(linguaCorrente()), { useGrouping: true }) ?? tr('communications.unavailable')}</span>
+            {' '}<small className="chat-modern-telemetry-note">{tr('communications.tokensUsagePartial')}</small>
+          </> : <span>{m.tokens.in != null && m.tokens.out != null
             ? `in ${m.tokens.in.toLocaleString(localeDi(linguaCorrente()), { useGrouping: true })} · out ${m.tokens.out.toLocaleString(localeDi(linguaCorrente()), { useGrouping: true })}`
-            : tr('communications.tokensMissingPartial')}</span>
+            : tr('communications.tokensMissingPartial')}</span>}
         </>
       )}
     </>
@@ -897,9 +882,6 @@ function Catena({ calls, m, hot, pin, onHot, onPin }: {
 }) {
   const tr = useT();
   if (!m) return (
-    /* Righe SINGOLE: la colonna e' larga 330px, cioe' ~45 caratteri a 12px.
-       Erano tre righe di prosa in un pannello che, a riposo, non ha altro da
-       dire. */
     <div className="catvuoto">
       {tr('communications.chainNoResponse')}
       <div className="nota1">{tr('communications.chainHint')}</div>
@@ -922,21 +904,16 @@ function Catena({ calls, m, hot, pin, onHot, onPin }: {
     <>
       {calls.map(c => (
         <div key={c.id}
-             className={'ev' + (sel === c.n ? ' hot' : '') + (c.ok === false ? ' ko' : '')}
+             className={'ev' + (sel === c.n ? ' hot' : '') + (c.ok === false ? ' ko' : c.ok == null ? ' run' : '')}
              onMouseEnter={() => onHot(c.n)} onMouseLeave={() => onHot(null)}
              onClick={() => onPin(pin === c.n ? null : c.n)}>
-          <div className="r1">
-            <span className="ix">[{c.n}]</span>
-            <span className={'ld ' + (c.ok === false ? 'r' : c.ok == null ? 'a' : 'g')} />
-            <span className="tn">{c.name}</span>
-            <span className="kb">{fmtKB(c.bytes) ?? (c.ok == null ? tr('communications.inProgressEllipsis') : tr('communications.unavailable'))}</span>
-          </div>
-          <div className="r2">
-            <span className="arg">{tr('communications.iteration')} {c.iteration}</span>
-            <span className="rt">{c.t1 != null ? fmtMs(c.t1 - c.t0) : tr('communications.sinceStart', { a: fmtMs(c.t0) ?? tr('communications.unavailable') })}</span>
-          </div>
+          <span className="ix num" aria-label={'[' + c.n + ']'}>{c.n}</span>
+          <span className="tn">{c.name}</span>
+          <span className="kb num">{fmtKB(c.bytes) ?? (c.ok == null ? tr('communications.inProgressEllipsis') : tr('communications.unavailable'))}
+            {' · '}{c.t1 != null ? fmtMs(c.t1 - c.t0) : tr('communications.sinceStart', { a: fmtMs(c.t0) ?? tr('communications.unavailable') })}</span>
+          <span className="arg">{tr('communications.iteration')} {c.iteration}</span>
           {c.ok === false && (
-            <div className="warn">{tr('communications.toolFailureWarning')}</div>
+            <span className="warn">{tr('communications.toolFailureWarning')}</span>
           )}
           {sel === c.n && c.preview && <div className="prev"><small>{tr('communications.originalSource')}</small><div>{c.preview}</div></div>}
         </div>
@@ -951,24 +928,33 @@ function Telemetria({ m, maxIter, modello }: {
   const tr = useT();
   const iter = m?.iterations ?? null;
   const cap = maxIter ?? 8;
+  const fmt = (n: number) => n.toLocaleString(localeDi(linguaCorrente()), { useGrouping: true });
   return (
-    <div className="tel">
-      <div>
-        <div className="telrow">{tr('communications.toolIterations')}
-          {iter != null ? <b className="am">{iter} / {maxIter ?? '?'}</b> : <b className="nd">{tr('communications.unavailable')}</b>}
-        </div>
-        <div className="iter">
-          {Array.from({ length: Math.min(cap, 12) }, (_, k) => (
-            <i key={k} className={iter != null && k < iter ? 'on' : ''} />
-          ))}
-        </div>
+    <dl className="tel bbn-stats">
+      <div className="bbn-chat-stat-wide"><CostoRisposta m={m} /></div>
+      <div className="telrow">
+        <dt>{tr('communications.toolIterations')}</dt>
+        {iter != null ? <dd className="num">{iter} / {maxIter ?? '?'}</dd> : <dd className="nd">{tr('communications.unavailable')}</dd>}
+        <span className="iter" aria-hidden="true">
+          {Array.from({ length: Math.min(cap, 12) }, (_, k) => <i key={k} className={iter != null && k < iter ? 'on' : ''} />)}
+        </span>
       </div>
-      <div className="telrow">{tr('communications.tokenInOut')}
+      <div className="telrow">
+        <dt>{tr('communications.duration')}</dt>
+        {m?.durata != null ? <dd className="num">{fmtMs(m.durata)}</dd> : <dd className="nd">{tr('communications.unavailable')}</dd>}
+      </div>
+      <div className="telrow">
+        <dt>{tr('communications.tokenInOut')}</dt>
         {m?.tokens
-          ? (m.tokens.in != null && m.tokens.out != null
-              ? <b>{m.tokens.in.toLocaleString(localeDi(linguaCorrente()), { useGrouping: true })} / {m.tokens.out.toLocaleString(localeDi(linguaCorrente()), { useGrouping: true })}</b>
-              : <b className="nd">{tr('communications.tokenMetricsLost')}</b>)
-          : <b className="nd">{!m ? tr('communications.unavailable')
+          ? (m.tokensStatus === 'parziale'
+              ? <dd className="num">{m.tokens.in != null ? fmt(m.tokens.in) : tr('communications.unavailable')}
+                  {' / '}{m.tokens.out != null ? fmt(m.tokens.out) : tr('communications.unavailable')}
+                  <small className="chat-modern-telemetry-note">{tr('communications.tokensUsagePartial')}</small>
+                </dd>
+              : m.tokens.in != null && m.tokens.out != null
+              ? <dd className="num">{fmt(m.tokens.in)} / {fmt(m.tokens.out)}</dd>
+              : <dd className="nd">{tr('communications.tokenMetricsLost')}</dd>)
+          : <dd className="nd">{!m ? tr('communications.unavailable')
               : m.storico ? tr('communications.tokensNotDelivered')
               /* «a fine risposta» SOLO mentre lo stream e' vivo: e' l'unico stato
                  in cui i token arriveranno davvero. A stream chiuso senza `done`
@@ -979,76 +965,113 @@ function Telemetria({ m, maxIter, modello }: {
                  `error` e il `done` che lo segue sempre (fra i due il backend fa
                  una scrittura SQLite e un to_thread: non e' un istante). */
               : m.streaming ? tr('communications.tokensAtEnd')
-                : tr('communications.tokensNoDone')}</b>}
-      </div>
-      <div className="telrow">{tr('communications.duration')}
-        {m?.durata != null ? <b>{fmtMs(m.durata)}</b> : <b className="nd">{tr('communications.unavailable')}</b>}
+                : tr('communications.tokensNoDone')}</dd>}
       </div>
       {/* Il motore e' un DATO, non una nota: sta in una riga come gli altri. */}
-      {modello && <div className="telrow">{tr('communications.engine')}<b>{modello}</b></div>}
-      {/* Note in RIGA SINGOLA e prefissate, forma di F6 (lotto chiarezza 28/07):
-          un paragrafo di commento in mezzo ai numeri e' cio' che il PM ha chiesto
-          di togliere. Erano tre frasi in un blocco di quattro righe.
-          ⚠️ E una di quelle frasi era FALSA: diceva «il costo in euro non c'e'
-          perche' il backend non lo consegna». `cost_eur` viaggia sull'evento
-          `done` dal lotto backend del 26/07 sera-6, applicato il 27/07 (ponte).
-          Un buco dichiarato che non e' piu' un buco non e' una cautela: e' una
-          bugia con l'aria di essere prudente. Ora dice il vero — il campo c'e',
-          questa pagina non lo legge ancora — e la voce di consumo e' a TODO. */}
-      <div className="telnote">{tr('communications.telemetryBase')}</div>
-      <div className="telnote">{tr('communications.costPrefix')} <b>cost_eur</b> {tr('communications.costNotShown')}</div>
+      {modello && <div className="telrow"><dt>{tr(m?.meta?.model ? 'communications.responseModel' : 'communications.configuredModel')}</dt><dd className="bbn-chat-model">{modello}</dd></div>}
+    </dl>
+  );
+}
+
+/** Stato del costo di una risposta: misurato, parziale, errore, nessuna chiamata o n.d.
+ *  Un costo non misurato non diventa mai zero. */
+function statoCosto(m: RuntimeMessage | null) {
+  const cost = m?.costEur || null;
+  const status = cost?.status?.toLowerCase() || '';
+  const measured = cost?.cost != null;
+  const statusDeclaresUsageGap = status.startsWith('parziale') || status === 'usage_unknown'
+    || (status.startsWith('non_calcolato') && /cache|usage|token|utilizzo/i.test(status));
+  const partial = statusDeclaresUsageGap || (!measured && !status && m?.tokensStatus === 'parziale');
+  const failed = status.startsWith('errore') || status === 'api_error';
+  const noCall = status.startsWith('nessuna_chiamata');
+  const state = noCall ? 'no-call' : failed ? 'error' : partial ? 'partial' : measured ? 'measured' : 'unavailable';
+  const reason = noCall ? 'communications.costNoCall'
+    : failed ? (measured ? 'communications.costRecordedBeforeError' : 'communications.costMeasurementFailed')
+    : partial ? (measured ? 'communications.costUsagePartial' : 'communications.costPartialUnavailable')
+    : measured && (cost?.nota || cost?.cacheFields === 'assenti') ? 'communications.costUsageDetailsPartial'
+    : measured ? null
+    : status.includes('cambio usd') || cost?.fxSource === 'n.d.' ? 'communications.costFxUnavailable'
+    : status === 'model_unknown' || status === 'pricing_unavailable' ? 'communications.costPricingUnavailable'
+    : status.includes('modello non risolto') ? 'communications.costModelUnavailable'
+    : status.startsWith('non_calcolato') ? 'communications.costUsageUnavailable'
+    : status.startsWith('errore') ? 'communications.costMeasurementFailed'
+    : 'communications.costUnavailableNote';
+  const value = measured
+    ? new Intl.NumberFormat(localeDi(linguaCorrente()), {
+        style: 'currency', currency: 'EUR', minimumFractionDigits: 2, maximumFractionDigits: 6,
+      }).format(cost!.cost as number)
+    : null;
+  return { state, reason, value } as const;
+}
+
+function CostoRisposta({ m }: { m: RuntimeMessage | null }) {
+  const tr = useT();
+  const { state, reason, value } = statoCosto(m);
+  return (
+    <div className="chat-modern-cost" data-cost-status={state}>
+      <span>{tr('communications.responseCost')}</span>
+      <b className={'num' + (value == null ? ' nd' : '')}>{value ?? tr('communications.unavailable')}</b>
+      {reason && <small className="chat-modern-telemetry-note">{tr(reason)}</small>}
     </div>
   );
 }
 
+/** Il costo in una parola, per l'intestazione: valore misurato o «costo n.d.», con il motivo nel title. */
+function CostoBreve({ m }: { m: RuntimeMessage }) {
+  const tr = useT();
+  const { state, reason, value } = statoCosto(m);
+  return <span className={'bbn-chat-cost num' + (value == null ? ' is-na' : '')} data-cost-state={state}
+               title={reason ? tr(reason) : tr('communications.responseCost')}>{value ?? parole().costNa}</span>;
+}
+
 /* ── un turno della conversazione ── */
-function Turno({ m, agente, hot, pin, onHot, onPin }: {
-  m: RuntimeMessage; agente: AgentInfo | null;
+function Turno({ m, agente, ritirato, hot, pin, onHot, onApri }: {
+  m: RuntimeMessage; agente: AgentInfo | null; ritirato: string | null;
   hot: number | null; pin: number | null;
-  onHot: (n: number | null) => void; onPin: (n: number | null) => void;
+  onHot: (n: number | null) => void; onApri: (n: number) => void;
 }) {
   const tr = useT();
   if (m.role === 'user') {
     return (
       <div className="pmq">
-        <div className="tag">PM{m.timestamp && <span style={{ display: 'block', fontWeight: 600, color: '#73829F', fontSize: 9 }}>{oraIt(m.timestamp)}</span>}</div>
         <div className="q">{m.content}</div>
+        <div className="tag">{parole().you}{m.timestamp && <> · <time className="num">{dataIt(m.timestamp)} {oraIt(m.timestamp)}</time></>}</div>
       </div>
     );
   }
-  const colore = agente?.color || '#FFA51E';
   const nomiUsati = new Set((m.calls || []).map(c => c.name));
+  const idDesk = ritirato || agente?.id || '';
   return (
     <div className="turn">
       <div className="ansh">
-        <span className="ld" style={{ background: colore, boxShadow: '0 0 7px ' + colore }} />
-        <span className="nm" style={{ color: colore }}>{(agente?.name || tr('communications.agentUpper')).toUpperCase()}</span>
-        {m.timestamp && <span className="chip n">{dataIt(m.timestamp)} {oraIt(m.timestamp)}</span>}
-        {m.streaming && <span className="chip a">{tr('communications.writing')}</span>}
+        <IconaDesk id={idDesk} colore={agente?.color} ritirato={!!ritirato} dimensione="xs" />
+        <span className="nm">{ritirato ? iniziale(ritirato) : agente?.name || frase(tr('communications.agentUpper'))}</span>
+        {m.timestamp && <span className="when num">{dataIt(m.timestamp)} {oraIt(m.timestamp)}</span>}
+        {m.streaming && <span className="chip a"><i className="bbn-chat-pulse" aria-hidden="true" />{iniziale(tr('communications.writing'))}</span>}
         <span className="chip n">{tr(m.output_language === 'it' ? 'communications.originalOutputIt'
           : m.output_language === 'en' ? 'communications.originalOutputEn' : 'communications.originalOutputUnknown')}</span>
         {!!m.calls?.length && (
-          <span className="chip c" style={{ marginLeft: 'auto' }}>
-            {tr(m.calls.length === 1 ? 'communications.signedToolOne' : 'communications.signedToolMany', { a: m.calls.length })}
+          <span className="chip c">
+            {frase(tr(m.calls.length === 1 ? 'communications.signedToolOne' : 'communications.signedToolMany', { a: m.calls.length }))}
           </span>
         )}
         {!m.streaming && !m.storico && !m.calls?.length && (
-          <span className="chip a" style={{ marginLeft: 'auto' }}>{tr('communications.noToolsUpper')}</span>
+          <span className="chip w">{frase(tr('communications.noToolsUpper'))}</span>
         )}
         {m.tokens && (m.tokens.out != null
           ? <span className="chip n">{tr(m.tokens.out === 1 ? 'activity.tokenCountOne' : 'communications.tokenCount', { a: m.tokens.out.toLocaleString(localeDi(linguaCorrente()), { useGrouping: true }) })}</span>
-          : <span className="chip a">{tr('communications.tokensUnknownUpper')}</span>)}
+          : <span className="chip w">{frase(tr('communications.tokensUnknownUpper'))}</span>)}
       </div>
-      <Corpo m={m} hot={hot} pin={pin} onHot={onHot} onPin={onPin} nomiUsati={nomiUsati} />
+      <div className="bbn-chat-body"><Corpo m={m} hot={hot} pin={pin} onHot={onHot} onApri={onApri} nomiUsati={nomiUsati} /></div>
       <div className="time" title={m.meta?.mandato?.impronta}>
         {m.meta?.mandato
           ? tr('communications.mandateOrigin', {a: m.meta.mandato.impronta.slice(0, 8), b: m.meta.mandato.origine, c: m.meta.mandato.dichiarato_il || tr('communications.unavailable')})
           : tr('communications.mandateOriginMissing')}
       </div>
       {m.errore && (
-        <div className="dec ko" style={{ margin: '8px 0 0' }}>
-          <b>{tr('communications.interruptedUpper')}</b> — {responseError(m)}{tr('communications.partialResponse')}
-        </div>
+        <p className="dec ko bbn-chat-alert">
+          <b>{frase(tr('communications.interruptedUpper'))}</b> — {responseError(m)}{tr('communications.partialResponse')}
+        </p>
       )}
     </div>
   );
@@ -1061,16 +1084,17 @@ function oraIt(s?: string) {
 }
 
 /** Il corpo della risposta, spezzato nei punti in cui l'agente ha chiamato uno strumento:
- *  il richiamo [n] non e' decorativo, sta esattamente dove lo stream l'ha visto passare. */
-function Corpo({ m, hot, pin, onHot, onPin, nomiUsati }: {
+ *  il richiamo [n] non e' decorativo, sta esattamente dove lo stream l'ha visto passare.
+ *  Un clic sul richiamo apre i dettagli su quella chiamata. */
+function Corpo({ m, hot, pin, onHot, onApri, nomiUsati }: {
   m: RuntimeMessage; hot: number | null; pin: number | null;
-  onHot: (n: number | null) => void; onPin: (n: number | null) => void;
+  onHot: (n: number | null) => void; onApri: (n: number) => void;
   nomiUsati: Set<string>;
 }) {
   const tr = useT();
   const sel = pin ?? hot;
-  if (!m.content && m.streaming) return <div className="prose" style={{ fontWeight: 600, color: '#73829F' }}>…</div>;
-  if (!m.content && !m.errore) return <div className="prose" style={{ fontWeight: 600, color: '#73829F' }}>{tr('communications.emptyResponse')}</div>;
+  if (!m.content && m.streaming) return <div className="prose"><span className="bbn-chat-caret" aria-label="…" /></div>;
+  if (!m.content && !m.errore) return <div className="prose chat-modern-note">{tr('communications.emptyResponse')}</div>;
 
   const marks = m.marks || [];
   const pezzi: JSX.Element[] = [];
@@ -1082,17 +1106,16 @@ function Corpo({ m, hot, pin, onHot, onPin, nomiUsati }: {
     const qui = marks.filter(k => k.pos === pos);
     pezzi.push(
       <div className="refrow" key={'r' + pos}>
-        <span className="lb">{tr('communications.tools')}</span>
         {qui.map(k => {
           const c = (m.calls || []).find(x => x.n === k.n);
           return (
-            <button key={k.n}
+            <button type="button" key={k.n}
                     className={'ref' + (sel === k.n ? ' hot' : '') + (c?.ok === false ? ' ko' : '')}
                     onMouseEnter={() => onHot(k.n)} onMouseLeave={() => onHot(null)}
-                    onClick={() => onPin(pin === k.n ? null : k.n)}
+                    onClick={() => onApri(k.n)}
                     title={tr('communications.viewToolCall')}>
-              <Wrench size={9} /> [{k.n}] {c?.name || '—'}
-              {c?.bytes != null && <span style={{ opacity: .7 }}>{fmtKB(c.bytes)}</span>}
+              <Wrench size={12} aria-hidden="true" /> {k.n} · {c?.name || '—'}
+              {c?.bytes != null && <span className="chat-modern-refbytes"> · {fmtKB(c.bytes)}</span>}
             </button>
           );
         })}
@@ -1104,6 +1127,7 @@ function Corpo({ m, hot, pin, onHot, onPin, nomiUsati }: {
   if (coda.trim() || pezzi.length === 0) {
     pezzi.push(<Prosa key={'t' + cur} md={coda} nomiUsati={nomiUsati} sel={sel} onHot={onHot} m={m} />);
   }
+  if (m.streaming) pezzi.push(<span key="caret" className="bbn-chat-caret" aria-hidden="true" />);
   return <>{pezzi}</>;
 }
 
@@ -1146,23 +1170,18 @@ function Prosa({ md, nomiUsati, sel, onHot, m }: {
   );
 }
 
-function Ingresso({ agente, modello, onPrompt, disabled }: {
-  agente: AgentInfo; modello: string | null; onPrompt: (p: string) => void; disabled: boolean;
+function Ingresso({ agente, onPrompt, disabled }: {
+  agente: AgentInfo; onPrompt: (p: string) => void; disabled: boolean;
 }) {
   const tr = useT();
   return (
-    <div className="intro">
-      <span className="ld" style={{ background: agente.color, boxShadow: '0 0 14px ' + agente.color, width: 9, height: 9 }} />
-      <div className="big" style={{ color: agente.color }}>{agente.name}</div>
-      <div className="rl">{agente.role}</div>
-      {/* Nota in RIGA SINGOLA: 64 caratteri stanno nei 430px di `max-width` a 10px
-          (0,6em = 6px/car = 71 car per riga). Erano tre righe con tre frasi.
-          Il MOTORE non si ripete qui: la barra in alto lo scrive gia' («MOTORE
-          claude-sonnet-5»), e su F6 la lezione era che un secondo posto dove
-          leggere lo stesso dato non aggiunge informazione, aggiunge rumore.
-          Anche «si salva da sola» e' via: sta nell'intestazione del riquadro. */}
-      <div className="hint">{tr('communications.methodHint')}</div>
-      <ChatSuggestions agent={agente.id} name={agente.name} disabled={disabled} onPrompt={onPrompt} />
+    <div className="intro chat-modern-intro">
+      <h2 className="big">{tr('communications.introHeadline', { a: agente.name })}</h2>
+      <p className="hint">{tr('communications.introHelper')}</p>
+      <div className="chat-modern-prompts">
+        <p className="bbn-chat-subhead">{tr('communications.promptGroup')}</p>
+        <ChatSuggestions agent={agente.id} name={agente.name} disabled={disabled} onPrompt={onPrompt} />
+      </div>
     </div>
   );
 }

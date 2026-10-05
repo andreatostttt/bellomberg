@@ -1,1009 +1,73 @@
 import { useT } from '@/i18n/provider';
-import { t as tr, type Chiave } from '@/i18n/t';
 import { linguaCorrente, localeDi } from '@/i18n/lingua';
-import { fmtNum } from '@/lib/format';
-import { dataIt, leggiDetail } from '@/lib/quota';
-import { externalWebUrl } from '../../electron/security';
 // ============================================================
-// BELLOMBERG — NEWS WIRE v3 OBSIDIAN (F5; v2 = T4-3 parte B)
-// Vestito OBSIDIAN COMMAND (.obsx/.p3 condivisi con F1/F2/F15),
-// LOGICA ED ENDPOINT INTATTI dalla v2:
-// Vista WIRE: nastro agenzia cronologico dal feed DB (get_feed),
-// filtri client-side sul prefetch (limit 200), MARKET MOVING per
-// _materiality, DESK STATS client-side, preferiti PM con stella.
-// Vista DESK: briefing/macro/societario/calendario/global (legacy v0.7).
-// Refresh pesante verso provider SOLO su bottone; AUTO 60s legge
-// soltanto /news/feed (DB locale).
-// FONTI MUTE (voce (25) backend): hero cell + banner cablati sui campi
-// fonti_mute/avviso dei payload consumati — oggi quegli endpoint NON li
-// espongono => "n.d." DICHIARATO; si accendono da soli col coordinamento
-// backend chiesto in (F5). Mai dedotto client-side.
+// BELLOMBERG — NOTIZIE in stile Nuova (02/10/2026; prima: News Wire v3 Obsidian)
+// Questo componente resta il controller della rotta: letture, timer e stato
+// vivono qui, le viste (Flusso, Agenda) ricevono solo dati. LOGICA ED ENDPOINT
+// INTATTI dalla v3:
+// Vista FLUSSO: nastro cronologico dal feed DB (get_feed), filtri client-side
+// sul prefetch (limit 200), ritmo per ora e radar dei temi, dettaglio della
+// notizia con riassunto AI SOLO su richiesta (pulsante, mai automatico).
+// Vista AGENDA: briefing/macro/societario/calendario/global.
+// Refresh pesante verso provider SOLO su bottone; AUTO 60s legge soltanto
+// /news/feed (DB locale) e lo stato giro; l'agenda si rilegge ogni 5 minuti.
+// FONTI MUTE: rese solo se il backend le dichiara (fonti_mute/avviso), mai
+// dedotte client-side.
 // ============================================================
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { localizePayload } from '@/lib/api-presentation';
-import { useScalaTesto } from '../lib/svg-kit';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import {
-  Newspaper, RefreshCw, AlertCircle, ExternalLink, FileText,
-  TrendingUp, Building2, Globe, Sparkles, Calendar, Layers,
-  Briefcase, Megaphone, Shield, Bitcoin, ChevronDown, Check,
-  Star, Zap, Activity, Filter,
-} from 'lucide-react';
+import { RefreshCw, TriangleAlert } from 'lucide-react';
 import {
   Bellomberg,
-  NewsItem, MacroNewsItem, CorporateEvent, GlobalNewsItem,
-  BriefingData, EconomicEvent, FavCompany, FontiMuteFields, UltimoGiro,
+  MacroNewsItem, CorporateEvent, GlobalNewsItem,
+  BriefingData, EconomicEvent, FavCompany, FontiMuteFields, UltimoGiro, PortfolioSnapshot, NewsProviderBudget,
 } from '@/lib/api';
-import './dashboard-command.css';
+import { createNewsRefreshWatcher, esitoGiro, NewsRefreshError } from '../lib/news-refresh';
+import { conteggioPerChip, passaFiltroPaese } from '@/lib/calendario-paesi';
+import { fmtNum } from '@/lib/format';
+import type { NewsRefreshJob } from '../lib/news-refresh';
+import ModernPage from '@/components/ModernPage';
+import { Segmenti } from '@/components/nuova/Card';
+import { NEWS_SELECT_EVENT, NEWS_SELECT_KEY, type RichiestaNotizia } from '@/components/AvvisiNotizie';
+import {
+  errorDetail, isHoliday, leggiUltimaVisita, matchesDatePresetCal, matchesDatePresetNews, nomeFonteMuta, motivoMuto,
+  hhmm, problemText, salvaUltimaVisita, sentBucket, statoGiroInCorso, testoErroreRefresh, themeKeyOf, tsOf,
+  type FeedItem, type NewsProblem, type SentBucket,
+} from './news/calcoli';
+import type { PesoTitolo } from './news/DettaglioNotizia';
+import MenuAvvisi from './news/MenuAvvisi';
+import PannelloFonti, { type Canale } from './news/PannelloFonti';
+import VistaAgenda from './news/VistaAgenda';
+import VistaFlusso from './news/VistaFlusso';
+import { parole } from './news/parole';
+import './news-nuova.css';
 
-// ------------------------------------------------------------
-// TIPI LOCALI — campi runtime restituiti da get_feed (backend
-// news_aggregator) non presenti nel tipo base NewsItem.
-// ------------------------------------------------------------
-type FeedItem = NewsItem & {
-  headline_it?: string | null;
-  why_matters?: string | null;
-  title_original?: string | null;
-  snippet_original?: string | null;
-  _materiality?: number | null;
-};
-
-type SentBucket = 'pos' | 'neu' | 'neg';
-
-type NewsProblem = { operation: 'feed' | 'refresh' | 'favorites' | 'scheduler' | 'providers' | 'briefing' | 'macro' | 'corporate' | 'global' | 'calendar'; detail: string | null };
-
-function errorDetail(error: any): string | null {
-  return leggiDetail(error?.response?.data?.detail ?? error?.message ?? error) || null;
-}
-
-function economicNumber(value?: number | string | null): string {
-  if (value == null) return '-';
-  // Provider strings carry their own units/precision: never parse them here.
-  return typeof value === 'number' && Number.isFinite(value)
-    ? value.toLocaleString(localeDi(linguaCorrente()), { useGrouping: true, maximumSignificantDigits: 21 })
-    : String(value);
-}
-
-function problemText(problem: NewsProblem): string {
-  return tr(`newsdesk.error_${problem.operation}`) + ': ' + (problem.detail || tr('newsdesk.errorUnknown'));
-}
-
-function originalLanguage(language?: string | null): string {
-  return language === 'it' ? tr('newsdesk.languageIt') : language === 'en' ? tr('newsdesk.languageEn') : tr('newsdesk.languageUnknown');
-}
-
-function SummaryOrigin({ item }: { item: FeedItem }) {
-  const tr = useT();
-  const generated = item.summary_status === 'available' || item.summary_status === 'legacy';
-  return <div className="text-3xs text-faint mt-0.5">
-    <span>{generated ? tr('newsdesk.originalSummary', { language: originalLanguage(item.summary_language) })
-      : item.summary_status ? tr('newsdesk.originalSource') : tr('newsdesk.receivedUnknown')}</span>
-    {item.summary_note && <span> · {item.summary_note}</span>}
-  </div>;
-}
-
-interface WireStats {
-  pos: number; neu: number; neg: number;
-  h24: number; h6: number; total: number;
-  topThemes: Array<{ key: string; label: string; count: number }>;
-  nTickers: number; nProviders: number; avgRel: number;
-}
-
-// ------------------------------------------------------------
-// PALETTE OBSIDIAN (hex solo per inline-style; classi altrove)
-// ------------------------------------------------------------
-const C = {
-  amber: '#FFA51E', amberBright: '#FFC555', cyan: '#29D3F2',
-  emerald: '#21E0A0', crimson: '#FF3D60', gold: '#D4AF37',
-  muted: '#8D9FC4', faint: '#73829F', steel: '#2A3760',
-};
-
-// ============================================================
-// HELPERS
-// ============================================================
-function timeAgo(iso: string | null | undefined): string {
-  if (!iso) return '-';
+function leggiRichiesta(): RichiestaNotizia | null {
   try {
-    const t = new Date(iso).getTime();
-    if (!isFinite(t)) return iso.slice(0, 16);
-    const diffMs = Date.now() - t;
-    const diffMin = Math.floor(diffMs / 60000);
-    if (diffMin < 1) return tr('newsdesk.s001');
-    if (diffMin < 60) return `${diffMin}m`;
-    const diffH = Math.floor(diffMin / 60);
-    if (diffH < 24) return `${diffH}h`;
-    return tr('newsdesk.s002', {a: Math.floor(diffH / 24)});
-  } catch { return '-'; }
+    const raw = sessionStorage.getItem(NEWS_SELECT_KEY);
+    if (!raw) return null;
+    sessionStorage.removeItem(NEWS_SELECT_KEY);
+    const v = JSON.parse(raw);
+    return typeof v?.id === 'number' ? v : null;
+  } catch { return null; }
 }
 
-function tsOf(n: { published_at?: string | null; pulled_at?: string | null }): number {
-  for (const s of [n.published_at, n.pulled_at]) {
-    if (s) { const t = new Date(s).getTime(); if (isFinite(t)) return t; }
-  }
-  return 0;
-}
-
-// Si traducono i codici del limiter e i prefissi riconosciuti dei motivi di una fonte muta.
-// Il suffisso dopo un prefisso riconosciuto resta come arriva dal backend.
-const CODICI_MOTIVO: Record<string, Chiave> = {
-  NEGOZIO_ASSENTE: 'newsdesk.muteStoreMissing',
-  NEGOZIO_ILLEGGIBILE: 'newsdesk.muteStoreUnreadable',
-  SENZA_CHIAVE: 'newsdesk.muteMissingKey',
-  MODULO_ASSENTE: 'newsdesk.muteMissingModule',
-};
-function motivoMuto(m: unknown): string {
-  const s = String(m);
-  if (s === 'SKIP_BUDGET') return tr('newsdesk.muteBudget');
-  if (s === 'SKIP_DISABLED') return tr('newsdesk.muteSuspended');
-  const codice = /^(?:NEGOZIO_[A-Z]+|SENZA_CHIAVE|MODULO_ASSENTE)(?=:|$)/.exec(s)?.[0];
-  if (codice && Object.prototype.hasOwnProperty.call(CODICI_MOTIVO, codice)) return tr(CODICI_MOTIVO[codice]) + s.slice(codice.length);
-  return s.replace('SKIP_', '');
-}
-
-// Un elenco che non entra nella cella si taglia con il segno del taglio: senza, «… · NEWS» sembrava
-// una fonte intera (revisione 13/09). L'elenco completo resta nel banner.
-function tagliaVisibile(testo: string, massimo: number): string {
-  return testo.length > massimo ? testo.slice(0, massimo - 1) + '…' : testo;
-}
-
-// Nome di una fonte muta. Le chiavi di fonti_mute sono nomi di provider (newsapi, tiingo, …) o
-// path finnhub, e restano come arrivano; le due dei negozi privati (news_aggregator.TERMINI_MUTI
-// e TEMI_TITOLI_MUTI) sono identificatori del backend e si rendono col nome del catalogo.
-const NOMI_FONTI_MUTE: Record<string, Chiave> = {
-  'termini_news (negozio)': 'newsdesk.muteStoreTerms',
-  'temi_titoli (negozio)': 'newsdesk.muteStoreTopics',
-};
-function nomeFonteMuta(chiave: string): string {
-  return Object.prototype.hasOwnProperty.call(NOMI_FONTI_MUTE, chiave) ? tr(NOMI_FONTI_MUTE[chiave]) : chiave;
-}
-
-function hhmm(n: FeedItem): string {
-  const t = tsOf(n);
-  if (!t) return '--:--';
-  return new Date(t).toLocaleTimeString(localeDi(linguaCorrente()), { hour: '2-digit', minute: '2-digit' });
-}
-
-function dayKeyFromTs(ts: number): string {
-  if (!ts) return 'nd';
-  const d = new Date(ts);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
-function dayLabel(key: string): string {
-  if (key === 'nd') return tr('newsdesk.s003');
-  const today = dayKeyFromTs(Date.now());
-  const yesterday = dayKeyFromTs(Date.now() - 86_400_000);
-  const d = new Date(`${key}T12:00:00`);
-  const fmt = d.toLocaleDateString(localeDi(linguaCorrente()), { weekday: 'short', day: '2-digit', month: 'short' })
-               .replace(/\./g, '').toUpperCase();
-  if (key === today) return tr('newsdesk.s004', {a: fmt});
-  if (key === yesterday) return tr('newsdesk.s005', {a: fmt});
-  const yr = d.getFullYear() !== new Date().getFullYear() ? ` ${d.getFullYear()}` : '';
-  return fmt + yr;
-}
-
-function sentBucket(s: string | null | undefined): SentBucket {
-  const v = (s || '').toLowerCase();
-  if (v === 'bullish' || v === 'positive') return 'pos';
-  if (v === 'bearish' || v === 'negative') return 'neg';
-  return 'neu';
-}
-
-function sentColor(s: string | null | undefined): string {
-  const b = sentBucket(s);
-  return b === 'pos' ? C.emerald : b === 'neg' ? C.crimson : C.muted;
-}
-
-function relColor(rel: number): string {
-  if (rel >= 8) return C.amber;
-  if (rel >= 5) return C.cyan;
-  return C.muted;
-}
-
-// Categorie derivate dal campo `theme` (valori scritti da
-// news_aggregator.auto_pull_feed: fed / ecb / ukraine / middle_east /
-// cpi / btc_etf / china / italy; '' = news ticker o feed generale).
-// Fallback: temi nuovi etichettati dinamicamente dagli item caricati.
-const THEME_LABELS = (): Record<string, string> => ({
-  fed: 'FED / FOMC',
-  ecb: tr('newsdesk.s006'),
-  cpi: tr('newsdesk.s007'),
-  ukraine: tr('newsdesk.s008'),
-  middle_east: tr('newsdesk.s009'),
-  btc_etf: 'BTC / ETF',
-  china: tr('newsdesk.s010'),
-  italy: tr('newsdesk.s011'),
-  __pf: tr('newsdesk.s012'),
-  __gen: tr('newsdesk.s013'),
-});
-
-function themeKeyOf(n: FeedItem): string {
-  const th = (n.theme || '').trim();
-  if (th) return th;
-  return n.ticker_mentioned ? '__pf' : '__gen';
-}
-
-function themeLabelOf(key: string): string {
-  return THEME_LABELS()[key] || key.replace(/_/g, ' ').toUpperCase();
-}
-
-function toggleIn<T>(arr: T[], v: T, set: (next: T[]) => void) {
-  set(arr.includes(v) ? arr.filter(x => x !== v) : [...arr, v]);
-}
-
-// --- helpers vista DESK (legacy v0.7, palette aggiornata) ---
-function sentimentTone(s: string | null | undefined) {
-  const b = sentBucket(s);
-  if (b === 'pos') return { color: C.emerald, label: tr('newsdesk.s014') };
-  if (b === 'neg') return { color: C.crimson, label: tr('newsdesk.s015') };
-  return { color: C.muted, label: tr('newsdesk.s016') };
-}
-
-function importanceTone(imp: number | undefined) {
-  const i = imp ?? 3;
-  if (i >= 5) return C.crimson;
-  if (i >= 4) return C.amber;
-  if (i >= 3) return C.amberBright;
-  return C.muted;
-}
-
-function categoryIcon(cat: string | undefined) {
-  switch (cat) {
-    case 'rates':       return Briefcase;
-    case 'inflation':   return TrendingUp;
-    case 'geopolitics': return Shield;
-    case 'politics':    return Megaphone;
-    case 'em':          return Globe;
-    case 'commodities': return Layers;
-    case 'crypto':      return Bitcoin;
-    case 'corporate':   return Building2;
-    default:            return Newspaper;
-  }
-}
-
-const CATEGORY_LABELS = (): Record<string, string> => ({
-  rates:       tr('newsdesk.s017'),
-  inflation:   tr('newsdesk.s018'),
-  geopolitics: tr('newsdesk.s019'),
-  politics:    tr('newsdesk.s020'),
-  em:          tr('newsdesk.s021'),
-  commodities: tr('newsdesk.s022'),
-  crypto:      tr('newsdesk.s023'),
-  corporate:   tr('newsdesk.s024'),
-});
-
-const COUNTRIES_AVAILABLE = ['US', 'EU', 'UK', 'IT', 'DE', 'JP', 'CN', 'FR', 'ES', 'CA', 'AU'];
-const IMPORTANCE_LEVELS = () => ([
-  { value: 5, label: tr('newsdesk.s025') },
-  { value: 4, label: tr('newsdesk.s026') },
-  { value: 3, label: tr('newsdesk.s027') },
-]);
-
-const DATE_PRESETS_NEWS = (): Array<{ value: string; label: string }> => ([
-  { value: 'today',  label: tr('newsdesk.s028') },
-  { value: '24h',    label: tr('newsdesk.s029') },
-  { value: '3days',  label: tr('newsdesk.s030') },
-  { value: 'week',   label: tr('newsdesk.s031') },
-  { value: 'all',    label: tr('newsdesk.s032') },
-]);
-const DATE_PRESETS_CAL = (): Array<{ value: string; label: string }> => ([
-  { value: 'today',    label: tr('newsdesk.s028') },
-  { value: 'tomorrow', label: tr('newsdesk.s033') },
-  { value: 'week',     label: tr('newsdesk.s034') },
-  { value: '2weeks',   label: tr('newsdesk.s035') },
-  { value: 'all',      label: tr('newsdesk.s032') },
-]);
-
-const SENT_FILTERS: Array<{ key: SentBucket; label: string; color: string }> = [
-  { key: 'pos', label: 'POS', color: C.emerald },
-  { key: 'neu', label: 'NEU', color: C.muted },
-  { key: 'neg', label: 'NEG', color: C.crimson },
-];
-const REL_FILTERS = () => ([
-  { value: 0, label: tr('newsdesk.s036') },
-  { value: 5, label: 'Rel 5+' },
-  { value: 8, label: 'Rel 8+' },
-]);
-
-const HOLIDAY_KEYWORDS = ['day of', 'eid ', 'arafa', 'independence', 'holiday', 'memorial', 'thanksgiving',
-                          'christmas', 'easter', 'new year', 'labour day', 'national day', 'bank holiday'];
-
-function isHoliday(title: string): boolean {
-  const t = title.toLowerCase();
-  return HOLIDAY_KEYWORDS.some(k => t.includes(k));
-}
-
-function matchesDatePresetNews(iso: string | null | undefined, preset: string): boolean {
-  if (!preset || preset === 'all') return true;
-  if (!iso) return true;
-  const t = new Date(iso).getTime();
-  if (!isFinite(t)) return true;
-  const now = Date.now();
-  const ageH = (now - t) / 3600_000;
-  if (preset === 'today') {
-    const today = new Date(); today.setHours(0, 0, 0, 0);
-    return t >= today.getTime();
-  }
-  if (preset === '24h')   return ageH <= 24;
-  if (preset === '3days') return ageH <= 72;
-  if (preset === 'week')  return ageH <= 168;
-  return true;
-}
-
-function matchesDatePresetCal(eventDate: string, preset: string): boolean {
-  if (!preset || preset === 'all') return true;
-  if (!eventDate) return false;
-  const today = new Date(); today.setHours(0, 0, 0, 0);
-  const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
-  const weekEnd = new Date(today); weekEnd.setDate(today.getDate() + 7);
-  const twoWeeksEnd = new Date(today); twoWeeksEnd.setDate(today.getDate() + 14);
-  const ed = new Date(eventDate);
-  if (preset === 'today')    return ed.toDateString() === today.toDateString();
-  if (preset === 'tomorrow') return ed.toDateString() === tomorrow.toDateString();
-  if (preset === 'week')     return ed >= today && ed <= weekEnd;
-  if (preset === '2weeks')   return ed >= today && ed <= twoWeeksEnd;
-  return true;
-}
-
-// ============================================================
-// DROPDOWN POPUP (multi-select con checkbox — vista DESK)
-// ============================================================
-function Dropdown<T extends string | number>({
-  label, options, selected, onChange, allLabel = tr('newsdesk.s032'), summaryFmt, width = 150,
-}: {
-  label: string;
-  options: Array<{ value: T; label: string; count?: number }>;
-  selected: T[];
-  onChange: (v: T[]) => void;
-  allLabel?: string;
-  summaryFmt?: (sel: T[], opts: Array<{ value: T; label: string; count?: number }>) => string;
-  width?: number;
-}) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDoc = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener('mousedown', onDoc);
-    return () => document.removeEventListener('mousedown', onDoc);
-  }, [open]);
-
-  const toggle = (v: T) => {
-    if (selected.includes(v)) onChange(selected.filter(x => x !== v));
-    else onChange([...selected, v]);
-  };
-  const summary = summaryFmt
-    ? summaryFmt(selected, options)
-    : selected.length === 0
-      ? allLabel
-      : selected.length === options.length
-        ? allLabel
-        : `${selected.length}/${options.length}`;
-
-  return (
-    <div ref={ref} className="relative" style={{ minWidth: width }}>
-      <div className="text-3xs text-faint uppercase tracking-wider font-mono mb-0.5">{label}</div>
-      <button
-        onClick={() => setOpen(v => !v)}
-        className={`w-full flex items-center justify-between gap-2 px-2 py-1 text-2xs font-mono
-                    bg-bg-elev border rounded-sm transition-colors
-                    ${open || selected.length > 0
-                      ? 'border-amber/60 text-amber'
-                      : 'border-border text-text hover:border-amber/40'}`}
-      >
-        <span className="truncate">{summary}</span>
-        <ChevronDown size={11} className={`transition-transform ${open ? 'rotate-180' : ''}`} />
-      </button>
-      {open && (
-        <div className="absolute z-50 mt-1 left-0 right-0 bg-bg border border-amber/40 rounded-sm
-                        max-h-64 overflow-y-auto py-1"
-             style={{ boxShadow: '0 4px 16px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,165,30,0.18)' }}>
-          {/* All toggle */}
-          <button
-            onClick={() => { onChange([]); }}
-            className={`w-full flex items-center gap-2 px-2 py-1 text-2xs font-mono text-left
-                        hover:bg-amber/10 transition-colors ${selected.length === 0 ? 'text-amber' : 'text-text-dim'}`}
-          >
-            <div className={`w-3 h-3 border rounded-sm flex items-center justify-center
-                            ${selected.length === 0 ? 'bg-amber border-amber' : 'border-border'}`}>
-              {selected.length === 0 && <Check size={9} className="text-bg" />}
-            </div>
-            <span>{allLabel}</span>
-          </button>
-          <div className="h-px bg-border my-0.5" />
-          {options.map(opt => {
-            const on = selected.includes(opt.value);
-            return (
-              <button
-                key={String(opt.value)}
-                onClick={() => toggle(opt.value)}
-                className={`w-full flex items-center gap-2 px-2 py-1 text-2xs font-mono text-left
-                            hover:bg-amber/10 transition-colors ${on ? 'text-amber' : 'text-text'}`}
-              >
-                <div className={`w-3 h-3 border rounded-sm flex items-center justify-center
-                                ${on ? 'bg-amber border-amber' : 'border-border'}`}>
-                  {on && <Check size={9} className="text-bg" />}
-                </div>
-                <span className="flex-1 truncate">{opt.label}</span>
-                {opt.count !== undefined && (
-                  <span className={`text-3xs ${on ? 'text-amber/70' : 'text-faint'}`}>{opt.count}</span>
-                )}
-              </button>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// SINGLE-SELECT dropdown (preset data — vista DESK)
-function DropdownSingle({
-  label, options, selected, onChange, width = 130,
-}: {
-  label: string;
-  options: Array<{ value: string; label: string }>;
-  selected: string;
-  onChange: (v: string) => void;
-  width?: number;
-}) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!open) return;
-    const onDoc = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener('mousedown', onDoc);
-    return () => document.removeEventListener('mousedown', onDoc);
-  }, [open]);
-
-  const summary = options.find(o => o.value === selected)?.label || options[0]?.label || '-';
-
-  return (
-    <div ref={ref} className="relative" style={{ minWidth: width }}>
-      <div className="text-3xs text-faint uppercase tracking-wider font-mono mb-0.5">{label}</div>
-      <button
-        onClick={() => setOpen(v => !v)}
-        className={`w-full flex items-center justify-between gap-2 px-2 py-1 text-2xs font-mono
-                    bg-bg-elev border rounded-sm transition-colors
-                    ${open ? 'border-amber/60 text-amber' : 'border-border text-text hover:border-amber/40'}`}
-      >
-        <span className="truncate">{summary}</span>
-        <ChevronDown size={11} className={`transition-transform ${open ? 'rotate-180' : ''}`} />
-      </button>
-      {open && (
-        <div className="absolute z-50 mt-1 left-0 right-0 bg-bg border border-amber/40 rounded-sm
-                        max-h-64 overflow-y-auto py-1"
-             style={{ boxShadow: '0 4px 16px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,165,30,0.18)' }}>
-          {options.map(opt => (
-            <button
-              key={opt.value}
-              onClick={() => { onChange(opt.value); setOpen(false); }}
-              className={`w-full flex items-center gap-2 px-2 py-1 text-2xs font-mono text-left
-                          hover:bg-amber/10 transition-colors ${selected === opt.value ? 'text-amber' : 'text-text'}`}
-            >
-              <div className={`w-3 h-3 border rounded-sm flex items-center justify-center
-                              ${selected === opt.value ? 'bg-amber border-amber' : 'border-border'}`}>
-                {selected === opt.value && <Check size={9} className="text-bg" />}
-              </div>
-              <span>{opt.label}</span>
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ============================================================
-// SUB-COMPONENTS CONDIVISI
-// ============================================================
-function PanelHeader({ icon: Icon, title, count, action }: {
-  icon: any; title: string; count?: number; action?: React.ReactNode;
-}) {
-  return (
-    <div className="p3h am">
-      <Icon size={11} /> {title}
-      {count !== undefined && <span className="n num">({count})</span>}
-      {action && <span className="side" style={{ display: 'inline-flex', alignItems: 'center' }}>{action}</span>}
-    </div>
-  );
-}
-
-function NewsRow({
-  title, snippet, url, provider, source, published_at, ticker,
-  sentiment, importance, badges, bellombergText = false, titleOrigin, snippetOrigin, presentationLanguages,
-}: {
-  title: string; snippet?: string | null; url?: string | null;
-  provider?: string | null; source?: string | null;
-  published_at?: string | null; ticker?: string | null;
-  sentiment?: string | null; importance?: number | null;
-  badges?: React.ReactNode;
-  bellombergText?: boolean;
-  titleOrigin?: string;
-  snippetOrigin?: string;
-  presentationLanguages?: string[];
-}) {
-  const tr = useT();
-  const tone = sentimentTone(sentiment);
-  const barColor = importance != null && importance >= 5 ? C.crimson
-                  : importance != null && importance >= 4 ? C.amber
-                  : sentBucket(sentiment) === 'pos' ? C.emerald
-                  : sentBucket(sentiment) === 'neg' ? C.crimson
-                  : C.steel;
-  const href = externalWebUrl(url || '') || undefined;
-  return (
-    <a href={href} target="_blank" rel="noopener noreferrer"
-       className={`block hover:bg-bg-elev border-b border-border/40 transition-colors group ${href ? '' : 'cursor-default'}`}
-       style={{ borderLeft: `2px solid ${barColor}` }}>
-      <div className="px-2 py-1">
-        <div className="flex items-center gap-1 flex-wrap">
-          {ticker && (
-            <span className="text-3xs font-mono font-bold px-1 bg-amber/15 text-gold rounded-sm">{ticker}</span>
-          )}
-          {sentiment && (
-            <span className="text-3xs font-mono px-1 rounded-sm"
-                  style={{ color: tone.color, background: tone.color + '14' }}>{tone.label}</span>
-          )}
-          {badges}
-          <span className="text-3xs text-faint font-mono ml-auto">{timeAgo(published_at)}</span>
-        </div>
-        <div className="text-2xs text-text leading-tight group-hover:text-amber-bright transition-colors mt-0.5">{title}</div>
-        {snippet && <div className="text-3xs text-muted leading-tight mt-0.5 line-clamp-1 italic">{snippet}</div>}
-        <div className="text-3xs text-faint">{titleOrigin === 'bellomberg' && presentationLanguages?.includes(linguaCorrente())
-          ? tr('newsdesk.currentWording', { language: originalLanguage(linguaCorrente()) })
-          : bellombergText ? tr('newsdesk.originalBellomberg', { language: originalLanguage(null) }) : tr('newsdesk.originalSource')}
-          {snippet && snippetOrigin === 'source' && <> · {tr('newsdesk.sourceExcerpt')}</>}</div>
-        <div className="flex items-center gap-1 mt-0.5">
-          <span className="text-3xs text-faint truncate">
-            {provider}{source && provider !== source ? ` · ${source}` : ''}
-          </span>
-          {href && <ExternalLink size={8} className="text-faint group-hover:text-amber" />}
-        </div>
-      </div>
-    </a>
-  );
-}
-
-function ErrorBox({ msg }: { msg: string | NewsProblem }) {
-  const tr = useT();
-  return (
-    <div className="m-2 p-2 border-l-2 border-crimson bg-crimson/5 text-2xs text-crimson font-mono flex items-start gap-2">
-      <AlertCircle size={11} className="mt-0.5 flex-shrink-0" /> {typeof msg === 'string' ? tr('newsdesk.sourceError', { detail: msg }) : problemText(msg)}
-    </div>
-  );
-}
-
-function LoadingBox({ label }: { label?: string }) {
-  const tr = useT();
-  return <div className="p-4 text-center text-2xs text-faint font-mono animate-pulse">{label ?? tr('newsdesk.s037')}</div>;
-}
-
-function EmptyBox({ label }: { label: string }) {
-  return <div className="p-4 text-center text-2xs text-faint font-mono">{label}</div>;
-}
-
-// ============================================================
-// BRIEFING CARD (vista DESK)
-// ============================================================
-function BriefingCard({ data, loading, error, onRefresh }: {
-  data: BriefingData | null; loading: boolean; error: NewsProblem | null; onRefresh: () => void;
-}) {
-  const tr = useT();
-  const stale = data?.stale;
-  const unreadable = data?.error_code === 'briefing_cache_unreadable';
-  const isInitial = !data?.generated_at;
-  const ageLabel = data?.age_minutes != null
-    ? (data.age_minutes < 60 ? tr('newsdesk.s038', {a: data.age_minutes}) : tr('newsdesk.s039', {a: Math.floor(data.age_minutes / 60)}))
-    : tr('newsdesk.ageUnknown');
-  return (
-    <div className="p3 flex-1 min-h-0" style={{ ...bd(60), borderLeft: '2px solid rgba(255,165,30,.55)' }}>
-      <div className="p3h am"><Sparkles size={11} /> {tr('newsdesk.s042')}
-        {data?.slot_label && <span className="n" title={data.slot_label} style={{ flex: '1 1 auto' }}>· {data.slot_label}</span>}
-        <span className="side" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexShrink: 0, overflow: 'visible' }}>
-          <span className={stale ? 'text-amber' : ''}>{unreadable ? tr('newsdesk.unreadableCache') : isInitial ? tr('newsdesk.s041') : ageLabel}</span>
-          <button onClick={onRefresh} disabled={loading}
-                  className={'tb' + (loading ? ' dis' : '')} style={{ color: '#FFA51E' }}>
-            {loading ? tr('newsdesk.s043') : tr('newsdesk.s044')}
-          </button>
-        </span>
-      </div>
-      <div className="flex-1 overflow-y-auto p-3 min-h-0">
-        {data?.generated_at && data.briefing_md && <div className="text-3xs text-faint mb-2">{tr('newsdesk.originalBriefing', { language: originalLanguage(data.language) })}</div>}
-        {error ? <ErrorBox msg={error} /> :
-         loading && !data ? <LoadingBox label={tr('newsdesk.s045')} /> :
-         <div className="prose prose-invert prose-sm max-w-none news-briefing-md">
-           <ReactMarkdown remarkPlugins={[remarkGfm]}>{data?.briefing_md || tr('newsdesk.s046')}</ReactMarkdown>
-         </div>}
-      </div>
-    </div>
-  );
-}
-
-// ============================================================
-// VISTA WIRE — componenti
-// ============================================================
-function RailLabel({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="font-mono text-3xs uppercase tracking-[0.22em] text-faint px-1 mb-1">{children}</div>
-  );
-}
-
-function RailChip({ on, label, count, star, onClick }: {
-  on: boolean; label: string; count?: number; star?: boolean; onClick: () => void;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={`w-full flex items-center gap-1.5 px-1.5 py-[3px] font-mono text-2xs rounded-sm text-left border transition-colors
-                  ${on
-                    ? 'bg-amber/15 text-amber border-amber/40'
-                    : 'border-transparent text-text-dim hover:text-text hover:bg-panel-hi'}`}
-    >
-      {star && <Star size={8} className={`shrink-0 ${on ? 'text-amber fill-amber' : 'text-gold fill-gold'}`} />}
-      <span className="truncate flex-1">{label}</span>
-      {count !== undefined && (
-        <span className={`text-3xs tabular-nums ${on ? 'text-amber/80' : 'text-faint'}`}>{count}</span>
-      )}
-    </button>
-  );
-}
-
-// Riga del nastro: orario mono, dot sentiment, ticker gold (+stella se
-// preferito), headline da desk, why_matters in corsivo, fonte e
-// relevance a destra. REL >= 8: accento ambra (bordo sx + fondo).
-function WireRow({ n, fav }: { n: FeedItem; fav: boolean }) {
-  const tr = useT();
-  const hot = (n.relevance ?? 0) >= 8;
-  const dot = sentColor(n.sentiment);
-  const rel = n.relevance ?? 0;
-  const href = externalWebUrl(n.url || '') || undefined;
-  return (
-    <a
-      href={href} target="_blank" rel="noopener noreferrer"
-      title={n.title_original || n.title}
-      className={`bb-row-in group flex items-start gap-2 px-2 py-[5px] border-b border-border/30 transition-colors
-                  ${hot ? 'bg-amber/[0.05] hover:bg-amber/[0.09]' : 'hover:bg-panel-hi'}
-                  ${href ? '' : 'cursor-default'}`}
-      style={{ borderLeft: hot ? `2px solid ${C.amber}` : '2px solid transparent' }}
-    >
-      <span className="font-mono text-2xs tabular-nums text-text-dim w-9 shrink-0 pt-0.5">{hhmm(n)}</span>
-      <span className="h-1.5 w-1.5 rounded-full shrink-0 mt-1.5"
-            style={{ background: dot, boxShadow: `0 0 5px ${dot}66` }} />
-      <div className="flex-1 min-w-0">
-        <div className="leading-snug">
-          {n.ticker_mentioned && (
-            <span className="font-mono text-2xs font-bold text-gold mr-1.5 whitespace-nowrap">
-              {n.ticker_mentioned}
-              {fav && <Star size={8} className="inline ml-0.5 -mt-0.5 text-amber fill-amber" />}
-            </span>
-          )}
-          <span className="text-xs text-text group-hover:text-amber-bright transition-colors">{n.title}</span>
-        </div>
-        {n.snippet && (
-          <div className="text-2xs italic text-muted leading-snug mt-0.5 truncate">{n.snippet}</div>
-        )}
-        <SummaryOrigin item={n} />
-      </div>
-      <div className="shrink-0 w-32 flex flex-col items-end gap-1 pt-0.5">
-        <span className="font-mono text-3xs text-faint uppercase truncate max-w-full">
-          {n.provider || '?'}{n.source && n.source !== n.provider ? ` · ${n.source}` : ''}
-        </span>
-        <div className="flex items-center gap-1.5">
-          <div className="h-[3px] w-12 rounded-full overflow-hidden bg-border/70">
-            <div className="h-full" style={{ width: `${Math.min(10, Math.max(0, rel)) * 10}%`, background: relColor(rel) }} />
-          </div>
-          <span className="font-mono text-3xs tabular-nums w-3 text-right" style={{ color: relColor(rel) }}>
-            {rel > 0 ? rel : '-'}
-          </span>
-          <ExternalLink size={8} className={href ? 'text-faint group-hover:text-amber' : 'text-transparent'} />
-        </div>
-      </div>
-    </a>
-  );
-}
-
-// Riga MARKET MOVING: catalyst REL>=8 ordinati per _materiality.
-// rank = posizione nella coda priorita' (l'ordine E' informazione: materiality).
-function MoverRow({ n, fav, rank }: { n: FeedItem; fav: boolean; rank: number }) {
-  const tr = useT();
-  const href = externalWebUrl(n.url || '') || undefined;
-  return (
-    <a href={href} target="_blank" rel="noopener noreferrer"
-       className={`block px-2 py-1.5 border-b border-border/40 hover:bg-panel-hi transition-colors group ${href ? '' : 'cursor-default'}`}>
-      <div className="flex items-center gap-1.5">
-        <span className="rkn num">{String(rank).padStart(2, '0')}</span>
-        <span className="font-mono text-3xs tabular-nums text-text-dim">{hhmm(n)}</span>
-        {n.ticker_mentioned && (
-          <span className="font-mono text-3xs font-bold text-gold">
-            {n.ticker_mentioned}
-            {fav && <Star size={7} className="inline ml-0.5 -mt-px text-amber fill-amber" />}
-          </span>
-        )}
-        <span className="ml-auto font-mono text-3xs tabular-nums px-1 rounded-sm bg-amber/15 text-amber">
-          R{n.relevance ?? '-'}
-        </span>
-        <span className="font-mono text-3xs tabular-nums text-cyan"
-              title={tr('newsdesk.s047')}>
-          M{fmtNum((n._materiality ?? 0), 1)}
-        </span>
-      </div>
-      <div className="text-2xs text-text leading-snug mt-0.5 line-clamp-2 group-hover:text-amber-bright transition-colors">
-        {n.title}
-      </div>
-      {n.snippet && (
-        <div className="text-3xs italic text-muted leading-snug mt-0.5 line-clamp-1">{n.snippet}</div>
-      )}
-      <SummaryOrigin item={n} />
-    </a>
-  );
-}
-
-// CANALI // LINK PROVIDER: i provider come canali di trasmissione (LED
-// vivo/spento/MUTO, barra volume) + copertura. Il muto viene SOLO dalla
-// dichiarazione backend (25), mai dedotto. Sentiment/flusso/temi vivono
-// nell'hero e nel rail: qui NIENTE doppioni della stessa misura.
-function ChannelsPanel({ stats, channels, fontiDeclared }: {
-  stats: WireStats; channels: Channel[]; fontiDeclared: boolean;
-}) {
-  const tr = useT();
-  const maxCh = Math.max(1, ...channels.map(c => c.count));
-  return (
-    <div className="p3 flex-1 min-h-0" style={bd(240)}>
-      <div className="p3h"><Activity size={11} /> {tr('newsdesk.s048')}
-        <span className="side">{tr('newsdesk.s049')}</span>
-      </div>
-      <div className="flex-1 overflow-y-auto p-2 space-y-3 min-h-0">
-        <div>
-          <div className="space-y-px">
-            {channels.length === 0 && (
-              <div className="font-mono text-3xs text-faint px-1">{tr('newsdesk.s050')}</div>
-            )}
-            {channels.map(ch => {
-              const live = ch.last > 0 && (Date.now() - ch.last) <= 24 * 3600_000;
-              return (
-                <div key={ch.name} className="chx font-mono"
-                     title={ch.muteReason
-                       ? tr('newsdesk.s051', {a: nomeFonteMuta(ch.name), b: motivoMuto(ch.muteReason)})
-                       : tr('newsdesk.s052', {a: ch.name, b: ch.count, c: ch.last ? new Date(ch.last).toLocaleString(localeDi(linguaCorrente())) : tr('newsdesk.s053')})}>
-                  <span className={`ld ${ch.muteReason ? 'r' : live ? 'g' : 'off'}`} />
-                  <span className="nm">{nomeFonteMuta(ch.name)}</span>
-                  <span className="bar"><i style={{ width: `${(ch.count / maxCh) * 100}%` }} /></span>
-                  {ch.muteReason
-                    ? <span className="mt">{motivoMuto(ch.muteReason)}</span>
-                    : <span className="ct num">{ch.count}</span>}
-                </div>
-              );
-            })}
-          </div>
-          <div className="font-mono text-3xs mt-1" style={{ color: fontiDeclared ? '#8D9FC4' : '#B97A00', letterSpacing: '.04em' }}
-               title={fontiDeclared
-                 ? tr('newsdesk.s054')
-                 : tr('newsdesk.s055')}>
-            {fontiDeclared ? tr('newsdesk.s056') : tr('newsdesk.s057')}
-          </div>
-        </div>
-
-        <div>
-          <div className="font-mono text-3xs uppercase tracking-[0.22em] text-faint mb-1">{tr('newsdesk.s058')}</div>
-          <div className="font-mono text-3xs text-text-dim tabular-nums leading-relaxed">
-            <div className="flex justify-between"><span className="text-faint">{tr('newsdesk.s059')}</span><span>{stats.nTickers}</span></div>
-            <div className="flex justify-between"><span className="text-faint">{tr('newsdesk.s060')}</span><span className="text-cyan">{fmtNum(stats.avgRel, 1)}</span></div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// Cella hero (stesso idioma di HeroStat in F2): etichetta 8px, valore 17px, sub.
-// `grado10`: la cella nata DOPO il lotto chiarezza nasce al gradino giusto
-// (etichetta/sub 10px, sub #8D9FC4) — le sorelle a 9px/600 su #73829F misurano
-// 4,27-4,40:1 (baseline cancello 17/08) e sono il debito di F8, non un modello:
-// saliranno tutte insieme il giorno del suo triage.
-function HeroCell({ label, value, tone, color, sub, title, grado10 }: {
-  label: string; value: string; tone?: 'up' | 'dn'; color?: string; sub?: string; title?: string;
-  grado10?: boolean;
-}) {
-  return (
-    <div title={title}
-         style={{ padding: '10px 16px', borderLeft: '1px solid rgba(26,36,64,.6)',
-                  display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
-      <div style={{ fontSize: grado10 ? 10 : 9, letterSpacing: '.2em', fontWeight: 600, color: '#73829F', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>{label}</div>
-      <div className={'num ' + (tone || '')} style={{ fontSize: 17, fontWeight: 300, marginTop: 2, color: color || (tone ? undefined : '#ECF1FA'), whiteSpace: 'nowrap' }}>{value}</div>
-      {sub && <div style={{ fontSize: grado10 ? 10 : 9, fontWeight: 600, color: grado10 ? '#8D9FC4' : '#73829F', marginTop: 2, whiteSpace: 'nowrap', letterSpacing: '.05em', textTransform: 'uppercase' }}>{sub}</div>}
-    </div>
-  );
-}
-
-// SIGNAL TRAFFIC: istogramma item/ora sulle ultime 24h, SOLO dai timestamp
-// veri del feed caricato (zero chiamate, zero numeri inventati). Barra 23 =
-// ora corrente (evidenziata). Tooltip per barra: ora · conteggio.
-function FlowBars({ feed, width = 220 }: { feed: FeedItem[]; width?: number }) {
-  const tr = useT();
-  const buckets = useMemo(() => {
-    const now = Date.now();
-    const arr = new Array(24).fill(0) as number[];
-    for (const n of feed) {
-      const t = tsOf(n);
-      if (!t) continue;
-      const age = now - t;
-      if (age < 0 || age >= 24 * 3600_000) continue;
-      arr[23 - Math.floor(age / 3600_000)]++;
-    }
-    return arr;
-  }, [feed]);
-  const max = Math.max(1, ...buckets);
-  const nowH = new Date().getHours();
-  return (
-    <div className="fbx num" style={{ width }}
-         title={tr('newsdesk.s061')}>
-      {buckets.map((c, i) => {
-        const hh = ((nowH - (23 - i)) + 48) % 24;
-        return (
-          <i key={i}
-             className={i === 23 ? 'now' : c > 0 ? 'on' : ''}
-             style={{ height: c === 0 ? 2 : Math.max(3, Math.round((c / max) * 26)) }}
-             title={tr('newsdesk.s062', {a: String(hh).padStart(2, '0'), b: c})} />
-        );
-      })}
-    </div>
-  );
-}
-
-// Canale provider per la matrice: count/last dal feed; muto = dichiarazione (25).
-interface Channel { name: string; count: number; last: number; muteReason: string | null }
-
-// Delay della sequenza di accensione pannelli (CSS .bootx, var --bd).
-const bd = (ms: number) => ({ ['--bd']: `${ms}ms` } as React.CSSProperties);
-
-// Jitter DETERMINISTICO (niente Math.random: i blip non devono ballare tra render).
-function hashJitter(s: string): number {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-  return (h % 1000) / 1000;
-}
-
-// ============================================================
-// RADAR SCOPE — contatti delle ultime 24h su quadrante polare.
-// OGNI BLIP E' UNA NEWS VERA (tooltip = titolo, click = fonte):
-// settore = tema · raggio = eta' (nuovo al centro, anelli 1H/6H/24H)
-// colore = sentiment · blip caldo con alone = REL>=8 · anello oro = preferito.
-// Zero dipendenze (SVG a mano, come l'altimetro della pagina di accesso).
-// ============================================================
-const SC_R_MIN = 14, SC_R_MAX = 118, SC_C = 150;
-function scRadius(ageFrac: number): number {
-  return SC_R_MIN + (SC_R_MAX - SC_R_MIN) * Math.sqrt(Math.min(1, Math.max(0, ageFrac)));
-}
-function RadarScope({ feed, favSet }: { feed: FeedItem[]; favSet: Set<string> }) {
-  const tr = useT();
-  const { contacts, sectors } = useMemo(() => {
-    const now = Date.now();
-    const H24 = 24 * 3600_000;
-    const items = feed.filter(n => { const t = tsOf(n); return t > 0 && (now - t) < H24; });
-    const counts: Record<string, number> = {};
-    items.forEach(n => { const k = themeKeyOf(n); counts[k] = (counts[k] || 0) + 1; });
-    const topKeys = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 7).map(([k]) => k);
-    const secs = topKeys.length > 0 ? [...topKeys, '__altro'] : ['__altro'];
-    const N = secs.length;
-    const cts = items.map(n => {
-      const age = (now - tsOf(n)) / H24;
-      const rr = scRadius(age);
-      const k = themeKeyOf(n);
-      const i0 = topKeys.indexOf(k);
-      const si = i0 >= 0 ? i0 : N - 1;
-      const j = hashJitter(String(n.id ?? n.title));
-      const ang = (-90 + (si + 0.12 + 0.76 * j) * (360 / N)) * Math.PI / 180;
-      return { n, x: SC_C + rr * Math.cos(ang), y: SC_C + rr * Math.sin(ang) };
-    });
-    return { contacts: cts, sectors: secs };
-  }, [feed]);
-  const N = sectors.length;
-  // Il testo dentro un viewBox fisso scala col contenitore. Misurato sull'app
-  // viva: questo radar e' reso a 244px a `terzo` (0,81x) e a 200px col
-  // Windows al 150% (0,67x), quindi un 7px arrivava all'occhio come 5,69px e
-  // 4,67px. Col fattore, il corpo dichiarato e' quello che si vede.
-  const svgRef = useRef<SVGSVGElement>(null);
-  const kT = useScalaTesto(svgRef, 300);
-  return (
-    <div className="scwrap">
-      <div className="scbox">
-      <svg ref={svgRef} viewBox="0 0 300 300">
-        {/* anelli tempo: 1H / 6H / 24H */}
-        {([[1 / 24, '1H'], [6 / 24, '6H'], [1, '24H']] as Array<[number, string]>).map(([f, lb]) => (
-          <g key={lb}>
-            <circle cx={SC_C} cy={SC_C} r={scRadius(f)} fill="none" stroke="#1A2440" strokeWidth={1} />
-            <text x={SC_C + 2} y={SC_C - scRadius(f) + 8} fontSize={9 * kT} fontWeight={600} fill="#73829F" fontFamily="inherit">{lb}</text>
-          </g>
-        ))}
-        {/* raggi settore + etichette tema */}
-        {sectors.map((k, i) => {
-          const a0 = (-90 + i * (360 / N)) * Math.PI / 180;
-          const am = (-90 + (i + 0.5) * (360 / N)) * Math.PI / 180;
-          const lx = SC_C + (SC_R_MAX + 10) * Math.cos(am);
-          const ly = SC_C + (SC_R_MAX + 10) * Math.sin(am);
-          return (
-            <g key={k}>
-              <line x1={SC_C} y1={SC_C} x2={SC_C + SC_R_MAX * Math.cos(a0)} y2={SC_C + SC_R_MAX * Math.sin(a0)}
-                    stroke="#1A2440" strokeWidth={0.6} />
-              <text x={lx} y={ly} fontSize={8 * kT} fill="#8D9FC4" textAnchor="middle" dominantBaseline="middle"
-                    fontFamily="inherit" letterSpacing={0.5}>
-                {k === '__altro' ? tr('newsdesk.s063') : themeLabelOf(k).slice(0, 9)}
-              </text>
-            </g>
-          );
-        })}
-        {/* croce centrale */}
-        <line x1={SC_C - 4} y1={SC_C} x2={SC_C + 4} y2={SC_C} stroke="#2A3760" strokeWidth={1} />
-        <line x1={SC_C} y1={SC_C - 4} x2={SC_C} y2={SC_C + 4} stroke="#2A3760" strokeWidth={1} />
-        {/* contatti (nuovo al centro) */}
-        {contacts.map(({ n, x, y }, i) => {
-          const hot = (n.relevance ?? 0) >= 8;
-          const col = sentColor(n.sentiment);
-          const fav = !!n.ticker_mentioned && favSet.has((n.ticker_mentioned || '').toUpperCase());
-          const href = externalWebUrl(n.url || '') || undefined;
-          const tip = `${hhmm(n)}${n.ticker_mentioned ? ' · ' + n.ticker_mentioned : ''} · ${n.title}`;
-          const blip = (
-            <g key={n.id ?? i} className={'blip' + (hot ? ' hot' : '')}>
-              {fav && <circle cx={x} cy={y} r={hot ? 5.2 : 4} fill="none" stroke="#D4AF37" strokeWidth={0.8} />}
-              <circle cx={x} cy={y} r={hot ? 3.4 : 2.2} fill={col} fillOpacity={hot ? 0.95 : 0.75}
-                      stroke={hot ? '#FFA51E' : 'none'} strokeWidth={hot ? 0.8 : 0} />
-              <title>{tip}</title>
-            </g>
-          );
-          return href
-            ? <a key={n.id ?? i} href={href} target="_blank" rel="noopener noreferrer">{blip}</a>
-            : blip;
-        })}
-      </svg>
-      {/* sweep: dimensioni in % del quadrante -> scala con .scbox */}
-      <div className="swp" />
-      </div>
-    </div>
-  );
-}
-
-// COMM TAPE: le ultime headline in nastro scorrevole (contenuto x2 = loop CSS).
-function CommTape({ feed }: { feed: FeedItem[] }) {
-  const tr = useT();
-  const latest = useMemo(
-    () => [...feed].sort((a, b) => tsOf(b) - tsOf(a)).slice(0, 18),
-    [feed]);
-  if (latest.length === 0) return null;
-  const run = (dup: number) => latest.map((n, i) => (
-    <span key={`${dup}-${n.id ?? i}`} style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-      <span className="tt num">{hhmm(n)}</span>
-      {n.ticker_mentioned && <span className="tk">{n.ticker_mentioned}</span>}
-      <span className="tl">{n.title}</span>
-      <span className="sep">◆</span>
-    </span>
-  ));
-  return (
-    <div className="tapex font-mono" title={tr('newsdesk.s064')}>
-      <div className="tapein">{run(0)}{run(1)}</div>
-    </div>
-  );
-}
-
-// ============================================================
-// MAIN PAGE — NEWS WIRE v3 OBSIDIAN "SIGNAL DECK" (F5)
-// ============================================================
 export default function NewsPage() {
   const tr = useT();
-  // ---- vista: WIRE (default) / DESK (briefing+macro+societario+calendario) ----
+  const w = parole();
+  // ---- vista: FLUSSO (default) / AGENDA ----
   const [view, setView] = useState<'wire' | 'desk'>('wire');
 
-  // ---- WIRE: feed dal DB (get_feed) ----
+  // ---- FLUSSO: feed dal DB (get_feed) ----
   const [feed, setFeed] = useState<FeedItem[]>([]);
   const [feedLoad, setFeedLoad] = useState(false);
   const [feedErr, setFeedErr] = useState<NewsProblem | null>(null);
   const [refreshing, setRefreshing] = useState(false);
-  const [refreshInfo, setRefreshInfo] = useState<{ saved: number; duplicates: number } | null>(null);
+  // conteggi null = n.d. (campo assente nell'esito), mai 0; joined = giro non avviato da questo click
+  const [refreshInfo, setRefreshInfo] = useState<{ saved: number | null; duplicates: number | null; notClassified: number | null; joined: boolean } | null>(null);
+  const [refreshJoined, setRefreshJoined] = useState(false);
+  const [refreshJob, setRefreshJob] = useState<NewsRefreshJob | null>(null);
+  const refreshWatcherRef = useRef<{ stop: () => void } | null>(null);
   const [auto, setAuto] = useState(true);
   const [lastFeedAt, setLastFeedAt] = useState<Date | null>(null);
   const [favs, setFavs] = useState<FavCompany[]>([]);
@@ -1014,7 +78,7 @@ export default function NewsPage() {
   const briefingRead = useRef(0);
   const cacheLanguage = useRef(linguaCorrente());
 
-  // ---- filtri wire (combinabili, client-side sul prefetch) ----
+  // ---- filtri del flusso (combinabili, client-side sul prefetch) ----
   const [fPeriod, setFPeriod] = useState<string>('all');
   const [fThemes, setFThemes] = useState<string[]>([]);
   const [fSent, setFSent] = useState<SentBucket[]>([]);
@@ -1026,7 +90,7 @@ export default function NewsPage() {
     return [];
   });
 
-  // ---- DESK (legacy v0.7) ----
+  // ---- AGENDA ----
   const [briefing, setBriefing] = useState<BriefingData | null>(null);
   const [briefingLoad, setBriefingLoad] = useState(false);
   const [briefingErr, setBriefingErr] = useState<NewsProblem | null>(null);
@@ -1043,7 +107,6 @@ export default function NewsPage() {
   const [corpLoad, setCorpLoad] = useState(false);
   const [corpErr, setCorpErr] = useState<NewsProblem | null>(null);
   const [corpDateSel, setCorpDateSel] = useState<string>('week');
-  const [corpTickerSel, setCorpTickerSel] = useState<string[]>([]);
 
   const [globalNews, setGlobalNews] = useState<GlobalNewsItem[]>([]);
   const [globalLoad, setGlobalLoad] = useState(false);
@@ -1062,7 +125,7 @@ export default function NewsPage() {
   // ---- FONTI MUTE (voce (25) backend, regola no-fallback-silenziosi) ----
   // declared=false finché NESSUN endpoint consumato espone fonti_mute/avviso:
   // in pagina si dichiara "n.d.", mai dedotto. Quando il campo arriva:
-  // mute={} = dichiarato "nessun provider muto"; mute={prov:motivo} = buco urlato.
+  // mute={} = dichiarato "nessun provider muto"; mute={prov:motivo} = buco dichiarato.
   const [fonti, setFonti] = useState<{ declared: boolean; mute: Record<string, string>; avviso: string | null }>(
     { declared: false, mute: {}, avviso: null });
   const takeFonti = useCallback((d: FontiMuteFields) => {
@@ -1072,12 +135,9 @@ export default function NewsPage() {
     setFonti({ declared: true, mute: d.fonti_mute || {}, avviso: d.avviso ?? null });
   }, []);
 
-  // ---- FRESCHEZZA DEL FEED (ponte (68) backend; scelta PM 17/08: cella in
-  // testata). Tre verità DISTINTE, mai confuse in un trattino: 'attesa' =
+  // ---- FRESCHEZZA DEL FEED (ponte (68) backend). Tre verità DISTINTE: 'attesa' =
   // prima lettura in volo · 'errore' = endpoint non raggiunto · 'assente' =
-  // risponde ma senza `ultimo_giro` (backend più vecchio del contratto 12/08).
-  // Il giro, quando c'è, si rende con lo STATO e non solo con l'età: poche
-  // news per quota e news fresche sono problemi diversi con la stessa età.
+  // risponde ma senza `ultimo_giro`. Il giro si rende con lo STATO e non solo con l'età.
   const [giro, setGiro] = useState<'attesa' | 'errore' | 'assente' | UltimoGiro>('attesa');
   const [nextRun, setNextRun] = useState<string | null>(null);
   const loadGiro = useCallback(async () => {
@@ -1085,11 +145,13 @@ export default function NewsPage() {
       const d = await Bellomberg.newsProviders();
       setProvidersErr(null);
       setGiro(d.ultimo_giro ?? 'assente');
-      takeFonti(d);   // il payload porta ANCHE fonti_mute/avviso: accende la cella FONTI MUTE
+      setRefreshJob(d.refresh_job ?? null);
+      setBudget(d.budget ?? null);
+      takeFonti(d);   // il payload porta ANCHE fonti_mute/avviso
     } catch (e) { setGiro('errore'); setProvidersErr({ operation: 'providers', detail: errorDetail(e) }); }
   }, [takeFonti]);
-  // il «prossimo giro» è NextRunTime del task NewsFeed (il join del ponte):
-  // task Disabled o formato imprevisto → null, e in cella si scrive n.d.
+  // il «prossimo giro» è NextRunTime del task NewsFeed: task Disabled o formato
+  // imprevisto → null, e in pagina si scrive n.d.
   const loadNextRun = useCallback(async () => {
     try {
       const d = await Bellomberg.scheduledTasks();
@@ -1101,54 +163,29 @@ export default function NewsPage() {
     } catch (e) { setNextRun(null); setSchedulerErr({ operation: 'scheduler', detail: errorDetail(e) }); }
   }, []);
 
-  // La cella ULTIMO GIRO FEED: età VIVA dal timestamp (modello FX STALE —
-  // invecchia fra un poll e l'altro; ricalcolata a ogni render, e la pagina
-  // ri-renderizza coi poll), age_minutes dichiarato come ripiego ETICHETTATO.
-  const giroCella = (() => {
-    if (giro === 'attesa') return {
-      v: '…', col: undefined as string | undefined, sub: tr('newsdesk.s065'),
-      tip: tr('newsdesk.s066'),
-    };
-    if (giro === 'errore') return {
-      v: tr('newsdesk.s053'), col: '#FF5C7A', sub: tr('newsdesk.s067'),
-      tip: tr('newsdesk.s068'),
-    };
-    if (giro === 'assente') return {
-      v: tr('newsdesk.s053'), col: '#FF5C7A', sub: tr('newsdesk.s069'),
-      tip: tr('newsdesk.s070'),
-    };
-    const g = giro;
-    const ts = g.timestamp ? new Date(g.timestamp).getTime() : NaN;
-    const eta = isFinite(ts) ? Math.max(0, Math.round((Date.now() - ts) / 60000))
-      : (typeof g.age_minutes === 'number' && isFinite(g.age_minutes) ? Math.round(g.age_minutes) : null);
-    const etaTxt = eta == null ? '?' : `${eta}′`;
-    const oraTxt = isFinite(ts)
-      ? new Date(ts).toLocaleTimeString(localeDi(linguaCorrente()), { hour: '2-digit', minute: '2-digit' }) : tr('newsdesk.s053');
-    const blocked = g.providers_blocked || {};
-    const nBlk = Object.keys(blocked).length;
-    const blkTxt = Object.entries(blocked)
-      .map(([p, m]) => `${nomeFonteMuta(p)} (${motivoMuto(m)})`).join(' · ');
-    const tip = tr('newsdesk.s071', {a: oraTxt, b: g.fetched ?? 0, c: g.classified ?? 0})
-      + tr('newsdesk.s072', {a: g.saved ?? 0, b: g.skipped_duplicates ?? 0})
-      + (nBlk ? tr('newsdesk.s073', {a: blkTxt}) : '')
-      + tr('newsdesk.s074', {a: nextRun ?? tr('newsdesk.s053')})
-      + tr('newsdesk.s075');
-    if (g.stato === 'ok') return {
-      v: `${etaTxt} · OK`, col: undefined,
-      sub: tr('newsdesk.s076', {a: g.fetched ?? 0, b: g.saved ?? 0, c: nextRun ?? tr('newsdesk.s053')}), tip,
-    };
-    if (g.stato === 'degradato') return {
-      v: tr('newsdesk.s077', {a: etaTxt}), col: '#FFA51E',
-      sub: tr('newsdesk.s078', {a: g.fetched ?? 0, b: g.saved ?? 0, c: nBlk, d: nBlk === 1 ? tr('newsdesk.s079') : tr('newsdesk.s080')}), tip,
-    };
-    // n.d. / illeggibile / valore imprevisto: il motivo VERBATIM, mai un trattino nudo
-    return {
-      v: tr('newsdesk.s053'), col: '#FF5C7A',
-      sub: (g.motivo || tr('newsdesk.s081', {a: String(g.stato)})).toUpperCase().slice(0, 42),
-      tip: (g.motivo ? tr('newsdesk.s082', {a: g.motivo}) : tr('newsdesk.s083', {a: String(g.stato)}))
-        + tr('newsdesk.s084', {a: oraTxt}),
-    };
-  })();
+  // ---- stato della presentazione Nuova (in coda: i test SSR seminano useState per indice) ----
+  const [fQuery, setFQuery] = useState('');
+  const [favOnly, setFavOnly] = useState(false);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [aiRequestId, setAiRequestId] = useState<number | null>(null);
+  const [sourcesOpen, setSourcesOpen] = useState(false);
+  const [snapRaw, setSnap] = useState<PortfolioSnapshot | null>(null);
+  const [favBusy, setFavBusy] = useState(false);
+  const [favActionErr, setFavActionErr] = useState<string | null>(null);
+  const [lastVisit] = useState(() => leggiUltimaVisita());
+  const [budget, setBudget] = useState<Record<string, NewsProviderBudget> | null>(null);
+
+  const providerIntervalLabel = refreshJob?.interval_seconds
+    ? `${Math.round(refreshJob.interval_seconds / 60)} min`
+    : null;
+  // next_run_at arriva ISO dal job del backend, NextRunTime già HH:MM dallo scheduler
+  const oraDa = (v: string | null | undefined) => {
+    if (!v) return null;
+    if (/^\d{2}:\d{2}$/.test(v)) return v;
+    const t = Date.parse(v);
+    return isFinite(t) ? hhmm(t) : v;
+  };
+  const providerNextRun = oraDa(refreshJob?.next_run_at) ?? nextRun ?? null;
 
   // ============================================================
   // LOADERS
@@ -1160,9 +197,11 @@ export default function NewsPage() {
     try {
       const d = await Bellomberg.newsFeed({ limit: 200, min_relevance: 0 });
       if (read !== feedRead.current || language !== linguaCorrente()) return;
-      setFeed((d.items || []) as FeedItem[]);
+      const items = (d.items || []) as FeedItem[];
+      setFeed(items);
       setFeedErr(null);
       setLastFeedAt(new Date());
+      salvaUltimaVisita(items.reduce((m, n) => Math.max(m, tsOf(n)), 0));
       takeFonti(d);
     } catch (e) { if (read === feedRead.current && language === linguaCorrente()) setFeedErr({ operation: 'feed', detail: errorDetail(e) }); }
     finally { if (read === feedRead.current) setFeedLoad(false); }
@@ -1173,17 +212,34 @@ export default function NewsPage() {
     catch (e) { setFavsErr({ operation: 'favorites', detail: errorDetail(e) }); }
   }, []);
 
-  // Refresh PESANTE (pull provider + classificazione Haiku): SOLO su bottone.
+  // Refresh provider: una POST di accettazione, poi solo GET dello stato condiviso.
   const heavyRefresh = useCallback(async () => {
-    setRefreshing(true); setRefreshInfo(null);
+    setRefreshing(true); setRefreshInfo(null); setFeedErr(null); setRefreshJoined(false);
+    const watcher = createNewsRefreshWatcher({
+      start: async () => {
+        const r = await Bellomberg.newsFeedRefresh(1, true);
+        takeFonti(r);
+        setRefreshJoined(r?.accepted === false);
+        return r;
+      },
+      // stato del SOLO job seguito (contratto G3); le fonti si rileggono a giro finito (loadGiro)
+      readStatus: async id => (await Bellomberg.newsRefreshJob(id)).job,
+      onStatus: setRefreshJob,
+    });
+    refreshWatcherRef.current = watcher;
     try {
-      const r = await Bellomberg.newsFeedRefresh(1, true);
-      setRefreshInfo({ saved: r.saved ?? 0, duplicates: r.skipped_duplicates ?? 0 });
-      takeFonti(r);
+      const job = await watcher.run();
+      if (job.status === 'error') throw new NewsRefreshError('job_error', {}, job);
+      if (job.status === 'interrupted') throw new NewsRefreshError('interrupted', {}, job);
+      const esito = esitoGiro(job);
+      setRefreshInfo({ saved: esito.saved, duplicates: esito.duplicates, notClassified: esito.notClassified, joined: job.joined });
       // il refresh manuale E' un giro: lo stato freschezza va riletto
       await Promise.all([loadFeed(), loadFavs(), loadGiro()]);
-    } catch (e) { setFeedErr({ operation: 'refresh', detail: errorDetail(e) }); }
-    finally { setRefreshing(false); }
+    } catch (e) { setFeedErr({ operation: 'refresh', detail: testoErroreRefresh(e) }); }
+    finally {
+      if (refreshWatcherRef.current === watcher) refreshWatcherRef.current = null;
+      setRefreshing(false);
+    }
   }, [loadFeed, loadFavs, loadGiro, takeFonti]);
 
   const loadBriefing = useCallback(async () => {
@@ -1250,8 +306,7 @@ export default function NewsPage() {
     cacheLanguage.current = selected;
     loadFeed(); loadBriefing();
   }, [tr, loadFeed, loadBriefing]);
-  // Mount + poll 5 min della vista DESK (cadenza identica alla v0.7:
-  // NESSUN aumento di frequenza verso i provider esterni).
+  // Mount + poll 5 min dell'agenda (nessun aumento di frequenza verso i provider esterni).
   useEffect(() => {
     loadFeed(); loadFavs(); refreshAllDesk(); loadGiro(); loadNextRun();
     const id = setInterval(() => { loadFeed(); refreshAllDesk(); loadGiro(); loadNextRun(); }, 5 * 60 * 1000);
@@ -1267,6 +322,8 @@ export default function NewsPage() {
     return () => clearInterval(id);
   }, [auto, loadFeed, loadGiro]);
 
+  useEffect(() => () => refreshWatcherRef.current?.stop(), []);
+
   // cambio categorie macro -> ricarica server-side (skip primo render)
   const firstMacroRun = useRef(true);
   useEffect(() => {
@@ -1275,12 +332,52 @@ export default function NewsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [macroCategorySel]);
 
+  // Pesi in portafoglio per «% del portafoglio»: una lettura all'apertura, poi lo
+  // snapshot che il runner di Layout pubblica (nessun polling in più).
+  useEffect(() => {
+    let vivo = true;
+    Bellomberg.portfolio().then(p => { if (vivo) setSnap(p); }).catch(() => {});
+    const onSnapshot = (event: Event) => {
+      const snapshot = (event as CustomEvent<PortfolioSnapshot>).detail;
+      if (snapshot) setSnap(snapshot);
+    };
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return () => { vivo = false; };
+    window.addEventListener('bb:portfolio-snapshot', onSnapshot);
+    return () => { vivo = false; window.removeEventListener('bb:portfolio-snapshot', onSnapshot); };
+  }, []);
+
+  // Un avviso (in app o di sistema) chiede di aprire una notizia: si torna al flusso
+  // senza filtri, così la notizia è visibile. Il riassunto AI parte solo se l'avviso
+  // lo ha chiesto esplicitamente con il suo pulsante.
+  useEffect(() => {
+    const apri = (r: RichiestaNotizia | null) => {
+      if (!r) return;
+      setView('wire');
+      setFPeriod('all'); setFThemes([]); setFSent([]); setFRel(0); setFTickers([]); setFQuery(''); setFavOnly(false);
+      setSelectedId(r.id);
+      setAiRequestId(r.ai ? r.id : null);
+    };
+    apri(leggiRichiesta());
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+    const on = (e: Event) => { leggiRichiesta(); apri((e as CustomEvent<RichiestaNotizia>).detail); };
+    window.addEventListener(NEWS_SELECT_EVENT, on);
+    return () => window.removeEventListener(NEWS_SELECT_EVENT, on);
+  }, []);
+
   // ============================================================
-  // DERIVED — WIRE
+  // DERIVED — FLUSSO
   // ============================================================
   const favSet = useMemo(
     () => new Set(favs.map(f => (f.ticker || '').toUpperCase()).filter(Boolean)),
     [favs]);
+
+  const pesi = useMemo(() => {
+    const m = new Map<string, PesoTitolo>();
+    for (const p of snapRaw?.positions || []) {
+      if (p.ticker && Number.isFinite(p.peso_pct)) m.set(p.ticker.toUpperCase(), { peso: p.peso_pct, nome: p.nome });
+    }
+    return m;
+  }, [snapRaw]);
 
   const feedTickerCounts = useMemo(() => {
     const m: Record<string, number> = {};
@@ -1301,74 +398,54 @@ export default function NewsPage() {
   const themeOptions = useMemo(() => {
     const counts: Record<string, number> = {};
     feed.forEach(n => { const k = themeKeyOf(n); counts[k] = (counts[k] || 0) + 1; });
-    return Object.entries(counts)
-      .map(([key, count]) => ({ key, count, label: themeLabelOf(key) }))
-      .sort((a, b) => b.count - a.count);
-  }, [feed, tr]);
+    fThemes.forEach(k => { if (!(k in counts)) counts[k] = 0; });
+    return Object.entries(counts).map(([key, count]) => ({ key, count })).sort((a, b) => b.count - a.count);
+  }, [feed, fThemes]);
 
   const filtered = useMemo(() => {
+    const q = fQuery.trim().toLowerCase();
     return feed.filter(n => {
       if (!matchesDatePresetNews(n.published_at || n.pulled_at, fPeriod)) return false;
       if (fThemes.length > 0 && !fThemes.includes(themeKeyOf(n))) return false;
       if (fSent.length > 0 && !fSent.includes(sentBucket(n.sentiment))) return false;
       if (fRel > 0 && (n.relevance ?? 0) < fRel) return false;
-      if (fTickers.length > 0 && !fTickers.includes((n.ticker_mentioned || '').toUpperCase())) return false;
+      const tk = (n.ticker_mentioned || '').toUpperCase();
+      if (fTickers.length > 0 && !fTickers.includes(tk)) return false;
+      if (favOnly && !(tk && favSet.has(tk))) return false;
+      if (q && ![n.title, n.snippet, n.title_original, n.snippet_original, tk, n.source]
+        .some(x => (x || '').toLowerCase().includes(q))) return false;
       return true;
     });
-  }, [feed, fPeriod, fThemes, fSent, fRel, fTickers]);
+  }, [feed, fPeriod, fThemes, fSent, fRel, fTickers, favOnly, favSet, fQuery]);
 
-  // nastro cronologico raggruppato per giorno (OGGI / IERI / data)
-  const dayGroups = useMemo(() => {
-    const sorted = [...filtered].sort((a, b) => tsOf(b) - tsOf(a));
-    const map = new Map<string, FeedItem[]>();
-    for (const n of sorted) {
-      const k = dayKeyFromTs(tsOf(n));
-      const arr = map.get(k);
-      if (arr) arr.push(n); else map.set(k, [n]);
-    }
-    return Array.from(map.entries());
-  }, [filtered]);
+  // Selezione: quella scelta se è nell'elenco filtrato, altrimenti la notizia più recente.
+  const effectiveId = useMemo(() => {
+    if (selectedId != null && filtered.some(n => n.id === selectedId)) return selectedId;
+    let best: FeedItem | null = null;
+    for (const n of filtered) if (!best || tsOf(n) > tsOf(best)) best = n;
+    return best?.id ?? null;
+  }, [selectedId, filtered]);
 
-  // fascia MARKET MOVING preservata (relevance >= 8), rank per _materiality
-  const marketMoving = useMemo(
-    () => feed.filter(n => (n.relevance ?? 0) >= 8)
-              .sort((a, b) => (b._materiality ?? 0) - (a._materiality ?? 0))
-              .slice(0, 6),
-    [feed]);
+  // «Nuove dall'ultima visita»: più recenti della notizia più nuova vista l'ultima volta.
+  const nuove = useMemo(() => {
+    if (!lastVisit) return new Set<number>();
+    return new Set(feed.filter(n => tsOf(n) > lastVisit.newestTs).map(n => n.id));
+  }, [feed, lastVisit]);
 
-  const stats = useMemo<WireStats>(() => {
-    const now = Date.now();
-    let pos = 0, neu = 0, neg = 0, h24 = 0, h6 = 0, relSum = 0, relN = 0;
-    const themes: Record<string, number> = {};
-    const tickers = new Set<string>();
-    const providers = new Set<string>();
+  const stats = useMemo(() => {
+    const tickers = new Set<string>(), providers = new Set<string>();
+    let relSum = 0, relN = 0;
     for (const n of feed) {
-      const b = sentBucket(n.sentiment);
-      if (b === 'pos') pos++; else if (b === 'neg') neg++; else neu++;
-      const t = tsOf(n);
-      if (t > 0) {
-        const ageH = (now - t) / 3600_000;
-        if (ageH <= 24) h24++;
-        if (ageH <= 6) h6++;
-      }
-      const k = themeKeyOf(n);
-      themes[k] = (themes[k] || 0) + 1;
       if (n.ticker_mentioned) tickers.add(n.ticker_mentioned.toUpperCase());
       if (n.provider) providers.add(n.provider);
       if (n.relevance != null) { relSum += n.relevance; relN++; }
     }
-    const topThemes = Object.entries(themes)
-      .map(([key, count]) => ({ key, label: themeLabelOf(key), count }))
-      .sort((a, b) => b.count - a.count).slice(0, 6);
-    return { pos, neu, neg, h24, h6, total: feed.length, topThemes,
-             nTickers: tickers.size, nProviders: providers.size,
-             avgRel: relN > 0 ? relSum / relN : 0 };
-  }, [feed, tr]);
+    return { tickers: tickers.size, providers: providers.size, avgRel: relN > 0 ? relSum / relN : 0, stored: feed.length };
+  }, [feed]);
 
-  // MATRICE CANALI: provider visti nel feed (count + ultimo item) fusi con la
-  // dichiarazione fonti_mute (25); un provider muto ASSENTE dal feed compare
-  // comunque a 0 — il buco si vede, non sparisce (lezione search_portfolio_news).
-  const channels = useMemo<Channel[]>(() => {
+  // CANALI: provider visti nel feed (count + ultimo item) fusi con la dichiarazione
+  // fonti_mute; un provider muto ASSENTE dal feed compare comunque a 0.
+  const channels = useMemo<Canale[]>(() => {
     const m: Record<string, { count: number; last: number }> = {};
     for (const n of feed) {
       const p = (n.provider || '?').toLowerCase();
@@ -1377,9 +454,8 @@ export default function NewsPage() {
       m[p].count++;
       if (t > m[p].last) m[p].last = t;
     }
-    const out: Channel[] = Object.entries(m).map(([name, v]) => ({
-      name, count: v.count, last: v.last,
-      muteReason: fonti.mute[name] ?? null,
+    const out: Canale[] = Object.entries(m).map(([name, v]) => ({
+      name, count: v.count, last: v.last, muteReason: fonti.mute[name] ?? null,
     }));
     for (const [p, motivo] of Object.entries(fonti.mute)) {
       if (!(p.toLowerCase() in m)) out.push({ name: p.toLowerCase(), count: 0, last: 0, muteReason: String(motivo) });
@@ -1387,35 +463,32 @@ export default function NewsPage() {
     return out.sort((a, b) => b.count - a.count);
   }, [feed, fonti.mute]);
 
-  const nActiveFilters = (fPeriod !== 'all' ? 1 : 0) + fThemes.length + fSent.length
-                       + (fRel > 0 ? 1 : 0) + fTickers.length;
   const resetFilters = useCallback(() => {
-    setFPeriod('all'); setFThemes([]); setFSent([]); setFRel(0); setFTickers([]);
+    setFPeriod('all'); setFThemes([]); setFSent([]); setFRel(0); setFTickers([]); setFQuery(''); setFavOnly(false);
   }, []);
+  const toggle = <T,>(set: React.Dispatch<React.SetStateAction<T[]>>) => (v: T) =>
+    set(arr => (arr.includes(v) ? arr.filter(x => x !== v) : [...arr, v]));
+
+  const toggleFav = useCallback(async (ticker: string, nome?: string) => {
+    setFavBusy(true); setFavActionErr(null);
+    try {
+      if (favSet.has(ticker)) await Bellomberg.favDel(ticker);
+      else await Bellomberg.favAdd({ ticker, ...(nome ? { name: nome } : {}) });
+      await loadFavs();
+    } catch (e) { setFavActionErr(errorDetail(e)); }
+    finally { setFavBusy(false); }
+  }, [favSet, loadFavs]);
 
   // ============================================================
-  // DERIVED — DESK (legacy)
+  // DERIVED — AGENDA
   // ============================================================
   const filteredMacro = useMemo(() => {
-    return macro.filter(n => matchesDatePresetNews(n.published_at, macroDateSel)).slice(0, 100);
+    return macro.filter(n => matchesDatePresetNews(n.published_at, macroDateSel)).slice(0, 100) as MacroNewsItem[];
   }, [macro, macroDateSel]);
 
-  const corpTickers = useMemo(() => {
-    const counts: Record<string, number> = {};
-    corp.forEach(e => {
-      const t = e.ticker_mentioned;
-      if (t) counts[t] = (counts[t] || 0) + 1;
-    });
-    return Object.entries(counts).map(([ticker, count]) => ({ ticker, count })).sort((a, b) => b.count - a.count);
-  }, [corp]);
-
   const filteredCorp = useMemo(() => {
-    let arr = corp;
-    if (corpTickerSel.length > 0)
-      arr = arr.filter(e => e.ticker_mentioned && corpTickerSel.includes(e.ticker_mentioned));
-    arr = arr.filter(e => matchesDatePresetNews(e.published_at, corpDateSel));
-    return arr;
-  }, [corp, corpTickerSel, corpDateSel]);
+    return (corp as CorporateEvent[]).filter(e => matchesDatePresetNews(e.published_at, corpDateSel));
+  }, [corp, corpDateSel]);
 
   const filteredGlobal = useMemo(() => {
     return globalNews.filter(n => matchesDatePresetNews(n.published_at, globalDateSel));
@@ -1426,573 +499,129 @@ export default function NewsPage() {
       if (isHoliday(e.title || '')) return false;
       if (!matchesDatePresetCal(e.date, econDateSel)) return false;
       if (econImportanceSel.length > 0 && !econImportanceSel.includes(e.importance)) return false;
-      if (econCountrySel.length > 0 && !econCountrySel.includes((e.country || '').toUpperCase())) return false;
+      // G8: le trimestrali del portafoglio passano sempre; paesi senza chip e «?» = chip «Altri»
+      if (!passaFiltroPaese(e, econCountrySel)) return false;
       return true;
     });
   }, [econ, econCountrySel, econImportanceSel, econDateSel]);
 
-  const econByDate = useMemo(() => {
-    const m: Record<string, EconomicEvent[]> = {};
-    for (const e of filteredEcon) {
-      const k = e.date;
-      if (!m[k]) m[k] = [];
-      m[k].push(e);
-    }
-    return m;
-  }, [filteredEcon]);
-
   const countryCounts = useMemo(() => {
-    const counts: Record<string, number> = {};
-    econ.forEach(e => {
-      if (isHoliday(e.title || '')) return;
-      const c = (e.country || '').toUpperCase();
-      if (c) counts[c] = (counts[c] || 0) + 1;
-    });
-    return counts;
+    return conteggioPerChip(econ.filter(e => !isHoliday(e.title || '')));
   }, [econ]);
 
   const deskBusy = briefingLoad || macroLoad || corpLoad || globalLoad || econLoad;
   const nMute = Object.keys(fonti.mute).length;
-  const tot3 = Math.max(1, stats.pos + stats.neu + stats.neg);
-  const radarCount = feed.filter(n => { const t = tsOf(n); return t > 0 && Date.now() - t < 86_400_000; }).length;
+  const giroDichiarato = typeof giro === 'object' ? giro : null;
+  const giroParziale = giroDichiarato?.stato === 'degradato';
+  const giroGuasto = giro === 'errore' || giro === 'assente' || (!!giroDichiarato && giroDichiarato.stato !== 'ok' && !giroParziale);
+  const fontiTono = giroGuasto ? 'bad' : nMute > 0 || giroParziale ? 'warn' : !fonti.declared ? 'off' : 'ok';
+  const bloccatiGiro = Object.entries(giroDichiarato?.providers_blocked || {}).map(([p, m]) => `${nomeFonteMuta(p)} (${motivoMuto(m)})`).join(', ');
+  const oraDi = (d: Date | null) => d ? d.toLocaleTimeString(localeDi(linguaCorrente()), { hour: '2-digit', minute: '2-digit' }) : null;
+  const aggiornato = oraDi(view === 'wire' ? lastFeedAt : lastDeskAt);
 
   // ============================================================
   // RENDER
   // ============================================================
   return (
-    <div className="obsx bootx h-full min-h-0 overflow-hidden animate-fadeIn">
-
-      {/* ══ HERO "SIGNAL DECK": traffico wire in vetrina + copertura DICHIARATA + comandi ══ */}
-      <div className="p3 hero scanx" style={{ flexShrink: 0 }}>
-        <span className="tick tl" /><span className="tick tr" /><span className="tick bl" /><span className="tick br" />
-        <div className="p3h am">{tr('newsdesk.s086')}
-          <span className="n">{tr('newsdesk.s087')}</span>
-          <span className="side num">
-            {feed.length} {tr('newsdesk.s088')} {lastFeedAt ? lastFeedAt.toLocaleTimeString(localeDi(linguaCorrente()), { hour12: false }) : '--:--:--'}
-            {refreshInfo ? ' · ' + tr('newsdesk.s085', { a: refreshInfo.saved, b: refreshInfo.duplicates }) : ''}
-            {view === 'desk'
-              ? ' · DESK AUTO 5M' + (lastDeskAt ? tr('newsdesk.s089') + lastDeskAt.toLocaleTimeString(localeDi(linguaCorrente()), { hour: '2-digit', minute: '2-digit' }) : '')
-              : auto ? ' · AUTO 60S' : ''}
+    <ModernPage page="news" render={() => (
+      <div className="bbn-notizie bbn-font" data-view={view}>
+        <header className="news-top">
+          <h1>{w.title}</h1>
+          <span data-qa="news-view">
+            <Segmenti<'wire' | 'desk'> etichetta={w.views} valore={view} onChange={setView} className="is-large"
+              opzioni={[{ id: 'wire', testo: w.viewFlow }, { id: 'desk', testo: w.viewAgenda }]} />
           </span>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'stretch', flexWrap: 'wrap', minHeight: 74 }}>
-          {/* vetrina: SIGNAL TRAFFIC — istogramma orario 24h + polso sentiment */}
-          <div style={{ padding: '9px 16px 11px' }}>
-            <div style={{ fontSize: 9, letterSpacing: '.22em', fontWeight: 600, color: '#73829F', textTransform: 'uppercase' }}>{tr('newsdesk.s090')}</div>
-            <div style={{ display: 'flex', alignItems: 'flex-end', gap: 12, marginTop: 3 }}>
-              <div className="num" style={{ fontSize: 22, fontWeight: 700, lineHeight: 1.1, color: '#ECF1FA', whiteSpace: 'nowrap' }}
-                   title={tr('newsdesk.s091')}>
-                {stats.h24}<span style={{ fontSize: 12, fontWeight: 600, marginLeft: 6, color: '#8D9FC4' }}>{tr('newsdesk.s092')}</span>
-              </div>
-              <FlowBars feed={feed} width={200} />
-            </div>
-            <div style={{ width: 260, height: 3, marginTop: 6, display: 'flex', background: 'rgba(26,36,64,.9)' }}
-                 title={tr('newsdesk.s093', {a: stats.pos, b: stats.neu, c: stats.neg})}>
-              <span style={{ display: 'block', width: `${(stats.pos / tot3) * 100}%`, background: C.emerald }} />
-              <span style={{ display: 'block', width: `${(stats.neu / tot3) * 100}%`, background: '#2A3760' }} />
-              <span style={{ display: 'block', width: `${(stats.neg / tot3) * 100}%`, background: C.crimson }} />
-            </div>
-            <div className="num" style={{ fontSize: 9, fontWeight: 600, color: '#73829F', marginTop: 4, letterSpacing: '.1em', textTransform: 'uppercase' }}>
-              6H {stats.h6} {tr('newsdesk.s094')} {stats.total} {tr('newsdesk.s095')}
-            </div>
+          {aggiornato && <span className="bbn-chip">{w.updatedAt(aggiornato)}</span>}
+          {nuove.size > 0 && view === 'wire' && <span className="bbn-chip news-chip-new"><i aria-hidden="true" />{w.newSince(nuove.size)}</span>}
+          {refreshing && refreshJob?.status === 'running' && <span className="bbn-chip" role="status" data-qa="news-refresh-running">{statoGiroInCorso(refreshJob, refreshJoined)}</span>}
+          {refreshInfo && <span className="bbn-chip" data-qa="news-refresh-result">{refreshInfo.joined ? w.refreshJoinedDone + ' ' : ''}{w.refreshResult(fmtNum(refreshInfo.saved, 0), fmtNum(refreshInfo.duplicates, 0))}{refreshInfo.notClassified ? ` · ${w.refreshNotClassified(fmtNum(refreshInfo.notClassified, 0))}` : ''}</span>}
+          {/* ESITO DELL'ULTIMO GIRO: quante lette, quante nuove, quando il prossimo — «nessuna novità»
+              e «non sta girando» non devono sembrare la stessa cosa */}
+          {giro !== 'attesa' && (
+            <button type="button" className={'bbn-chip news-round' + (giroGuasto ? ' is-bad' : giroParziale ? ' is-warn' : '')}
+              data-qa="news-round" onClick={() => setSourcesOpen(true)} title={w.roundChipHint}>
+              <span className={`news-dot is-${giroGuasto ? 'bad' : giroParziale ? 'warn' : 'ok'}`} aria-hidden="true" />
+              {giroDichiarato && giroDichiarato.timestamp
+                ? <>{w.roundChip(hhmm(Date.parse(giroDichiarato.timestamp)), giroDichiarato.saved ?? null, giroDichiarato.fetched ?? null)}
+                    {providerNextRun && <span className="nx"> · {w.roundChipNext(providerNextRun)}</span>}</>
+                : w.roundChipNone}
+            </button>
+          )}
+          <span className="bbn-grow" />
+          <button type="button" className="bbn-switch" role="switch" aria-checked={auto} onClick={() => setAuto(a => !a)} title={w.autoHint}>
+            <i />{w.auto}
+          </button>
+          <MenuAvvisi />
+          <button type="button" className="bbn-btn" data-qa="news-sources" onClick={() => setSourcesOpen(true)}>
+            <span className={`news-dot is-${fontiTono}`} aria-hidden="true" />{w.sources}
+          </button>
+          {view === 'wire' ? (
+            <button type="button" className="bbn-btn is-primary" data-qa="news-refresh" onClick={heavyRefresh} disabled={refreshing} title={w.pollHint}>
+              <RefreshCw size={14} className={refreshing ? 'spin' : undefined} />{refreshing ? w.pollingProviders : w.pollProviders}
+            </button>
+          ) : (
+            <button type="button" className="bbn-btn is-primary" data-qa="news-refresh" onClick={refreshAllDesk} disabled={deskBusy}>
+              <RefreshCw size={14} className={deskBusy ? 'spin' : undefined} />{deskBusy ? w.refreshingAgenda : w.refreshAgenda}
+            </button>
+          )}
+        </header>
+
+        {(schedulerErr || providersErr || favsErr) && (
+          <div className="news-notes">
+            {[schedulerErr, providersErr, favsErr].filter(Boolean).map(p => (
+              <p key={p!.operation} className="news-note is-bad" role="status"><TriangleAlert size={15} aria-hidden="true" />{problemText(p!)}</p>
+            ))}
           </div>
-          <HeroCell label={tr('newsdesk.s096')} value={String(marketMoving.length)}
-                    color={marketMoving.length > 0 ? '#FFA51E' : undefined}
-                    sub={tr('newsdesk.s097')}
-                    title={tr('newsdesk.s098')} />
-          <HeroCell label={tr('newsdesk.s099')} value={`${stats.nTickers} TKR`}
-                    sub={tr('newsdesk.s100', {a: stats.nProviders, b: fmtNum(stats.avgRel, 1)})}
-                    title={tr('newsdesk.s101')} />
-          <HeroCell label={tr('newsdesk.s102')}
-                    value={!fonti.declared ? tr('newsdesk.s053') : nMute === 0 ? tr('newsdesk.s103') : String(nMute)}
-                    tone={!fonti.declared ? undefined : nMute === 0 ? 'up' : 'dn'}
-                    sub={!fonti.declared ? tr('newsdesk.s104')
-                         : nMute === 0 ? tr('newsdesk.s105')
-                         : tagliaVisibile(Object.keys(fonti.mute).sort().map(nomeFonteMuta).join(' · '), 34).toUpperCase()}
-                    title={!fonti.declared
-                      ? tr('newsdesk.s106')
-                      : nMute === 0
-                        ? tr('newsdesk.s107')
-                        : tr('newsdesk.s108')} />
-          {/* FRESCHEZZA (ponte (68), impianto A scelto dal PM 17/08 sulla rosa
-              in situ): stato + età, MAI solo l'età; il verbale pieno nel title */}
-          <HeroCell label={tr('newsdesk.s109')} grado10
-                    value={giroCella.v} color={giroCella.col}
-                    sub={giroCella.sub} title={giroCella.tip} />
-          <div style={{ marginLeft: 'auto', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', justifyContent: 'center', gap: 6, padding: '8px 14px' }}>
-            <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-              <span className="tfg">
-                <button className={'tb' + (view === 'wire' ? ' on' : '')} onClick={() => setView('wire')}>WIRE</button>
-                <button className={'tb' + (view === 'desk' ? ' on' : '')} onClick={() => setView('desk')}>DESK</button>
-              </span>
-              <button className={'tb' + (auto ? ' on' : '')} onClick={() => setAuto(a => !a)}
-                      title={tr('newsdesk.s110')}>
-                AUTO 60S
-              </button>
-              {view === 'wire' ? (
-                <button className={'tb' + (refreshing ? ' dis' : '')} onClick={heavyRefresh} disabled={refreshing}
-                        style={{ color: '#FFA51E' }}
-                        title={tr('newsdesk.s111')}>
-                  {refreshing ? tr('newsdesk.s112') : tr('newsdesk.s113')}
-                </button>
-              ) : (
-                <button className={'tb' + (deskBusy ? ' dis' : '')} onClick={refreshAllDesk} disabled={deskBusy}
-                        style={{ color: '#FFA51E' }}>
-                  {deskBusy ? tr('newsdesk.s114') : tr('newsdesk.s115')}
-                </button>
-              )}
-            </div>
-            <div className="num" style={{ fontSize: 9, fontWeight: 600, color: '#73829F', letterSpacing: '.1em', textTransform: 'uppercase' }}>
-              {view === 'wire'
-                ? tr(nActiveFilters === 1 ? 'newsdesk.activeFilterOne' : 'newsdesk.s116', {a: filtered.length, b: feed.length, c: nActiveFilters})
-                : tr('newsdesk.s117')}
-            </div>
-          </div>
-        </div>
+        )}
+
+        {/* AVVISO COPERTURA: reso SOLO se il backend lo dichiara, mai dedotto */}
+        {fonti.declared && (nMute > 0 || fonti.avviso) && (
+          <p className="news-note is-warn" role="status">
+            <TriangleAlert size={15} aria-hidden="true" />
+            <span className="txt"><b>{w.coverage}</b>{' '}
+              {nMute > 0 && w.coverageMute(Object.entries(fonti.mute).map(([p, m]) => `${nomeFonteMuta(p)} (${motivoMuto(m)})`).join(', '))}
+              {fonti.avviso ? ` ${fonti.avviso}` : ''}
+            </span>
+            <button type="button" className="bbn-link" onClick={() => setSourcesOpen(true)}>{w.seeSources}</button>
+          </p>
+        )}
+
+        {/* GIRO PARZIALE: lo stato del giro dei provider resta visibile anche quando il feed
+            dichiara le fonti attive (risposte diverse, momenti diversi): mai solo nel pannello */}
+        {giroParziale && !(fonti.declared && nMute > 0) && (
+          <p className="news-note is-warn" role="status">
+            <TriangleAlert size={15} aria-hidden="true" />
+            <span className="txt">{w.roundPartialNote(bloccatiGiro)}</span>
+            <button type="button" className="bbn-link" onClick={() => setSourcesOpen(true)}>{w.seeSources}</button>
+          </p>
+        )}
+
+        {view === 'wire' ? (
+          <VistaFlusso feed={feed} filtered={filtered} feedLoad={feedLoad} feedErr={feedErr} refreshing={refreshing}
+            onRetry={loadFeed} onPoll={heavyRefresh}
+            filtri={{ period: fPeriod, themes: fThemes, sent: fSent, rel: fRel, tickers: fTickers, q: fQuery, favOnly }}
+            azioni={{ setPeriod: setFPeriod, toggleTheme: toggle(setFThemes), toggleSent: toggle(setFSent), setRel: setFRel,
+              toggleTicker: toggle(setFTickers), setQ: setFQuery, setFavOnly, reset: resetFilters }}
+            themeOptions={themeOptions} tickerOptions={tickerOptions} favSet={favSet} pesi={pesi}
+            selectedId={effectiveId} onSelect={id => { setSelectedId(id); setAiRequestId(null); }}
+            onToggleFav={toggleFav} favBusy={favBusy} favError={favActionErr}
+            nuove={nuove} ultimaVisita={lastVisit?.at ?? null}
+            aiSubito={aiRequestId != null && aiRequestId === effectiveId} onAiSubito={() => setAiRequestId(null)} />
+        ) : (
+          <VistaAgenda briefing={briefing} briefingLoad={briefingLoad} briefingErr={briefingErr} onRewrite={refreshBriefing}
+            econ={filteredEcon} econLoad={econLoad} econErr={econErr} countryCounts={countryCounts}
+            econDate={econDateSel} setEconDate={setEconDateSel} econImportance={econImportanceSel} setEconImportance={setEconImportanceSel}
+            econCountries={econCountrySel} setEconCountries={setEconCountrySel}
+            corp={filteredCorp} corpLoad={corpLoad} corpErr={corpErr} corpDate={corpDateSel} setCorpDate={setCorpDateSel}
+            macro={filteredMacro} macroLoad={macroLoad} macroErr={macroErr} macroDate={macroDateSel} setMacroDate={setMacroDateSel}
+            macroCategories={macroCategorySel} setMacroCategories={setMacroCategorySel}
+            global={filteredGlobal} globalLoad={globalLoad} globalErr={globalErr} globalDate={globalDateSel} setGlobalDate={setGlobalDateSel}
+            pesi={pesi} />
+        )}
+
+        <PannelloFonti aperto={sourcesOpen} onChiudi={() => setSourcesOpen(false)} giro={giro}
+          intervallo={providerIntervalLabel} prossimo={providerNextRun} canali={channels} fonti={fonti} copertura={stats} budget={budget} />
       </div>
-
-      {/* ══ COMM TAPE: nastro headline live (dati veri, hover=pausa) ══ */}
-      <CommTape feed={feed} />
-      {(schedulerErr || providersErr) && <div style={{ flexShrink: 0 }}>
-        {schedulerErr && <ErrorBox msg={schedulerErr} />}
-        {providersErr && <ErrorBox msg={providersErr} />}
-      </div>}
-
-      {/* ══ AVVISO COPERTURA (reso SOLO se il backend lo dichiara: mai dedotto) ══ */}
-      {fonti.declared && (nMute > 0 || fonti.avviso) && (
-        <div className="border border-amber/50 bg-amber/5 px-3 py-2 font-mono text-2xs text-amber flex items-start gap-2"
-             style={{ flexShrink: 0 }}>
-          <AlertCircle size={12} className="mt-0.5 shrink-0" />
-          <span>
-            <b>{tr('newsdesk.s118')} </b>
-            {Object.entries(fonti.mute).map(([p, m]) => `${nomeFonteMuta(p)} (${motivoMuto(m)})`).join(' · ') || '—'}
-            {fonti.avviso ? ` — ${fonti.avviso}` : ''}
-          </span>
-        </div>
-      )}
-
-      {view === 'wire' ? (
-        /* ================= VISTA WIRE: rail filtri | nastro | destra + runline ================= */
-        <>
-        <div className="nwir flex-1 flex gap-2 overflow-hidden min-h-0 animate-fadeIn">
-          {/* (a) RAIL FILTRI */}
-          <div className="w-44 shrink-0 p3" style={bd(60)}>
-            <div className="p3h"><Filter size={10} /> {tr('newsdesk.s119')}
-              {nActiveFilters > 0 && (
-                <span className="side">
-                  <button onClick={resetFilters}
-                          className="font-mono text-3xs text-amber hover:text-amber-bright transition-colors">
-                    {tr('newsdesk.s120')}{nActiveFilters})
-                  </button>
-                </span>
-              )}
-            </div>
-            <div className="flex-1 overflow-y-auto p-1.5 space-y-3 min-h-0">
-              <div>
-                <RailLabel>{tr('newsdesk.s121')}</RailLabel>
-                <div className="space-y-px">
-                  {DATE_PRESETS_NEWS().map(p => (
-                    <RailChip key={p.value} on={fPeriod === p.value} label={p.label}
-                              onClick={() => setFPeriod(p.value)} />
-                  ))}
-                </div>
-              </div>
-
-              <div>
-                <RailLabel>{tr('newsdesk.s122')}</RailLabel>
-                <div className="space-y-px">
-                  {themeOptions.length === 0 && (
-                    <div className="px-1.5 font-mono text-3xs text-faint">{tr('newsdesk.s123')}</div>
-                  )}
-                  {themeOptions.map(t => (
-                    <RailChip key={t.key} on={fThemes.includes(t.key)} label={t.label} count={t.count}
-                              onClick={() => toggleIn(fThemes, t.key, setFThemes)} />
-                  ))}
-                </div>
-              </div>
-
-              <div>
-                <RailLabel>{tr('newsdesk.s124')}</RailLabel>
-                <div className="grid grid-cols-3 gap-1">
-                  {SENT_FILTERS.map(s => {
-                    const on = fSent.includes(s.key);
-                    return (
-                      <button key={s.key}
-                        onClick={() => toggleIn(fSent, s.key, setFSent)}
-                        className="font-mono text-3xs py-1 rounded-sm border text-center transition-colors"
-                        style={on
-                          ? { borderColor: s.color, color: s.color, background: s.color + '1f' }
-                          : { borderColor: '#1A2440', color: C.muted }}>
-                        {s.label}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div>
-                <RailLabel>{tr('newsdesk.s125')}</RailLabel>
-                <div className="grid grid-cols-3 gap-1">
-                  {REL_FILTERS().map(r => {
-                    const on = fRel === r.value;
-                    return (
-                      <button key={r.value}
-                        onClick={() => setFRel(r.value)}
-                        className={`font-mono text-3xs py-1 rounded-sm border text-center transition-colors
-                                    ${on ? 'border-amber/60 text-amber bg-amber/15' : 'border-border text-muted hover:text-text-dim'}`}>
-                        {r.label.toUpperCase()}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div>
-                <RailLabel>{tr('newsdesk.s126')}</RailLabel>
-                <div className="space-y-px max-h-44 overflow-y-auto pr-0.5">
-                  {tickerOptions.length === 0 && (
-                    <div className="px-1.5 font-mono text-3xs text-faint">{tr('newsdesk.s127')}</div>
-                  )}
-                  {tickerOptions.slice(0, 40).map(t => (
-                    <RailChip key={t.ticker} on={fTickers.includes(t.ticker)} label={t.ticker} count={t.count}
-                              star={favSet.has(t.ticker)}
-                              onClick={() => toggleIn(fTickers, t.ticker, setFTickers)} />
-                  ))}
-                </div>
-              </div>
-
-              <div>
-                <RailLabel>{tr('newsdesk.s128')}</RailLabel>
-                <div className="space-y-px max-h-44 overflow-y-auto pr-0.5">
-                  {favsErr && <ErrorBox msg={favsErr} />}
-                  {!favsErr && favs.length === 0 && (
-                    <div className="px-1.5 font-mono text-3xs text-faint">{tr('newsdesk.s129')}</div>
-                  )}
-                  {favs.map(f => {
-                    const tk = (f.ticker || '').toUpperCase();
-                    if (!tk) return null;
-                    return (
-                      <RailChip key={tk} on={fTickers.includes(tk)} label={tk}
-                                count={feedTickerCounts[tk] || 0} star
-                                onClick={() => toggleIn(fTickers, tk, setFTickers)} />
-                    );
-                  })}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* (b) NASTRO WIRE */}
-          <div className="nwmain flex-1 min-w-0 p3" style={bd(120)}>
-            <div className="p3h am">{tr('newsdesk.s130')}
-              <span className="n num">{filtered.length}/{feed.length} {tr('newsdesk.s092')}</span>
-              {feedLoad && <RefreshCw size={10} className="animate-spin text-amber" />}
-              <span className="side hidden xl:block">{tr('newsdesk.s131')}</span>
-            </div>
-            <div className="flex-1 overflow-y-auto min-h-0">
-              {feedErr ? (
-                <div className="p-4">
-                  <ErrorBox msg={feedErr} />
-                  <div className="text-center mt-2">
-                    <button onClick={loadFeed} className="btn btn-amber text-3xs px-3 py-1">{tr('newsdesk.s132')}</button>
-                  </div>
-                </div>
-              ) : feed.length === 0 && (feedLoad || refreshing) ? (
-                <LoadingBox label={tr('newsdesk.s133')} />
-              ) : feed.length === 0 ? (
-                <div className="p-8 text-center font-mono text-2xs text-faint">
-                  <div className="mb-3">{tr('newsdesk.s134')}</div>
-                  <button onClick={heavyRefresh} disabled={refreshing}
-                          className="btn btn-amber text-3xs px-3 py-1 disabled:opacity-50">
-                    <RefreshCw size={10} className={refreshing ? 'animate-spin' : ''} /> {tr('newsdesk.s135')}
-                  </button>
-                </div>
-              ) : filtered.length === 0 ? (
-                <div className="p-8 text-center font-mono text-2xs text-faint">
-                  <div className="mb-3">{tr('newsdesk.s136')}</div>
-                  <button onClick={resetFilters} className="btn btn-amber text-3xs px-3 py-1">{tr('newsdesk.s137')}</button>
-                </div>
-              ) : (
-                dayGroups.map(([k, items]) => (
-                  <div key={k}>
-                    <div className="sticky top-0 z-10 px-2 py-1 bg-bg-elev border-y border-border
-                                    font-mono text-3xs tracking-[0.25em] text-amber flex items-center justify-between">
-                      <span>{dayLabel(k)}</span>
-                      <span className="text-faint tabular-nums">{items.length}</span>
-                    </div>
-                    {items.map((n, i) => (
-                      <WireRow key={n.id ?? `${k}-${i}`} n={n}
-                               fav={!!n.ticker_mentioned && favSet.has((n.ticker_mentioned || '').toUpperCase())} />
-                    ))}
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
-
-          {/* (c) COLONNA DESTRA: SCOPE + MARKET MOVING + CANALI */}
-          <div className="nwright w-72 shrink-0 flex flex-col gap-2 overflow-hidden min-h-0">
-            <div className="p3 scpx cy shrink-0" style={bd(150)}>
-              <span className="tick tl" /><span className="tick tr" /><span className="tick bl" /><span className="tick br" />
-              <div className="p3h">{tr('newsdesk.s138')}
-                <span className="side num">{tr(radarCount === 1 ? 'newsdesk.blipCountOne' : 'newsdesk.blipCount', { a: radarCount })}</span>
-              </div>
-              <RadarScope feed={feed} favSet={favSet} />
-              <div className="scleg num">{tr('newsdesk.s139')}</div>
-            </div>
-            <div className="p3 flex-1 min-h-0" style={{ ...bd(180), borderLeft: '2px solid rgba(255,165,30,.55)' }}>
-              <div className="p3h am"><Zap size={11} /> {tr('newsdesk.s096')}
-                <span className="n">REL ≥ 8</span>
-                <span className="side"><span className={`led ${marketMoving.length > 0 ? 'led-amber pulse-dot' : 'led-off'}`} /></span>
-              </div>
-              <div className="overflow-y-auto min-h-0">
-                {marketMoving.length === 0
-                  ? <EmptyBox label={tr('newsdesk.s140')} />
-                  : marketMoving.map((n, i) => (
-                      <MoverRow key={n.id ?? i} n={n} rank={i + 1}
-                                fav={!!n.ticker_mentioned && favSet.has((n.ticker_mentioned || '').toUpperCase())} />
-                    ))}
-              </div>
-            </div>
-            <ChannelsPanel stats={stats} channels={channels} fontiDeclared={fonti.declared} />
-          </div>
-        </div>
-
-        {/* runline di stato del link wire (idioma SECURE CHANNEL della pagina di accesso) */}
-        <div className="runline num" style={{ flexShrink: 0 }}>
-          <span className={`led ${auto ? 'led-cyan pulse-dot' : 'led-off'}`} />
-          {tr('newsdesk.s141')} {auto ? tr('newsdesk.s142') : tr('newsdesk.s143')} {tr('newsdesk.s144')}
-          <span style={{ marginLeft: 'auto' }}>
-            {tr('newsdesk.s145')} {lastFeedAt ? lastFeedAt.toLocaleTimeString(localeDi(linguaCorrente()), { hour12: false }) : '--:--:--'}
-          </span>
-        </div>
-        </>
-      ) : (
-        /* ================= VISTA DESK: briefing / macro / societario / calendario ================= */
-        <div className="nwdesk flex-1 grid grid-cols-12 gap-2 overflow-hidden min-h-0 animate-fadeIn">
-          {/* col 1: briefing */}
-          <div className="col-span-4 flex flex-col gap-2 overflow-hidden min-h-0">
-            <BriefingCard data={briefing} loading={briefingLoad} error={briefingErr} onRefresh={refreshBriefing} />
-          </div>
-
-          {/* col 2: macro + eventi societari */}
-          <div className="col-span-4 flex flex-col gap-2 overflow-hidden min-h-0">
-            <div className="p3 flex-1 min-h-0" style={bd(120)}>
-              <PanelHeader
-                icon={Globe} title={tr('newsdesk.s146')} count={filteredMacro.length}
-                action={macroLoad && <RefreshCw size={10} className="animate-spin text-amber" />}
-              />
-              <div className="px-2 py-2 border-b border-border bg-bg/50 flex gap-2 flex-shrink-0">
-                <DropdownSingle
-                  label={tr('newsdesk.s121')} options={DATE_PRESETS_NEWS()}
-                  selected={macroDateSel} onChange={setMacroDateSel}
-                />
-                <Dropdown
-                  label={tr('newsdesk.s147')}
-                  options={Object.entries(CATEGORY_LABELS()).map(([k, v]) => ({ value: k, label: v }))}
-                  selected={macroCategorySel}
-                  onChange={setMacroCategorySel}
-                  allLabel={tr('newsdesk.s036')}
-                />
-              </div>
-              <div className="flex-1 overflow-y-auto min-h-0">
-                {macroErr ? <ErrorBox msg={macroErr} /> :
-                 filteredMacro.length === 0 && macroLoad ? <LoadingBox label={tr('newsdesk.s148')} /> :
-                 filteredMacro.length === 0 ? <EmptyBox label={tr('newsdesk.s149')} /> :
-                 filteredMacro.map((n, i) => {
-                   const CatIcon = categoryIcon(n.topic_category);
-                   return (
-                     <NewsRow key={i}
-                       title={n.title} snippet={n.snippet} url={n.url}
-                       provider={n.provider} source={n.source}
-                       published_at={n.published_at} importance={n.topic_importance}
-                       badges={
-                         <>
-                           <span className="text-3xs font-mono px-1 rounded-sm flex items-center gap-1"
-                                 style={{ background: importanceTone(n.topic_importance) + '14',
-                                          color: importanceTone(n.topic_importance) }}>
-                             <CatIcon size={9} /><span title={tr('newsdesk.serviceLabel', { label: n.topic_label || 'macro' })}>{n.topic_label?.slice(0, 16) || 'macro'}</span>
-                           </span>
-                           {n.tickers_affected && n.tickers_affected.length > 0 && (
-                             <span className="text-3xs font-mono text-amber/80">
-                               {n.tickers_affected.slice(0, 3).join(',')}
-                             </span>
-                           )}
-                         </>
-                       } />
-                   );
-                 })}
-              </div>
-            </div>
-
-            <div className="p3 flex-1 min-h-0" style={bd(180)}>
-              <PanelHeader
-                icon={Building2} title={tr('newsdesk.s150')} count={filteredCorp.length}
-                action={corpLoad && <RefreshCw size={10} className="animate-spin text-amber" />}
-              />
-              <div className="px-2 py-2 border-b border-border bg-bg/50 flex gap-2 flex-shrink-0">
-                <DropdownSingle
-                  label={tr('newsdesk.s121')} options={DATE_PRESETS_NEWS()}
-                  selected={corpDateSel} onChange={setCorpDateSel}
-                />
-                <Dropdown
-                  label="Ticker"
-                  options={corpTickers.map(t => ({ value: t.ticker, label: t.ticker, count: t.count }))}
-                  selected={corpTickerSel}
-                  onChange={setCorpTickerSel}
-                  allLabel={tr('newsdesk.s151', {a: corp.length})}
-                />
-              </div>
-              <div className="flex-1 overflow-y-auto min-h-0">
-                {corpErr ? <ErrorBox msg={corpErr} /> :
-                 filteredCorp.length === 0 && corpLoad ? <LoadingBox label={tr('newsdesk.s152')} /> :
-                 filteredCorp.length === 0 ? <EmptyBox label={tr('newsdesk.s153')} /> :
-                 filteredCorp.map((e, i) => (
-                   <NewsRow key={i}
-                     title={e.title} snippet={e.snippet} url={e.url}
-                     bellombergText={e.source_type === 'sec'}
-                     titleOrigin={e.title_origin} snippetOrigin={e.snippet_origin} presentationLanguages={e.presentation_languages}
-                     provider={e.provider} published_at={e.published_at}
-                     ticker={e.ticker_mentioned} importance={e.topic_importance}
-                     badges={e.event_type ? (
-                       <span className="text-3xs font-mono px-1 rounded-sm flex items-center gap-1"
-                             style={{ background: importanceTone(e.topic_importance) + '14',
-                                      color: importanceTone(e.topic_importance) }}>
-                         <FileText size={9} />{e.event_type}
-                       </span>
-                     ) : undefined} />
-                 ))}
-              </div>
-            </div>
-          </div>
-
-          {/* col 3: calendario economico + top global */}
-          <div className="col-span-4 flex flex-col gap-2 overflow-hidden min-h-0">
-            <div className="p3 cy min-h-0" style={{ ...bd(240), flex: '1.5 1 0' }}>
-              <PanelHeader
-                icon={Calendar} title={tr('newsdesk.s154')} count={filteredEcon.length}
-                action={econLoad && <RefreshCw size={10} className="animate-spin text-amber" />}
-              />
-              <div className="px-2 py-2 border-b border-border bg-bg/50 flex gap-2 flex-wrap flex-shrink-0">
-                <DropdownSingle
-                  label={tr('newsdesk.s155')} options={DATE_PRESETS_CAL()}
-                  selected={econDateSel} onChange={setEconDateSel}
-                />
-                <Dropdown
-                  label={tr('newsdesk.s156')}
-                  options={IMPORTANCE_LEVELS().map(l => ({ value: l.value, label: l.label }))}
-                  selected={econImportanceSel} onChange={setEconImportanceSel}
-                  allLabel={tr('newsdesk.s157')}
-                />
-                <Dropdown
-                  label={tr('newsdesk.s158')}
-                  options={COUNTRIES_AVAILABLE.map(c => ({ value: c, label: c, count: countryCounts[c] }))}
-                  selected={econCountrySel} onChange={setEconCountrySel}
-                  allLabel={tr('newsdesk.s159')}
-                />
-              </div>
-              <div className="flex-1 overflow-y-auto min-h-0">
-                {econErr ? (
-                  <ErrorBox msg={econErr} />
-                ) : econLoad && Object.keys(econByDate).length === 0 ? (
-                  <LoadingBox label={tr('newsdesk.calendarLoading')} />
-                ) : Object.keys(econByDate).length === 0 ? (
-                  <EmptyBox label={tr('newsdesk.s153')} />
-                ) : (
-                  Object.entries(econByDate).map(([date, events]) => (
-                    <div key={date} className="border-b border-border/40">
-                      <div className="px-3 py-1 bg-bg-elev text-3xs font-mono text-amber uppercase tracking-wider sticky top-0">
-                        {dataIt(date)}
-                      </div>
-                      {events.map((e, j) => {
-                        const hasData = e.previous != null || e.estimate != null || e.actual != null;
-                        const beat = e.actual != null && e.estimate != null
-                          ? (Number(e.actual) > Number(e.estimate) ? 'beat'
-                            : Number(e.actual) < Number(e.estimate) ? 'miss' : 'inline') : null;
-                        const beatColor = beat === 'beat' ? C.emerald : beat === 'miss' ? C.crimson : C.muted;
-                        return (
-                          <div key={j} className="px-2 py-1 hover:bg-bg-elev/50 border-b border-border/20">
-                            <div className="flex items-center gap-1">
-                              <span className="text-3xs font-mono text-faint w-12">{e.time}</span>
-                              <span className="text-3xs font-mono px-1 rounded-sm"
-                                    style={{ background: importanceTone(e.importance) + '14',
-                                             color: importanceTone(e.importance) }}>
-                                {'*'.repeat(Math.min(5, e.importance))}
-                              </span>
-                              <span className="text-3xs font-mono text-amber">{e.country}</span>
-                              {beat && (
-                                <span className="text-3xs font-mono font-bold ml-auto" style={{ color: beatColor }}>
-                                  {beat === 'beat' ? tr('newsdesk.s160') : beat === 'miss' ? tr('newsdesk.s161') : tr('newsdesk.s162')}
-                                </span>
-                              )}
-                            </div>
-                            <div className="text-2xs text-text leading-tight mt-0.5">{e.title}</div>
-                            {hasData && (
-                              <div className="flex gap-3 mt-0.5 text-3xs font-mono tabular-nums">
-                                <span className="text-faint">{tr('newsdesk.s163')} <span className="text-text-dim">{economicNumber(e.previous)}{e.unit || ''}</span></span>
-                                <span className="text-faint">{tr('newsdesk.s164')} <span style={{ color: C.cyan }}>{economicNumber(e.estimate)}{e.unit || ''}</span></span>
-                                <span className="text-faint">{tr('newsdesk.s165')} <span style={{ color: beat === 'beat' ? C.emerald : beat === 'miss' ? C.crimson : C.amberBright, fontWeight: 700 }}>{economicNumber(e.actual)}{e.unit || ''}</span></span>
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-
-            <div className="p3 vi flex-1 min-h-0" style={bd(300)}>
-              <PanelHeader
-                icon={Globe} title={tr('newsdesk.s166')} count={filteredGlobal.length}
-                action={globalLoad && <RefreshCw size={10} className="animate-spin text-amber" />}
-              />
-              <div className="px-2 py-2 border-b border-border bg-bg/50 flex gap-2 flex-shrink-0">
-                <DropdownSingle
-                  label={tr('newsdesk.s121')} options={DATE_PRESETS_NEWS()}
-                  selected={globalDateSel} onChange={setGlobalDateSel}
-                />
-              </div>
-              <div className="flex-1 overflow-y-auto min-h-0">
-                {globalErr ? <ErrorBox msg={globalErr} /> :
-                 filteredGlobal.length === 0 && globalLoad ? <LoadingBox /> :
-                 filteredGlobal.length === 0 ? <EmptyBox label={tr('newsdesk.s167')} /> :
-                 filteredGlobal.map((n, i) => (
-                   <NewsRow key={i}
-                     title={n.title} snippet={n.snippet} url={n.url}
-                     provider={n.provider} source={n.source}
-                     published_at={n.published_at} />
-                 ))}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      <style>{`
-        .news-briefing-md h2 {
-          color: #FFA51E; font-size: 11px; font-weight: 700;
-          text-transform: uppercase; letter-spacing: 0.1em;
-          margin: 10px 0 4px 0;
-          border-bottom: 1px solid rgba(255, 165, 30, 0.22); padding-bottom: 2px;
-        }
-        .news-briefing-md h2:first-child { margin-top: 0; }
-        .news-briefing-md p {
-          font-size: 11px; line-height: 1.6; color: #ECF1FA; margin: 4px 0 8px 0;
-        }
-        .news-briefing-md strong { color: #FFC555; font-weight: 600; }
-        .news-briefing-md em { color: #29D3F2; }
-        .news-briefing-md code {
-          background: rgba(255, 165, 30, 0.1); color: #FFA51E;
-          padding: 1px 4px; border-radius: 2px; font-size: 10px;
-        }
-        .news-briefing-md ul {
-          font-size: 11px; color: #ECF1FA; margin: 4px 0 8px 0;
-          padding-left: 16px; list-style: disc;
-        }
-        .news-briefing-md li { margin: 2px 0; line-height: 1.5; }
-      `}</style>
-    </div>
+    )} />
   );
 }

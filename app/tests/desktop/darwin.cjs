@@ -6,6 +6,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
+const { spawnSync } = require('node:child_process');
 const vm = require('node:vm');
 const ts = require('typescript');
 const { EventEmitter } = require('node:events');
@@ -19,6 +21,11 @@ function loadModule(file) {
 const security = loadModule('electron/security.ts');
 const mainSource = fs.readFileSync(path.join(root, 'electron/main.ts'), 'utf8');
 const mainTree = ts.createSourceFile('main.ts', mainSource, ts.ScriptTarget.Latest, true);
+const timeoutDeclaration = mainTree.statements
+  .flatMap(statement => ts.isVariableStatement(statement) ? [...statement.declarationList.declarations] : [])
+  .find(declaration => declaration.name.getText(mainTree) === 'BACKEND_START_TIMEOUT_MS');
+const backendStartTimeoutMs = Number(timeoutDeclaration?.initializer?.getText(mainTree).replaceAll('_', ''));
+assert.ok(Number.isFinite(backendStartTimeoutMs), 'backend startup timeout is declared');
 
 function functionText(name) {
   const node = mainTree.statements.find(s => ts.isFunctionDeclaration(s) && s.name?.text === name);
@@ -47,6 +54,28 @@ function handler(event, scope) {
 }
 
 const VENV = '/synthetic/backend/.venv/bin/python';
+
+// Il launcher .command si esegue davvero con /bin/bash: ha senso solo su macOS. Altrove il test e'
+// SALTATO e lo dichiara (prima falliva su Windows per lo spawn di /bin/bash, mascherando il resto).
+const SOLO_MACOS = process.platform === 'darwin' ? false : `launcher macOS: piattaforma ${process.platform}, /bin/bash e .command non applicabili`;
+test('Avvia Bellomberg.command uses this checkout venv despite an inherited Python setting', { skip: SOLO_MACOS }, () => {
+  const tempBin = fs.mkdtempSync(path.join(os.tmpdir(), 'bellomberg-launcher-'));
+  const launcher = path.resolve(root, '../tools/macos/Avvia Bellomberg.command');
+  const fakeNpm = path.join(tempBin, 'npm');
+  fs.writeFileSync(fakeNpm, '#!/bin/sh\nprintf "%s\\n" "$BELLOMBERG_PYTHON"\n');
+  fs.chmodSync(fakeNpm, 0o755);
+  try {
+    const result = spawnSync('/bin/bash', [launcher], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: tempBin + path.delimiter + process.env.PATH,
+        BELLOMBERG_PYTHON: '/opt/homebrew/bin/python3' },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), path.resolve(root, '../.venv/bin/python'));
+  } finally {
+    fs.rmSync(tempBin, { recursive: true, force: true });
+  }
+});
 
 // ---------------------------------------------------------------------------------------------
 // pure resolution (electron/security.ts)
@@ -78,16 +107,18 @@ test('Windows keeps its historical default and does not consult the venv', () =>
 // ---------------------------------------------------------------------------------------------
 // wiring: startPythonBackend (electron/main.ts) on darwin
 // ---------------------------------------------------------------------------------------------
-function backendScope({ platform = 'darwin', env = {}, exists = () => false, scriptExists = true, alreadyUp = false, child: childPlan = 'up', alive = false } = {}) {
-  const errors = []; const spawns = []; let killed = 0; let pings = 0;
+function backendScope({ platform = 'darwin', env = {}, exists = () => false, scriptExists = true, alreadyUp = false, child: childPlan = 'up', alive = false, readyAfterMs = 500 } = {}) {
+  const errors = []; const spawns = []; let killed = 0; let pings = 0; let now = 0;
   const context = vm.createContext({
     PROJECT_ROOT: '/synthetic/backend', API_PORT: 8765, quitting: false,
+    BACKEND_START_TIMEOUT_MS: backendStartTimeoutMs,
     pythonBackend: alive ? { exitCode: null } : null, backendOwned: alive,
     console: { log() {}, error() {} }, process: { platform, env },
+    Date: { now: () => now },
     path: path.posix, fs: { existsSync: p => p === '/synthetic/backend/bellomberg_api.py' ? scriptExists : exists(p) }, backendError(message) { errors.push(message); },
     defaultPython: security.defaultPython,
-    pingBackend: async () => { pings++; return alreadyUp || (childPlan === 'up' && pings > 1); },
-    setTimeout(callback) { callback(); },
+    pingBackend: async () => { pings++; return alreadyUp || (childPlan === 'up' && now >= readyAfterMs); },
+    setTimeout(callback, delay = 0) { now += delay; callback(); },
     spawn(executable, args, options) {
       spawns.push({ executable, args, options });
       const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.exitCode = null;
@@ -122,6 +153,14 @@ test('darwin: the backend virtual environment is used when it exists', async () 
   assert.equal(scope.spawns[0].executable, VENV);
   assert.equal(scope.errors.length, 0, JSON.stringify(scope.errors));
   assert.equal(scope.context.backendOwned, true);
+});
+
+test('darwin: a cold Python import can take longer than 30 seconds and still start', async () => {
+  const scope = backendScope({ exists: p => p === VENV, readyAfterMs: 45_000 });
+  await scope.context.startPythonBackend();
+  assert.equal(scope.spawns[0].executable, VENV);
+  assert.equal(scope.errors.length, 0, JSON.stringify(scope.errors));
+  assert.equal(scope.counts().killed, 0, 'slow but healthy backend is not killed');
 });
 
 test('darwin: BELLOMBERG_PYTHON wins over the venv', async () => {

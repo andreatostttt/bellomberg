@@ -34,10 +34,24 @@ from bellomberg.core.paths import REPORT_DIR
 # TOOL DEFINITIONS (JSON schema per Anthropic)
 # ============================================================
 
+from bellomberg.agents.filing_context import FILING_CHANGES_PROPERTIES
+
+# W1 (04/10, Opus 5.5): opt-in ESPLICITO al gemello USA confermato dal PM. UN solo posto
+# (agent_tools lo importa da qui): cosa significa proxy_usa per ogni tool che lo accetta.
+PROXY_USA_PROP = {"type": "boolean", "default": False,
+                  "description": ("Solo per un ticker NON coperto dalla fonte USA (es. listino "
+                                  "europeo): true = usa il gemello USA CONFERMATO dal PM nel negozio "
+                                  "gemelli (ETF stesso indice o ADR). Il payload porta in testa la "
+                                  "chiave 'proxy' con l'etichetta PROXY da citare. Senza gemello "
+                                  "confermato nessun proxy: risposta 'non coperto'. Mai scegliere "
+                                  "un proxy da soli.")}
+
+
 TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {"name": "get_filing_changes",
      "description": "Legge SOLO l'archivio locale dei confronti filing verificati. Espone periodo, copertura, freschezza, confronto corrente/storico, citazioni e stato del giudizio qualitativo. Nessuna acquisizione o nuova valutazione; un cambiamento e' un tripwire, non un segnale di trading o aggiornamento del FV.",
-     "input_schema": {"type": "object", "properties": {"ticker": {"type": "string"}}, "required": ["ticker"]}},
+     "input_schema": {"type": "object", "properties": FILING_CHANGES_PROPERTIES,
+         "required": ["ticker"]}},
     # ---- QUANT (deterministic Python) ----
     {
         "name": "get_portfolio_risk",
@@ -90,18 +104,19 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     },
     {
         "name": "get_portfolio_montecarlo",
-        "description": "Monte Carlo simulation 10k sim (default FHS bank-grade: GARCH + bootstrap residui) sul portfolio. Ritorna percentili P5/25/50/75/95 di valore portfolio a horizon, expected return, Sharpe simulato, probabilita' loss/gain thresholds, max drawdown distribution. Supporta stress replay STORICO ('gfc_2008', 'covid_2020': finestra reale scaricata ad hoc, nomi giovani via proxy beta x SPY dichiarati in stress_meta.proxied) e 'shock_3sigma'. Il campo stress_scenario nel payload e' quello APPLICATO davvero: se stress_fallback=true il replay non era possibile (fallback dichiarato). stress_meta.window_loss_pct/eur = perdita deterministica del replay da citare DICHIARANDO la base (stress_meta.basis: rendimenti in valuta LOCALE per-asset scalati sul NAV EUR — per il replay GFC direzione conservativa). Supporta what-if: add_tickers o remove_tickers.",
+        "description": "Monte Carlo simulation 10k sim (default FHS bank-grade: GARCH + bootstrap residui) sul portfolio. Ritorna percentili P5/25/50/75/95 di valore portfolio a horizon, expected return, Sharpe simulato, probabilita' loss/gain thresholds, max drawdown distribution. Supporta stress replay STORICO ('gfc_2008', 'covid_2020': finestra reale scaricata ad hoc, nomi giovani via proxy beta x SPY dichiarati in stress_meta.proxied) e 'shock_3sigma'. Il campo stress_scenario nel payload e' quello APPLICATO davvero: se stress_fallback=true il replay non era possibile (fallback dichiarato). stress_meta.window_loss_pct/eur = perdita deterministica del replay da citare DICHIARANDO la base (stress_meta.basis: rendimenti in valuta LOCALE per-asset scalati sul NAV EUR — per il replay GFC direzione conservativa). Supporta what-if: add_tickers o remove_tickers. ATTENZIONE what-if add: i ticker aggiunti ricevono INSIEME la quota new_alloc del book (frazione, es. 0.025 = 2,5%); se new_alloc NON e' passato la quota e' un valore fisso di STRESS del 30% che NON e' la size proposta: ES/VaR di quello scenario descrivono una posizione al 30%, non la posizione proposta. Il payload lo dichiara in what_if_allocation (origin 'stress_fisso' | 'parametro_chiamante', added_weight_pct_effective = peso vero simulato): citalo sempre accanto all'ES99 del pro-forma. Il campione di calibrazione e' l'intersezione delle serie: calibration_sample dice n osservazioni, date, il ticker che limita la finestra (limiting_ticker) e quante osservazioni tolgono i calendari; sotto 250 osservazioni tail_reliability_warning segnala code (ES99/VaR99) poco affidabili e va citato con l'ES99.",
         "input_schema": {"type": "object", "properties": {
             "horizon_days": {"type": "integer", "description": "5/22/63/126/252/504 trading days (default 252=1y)"},
             "n_sims": {"type": "integer", "description": "Numero simulazioni (default 10000, max 50000)"},
             "stress": {"type": "string", "enum": ["none", "gfc_2008", "covid_2020", "shock_3sigma"], "description": "Scenario stress: replay storico 2008/2020 o shock -3 sigma (default none)"},
             "add_tickers": {"type": "array", "items": {"type": "string"}, "description": "Ticker da aggiungere al portfolio per what-if (es. ['AAPL', 'GOOG'])"},
+            "new_alloc": {"type": "number", "description": "Quota del book (frazione 0-1, es. 0.025 = 2,5%) data INSIEME ai ticker di add_tickers. Passa la size proposta. Omesso = stress fisso 30% (NON e' la size proposta)."},
             "remove_tickers": {"type": "array", "items": {"type": "string"}, "description": "Ticker da rimuovere per what-if"}
         }, "required": []},
     },
     {
         "name": "get_var_backtest",
-        "description": "Backtest del VaR storico ufficiale (historical 95/99 1d): Kupiec POF (copertura) + Christoffersen (indipendenza/clustering delle eccezioni) su VaR rolling 252 obs, rendimenti EUR. Verdetto PASS/FAIL per confidenza. DICHIARATO: gira sul book corrente proiettato all'indietro (valida il MODELLO, non la P&L storica); il test sul 99% ha bassa potenza. Usalo per qualificare l'affidabilita' del VaR citato nel memo.",
+        "description": "Backtest del VaR storico ufficiale (historical 95/99 1d): Kupiec POF (copertura) + Christoffersen (indipendenza/clustering delle eccezioni) su VaR rolling 252 obs, rendimenti EUR. Verdetto per confidenza: PASS / FAIL / NON AFFIDABILE / n.d. Il verdetto ha DUE ASSI nominati, coverage (Kupiec: numero di eccezioni) e independence (Christoffersen: eccezioni a grappoli): cita sempre verdict_detail, che dice QUALE asse fallisce, mai un 'FAIL' secco. NON AFFIDABILE (reliable=false) = troppo peso del book senza serie utilizzabile (excluded_weight_pct oltre la soglia, nomi in excluded_detail) oppure mancante in media nei giorni testati (missing_weight_tested_window_pct; nomi con serie parziale in partial_coverage_tested_window): il backtest NON valida il VaR e va detto cosi', coi nomi. n.d. = un asse non calcolabile (nessun asse FAIL): il backtest non da' verdetto, NON e' un PASS. low_power=true = poche eccezioni attese, verdetto indicativo. DICHIARATO: gira sul book corrente proiettato all'indietro (valida il MODELLO, non la P&L storica); il test sul 99% ha bassa potenza. Usalo per qualificare l'affidabilita' del VaR citato nel memo.",
         "input_schema": {"type": "object", "properties": {
             "window": {"type": "integer", "description": "Finestra rolling del VaR in obs (default 252)"},
             "period": {"type": "string", "description": "Storia totale (default '3y')"}
@@ -125,17 +140,19 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     },
     {
         "name": "get_options_data",
-        "description": "Options data: IV ATM, put/call ratio, max pain, open interest, gamma exposure se disponibile. Prima prova IBKR TWS (real-time), fallback yfinance. Solo per US tickers.",
+        "description": "Options data: IV ATM, put/call ratio, max pain, open interest, gamma exposure se disponibile. Fonte primaria Polygon, poi IBKR TWS (delayed-frozen), poi yfinance; se Polygon non ha risposto il motivo e' in polygon_non_usato. Solo opzioni USA: un ticker estero (es. .MI, .DE, .L) riceve 'non coperto' PRIMA di ogni fornitore (nessun tentativo IBKR) e il campo gemello_usa dice se esiste un gemello USA CONFERMATO dal PM; lo usi SOLO richiamando con proxy_usa=true e citando l'etichetta della chiave 'proxy' in testa al payload.",
         "input_schema": {"type": "object", "properties": {
             "ticker": {"type": "string"},
-            "expiry": {"type": "string", "description": "Optional expiry date YYYY-MM-DD, default nearest"}
+            "expiry": {"type": "string", "description": "Optional expiry date YYYY-MM-DD, default nearest"},
+            "proxy_usa": PROXY_USA_PROP
         }, "required": ["ticker"]},
     },
     {
         "name": "get_option_expirations_polygon",
-        "description": "Lista date di scadenza opzioni disponibili per un sottostante US (Polygon professional). Usala PRIMA di get_options_chain_polygon per scegliere l'expiry giusta.",
+        "description": "Lista date di scadenza opzioni disponibili per un sottostante US (Polygon professional). Usala PRIMA di get_options_chain_polygon per scegliere l'expiry giusta. Ticker estero = 'non coperto' dichiarato (gemello USA solo con proxy_usa=true).",
         "input_schema": {"type": "object", "properties": {
-            "ticker": {"type": "string"}
+            "ticker": {"type": "string"},
+            "proxy_usa": PROXY_USA_PROP
         }, "required": ["ticker"]},
     },
     {
@@ -143,7 +160,8 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "description": "Chain opzioni professionale via Polygon: IV, delta/gamma/theta/vega, open interest e volume per ogni strike, su QUALSIASI expiry (YYYY-MM-DD). Fonte premium, preferiscila a get_options_data quando disponibile.",
         "input_schema": {"type": "object", "properties": {
             "ticker": {"type": "string"},
-            "expiry": {"type": "string", "description": "YYYY-MM-DD opzionale; senza, ritorna tutte le scadenze (cap 250 contratti)"}
+            "expiry": {"type": "string", "description": "YYYY-MM-DD opzionale; senza, ritorna tutte le scadenze (cap 250 contratti)"},
+            "proxy_usa": PROXY_USA_PROP
         }, "required": ["ticker"]},
     },
     {
@@ -208,26 +226,29 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     },
     {
         "name": "get_congress_trades",
-        "description": "Trade azionari dichiarati dai membri del Congresso USA (Quiver Quantitative, STOCK Act). ticker opzionale per filtrare una società; senza ticker ritorna i più recenti di tutto il Congresso.",
+        "description": "Trade azionari dichiarati dai membri del Congresso USA (Quiver Quantitative, STOCK Act). ticker opzionale per filtrare una società; senza ticker ritorna i più recenti di tutto il Congresso. Solo emittenti USA: un listino estero riceve 'non coperto' dichiarato (gemello USA solo con proxy_usa=true).",
         "input_schema": {"type": "object", "properties": {
             "ticker": {"type": "string"},
-            "limit": {"type": "integer", "default": 30}
+            "limit": {"type": "integer", "default": 30},
+            "proxy_usa": PROXY_USA_PROP
         }},
     },
     {
         "name": "get_lobbying",
-        "description": "Spesa di LOBBYING dichiarata da una societa' (Quiver Quantitative): quanto spende e su quali temi. Segnala esposizione regolatoria e posizionamento politico. Usa per tesi su regolamentazione/policy.",
+        "description": "Spesa di LOBBYING dichiarata da una societa' (Quiver Quantitative): quanto spende e su quali temi. Segnala esposizione regolatoria e posizionamento politico. Usa per tesi su regolamentazione/policy. Solo emittenti USA: un listino estero riceve 'non coperto' dichiarato (gemello USA solo con proxy_usa=true).",
         "input_schema": {"type": "object", "properties": {
             "ticker": {"type": "string"},
-            "limit": {"type": "integer", "default": 30}
+            "limit": {"type": "integer", "default": 30},
+            "proxy_usa": PROXY_USA_PROP
         }, "required": ["ticker"]},
     },
     {
         "name": "get_gov_contracts",
-        "description": "CONTRATTI GOVERNATIVI USA assegnati a una societa' (Quiver Quantitative): gli appalti federali sono un segnale duro di ricavi/visibilita' (difesa, sanita', infrastrutture). Usa per tesi fondamentali + policy.",
+        "description": "CONTRATTI GOVERNATIVI USA assegnati a una societa' (Quiver Quantitative): gli appalti federali sono un segnale duro di ricavi/visibilita' (difesa, sanita', infrastrutture). Usa per tesi fondamentali + policy. Solo emittenti USA: un listino estero riceve 'non coperto' dichiarato (gemello USA solo con proxy_usa=true).",
         "input_schema": {"type": "object", "properties": {
             "ticker": {"type": "string"},
-            "limit": {"type": "integer", "default": 30}
+            "limit": {"type": "integer", "default": 30},
+            "proxy_usa": PROXY_USA_PROP
         }, "required": ["ticker"]},
     },
     {
@@ -468,15 +489,16 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     },
     {
         "name": "get_insider_trades",
-        "description": "Form 4 SEC insider trades per un ticker: chi (CEO/CFO/director), cosa (BUY/SELL), quante azioni, prezzo, valore totale. Real-time via Finnhub.",
+        "description": "Form 4 SEC insider trades per un ticker: chi (CEO/CFO/director), cosa (BUY/SELL), quante azioni, prezzo, valore totale. Real-time via Finnhub, poi SEC EDGAR (fonti_mute dice chi non ha risposto). Titoli italiani (.MI): internal dealing da eMarket SDIR, con stato dichiarato (ok / vuoto_misurato / KO / non_coperto / STALE): un KO NON vuol dire 'nessun insider'. Altri listini esteri: 'non coperto' dichiarato, nessuna chiamata a Finnhub/SEC (togliere il suffisso aggancerebbe un omonimo USA); gemello USA solo con proxy_usa=true.",
         "input_schema": {"type": "object", "properties": {
             "ticker": {"type": "string"},
-            "days": {"type": "integer", "default": 30}
+            "days": {"type": "integer", "default": 30},
+            "proxy_usa": PROXY_USA_PROP
         }, "required": ["ticker"]},
     },
     {
         "name": "get_earnings_calendar",
-        "description": "Earnings calendar prossimi N giorni. Se ticker fornito, filtra per quello. Altrimenti ritorna tutti gli earnings del periodo (max 100).",
+        "description": "Earnings calendar prossimi N giorni. Se ticker fornito, filtra per quello. Altrimenti ritorna tutti gli earnings del periodo (max 100). Per un titolo italiano (.MI) il calendario viene da Borsa Italiana (eventi societari: items nella finestra + prossimo), con stato dichiarato: KO / non_coperto / tabella ticker->ISIN mancante = errore, NON 'nessun evento'; STALE = dato vecchio con la data vera di lettura.",
         "input_schema": {"type": "object", "properties": {
             "days_ahead": {"type": "integer", "default": 14},
             "ticker": {"type": "string",
@@ -1114,6 +1136,73 @@ def _esito_fonte(n: int, ok: int, ko: int, motivi: List[str]) -> str:
     return "interrogata: %d eventi" % n
 
 
+def _prossima_trimestrale(ticker: str) -> Tuple[Any, Any, Any]:
+    """Scadenza D4 della guidance: (data ISO | None, fonte | None, nota | None).
+    W1 (04/10): `.MI` -> primo evento «risultati» STRETTAMENTE futuro del calendario Borsa
+    Italiana (stati KO/non_coperto/STALE detti nella nota); listino estero -> Finnhub NON
+    interrogato (toglierebbe il suffisso: omonimo USA); USA -> finnhub_news.next_earnings_date.
+    Data None = memory_db applica il fallback +120g, e la nota dice perche'."""
+    t = str(ticker or "").strip().upper()
+    if t.endswith(".MI"):
+        from bellomberg.market_data.borsa_italiana import get_eventi_societari, oggi_roma
+        rifiuto, _nn = _strumento_non_societario(t)
+        if rifiuto is not None:
+            return None, None, rifiuto["error"]
+        r = get_eventi_societari(t)
+        stato = r.get("stato")
+        if stato not in ("ok", "vuoto_misurato", "STALE"):
+            return None, None, "calendario Borsa Italiana %s: %s" % (stato, r.get("motivo") or r.get("errore"))
+        oggi = oggi_roma().isoformat()
+        futuri = sorted(e["data"] for e in (r.get("eventi") or [])
+                        if e.get("data") and e["data"] > oggi and e.get("tipo") == "risultati")
+        stale = (" (STALE: calendario letto il %s)" % r.get("letto_il")) if stato == "STALE" else ""
+        if futuri:
+            return futuri[0], "prossimi risultati dal calendario Borsa Italiana" + stale, (stale.strip() or None)
+        return None, None, ("Borsa Italiana (%s): nessun evento 'risultati' futuro nella prima pagina%s"
+                            % (stato, stale))
+    from bellomberg.agents.agent_tools import guardia_fonte_usa
+    g = guardia_fonte_usa(t, "calendario earnings Finnhub", None, "next_earnings_date(%s)" % t,
+                          gemello=False)
+    if g["rifiuto"] is not None:
+        return None, None, str(g["rifiuto"]["error"])
+    from bellomberg.market_data.finnhub_news import next_earnings_date
+    vu = next_earnings_date(g["simbolo"])
+    if vu:
+        return vu, "prossima trimestrale dal calendar (finnhub)", g.get("nota_valuta")
+    return None, None, "calendar Finnhub n.d. per %s" % t
+
+
+def _fonte_borsa_italiana(ticker: str, days: int) -> Tuple[List[Dict[str, Any]], str, int, int]:
+    """Eventi societari di un `.MI` da Borsa Italiana per `_eventi_societari_per_ticker`:
+    (eventi, riga fonte, ok, ko). Eventi dal giorno (oggi - days) in avanti: quelli futuri
+    datati sono i catalyst. KO = MUTA col motivo; non_coperto = NON COPRE; STALE detto."""
+    from bellomberg.market_data.borsa_italiana import get_eventi_societari, oggi_roma
+    from datetime import timedelta
+    rifiuto, nota_natura = _strumento_non_societario(ticker)
+    if rifiuto is not None:
+        return [], "NON INTERROGATA (apposta): " + rifiuto["error"], 0, 0
+    r = get_eventi_societari(ticker)
+    stato = r.get("stato")
+    motivo = r.get("motivo") or r.get("errore") or "n.d."
+    if stato == "non_coperto":
+        return [], "NON COPRE questo emittente: " + str(motivo), 1, 0
+    if stato not in ("ok", "vuoto_misurato", "STALE"):
+        return [], _esito_fonte(0, 0, 1, ["%s: %s" % (stato, motivo)]), 0, 1
+    dal = (oggi_roma() - timedelta(days=int(days))).isoformat()
+    eventi = [{"title": (e.get("descrizione") or "")[:160], "type": e.get("tipo", ""),
+               "date": e.get("data") or "", "url": r.get("url") or "",
+               "provider": "Borsa Italiana", "_imp": 4}
+              for e in (r.get("eventi") or []) if e.get("data") and e["data"] >= dal]
+    riga = _esito_fonte(len(eventi), 1, 0, [])
+    if nota_natura:
+        riga += " [" + nota_natura + "]"
+    if r.get("voce_da") == "automatico":
+        riga += " [ISIN risolto AUTOMATICAMENTE su Borsa Italiana (negozio isin_it_auto, non confermato dal PM): verifica il titolo prima di usare il dato]"
+    if stato == "STALE":
+        riga += " [STALE: fonte in guasto, calendario letto il %s]" % r.get("letto_il")
+    return eventi, riga, 1, 0
+
+
 def _eventi_societari_per_ticker(ticker: str, days: int) -> Tuple[Dict[str, Any], str]:
     """Ritorna (payload, firma). Interroga Finnhub e SEC EDGAR SUL TICKER."""
     eventi: List[Dict[str, Any]] = []
@@ -1213,6 +1302,16 @@ def _eventi_societari_per_ticker(ticker: str, days: int) -> Tuple[Dict[str, Any]
     else:
         fonti["sec_edgar"] = _esito_fonte(n_sec, ok_sec, ko_sec, motivi_sec)
 
+    # --- Borsa Italiana (W1, 04/10): per un `.MI` il calendario societario VERO
+    #     (cda, risultati, assemblee, dividendi) con lo stato della fonte dichiarato.
+    ok_bi = 0
+    if str(ticker or "").strip().upper().endswith(".MI"):
+        try:
+            _ev_bi, fonti["borsa_italiana"], ok_bi, _ko_bi = _fonte_borsa_italiana(ticker, days)
+            eventi.extend(_ev_bi)
+        except Exception as e:
+            fonti["borsa_italiana"] = _esito_fonte(0, 0, 1, [type(e).__name__])
+
     # --- dedup: un 8-K e la company-news che lo racconta arrivano con lo
     #     stesso titolo e lo stesso giorno — e' QUESTA la coppia che il dedup
     #     previene oggi (fino al 25/08 c'era anche press-release+news, sparita
@@ -1261,7 +1360,7 @@ def _eventi_societari_per_ticker(ticker: str, days: int) -> Tuple[Dict[str, Any]
     senza_misura = sorted(k for k, v in fonti.items()
                            if not (v.startswith("interrogata") or v.startswith("NON COPRE")))
     mute = senza_misura
-    risposte = ok_fh + ok_sec          # chiamate che hanno DAVVERO risposto
+    risposte = ok_fh + ok_sec + ok_bi  # chiamate che hanno DAVVERO risposto
     if totale == 0 and risposte == 0:
         out["avviso"] = ("ZERO NON MISURATO: nessuna fonte ha fornito una misura "
                           "(%s) — questo zero NON e' una misura, non dedurne che "
@@ -1329,6 +1428,75 @@ def _guidance_drift_nudge(r, variant_view):
             "ignorando un fatto datato con fonte." % _gdev)
 
 
+# Nature (classificazione.TIPI) che NON sono un emittente societario: un ETF/ETN/ETC non ha
+# cda, risultati o assemblee proprie da calendario (misura IT2, regola main 04/10).
+NATURE_NON_SOCIETARIE = ("etf", "etn", "commodity")
+
+
+def _strumento_non_societario(ticker: str) -> Tuple[Any, Any]:
+    """(rifiuto | None, nota | None). Natura dal negozio dei veicoli (classificazione.natura,
+    la stessa fonte del tipo nella vista posizioni). ETF/ETN/ETC -> rifiuto «non coperto»
+    PRIMA di Borsa Italiana; natura ignota o negozio rotto -> si procede e la nota lo DICE."""
+    try:
+        from bellomberg.storage import classificazione as _cl
+        e = _cl.natura(ticker)
+    except Exception as ex:
+        return None, "natura del titolo non leggibile (%s): calendario emittente chiesto comunque" % type(ex).__name__
+    if e.valore in NATURE_NON_SOCIETARIE:
+        motivo = ("non coperto: strumento non societario (%s), nessun calendario emittente"
+                  % str(e.valore).upper())
+        return {"error": motivo, "copertura": "non_coperto", "natura": e.valore,
+                "fonte_natura": e.evidenza, "ticker": ticker}, None
+    if e.valore is None:
+        return None, "natura del titolo non nota (%s): calendario emittente chiesto comunque" % e.evidenza
+    return None, None
+
+
+def _eventi_borsa_italiana(ticker: str, days: int) -> Dict[str, Any]:
+    """Calendario di un titolo italiano da Borsa Italiana (IT1). Tabella ticker->ISIN
+    mancante, fonte in KO o emittente non coperto = `error` dichiarato col motivo (zero
+    eventi con la fonte in KO NON e' «nessun evento»); STALE = `avviso` con la data VERA
+    della lettura. `items` = eventi datati nella finestra [oggi, oggi+days]; `prossimo` e
+    gli eventi fuori finestra restano contati, non buttati."""
+    from datetime import date, timedelta
+    from bellomberg.market_data.borsa_italiana import get_eventi_societari, oggi_roma
+    rifiuto, nota_natura = _strumento_non_societario(ticker)
+    if rifiuto is not None:
+        return {**rifiuto, "source": "Borsa Italiana (non interrogata)", "count": 0, "items": []}
+    r = get_eventi_societari(ticker)
+    eventi = r.get("eventi") or []
+    try:
+        oggi = oggi_roma()
+    except Exception:
+        oggi = date.today()
+    fine = (oggi + timedelta(days=int(days))).isoformat()
+    nella_finestra = [e for e in eventi if e.get("data") and oggi.isoformat() <= e["data"] <= fine]
+    out: Dict[str, Any] = {
+        "ticker": ticker, "source": "Borsa Italiana (eventi societari)",
+        "stato": r.get("stato"), "errore": r.get("errore"), "motivo": r.get("motivo"),
+        "isin": r.get("isin"), "letto_il": r.get("letto_il"),
+        "count": len(nella_finestra), "items": nella_finestra,
+        "finestra": {"dal": oggi.isoformat(), "al": fine},
+        "prossimo": r.get("prossimo"), "eventi_letti": len(eventi),
+        "date_illeggibili": r.get("date_illeggibili"), "limiti": r.get("limiti"),
+        "cache": r.get("cache"), "fonte_finnhub": "non interrogata per un titolo .MI",
+    }
+    if nota_natura:
+        out["natura_nota"] = nota_natura
+    out["voce_da"] = r.get("voce_da")
+    if r.get("voce_da") == "automatico":
+        out["voce_da_nota"] = ("ISIN risolto AUTOMATICAMENTE su Borsa Italiana (negozio isin_it_auto, non confermato dal PM): verifica il titolo prima di usare il dato")
+    stato = r.get("stato")
+    if stato in ("KO", "non_coperto"):
+        out["error"] = "calendario Borsa Italiana %s: %s" % (stato, r.get("motivo") or r.get("errore") or "n.d.")
+    elif stato == "STALE":
+        out["avviso"] = ("STALE: Borsa Italiana in guasto, servito il calendario letto il %s "
+                         "(stato originale %s)" % (r.get("letto_il"), r.get("stato_originale")))
+    elif stato not in ("ok", "vuoto_misurato"):
+        out["error"] = "calendario Borsa Italiana: stato inatteso %r" % (stato,)
+    return out
+
+
 def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
              prepared_bundle=None, sector_providers=None, as_of=None,
              valuation_preparer=None) -> Dict[str, Any]:
@@ -1341,8 +1509,9 @@ def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
             'error': 'Generazione Excel archiviata. Usa analisi societaria, bilanci, guidance e consensus; i modelli storici sono consultabili in Archivio Excel.'}
     try:
         if tool_name == "get_filing_changes":
-            from bellomberg.agents.filing_context import get_filing_changes
-            return _stamp(get_filing_changes(tool_input.get("ticker")), "filing_archive")
+            from bellomberg.agents.filing_context import get_filing_changes_da_input
+            # parametri non validi: payload "errore" da get_filing_changes, mai eccezioni
+            return _stamp(get_filing_changes_da_input(tool_input), "filing_archive")
         if tool_name == "get_portfolio_risk":
             from bellomberg.portfolio.portfolio_risk import compute_portfolio_risk
             r = compute_portfolio_risk(force=bool(tool_input.get("force_refresh", False)))
@@ -1396,6 +1565,7 @@ def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
                 stress_scenario=str(tool_input.get("stress") or "none"),
                 add_tickers=tool_input.get("add_tickers"),
                 remove_tickers=tool_input.get("remove_tickers"),
+                new_alloc=tool_input.get("new_alloc"),
             )
             return _stamp(_compatta_montecarlo(r),
                           "portfolio_montecarlo.run_monte_carlo (FHS bank-grade; stress replay storico)")
@@ -1452,33 +1622,79 @@ def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
             r = tool_get_options_data(
                 ticker=tool_input["ticker"],
                 expiry=tool_input.get("expiry"),
+                proxy_usa=bool(tool_input.get("proxy_usa", False)),
             )
-            return _stamp(r, f"IBKR TWS + yfinance fallback({tool_input['ticker']})")
+            _src = f"Polygon -> IBKR TWS -> yfinance({tool_input['ticker']})"
+            if isinstance(r, dict) and isinstance(r.get("proxy"), dict):
+                from bellomberg.market_data.lookthrough_usa import source_con_proxy
+                _src = source_con_proxy(_src, r["proxy"])
+            return _stamp(r, _src)
 
         if tool_name == "get_option_expirations_polygon":
+            from bellomberg.agents.agent_tools import con_proxy, guardia_fonte_usa, source_proxy
             from bellomberg.market_data.polygon_data import get_option_expirations
-            r = get_option_expirations(tool_input["ticker"])
-            return _stamp(r, f"polygon expirations({tool_input['ticker']})")
+            g = guardia_fonte_usa(tool_input["ticker"], "opzioni_usa", "opzioni",
+                                  f"polygon expirations({tool_input['ticker']})",
+                                  proxy_usa=bool(tool_input.get("proxy_usa", False)), opzioni=True)
+            if g["rifiuto"] is not None:
+                return _stamp(g["rifiuto"], g["rifiuto"]["_source"])
+            r = get_option_expirations(g["simbolo"])
+            return _stamp(con_proxy(r, g), source_proxy(f"polygon expirations({tool_input['ticker']})", g))
 
         if tool_name == "get_options_chain_polygon":
+            from bellomberg.agents.agent_tools import con_proxy, guardia_fonte_usa, source_proxy
             from bellomberg.market_data.polygon_data import get_options_chain
-            r = get_options_chain(tool_input["ticker"], tool_input.get("expiry"))
-            return _stamp(r, f"polygon options chain({tool_input['ticker']})")
+            g = guardia_fonte_usa(tool_input["ticker"], "opzioni_usa", "opzioni",
+                                  f"polygon options chain({tool_input['ticker']})",
+                                  proxy_usa=bool(tool_input.get("proxy_usa", False)), opzioni=True)
+            if g["rifiuto"] is not None:
+                return _stamp(g["rifiuto"], g["rifiuto"]["_source"])
+            r = get_options_chain(g["simbolo"], tool_input.get("expiry"))
+            return _stamp(con_proxy(r, g), source_proxy(f"polygon options chain({tool_input['ticker']})", g))
 
         if tool_name == "get_congress_trades":
+            from bellomberg.agents.agent_tools import con_proxy, guardia_fonte_usa, source_proxy
             from bellomberg.market_data.quiver_data import get_congress_trades
-            r = get_congress_trades(tool_input.get("ticker"),
-                                    int(tool_input.get("limit", 30)))
+            _t = tool_input.get("ticker")
+            if _t:
+                # W1: guardia + gemello (proxy_usa) PRIMA del provider; senza ticker = feed generale
+                g = guardia_fonte_usa(_t, "quiver_congress", "congress", "quiver congress trading(%s)" % _t,
+                                      proxy_usa=bool(tool_input.get("proxy_usa", False)))
+                if g["rifiuto"] is not None:
+                    return _stamp(g["rifiuto"], g["rifiuto"]["_source"])
+                r = get_congress_trades(g["simbolo"], int(tool_input.get("limit", 30)))
+                return _stamp(con_proxy(r, g), source_proxy("quiver congress trading", g))
+            r = get_congress_trades(_t, int(tool_input.get("limit", 30)))
             return _stamp(r, "quiver congress trading")
 
         if tool_name == "get_lobbying":
+            from bellomberg.agents.agent_tools import con_proxy, guardia_fonte_usa, source_proxy
             from bellomberg.market_data.quiver_data import get_lobbying
-            r = get_lobbying(tool_input.get("ticker"), int(tool_input.get("limit", 30)))
+            _t = tool_input.get("ticker")
+            if _t:
+                # W1: guardia + gemello (proxy_usa) PRIMA del provider; senza ticker = feed generale
+                g = guardia_fonte_usa(_t, "quiver_lobbying", "lobbying", "quiver lobbying(%s)" % _t,
+                                      proxy_usa=bool(tool_input.get("proxy_usa", False)))
+                if g["rifiuto"] is not None:
+                    return _stamp(g["rifiuto"], g["rifiuto"]["_source"])
+                r = get_lobbying(g["simbolo"], int(tool_input.get("limit", 30)))
+                return _stamp(con_proxy(r, g), source_proxy("quiver lobbying", g))
+            r = get_lobbying(_t, int(tool_input.get("limit", 30)))
             return _stamp(r, "quiver lobbying")
 
         if tool_name == "get_gov_contracts":
+            from bellomberg.agents.agent_tools import con_proxy, guardia_fonte_usa, source_proxy
             from bellomberg.market_data.quiver_data import get_gov_contracts
-            r = get_gov_contracts(tool_input.get("ticker"), int(tool_input.get("limit", 30)))
+            _t = tool_input.get("ticker")
+            if _t:
+                # W1: guardia + gemello (proxy_usa) PRIMA del provider; senza ticker = feed generale
+                g = guardia_fonte_usa(_t, "quiver_gov_contracts", "gov_contracts", "quiver government contracts(%s)" % _t,
+                                      proxy_usa=bool(tool_input.get("proxy_usa", False)))
+                if g["rifiuto"] is not None:
+                    return _stamp(g["rifiuto"], g["rifiuto"]["_source"])
+                r = get_gov_contracts(g["simbolo"], int(tool_input.get("limit", 30)))
+                return _stamp(con_proxy(r, g), source_proxy("quiver government contracts", g))
+            r = get_gov_contracts(_t, int(tool_input.get("limit", 30)))
             return _stamp(r, "quiver government contracts")
 
         if tool_name == "compute_gex":
@@ -1525,14 +1741,11 @@ def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
             # D4: scadenza = prossima trimestrale STRETTAMENTE futura dal calendar
             # (review V6 A1: l'evento di OGGI renderebbe stale domani la guidance
             # appena letta); n.d. = fallback +120g DICHIARATO dentro memory_db.
-            _vu, _vus = None, None
+            _vu, _vus, _vnota = None, None, None
             try:
-                from bellomberg.market_data.finnhub_news import next_earnings_date
-                _vu = next_earnings_date(tool_input["ticker"])
-                if _vu:
-                    _vus = "prossima trimestrale dal calendar (finnhub)"
-            except Exception:
-                pass  # fallback dichiarato in memory_db
+                _vu, _vus, _vnota = _prossima_trimestrale(tool_input["ticker"])
+            except Exception as _e:
+                _vnota = "scadenza dal calendario non calcolata (%s)" % type(_e).__name__
             r = MemoryDB().add_guidance(
                 ticker=tool_input["ticker"], metric=tool_input["metric"],
                 period=tool_input["period"], value_mid=tool_input["value_mid"],
@@ -1546,6 +1759,9 @@ def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
                 # dispatch ("chat:fundamentals" | "specialista-run:fundamentals"
                 # | "red-team"); senza caller resta il generico di v1
                 entered_by=(caller or "agente/chat (D1)"), note=tool_input.get("note"))
+            if _vnota and isinstance(r, dict):
+                # perche' la scadenza e' il fallback +120g (o da dove viene): detto, non zitto
+                r["scadenza_nota"] = _vnota
             return _stamp(r, "registro guidance V6")
 
         if tool_name == "get_guidance":
@@ -1960,7 +2176,7 @@ def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
                 min_importance=int(tool_input.get("min_importance", 4)),
                 days=int(tool_input.get("days", 2)),
                 max_per_topic=int(tool_input.get("max_per_topic", 3)),
-                include_reddit=True,
+                include_reddit=False,   # Reddit SPENTA (decisione PM 04/10): dichiarata sotto
             )
             compact = [{
                 "title": it.get("title", "")[:140],
@@ -1976,15 +2192,19 @@ def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
             # residuo muto #2 (Lotto C verita' dei numeri, 23/07): il tool macro
             # dei 5 specialisti dichiara i provider fuori per budget/disable —
             # "poche news macro" e "fonti spente" non sono piu' indistinguibili.
-            from bellomberg.market_data.news_aggregator import providers_blocked
+            from bellomberg.market_data.news_aggregator import fonti_spente, providers_blocked
             _muti = providers_blocked()
             _out = {"count": len(items), "items": compact}
+            # fonti tolte per DECISIONE (non guasti): dette al modello, non fuse in fonti_mute
+            _spente = fonti_spente()
+            if _spente:
+                _out["fonti_spente"] = _spente
             if _muti:
                 _out["fonti_mute"] = _muti
                 _out["avviso"] = ("copertura PARZIALE: provider bloccati "
                                   + ", ".join(sorted(_muti))
                                   + " — dichiara il buco, non dedurre calma dal silenzio")
-            return _stamp(_out, "news_aggregator.fetch_macro_news (multi-source + Reddit)")
+            return _stamp(_out, "news_aggregator.fetch_macro_news (multi-source)")
 
         if tool_name == "get_corporate_events_for_ticker":
             ticker = tool_input["ticker"].upper()
@@ -1993,27 +2213,42 @@ def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
             return _stamp(payload, firma)
 
         if tool_name == "get_insider_trades":
-            ticker = tool_input["ticker"].upper()
-            days = int(tool_input.get("days", 30))
-            try:
-                from bellomberg.market_data.finnhub_news import fetch_insider_trades as fn_insider
-                trades = fn_insider(ticker, days=days)
-                if trades:
-                    return _stamp({"ticker": ticker, "source": "finnhub", "count": len(trades),
-                                    "trades": trades[:20]},
-                                    "Finnhub insider transactions (Form 4 real-time)")
-            except Exception:
-                pass
-            from bellomberg.market_data.sec_edgar import get_insider_trades as sec_insider
-            trades = sec_insider(ticker, days=days)
-            return _stamp({"ticker": ticker, "source": "sec_edgar", "count": len(trades),
-                            "trades": trades[:20]},
-                            "SEC EDGAR Form 4 (fallback)")
+            # W1 (04/10): guardia di copertura PRIMA di Finnhub/SEC (Finnhub toglie il
+            # suffisso: omonimo), .MI -> internal dealing eMarket SDIR, gemello solo con proxy_usa
+            from bellomberg.agents.agent_tools import insider_dichiarati
+            payload, firma = insider_dichiarati(tool_input["ticker"],
+                                                days=int(tool_input.get("days", 30)),
+                                                max_trades=20,
+                                                proxy_usa=bool(tool_input.get("proxy_usa", False)))
+            return _stamp(payload, firma)
 
         if tool_name == "get_earnings_calendar":
             from bellomberg.market_data.finnhub_news import fetch_earnings_calendar, fetch_earnings_for_portfolio
             ticker = tool_input.get("ticker")
             days = int(tool_input.get("days_ahead", 14))
+            if ticker and str(ticker).strip().upper().endswith(".MI"):
+                # W1 (04/10): Finnhub toglie .MI (omonimo / niente dati sui nomi italiani):
+                # il calendario di un titolo italiano viene da Borsa Italiana, stato dichiarato
+                payload = _eventi_borsa_italiana(str(ticker).strip().upper(), days)
+                return _stamp(payload, "Borsa Italiana eventi societari (%s)"
+                              % str(ticker).strip().upper())
+            if ticker:
+                # W1 (04/10): Finnhub filtra col simbolo SENZA suffisso (_norm_ticker): su un
+                # listino estero aggancerebbe un omonimo USA -> non coperto dichiarato, nessuna
+                # chiamata. Senza suffisso la valuta viene dal book (presunzione USA dichiarata).
+                from bellomberg.agents.agent_tools import con_proxy, guardia_fonte_usa
+                g = guardia_fonte_usa(ticker, "calendario earnings Finnhub", None,
+                                      "Finnhub earnings calendar(%s)" % ticker, gemello=False)
+                if g["rifiuto"] is not None:
+                    return _stamp(g["rifiuto"], g["rifiuto"]["_source"])
+                _mot: List[str] = []
+                items = fetch_earnings_for_portfolio([g["simbolo"]], days_ahead=days, motivo=_mot)
+                _out = {"count": len(items), "items": items[:100]}
+                if _mot:
+                    _out["fonti_mute"] = {"finnhub": "; ".join(str(m) for m in _mot)}
+                    if not items:
+                        _out["error"] = "calendario Finnhub non ha risposto: " + _out["fonti_mute"]["finnhub"]
+                return _stamp(con_proxy(_out, g), "Finnhub earnings calendar")
             if ticker:
                 items = fetch_earnings_for_portfolio([ticker], days_ahead=days)
             else:

@@ -4,6 +4,8 @@ import { Bellomberg, FavCompany, MktQuote } from '@/lib/api';
 import { Star, Cpu, Heart, RefreshCw, Globe, Lightbulb } from 'lucide-react';
 import { useT } from '@/i18n/provider';
 import { linguaCorrente, localeDi } from '@/i18n/lingua';
+import ModernPage from '@/components/ModernPage';
+import './research-modern.css';
 
 /** T4-3: WATCHLIST - le favorite companies del PM con quote live. */
 
@@ -69,7 +71,8 @@ export default function WatchlistPage() {
   (favs || []).forEach(f => { const k = (f.sector || f.industry || '').trim(); if (k) sectors[k] = (sectors[k] || 0) + 1; });
 
   return (
-    <div className="space-y-3 font-sans animate-fadeIn">
+    <ModernPage page="watchlist" render={() => (
+    <div className="space-y-3 font-sans animate-fadeIn watchlist-page">
       <div className="panel flex items-center justify-between px-3 py-2 border-amber-deep">
         <div className="flex items-center gap-3 font-mono text-2xs">
           <Star size={13} className="text-amber" />
@@ -125,7 +128,7 @@ export default function WatchlistPage() {
                   return (
                     <Fragment key={f.ticker}>
                     <tr onClick={() => openMkt(f.ticker)} className="cursor-pointer">
-                      <td className="text-gold font-semibold">{f.ticker}</td>
+                      <td className="text-gold font-semibold"><button type="button" className="research-ticker-action" onClick={event => { event.stopPropagation(); openMkt(f.ticker); }}>{f.ticker}</button></td>
                       <td className="text-text-dim">{q?.name || f.name || '-'}</td>
                       <td className="text-muted text-3xs">{(f.sector || '-') + (f.industry ? ' / ' + f.industry : '')}</td>
                       <td className="text-right text-cyan tabular-nums">{q ? fx2(q.price) + ' ' + (q.currency || '') : '...'}</td>
@@ -139,7 +142,7 @@ export default function WatchlistPage() {
                           </span>
                         )}
                       </td>
-                      <td className="text-right text-muted text-3xs">{(f.added_at || '').slice(0, 10)}</td>
+                      <td className="text-right text-muted text-3xs">{f.added_at ? f.added_at.slice(0, 10) : '—'}</td>
                       <td className="text-right">
                         <button onClick={e => { e.stopPropagation(); remove(f.ticker); }}
                                 title={tr('ui.remove_favorite')}
@@ -152,7 +155,7 @@ export default function WatchlistPage() {
                       <td colSpan={8} className="py-1.5 px-3">
                         <div className="flex items-start gap-2" onClick={e => e.stopPropagation()}>
                           <span className="text-3xs text-faint font-mono uppercase tracking-wider mt-1 shrink-0">{tr('ui.pm_note')}</span>
-                          <textarea value={notes[f.ticker] ?? ''}
+                          <textarea aria-label={`${tr('ui.pm_note')} · ${f.ticker}`} value={notes[f.ticker] ?? ''}
                             onChange={e => {
                               notesRef.current = { ...notesRef.current, [f.ticker]: e.target.value };
                               setNotes(notesRef.current);
@@ -180,5 +183,6 @@ export default function WatchlistPage() {
         )}
       </div>
     </div>
+    )} />
   );
 }

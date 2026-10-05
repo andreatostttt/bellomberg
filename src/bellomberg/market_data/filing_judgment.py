@@ -45,7 +45,9 @@ def judge_filing(result, *, client=None, model=None, language=None):
                "freschezza": (result.get("freschezza") or {}).get("stato", "n.d."),
                "copertura": (result.get("copertura") or {}).get("stato", "n.d."),
                "limiti_copertura": [str(x)[:300] for x in (result.get("copertura") or {}).get("limiti", [])[:3]],
-               "sezioni_confrontate": diff.get("sezioni_confrontate", [])[:20]}
+               "sezioni_confrontate": diff.get("sezioni_confrontate", [])[:20],
+               # Fase F: trimestre su trimestre (emittente nuovo), dichiarato solo quando vale.
+               **({"regola_coppia": "sequenziale"} if diff.get("regola") == "sequenziale" else {})}
     raw = json.dumps({"contesto": context, "estratti": payload}, ensure_ascii=False)
     while len(raw) > MAX_INPUT_CHARS and payload:
         payload.pop()

@@ -1,0 +1,188 @@
+/*
+ * Semantic theme tokens for the Nuova (modern) presentation.
+ *
+ * Light values are the exact colours the Nuova already used, so replacing a
+ * literal with the token whose light value is byte-identical never changes the
+ * light rendering. Dark values apply only when <html data-bb-theme="dark">,
+ * which InterfaceThemeProvider sets for the Dark theme. Keep
+ * app/src/lib/theme-palette.ts in sync (a unit test compares both).
+ *
+ * Contract for page CSS:
+ *  - light rules stay as they are, or use var(--bbt-*) only where the token's
+ *    light value equals the literal;
+ *  - dark adjustments go under :root[data-bb-theme="dark"] <selector>;
+ *  - financial meaning is preserved: good = gains, bad = losses, warn = caution.
+ */
+:root {
+  /* backgrounds and surfaces */
+  --bbt-bg: #f7f9fc;
+  --bbt-surface: #fff;
+  --bbt-surface-2: #f8fafc;
+  --bbt-surface-3: #f1f5f9;
+  --bbt-raised: #fff;
+  --bbt-overlay: rgba(15, 23, 42, .28);
+  --bbt-shadow: rgba(15, 23, 42, .12);
+  /* text */
+  --bbt-text: #1e293b;
+  --bbt-text-strong: #172554;
+  --bbt-text-2: #334155;
+  --bbt-muted: #64748b;
+  --bbt-faint: #94a3b8;
+  /* lines and interaction */
+  --bbt-line: #dfe7f3;
+  --bbt-line-strong: #cbd5e1;
+  --bbt-hover: #edf2f8;
+  --bbt-selected: #eef3ff;
+  --bbt-selected-line: #c6d5f7;
+  --bbt-focus: #0f172a;
+  /* blue accent */
+  --bbt-accent: #1455ff;
+  --bbt-accent-text: #1747c8;
+  --bbt-accent-soft: #eef3ff;
+  --bbt-accent-fill: #1455ff;
+  --bbt-on-accent: #fff;
+  /* status */
+  --bbt-good: #008f63;
+  --bbt-good-text: #047857;
+  --bbt-good-soft: #edf8f3;
+  --bbt-bad: #c52943;
+  --bbt-bad-text: #b4233d;
+  --bbt-bad-soft: #fff0f2;
+  --bbt-warn: #9a6500;
+  --bbt-warn-text: #815400;
+  --bbt-warn-soft: #fff7df;
+  --bbt-stale: #805900;
+  --bbt-stale-soft: #fff9e8;
+  /* charts */
+  --bbt-chart-bg: #fff;
+  --bbt-chart-grid: #e8edf5;
+  --bbt-chart-axis: #cbd5e1;
+  --bbt-chart-label: #64748b;
+  --bbt-chart-legend: #475569;
+  --bbt-chart-up: #008f63;
+  --bbt-chart-down: #c52943;
+  --bbt-tooltip-bg: #fff;
+  --bbt-tooltip-text: #1e293b;
+  --bbt-tooltip-line: #cbd5e1;
+}
+
+:root[data-bb-theme="dark"] {
+  color-scheme: dark;
+  /* backgrounds and surfaces: layered slate-navy, never flat black */
+  --bbt-bg: #0e1522;
+  --bbt-surface: #151e2d;
+  --bbt-surface-2: #1a2436;
+  --bbt-surface-3: #202b3f;
+  --bbt-raised: #1c2639;
+  --bbt-overlay: rgba(3, 7, 15, .62);
+  --bbt-shadow: rgba(0, 0, 0, .45);
+  /* text */
+  --bbt-text: #e3e9f3;
+  --bbt-text-strong: #f2f5fa;
+  --bbt-text-2: #c7d1df;
+  --bbt-muted: #9aa8bd;
+  --bbt-faint: #75849b;
+  /* lines and interaction */
+  --bbt-line: #29364b;
+  --bbt-line-strong: #384861;
+  --bbt-hover: #223049;
+  --bbt-selected: #1d2f57;
+  --bbt-selected-line: #3d5aa0;
+  --bbt-focus: #9db8ff;
+  /* blue accent */
+  --bbt-accent: #6b93ff;
+  --bbt-accent-text: #9db8ff;
+  --bbt-accent-soft: #1b2a4c;
+  --bbt-accent-fill: #2f62f5;
+  --bbt-on-accent: #fff;
+  /* status */
+  --bbt-good: #34c98f;
+  --bbt-good-text: #4fd8a1;
+  --bbt-good-soft: #10302a;
+  --bbt-bad: #f0647a;
+  --bbt-bad-text: #ff8597;
+  --bbt-bad-soft: #3a1922;
+  --bbt-warn: #e7ae45;
+  --bbt-warn-text: #f0c062;
+  --bbt-warn-soft: #34290f;
+  --bbt-stale: #d9a94c;
+  --bbt-stale-soft: #2f2712;
+  /* charts */
+  --bbt-chart-bg: #151e2d;
+  --bbt-chart-grid: #243149;
+  --bbt-chart-axis: #3a4a64;
+  --bbt-chart-label: #9aa8bd;
+  --bbt-chart-legend: #c7d1df;
+  --bbt-chart-up: #34c98f;
+  --bbt-chart-down: #f0647a;
+  --bbt-tooltip-bg: #1c2639;
+  --bbt-tooltip-text: #e3e9f3;
+  --bbt-tooltip-line: #3a4a64;
+}
+
+/*
+ * Consumer palette (--bbn-*): the investing-app look of the Dashboard, meant to
+ * spread to the other pages one at a time. Neutral, not blue-tinted; green and
+ * red appear only on figures and change pills; one gradient, under the chart.
+ * Text pairs measured ≥ 4.5:1 on --bbn-card and --bbn-bg (2026-10-02).
+ */
+:root {
+  --bbn-bg: #f3f3f5;
+  --bbn-card: #ffffff;
+  --bbn-raised: #f6f6f8;
+  --bbn-line: #e7e7ec;
+  --bbn-text: #0a0a0b;
+  --bbn-muted: #62626b;
+  --bbn-accent: #1d56f0;
+  --bbn-accent-fill: #1d56f0;
+  --bbn-accent-soft: rgba(29, 86, 240, .10);
+  --bbn-on-accent: #fff;
+  --bbn-good: #047a46;
+  --bbn-good-soft: rgba(4, 122, 70, .10);
+  --bbn-bad: #d42a3a;
+  --bbn-bad-soft: rgba(212, 42, 58, .10);
+  --bbn-warn: #8a5300;
+  --bbn-warn-soft: rgba(196, 128, 0, .14);
+  --bbn-chart-top: rgba(29, 86, 240, .20);
+  --bbn-chart-bottom: rgba(29, 86, 240, 0);
+  --bbn-spy: #8b8b94;
+  --bbn-heat-up: 22, 163, 94;
+  --bbn-heat-down: 225, 52, 62;
+  --bbn-shadow: 0 1px 2px rgba(10, 10, 11, .04), 0 8px 24px rgba(10, 10, 11, .05);
+  --bbn-seg-on: #ffffff;
+}
+:root[data-bb-theme="dark"] {
+  --bbn-bg: #0a0a0b;
+  --bbn-card: #161618;
+  --bbn-raised: #202023;
+  --bbn-line: #26262a;
+  --bbn-text: #ffffff;
+  --bbn-muted: #a1a1aa;
+  --bbn-accent: #5b8cff;
+  --bbn-accent-fill: #2563eb;
+  --bbn-accent-soft: rgba(91, 140, 255, .16);
+  --bbn-on-accent: #fff;
+  --bbn-good: #2ed47a;
+  --bbn-good-soft: rgba(46, 212, 122, .14);
+  --bbn-bad: #ff5d5d;
+  --bbn-bad-soft: rgba(255, 93, 93, .14);
+  --bbn-warn: #f0c062;
+  --bbn-warn-soft: rgba(240, 192, 98, .14);
+  --bbn-chart-top: rgba(91, 140, 255, .32);
+  --bbn-chart-bottom: rgba(91, 140, 255, 0);
+  --bbn-spy: #8e8e96;
+  --bbn-shadow: none;
+  --bbn-seg-on: #34343a;
+}
+
+/* Native controls, scrollbars and selection inside the dark Nuova. */
+:root[data-bb-theme="dark"] .bb-layout-frame[data-mode="modern"],
+:root[data-bb-theme="dark"] .bb-page-modern,
+:root[data-bb-theme="dark"] .bb-modern-shell {
+  color-scheme: dark;
+}
+
+:root[data-bb-theme="dark"] body { background: var(--bbt-bg); }
+:root[data-bb-theme="dark"] ::-webkit-scrollbar-thumb { background: #34425a; }
+:root[data-bb-theme="dark"] ::-webkit-scrollbar-thumb:hover { background: #4a5b78; }
+:root[data-bb-theme="dark"] ::selection { background: rgba(107, 147, 255, .35); color: #fff; }

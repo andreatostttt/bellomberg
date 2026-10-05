@@ -5,6 +5,9 @@ import RunConfirmDialog from './RunConfirmDialog';
 import { conservaDettaglioRun, dettaglioLeggibile, statusHttp } from '../lib/mandato';
 import { useLingua, useT } from '../i18n/provider';
 import type { Chiave } from '../i18n/t';
+import { createNewsRefreshWatcher, esitoGiro, NewsRefreshError } from '../lib/news-refresh';
+import { statoGiroInCorso, testoErroreRefresh } from '../pages/news/calcoli';
+import { fmtNum } from '../lib/format';
 
 type Item = { k: string; label: string; hint?: string; run: () => void | Promise<void> };
 
@@ -51,6 +54,36 @@ export default function CommandPalette() {
   }, [open]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   const close = useCallback(() => setOpen(false), []);
+  // POST /news/feed/refresh risponde SUBITO {accepted, job}: «aggiornate» si dice solo a giro finito
+  // (stato letto da /news/providers.refresh_job), con i conteggi veri; accepted:false si dichiara.
+  const newsWatcher = useRef<{ stop: () => void } | null>(null);
+  useEffect(() => () => newsWatcher.current?.stop(), []);
+  const refreshNews = useCallback(async () => {
+    if (newsWatcher.current) return;
+    setBusy({ key: 'settings.feed_updating' });
+    let joined = false;
+    const watcher = createNewsRefreshWatcher({
+      start: async () => { const r = await Bellomberg.newsFeedRefresh(1, true); joined = r?.accepted === false; return r; },
+      readStatus: async id => (await Bellomberg.newsRefreshJob(id)).job,
+      onStatus: job => { if (job.status === 'running') setBusy({ key: 'settings.feed_running', detail: statoGiroInCorso(job, joined) }); },
+    });
+    newsWatcher.current = watcher;
+    try {
+      const job = await watcher.run();
+      if (job.status === 'error') throw new NewsRefreshError('job_error', {}, job);
+      if (job.status === 'interrupted') throw new NewsRefreshError('interrupted', {}, job);
+      const esito = esitoGiro(job);
+      setBusy({ key: 'settings.feed_updated', detail: (job.joined ? tr('newsPage.refreshJoinedDone') + ' ' : '')
+        + tr('newsPage.refreshResult', { saved: fmtNum(esito.saved, 0), dup: fmtNum(esito.duplicates, 0) })
+        + (esito.notClassified ? ' · ' + tr('newsPage.refreshNotClassified', { n: fmtNum(esito.notClassified, 0) }) : '') });
+      setTimeout(() => { setBusy(null); close(); }, 2200);
+    } catch (e) {
+      setBusy({ key: 'settings.command_failed', detail: testoErroreRefresh(e) ?? undefined });
+      setTimeout(() => setBusy(null), 6000);
+    } finally {
+      if (newsWatcher.current === watcher) newsWatcher.current = null;
+    }
+  }, [close, tr]);
   const act = useCallback(async (label: Chiave, fn: () => Promise<any>, done: Chiave) => {
     setBusy({ key: label });
     try { await fn(); setBusy({ key: done }); setTimeout(() => { setBusy(null); close(); }, 900); }
@@ -97,8 +130,7 @@ export default function CommandPalette() {
           setAskRun(true) },
       { k: 'PX', label: tr('settings.refresh_prices'), hint: tr('settings.all_positions'), run: () =>
           act('settings.prices_updating', () => Bellomberg.updatePrices(), 'settings.prices_updated') },
-      { k: 'NEWS', label: tr('settings.refresh_news'), hint: tr('settings.news_pull'), run: () =>
-          act('settings.feed_updating', () => Bellomberg.newsFeedRefresh(1, true), 'settings.feed_updated') },
+      { k: 'NEWS', label: tr('settings.refresh_news'), hint: tr('settings.news_pull'), run: () => { void refreshNews(); } },
       { k: 'NAV', label: tr('settings.recalculate_nav'), hint: tr('settings.force_performance'), run: () =>
           act('settings.nav_updating', () => Bellomberg.navHistory(true), 'settings.nav_updated') },
       { k: 'MEMO', label: tr('settings.latest_memo'), hint: tr('settings.weekly_note'), run: async () => {
@@ -109,7 +141,7 @@ export default function CommandPalette() {
     );
     if (!Q) return base;
     return base.filter(i => (i.k + ' ' + i.label + ' ' + (i.hint || '')).toUpperCase().includes(Q));
-  }, [q, tickers, navigate, close, act, tr, language]);
+  }, [q, tickers, navigate, close, act, refreshNews, tr, language]);
 
   useEffect(() => { setIdx(0); }, [q]);
   useEffect(() => { setIdx(i => Math.max(0, Math.min(i, items.length - 1))); }, [items.length]);

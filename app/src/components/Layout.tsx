@@ -1,20 +1,27 @@
 import { NavLink, useNavigate, useLocation } from 'react-router-dom';
-import { useEffect, useState } from 'react';
-import { version as appVersion } from '../../package.json';
+import { Fragment, useEffect, useState } from 'react';
+import { frase } from '@/lib/frase';
 import {
   LayoutDashboard, FileText, MessageSquare, CheckSquare, ClipboardList,
-  Settings as SettingsIcon, TrendingUp, Activity, Zap, Cpu, Wallet, Newspaper, PieChart, LineChart, Waves, Radar, ArrowLeftRight, Globe, Star, FileSpreadsheet
+  Settings as SettingsIcon, TrendingUp, Activity, Zap, Cpu, Wallet, Newspaper, PieChart, LineChart, Waves, Radar, ArrowLeftRight, Globe, Star, FileSpreadsheet, FileSearch
 } from 'lucide-react';
 import { Bellomberg } from '@/lib/api';
+import { version as appVersion } from '../../package.json';
+import type { PortfolioSnapshot } from '@/lib/api';
 import SettingsPanel from './SettingsPanel';
 import { useLingua, useT } from '@/i18n/provider';
 import { fmtDataBreve, fmtOra, fmtNum } from '@/lib/format';
+import { startGlobalPriceRefresh } from '../lib/price-refresh';
 
+import BadgeFiling from './BadgeFiling';
 import { PAGE_DESTINATIONS, SETTINGS_DESTINATION, localizeDestination } from '../lib/navigation';
+import AppearanceMenu from './AppearanceMenu';
+import NewInterfaceBoundary from './NewInterfaceBoundary';
+import './shell-modern.css';
 
 const icons: Record<string, typeof LayoutDashboard> = {
   dashboard: LayoutDashboard, performance: LineChart, watchlist: Star,
-  market: Globe, news: Newspaper, fundamentals: FileSpreadsheet,
+  market: Globe, news: Newspaper, fundamentals: FileSpreadsheet, filing: FileSearch,
   factors: PieChart, montecarlo: Cpu, vol: Waves, edge: Radar,
   chat: MessageSquare, agents: Activity, progress: TrendingUp, memos: FileText,
   decisions: CheckSquare, trades: Wallet, movements: ArrowLeftRight, mandato: ClipboardList,
@@ -137,6 +144,48 @@ function useFx() {
   return { fx, fxAt, fxErr };
 }
 
+function useGlobalPriceRefresh() {
+  // partial = /prices/update ha dichiarato failed>0; undeclared = esito senza `failed` (mai verde)
+  const [sync, setSync] = useState<{ state: 'sync' | 'ok' | 'partial' | 'undeclared' | 'error'; at: string | null; failed: number | null }>(
+    { state: 'sync', at: null, failed: null });
+  useEffect(() => {
+    let mounted = true;
+    const runner = startGlobalPriceRefresh<PortfolioSnapshot>({
+      updatePrices: Bellomberg.updatePrices,
+      readPortfolio: Bellomberg.portfolio,
+      publish: (snapshot, outcome) => {
+        if (!mounted) return;
+        if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function'
+            && typeof CustomEvent !== 'undefined') {
+          window.dispatchEvent(new CustomEvent<PortfolioSnapshot>('bb:portfolio-snapshot', {
+            detail: snapshot,
+          }));
+        }
+        setSync({ state: outcome.failed === 0 ? 'ok' : outcome.failed == null ? 'undeclared' : 'partial',
+          at: new Date().toISOString(), failed: outcome.failed });
+      },
+      isHidden: () => typeof document !== 'undefined' && Boolean(document.hidden),
+      schedule: (callback, milliseconds) => setInterval(callback, milliseconds),
+      cancel: handle => clearInterval(handle as ReturnType<typeof setInterval>),
+      onError: () => { if (mounted) setSync(s => ({ ...s, state: 'error' })); },
+    });
+    const onVisibility = () => {
+      if (!document.hidden) void runner.refresh();
+    };
+    const canListenVisibility = typeof document !== 'undefined'
+      && typeof document.addEventListener === 'function';
+    if (canListenVisibility) document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      mounted = false;
+      if (canListenVisibility && typeof document.removeEventListener === 'function') {
+        document.removeEventListener('visibilitychange', onVisibility);
+      }
+      runner.stop();
+    };
+  }, []);
+  return sync;
+}
+
 /* Il pallino d'allarme sulla rotellina: e' la ragione per cui togliere
    le impostazioni dalle pagine e' un GUADAGNO e non una perdita. Prima
    il PM doveva aprire F11 per scoprire che il salvataggio notturno del
@@ -173,6 +222,15 @@ function useTaskAlarm() {
   return guasti;
 }
 
+// stato della sincronizzazione prezzi -> chiave del catalogo (prima: l'enum interno in maiuscolo,
+// SYNC/ERROR in inglese anche in italiano). API PING/LIVE/DOWN, ONLINE/OFFLINE, RUN, STALE, CONFIG
+// restano sigle da terminale: sono le etichette neutre dichiarate in tests/i18n/dizionari.test.cjs.
+// Integrazione G9b+G9c: ogni stato del pallino prezzi ha la sua parola (partial/undeclared di G9b
+// non ricadono su «ok»); `satisfies` fa fallire tsc se uno stato nuovo resta senza chiave.
+const PX_STATE = {
+  sync: 'shell.px_sync', ok: 'shell.px_ok', partial: 'shell.px_partial', undeclared: 'shell.px_undeclared', error: 'shell.px_error',
+} as const satisfies Record<'sync' | 'ok' | 'partial' | 'undeclared' | 'error', string>;
+
 function marketStatus(now: Date) {
   const dayUTC = now.getUTCDay();
   const minUTC = now.getUTCHours() * 60 + now.getUTCMinutes();
@@ -189,12 +247,17 @@ function marketStatus(now: Date) {
   ];
 }
 
+function ShellSurface({ render }: { render: () => React.ReactNode }) {
+  return <>{render()}</>;
+}
+
 export default function Layout({ children }: { children: React.ReactNode }) {
   const language = useLingua(), t = useT();
   const nav = PAGE_DESTINATIONS.map(entry => ({ ...localizeDestination(entry, language), icon: icons[entry.id] }));
   const now = useNow();
   const health = useBackendHealth();
   const { fx, fxAt, fxErr } = useFx();
+  const priceSync = useGlobalPriceRefresh();
   const tel = useTelemetry();
   const guasti = useTaskAlarm();
   const [cfgOpen, setCfgOpen] = useState(false);
@@ -242,180 +305,149 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const dateStr = fmtDataBreve(now, language);
   const tzOffset = now.getTimezoneOffset();
 
+  const settingsTitle = guasti == null
+    ? t('shell.settings_unknown', { key: KEY_SETTINGS })
+    : guasti > 0
+      ? t('shell.settings_failed', { key: KEY_SETTINGS, n: guasti })
+      : `${t('shell.settings')} (${KEY_SETTINGS})`;
+
   return (
-    <div className="flex flex-col h-screen bg-bg overflow-hidden">
+    <div className="bb-layout-frame" data-mode="modern">
+      <AppearanceMenu />
+      <NewInterfaceBoundary language={language}>
+        <ShellSurface render={() => (
+        <div className="bb-modern-shell">
+          <header className="bb-modern-header">
+              <>
+                <div className="bb-modern-brand">
+                  <strong>{current?.label ?? nav[0]?.label}</strong>
+                  <span>{current?.group ?? nav[0]?.group}</span>
+                </div>
+                <div className="bb-modern-markets" aria-label={t('shell.markets')}>
+                  {markets.map(m => (
+                    <span key={m.label} className={'bb-modern-market' + (m.live ? ' is-live' : '')} title={`${m.label} ${m.live ? t('shell.market_open') : t('shell.market_closed')}`}>
+                      <i aria-hidden="true" />{m.label}
+                    </span>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => window.dispatchEvent(new Event('bb:palette'))}
+                  className="bb-modern-search"
+                  title={t('shell.palette')}
+                >
+                  <span aria-hidden="true">⌕</span>
+                  <span>{frase(t('shell.search'))}</span>
+                  <kbd>CTRL+K</kbd>
+                </button>
+                {/* Un solo pallino: verde se backend e prezzi sono a posto, rosso se uno dei due
+                    è giù, giallo mentre si verifica. Il dettaglio sta nel tooltip. */}
+                <div className="bb-modern-statuses">
+                  {(() => {
+                    const stato = health === false || priceSync.state === 'error' ? 'is-bad'
+                      : health && priceSync.state === 'ok' ? 'is-good' : 'is-pending';
+                    const api = `API ${health === null ? 'PING' : health ? 'LIVE' : 'DOWN'}`;
+                    const esitoPx = priceSync.state === 'partial' ? ` · ${t('shell.prices_failed', { n: String(priceSync.failed) })}`
+                      : priceSync.state === 'undeclared' ? ` · ${t('shell.prices_undeclared')}` : '';
+                    const px = `PX ${t(PX_STATE[priceSync.state])}${esitoPx}${priceSync.at ? ` · ${t('shell.last_snapshot')} ${priceSync.at}` : ''}`;
+                    return <span className={'bb-modern-status bb-modern-status-dot ' + stato} role="status" title={`${api}\n${px}`}
+                      aria-label={`${t('shell.data_status')}: ${api}, ${px}`}><i aria-hidden="true" /></span>;
+                  })()}
+                </div>
+                <div className="bb-modern-clock" title={`UTC${tzOffset <= 0 ? '+' : '-'}${Math.abs(Math.round(tzOffset / 60))}`}>
+                  <span>{dateStr}</span><strong>{timeStr}</strong>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setCfgOpen(o => !o)}
+                  title={settingsTitle}
+                  aria-label={t('shell.settings')}
+                  aria-expanded={cfgOpen}
+                  className="bb-modern-settings"
+                >
+                  <SettingsIcon size={15} />
+                  {guasti == null ? <span className="bb-settings-alarm" aria-label={t('shell.settings_unknown', { key: KEY_SETTINGS })} />
+                    : guasti > 0 ? <span className="bb-settings-alarm is-error" aria-label={t('shell.settings_failed', { key: KEY_SETTINGS, n: guasti })} /> : null}
+                </button>
+              </>
+          </header>
 
-      {/* ===== TIER 1: plancia di comando ===== */}
-      {/* z-45: la fascia sta SOPRA il velo del pannello impostazioni (z-40).
-          La rotellina resta accesa e cliccabile mentre il pannello e' aperto,
-          perche' e' anche il bottone con cui lo richiudi: spegnerla insieme
-          al resto sarebbe un vicolo cieco. */}
-      <header className="relative z-[45] h-10 flex items-stretch border-b border-border bg-bg-elev shrink-0 text-2xs font-mono">
-        <div className="flex items-center gap-2.5 px-3 border-r border-border bg-bg">
-          <span className="inline-block w-2 h-2 bg-amber" style={{ boxShadow: '0 0 8px rgba(255,165,30,0.55)' }} />
-          <span className="text-amber font-bold tracking-[0.28em] text-glow-amber">BELLOMBERG</span>
-          <span className="text-faint text-3xs tracking-[0.2em]">v{appVersion} OBSIDIAN</span>
-        </div>
+          <nav {...dietro} aria-label={t('shell.modules')} className="bb-modern-sidebar">
+              <>
+                <div className="bb-modern-sidebar-brand"><div><strong>BELLOMBERG</strong></div></div>
+                <div className="bb-modern-nav-scroll">
+                  {nav.map(({ to, label, group, icon: Icon, key }, index) => (
+                    <Fragment key={to}>
+                      {(index === 0 || nav[index - 1].group !== group) && <div className="bb-modern-nav-group">{group}</div>}
+                      <NavLink
+                        to={to}
+                        title={`${key} · ${label} · ${group}`}
+                        aria-label={`${key} · ${label} · ${group}`}
+                        className={({ isActive }) => 'bb-modern-nav-link' + (isActive ? ' is-active' : '')}
+                      >
+                        <Icon size={13} aria-hidden="true" />
+                        <span>{label}</span>
+                        {to === '/filing' && <BadgeFiling etichetta={n => t('shell.filing_new', { n })} />}
+                      </NavLink>
+                    </Fragment>
+                  ))}
+                </div>
+                <button onClick={() => setCfgOpen(true)} title={`${KEY_SETTINGS} · ${t('shell.settings')}`}
+                  aria-label={`${KEY_SETTINGS} · ${t('shell.settings')}`} className="bb-modern-config">
+                  <SettingsIcon size={14} aria-hidden="true" /><span>CONFIG</span><kbd>{KEY_SETTINGS}</kbd>
+                  {guasti == null ? <i className="bb-settings-alarm" aria-label={t('shell.settings_unknown', { key: KEY_SETTINGS })} />
+                    : guasti > 0 ? <i className="bb-settings-alarm is-error" aria-label={t('shell.settings_failed', { key: KEY_SETTINGS, n: guasti })} /> : null}
+                </button>
+              </>
+          </nav>
 
-        <div className="flex items-center gap-3 px-4 border-r border-border">
-          {markets.map(m => (
-            <div key={m.label} className="flex items-center gap-1.5">
-              <span className="led" style={{ background: m.color, boxShadow: m.live ? '0 0 6px ' + m.color : 'none' }} />
-              <span className={m.live ? 'text-text' : 'text-muted'}>{m.label}</span>
-            </div>
-          ))}
-        </div>
+          {/* I cambi servono a chi guarda i mercati: la fascia vive solo nella pagina Mercati. */}
+          {location.pathname.startsWith('/market') && <div {...dietro} className="bb-modern-fx">
+              <>
+                <span className="bb-modern-fx-title">FX / EUR</span>
+                <div className="bb-modern-fx-rates">
+                  {Object.entries(fx).length === 0 ? (
+                    <span className={fxErr ? 'bb-modern-fx-error' : ''}>{fxErr ? t('shell.fx_error') : t('shell.fx_waiting')}</span>
+                  ) : Object.entries(fx).map(([currency, rate]) => {
+                    const safe = typeof rate === 'number' && isFinite(rate);
+                    return <span key={currency} className="bb-modern-fx-rate"><span>{currency}/EUR</span><strong>{safe ? fmtNum(rate, currency === 'GBX' ? 5 : 4) : '—'}</strong></span>;
+                  })}
+                </div>
+                {fxErr && fxAt != null
+                  ? <span className="bb-modern-fx-meta is-stale" title={t('shell.fx_stale')}>STALE {Math.max(1, Math.round((now.getTime() - fxAt) / 60000))}M</span>
+                  : <span className="bb-modern-fx-meta">FX 60s</span>}
+              </>
+          </div>}
 
-        {/* OMNIBOX: il cuore del terminale (apre la palette) */}
-        <button
-          onClick={() => window.dispatchEvent(new Event('bb:palette'))}
-          className="flex-1 flex items-center gap-2.5 px-4 mx-3 my-1.5 bg-bg border border-border hover:border-amber-deep hover:bg-panel transition-colors cursor-pointer text-left group"
-          title={t('shell.palette')}>
-          <span className="text-amber font-bold">&#10095;</span>
-          <span className="text-faint group-hover:text-muted transition-colors tracking-wider">
-            {t('shell.search')}
-          </span>
-          <span className="ml-auto text-faint text-3xs border border-border px-1.5 py-0.5 tracking-wider">CTRL+K</span>
-        </button>
+          <main {...dietro} className={location.pathname === '/dashboard' ? 'bb-modern-main' : 'bb-modern-main bb-modern-main-classic-content'}>
+            <div className="relative p-4 h-full overflow-y-auto">{children}</div>
+          </main>
 
-        <div className="flex items-center gap-2 px-3 border-r border-l border-border">
-          <span className={'led ' + (health ? 'led-green' : health === false ? 'led-red' : 'led-amber')} />
-          <span className="text-muted">API</span>
-          <span className={health ? 'text-emerald' : health === false ? 'text-crimson' : 'text-amber'}>
-            {health === null ? 'PING' : health ? 'LIVE' : 'DOWN'}
-          </span>
-        </div>
-
-        <div className="flex items-center gap-3 px-3">
-          <span className="text-muted">{dateStr}</span>
-          <span className="text-amber tabular-nums text-glow-amber">{timeStr}</span>
-          <span className="text-faint">UTC{tzOffset <= 0 ? '+' : '-'}{Math.abs(Math.round(tzOffset/60))}</span>
-        </div>
-
-        {/* ── LA ROTELLINA — ultimo segmento, dopo l'orologio ──────────────
-            Sta nella famiglia di DESTRA insieme ad API e ora: a sinistra
-            l'identita', al centro l'azione, a destra lo stato della macchina.
-            Il pallino rosso compare quando un lavoro automatico e' in errore. */}
-        <button
-          onClick={() => setCfgOpen(o => !o)}
-          title={guasti == null
-            ? t('shell.settings_unknown', { key: KEY_SETTINGS })
-            : guasti > 0
-              ? t('shell.settings_failed', { key: KEY_SETTINGS, n: guasti })
-              : `${t('shell.settings')} (${KEY_SETTINGS})`}
-          aria-label={t('shell.settings')}
-          aria-expanded={cfgOpen}
-          className={'relative flex items-center gap-2 px-3.5 border-l border-border transition-colors ' +
-            (cfgOpen ? 'text-amber bg-amber/10' : 'text-text-dim hover:text-amber hover:bg-bg-elev')}>
-          <SettingsIcon size={14} />
-          <span className="text-3xs text-muted tracking-wider">{KEY_SETTINGS}</span>
-          {/* rosso = guasto misurato · ambra cava = stato NON leggibile · niente = tutto a posto */}
-          {guasti == null ? (
-            <span
-              className="absolute top-1.5 right-1.5 w-[7px] h-[7px] rounded-full border border-amber"
-              style={{ boxShadow: '0 0 0 2px #0b0e17' }}
-            />
-          ) : guasti > 0 ? (
-            <span
-              className="absolute top-1.5 right-1.5 w-[7px] h-[7px] rounded-full bg-crimson motion-safe:animate-pulse"
-              style={{ boxShadow: '0 0 0 2px #0b0e17, 0 0 9px rgba(255,61,96,.85)' }}
-            />
-          ) : null}
-        </button>
-      </header>
-
-      {/* ===== TIER 2: module bar orizzontale (niente sidebar: questo e' un terminale) ===== */}
-      <nav {...dietro} aria-label={t('shell.modules')} className="h-10 flex items-stretch border-b border-border bg-bg shrink-0 font-mono overflow-x-auto overflow-y-hidden">
-        {nav.map(({ to, short, label, group, icon: Icon, key }, index) => (
-          <NavLink key={to} to={to} title={`${key} · ${label} · ${group}`}
-            className={({ isActive }) =>
-              'relative flex items-center gap-1.5 px-3 text-2xs tracking-wider whitespace-nowrap transition-colors border-r border-border/50 ' +
-              (index > 0 && nav[index - 1].group !== group ? 'border-l-2 border-l-amber/25 ' : '') +
-              (isActive ? 'text-amber bg-panel shadow-[inset_0_-2px_0_0_#ffa51e]' : 'text-text-dim hover:text-amber hover:bg-bg-elev')}
-          >
-            <span className="text-3xs text-muted tabular-nums">{key.slice(1).padStart(2, '0')}</span>
-            <Icon size={12} />
-            <span>{short}</span>
-          </NavLink>
-        ))}
-        <button onClick={() => setCfgOpen(true)} title={`${KEY_SETTINGS} · ${t('shell.settings')}`}
-          className="ml-auto flex items-center gap-1.5 px-3 text-2xs tracking-wider whitespace-nowrap border-l-2 border-amber/25 text-text-dim hover:text-amber hover:bg-bg-elev">
-          <span className="text-3xs text-muted tabular-nums">{KEY_SETTINGS.slice(1)}</span>
-          <SettingsIcon size={12} /><span>CONFIG</span>
-        </button>
-      </nav>
-
-      {/* ===== TIER 3: contesto modulo + nastro FX ===== */}
-      <div {...dietro} className="h-7 flex items-center border-b border-border bg-bg-elev/60 shrink-0 font-mono text-2xs px-3 gap-4">
-        <span className="text-amber-deep uppercase tracking-[0.2em]">
-          {current ? current.key + ' // ' + current.label : '//'}
-        </span>
-        <span className="text-faint">|</span>
-        <div className="flex-1 flex items-center overflow-hidden gap-5">
-          {Object.entries(fx).length === 0 ? (
-            <span className={fxErr ? 'text-crimson' : 'text-faint'}>
-              {fxErr ? t('shell.fx_error') : t('shell.fx_waiting')}
-            </span>
-          ) : (
-            Object.entries(fx).map(([c, r]) => {
-              const safe = typeof r === 'number' && isFinite(r);
-              return (
-                <span key={c} className="flex items-center gap-1.5">
-                  <span className="text-muted">{c}/EUR</span>
-                  <span className="text-cyan tabular-nums">
-                    {safe ? fmtNum(r, c === 'GBX' ? 5 : 4) : '-'}
-                  </span>
+          <footer {...dietro} className="bb-modern-footer">
+              <>
+                {/* the footer identifies the actual frontend version (Classica showed "v{version} OBSIDIAN"; release test f13) */}
+                <span className="bb-modern-footer-brand">BELLOMBERG · v{appVersion} OBSIDIAN</span>
+                <span>{t('shell.engine')} <strong>{tel.engineMissing ? t('shell.engine_restart') : tel.engine ?? t('shell.unavailable')}</strong></span>
+                <span>{t('shell.agents')} <strong>{tel.running
+                  ? `${tel.done ?? t('shell.unavailable')}/${tel.total ?? t('shell.unavailable')} RUN`
+                  : tel.total == null ? t('shell.unavailable') : `${tel.total} ${t('shell.ready')}`}</strong></span>
+                <span className={tel.running ? 'is-live' : tel.ok ? 'is-warning' : 'is-error'}>
+                  {tel.running ? <><Zap size={10} aria-hidden="true" /> {t('shell.live_run')}</>
+                    : tel.ok && tel.running === null ? t('shell.unavailable')
+                      : tel.ok ? <><Zap size={10} aria-hidden="true" /> ONLINE</> : 'OFFLINE'}
                 </span>
-              );
-            })
-          )}
+                <span>{t('shell.session')} {now.toISOString().slice(0, 10)}</span>
+                <span className="bb-modern-footer-workspace">{t('shell.workspace')}</span>
+              </>
+          </footer>
         </div>
-        {fxErr && fxAt != null ? (
-          <span className="text-amber text-3xs uppercase tracking-wider" title={t('shell.fx_stale')}>
-            FX STALE {Math.max(1, Math.round((now.getTime() - fxAt) / 60000))}M
-          </span>
-        ) : (
-          <span className="text-faint text-3xs uppercase tracking-wider">FX 60s</span>
-        )}
-      </div>
-
-      {/* ===== CONTENUTO: tutta la larghezza ===== */}
-      <main {...dietro} className="flex-1 overflow-hidden bg-bg relative">
-        <div className="absolute inset-0 pointer-events-none opacity-40 grid-hud" />
-        <div className="relative p-4 h-full overflow-y-auto">
-          {children}
-        </div>
-      </main>
-
-      {/* ===== FOOTER: telemetria viva ===== */}
-      <footer {...dietro} className="h-7 border-t border-border bg-bg-elev flex items-center text-3xs font-mono text-faint px-3 gap-5 shrink-0">
-        <span className="text-amber-deep uppercase tracking-widest">[ Bellomberg &middot; Obsidian ]</span>
-        <span className="flex items-center gap-1.5">
-          <span className="text-faint uppercase">{t('shell.engine')}</span>
-          <span className="text-cyan">{tel.engineMissing ? t('shell.engine_restart') : tel.engine ?? '…'}</span>
-        </span>
-        <span className="flex items-center gap-1.5">
-          <span className="text-faint uppercase">{t('shell.agents')}</span>
-          <span className={tel.running ? 'text-emerald' : 'text-amber'}>{tel.running
-            ? `${tel.done ?? t('shell.unavailable')}/${tel.total ?? t('shell.unavailable')} RUN`
-            : tel.total == null ? t('shell.unavailable') : `${tel.total} ${t('shell.ready')}`}</span>
-        </span>
-        <span className="flex items-center gap-1">
-          {tel.running
-            ? <span className="text-emerald flex items-center gap-1"><Zap size={9} /> {t('shell.live_run')}</span>
-            : tel.ok && tel.running === null
-              ? <span className="text-amber">{t('shell.unavailable')}</span>
-            : tel.ok
-              ? <span className="text-cyan flex items-center gap-1"><Zap size={9} /> ONLINE</span>
-              : <span className="text-crimson">OFFLINE</span>}
-        </span>
-        <span>{t('shell.session')} {now.toISOString().slice(0,10)}</span>
-        <span className="flex-1 text-right text-muted uppercase tracking-[0.15em]">
-          {t('shell.workspace')}
-        </span>
-      </footer>
-
-      {/* F11 IMPOSTAZIONI: sta SOPRA la pagina, non al posto suo */}
+        )} />
+      </NewInterfaceBoundary>
+      {/* macOS/Electron: the header is a window-drag region and Electron applies
+          app regions in document order, so the earlier no-drag selector above was
+          swallowed by the later header drag. This later, click-through no-drag
+          area under the Appearance button keeps Chiaro/Scuro clickable. */}
+      <div className="bb-interface-mode-drag-exclusion" aria-hidden="true" />
       <SettingsPanel open={cfgOpen} onClose={() => setCfgOpen(false)} />
     </div>
   );

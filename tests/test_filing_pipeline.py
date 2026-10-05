@@ -137,7 +137,7 @@ def test_unverified_new_sec_filing_labels_old_comparison_historical(profilo, tmp
     rows = [{"url": url, "form": "10-K", "report_date": f"{anno}-12-31",
              "filed_date": f"{anno + 1}-02-01", "emittente_id": profilo["emittente_id"]}
             for anno, url in zip((2026, 2025, 2024), urls)]
-    monkeypatch.setattr(sec_edgar, "get_filing_catalog", lambda ticker: {
+    monkeypatch.setattr(sec_edgar, "get_filing_catalog", lambda ticker, **_k: {
         "stato": "ok", "documenti": rows, "motivi": []})
     rete(monkeypatch, {urls[0]: b'<html>Unreadable identity and period.</html>',
                       urls[1]: relazione(2025), urls[2]: relazione(2024)})
@@ -184,7 +184,7 @@ def test_europe_uses_explicit_lei_without_sec_or_fuzzy_lookup(profilo, tmp_path,
     monkeypatch.setattr(sec_edgar, "get_filing_catalog", vietato)
     urls = [f"https://filings.xbrl.org/annual-{anno}.html" for anno in (2025, 2024)]
     lei_chiamati = []
-    def elenco(lei):
+    def elenco(lei, **k):
         lei_chiamati.append(lei)
         return [{"report_url": url, "period_end": f"{anno}-12-31", "language": "en",
                  "emittente_id": profilo["emittente_id"]}
@@ -207,7 +207,7 @@ def test_esef_other_catalog_language_does_not_consume_document_budget(profilo, t
              "emittente_id": profilo["emittente_id"]}] + [
         {"report_url": url, "period_end": f"{anno}-12-31", "language": "it",
          "emittente_id": profilo["emittente_id"]} for url, anno in zip(italiane, (2025, 2024))]
-    monkeypatch.setattr(esef, "_list_filings", lambda lei: rows)
+    monkeypatch.setattr(esef, "_list_filings", lambda lei, **k: rows)
     chiamate = rete(monkeypatch, {url: relazione(anno).replace(b"Report language: English", b"Lingua del rapporto: italiano")
                                  for url, anno in zip(italiane, (2025, 2024))})
     out = esegui(profilo, tmp_path, max_documenti=2)
@@ -226,7 +226,7 @@ def test_esef_unknown_or_contradicted_language_remains_unverified(profilo, tmp_p
     profilo.update(emittente_id="LEI:ACMEEXPLICITLEI", fonti=["esef"], lingua="it")
     profilo["verifica"]["lingua"] = r"Lingua del rapporto: italiano"
     url = "https://filings.xbrl.org/annual-2025.html"
-    monkeypatch.setattr(esef, "_list_filings", lambda lei: [{
+    monkeypatch.setattr(esef, "_list_filings", lambda lei, **k: [{
         "report_url": url, "period_end": "2025-12-31", "language": lingua_catalogo,
         "emittente_id": profilo["emittente_id"]}])
     chiamate = rete(monkeypatch, {url: relazione(2025)})
@@ -246,7 +246,7 @@ def test_esef_unverified_second_base_version_makes_comparison_historical(profilo
     rows = [{"report_url": url, "period_end": fine, "language": "en",
              "emittente_id": profilo["emittente_id"]}
             for url, fine in zip(urls, ("2025-12-31", "2024-12-31", "2024-12-31"))]
-    monkeypatch.setattr(esef, "_list_filings", lambda lei: rows)
+    monkeypatch.setattr(esef, "_list_filings", lambda lei, **k: rows)
     chiamate = rete(monkeypatch, {urls[0]: relazione(2025), urls[1]: relazione(2024),
                                  urls[2]: relazione(2024, rischio="Another version.")})
     out = esegui(profilo, tmp_path, max_documenti=2)
@@ -331,7 +331,7 @@ def test_sec_amendment_is_visible_and_blocks_current_comparison(profilo, tmp_pat
              "emittente_id": profilo["emittente_id"]} for anno, url in zip((2025, 2024), urls)]
     rows.insert(0, {"url": rettifica, "form": "10-K/A", "report_date": periodo_rettificato,
                     "emittente_id": profilo["emittente_id"]})
-    monkeypatch.setattr(sec_edgar, "get_filing_catalog", lambda ticker: {
+    monkeypatch.setattr(sec_edgar, "get_filing_catalog", lambda ticker, **_k: {
         "stato": "ok", "documenti": rows, "motivi": []})
     chiamate = rete(monkeypatch, {url: relazione(anno) for url, anno in zip(urls, (2025, 2024))})
     out = esegui(profilo, tmp_path)
@@ -360,7 +360,7 @@ def test_censused_ir_source_keeps_documented_calendar(profilo, tmp_path, monkeyp
 def test_catalog_failure_is_declared_without_false_empty_success(profilo, tmp_path, monkeypatch):
     from bellomberg.market_data import sec_edgar
     profilo.update(emittente_id="CIK:0000000001", fonti=["sec"])
-    monkeypatch.setattr(sec_edgar, "get_filing_catalog", lambda ticker: {
+    monkeypatch.setattr(sec_edgar, "get_filing_catalog", lambda ticker, **_k: {
         "stato": "errore", "documenti": [], "motivi": ["contatto SEC mancante"]})
     rete(monkeypatch, {})
     out = esegui(profilo, tmp_path)

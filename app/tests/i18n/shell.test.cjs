@@ -5,7 +5,7 @@ const { renderToStaticMarkup } = require('react-dom/server');
 const { MemoryRouter } = require('react-router-dom');
 const { creaCaricatore, ambienteBrowser, apiFinta } = require('./_carica.cjs');
 
-test('nineteen destinations keep routes and shortcuts while their names follow the selected language', () => {
+test('twenty destinations keep routes and shortcuts while their names follow the selected language', () => {
   ambienteBrowser();
   const load = creaCaricatore();
   const nav = load('lib/navigation.ts');
@@ -14,7 +14,9 @@ test('nineteen destinations keep routes and shortcuts while their names follow t
     for (const field of ['id', 'to', 'key', 'kind', 'short']) assert.equal(it[field], en[field], `${entry.id}.${field}`);
     assert.doesNotMatch(en.label + en.group, /⟦/);
   }
-  assert.equal(nav.NAVIGATION.length, 19);
+  assert.equal(nav.NAVIGATION.length, 20);
+  assert.equal(nav.localizeDestination(nav.NAVIGATION.find(x => x.id === 'filing'), 'it').label, 'Filing');
+  assert.equal(nav.localizeDestination(nav.NAVIGATION.find(x => x.id === 'filing'), 'en').label, 'Filings');
   assert.equal(nav.localizeDestination(nav.SETTINGS_DESTINATION, 'en').label, 'Settings');
   assert.equal(nav.localizeDestination(nav.SETTINGS_DESTINATION, 'it').label, 'Impostazioni');
   assert.equal(nav.localizeDestination(nav.NAVIGATION.find(x => x.id === 'mandato'), 'en').label, 'Mandate and Journal');
@@ -188,4 +190,53 @@ for (const [surface, file, invoke] of [
     assert.deepEqual(calls.map(x => x.headers['X-BB-Language']), ['en', 'it']);
     assert.deepEqual(calls.map(x => x.headers['X-BB-Token']), ['synthetic-verified', 'synthetic-verified']);
   } finally { global.fetch = previousFetch; }
+});
+
+test('shell chrome states (markets, API, prices) follow the selected language', () => {
+  // G9c (Opus 5.5): market LIVE/CLOSED and PX SYNC/ERROR were fixed English in both languages.
+  // API PING/LIVE/DOWN stay: neutral terminal labels declared in dizionari.test.cjs (NEUTRE).
+  ambienteBrowser();
+  const load = creaCaricatore({ stub: { '@/lib/api': apiFinta(), './SettingsPanel': { default: () => null, __esModule: true } } });
+  const language = load('i18n/lingua.ts'), Layout = load('components/Layout.tsx').default;
+  const render = locale => { language.impostaLinguaCorrente(locale);
+    return renderToStaticMarkup(React.createElement(MemoryRouter, { initialEntries: ['/dashboard'] }, React.createElement(Layout, {}, null))); };
+  // REV_G9c R3: l'orologio e' fissato, cosi' entrambi i rami (aperto/chiuso) sono misurati a ogni giro.
+  // Mercoledi' 07/10/2026 15:00 UTC: NY, LN, MI aperti, HK chiuso; 22:00 UTC: tutti chiusi.
+  const RealDate = Date;
+  const at = iso => class extends RealDate { constructor(...args) { super(...(args.length ? args : [iso])); } static now() { return new RealDate(iso).getTime(); } };
+  const renderAt = (iso, locale) => { global.Date = at(iso); try { return render(locale); } finally { global.Date = RealDate; } };
+  const markets = html => [...html.matchAll(/class="bb-modern-market[^"]*" title="([^"]*)"/g)].map(m => m[1]);
+  const it = renderAt('2026-10-07T15:00:00Z', 'it'), en = renderAt('2026-10-07T15:00:00Z', 'en');
+  assert.deepEqual(markets(it), ['NY APERTO', 'LN APERTO', 'MI APERTO', 'HK CHIUSO']);
+  assert.deepEqual(markets(en), ['NY OPEN', 'LN OPEN', 'MI OPEN', 'HK CLOSED']);
+  assert.deepEqual(markets(renderAt('2026-10-07T22:00:00Z', 'it')), ['NY CHIUSO', 'LN CHIUSO', 'MI CHIUSO', 'HK CHIUSO']);
+  assert.deepEqual(markets(renderAt('2026-10-07T22:00:00Z', 'en')), ['NY CLOSED', 'LN CLOSED', 'MI CLOSED', 'HK CLOSED']);
+  assert.match(it, /PX IN AGGIORNAMENTO/); assert.match(en, /PX SYNCING/);
+  assert.doesNotMatch(it, /\b(CLOSED|SYNC)\b/);
+});
+
+test('the shell chrome writes no visible words outside the catalog (acronyms, keys and brand only)', () => {
+  // G9c (Opus 5.5): some states are not reachable in a static render, so the source of Layout.tsx
+  // is read: JSX text and literals inside JSX may only be acronyms, key names, the brand or the
+  // neutral terminal labels that dizionari.test.cjs declares (PING, LIVE, ONLINE, RUN, STALE...).
+  const fs = require('node:fs'), path = require('node:path'), ts = require('typescript');
+  const file = path.resolve(__dirname, '../../src/components/Layout.tsx');
+  const sf = ts.createSourceFile(file, fs.readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const SIGLE = new Set(['API', 'PX', 'FX', 'EUR', 'CTRL', 'K', 'UTC', 'BELLOMBERG', 'OBSIDIAN', 'CONFIG', 'ERR', 'v', 's',
+    'PING', 'LIVE', 'DOWN', 'ONLINE', 'OFFLINE', 'RUN', 'STALE', 'M']);
+  const ammesso = text => (text.match(/[A-Za-zÀ-ÿ]+/g) || []).every(w => SIGLE.has(w));
+  // nei letterali (classi CSS comprese) contano le parole in MAIUSCOLO da terminale: LIVE, ONLINE...
+  const maiuscole = text => (text.match(/[A-Za-zÀ-ÿ]+/g) || []).some(w => /[A-Z]{2}/.test(w) && !SIGLE.has(w));
+  const dentroJsx = n => { for (let p = n.parent; p; p = p.parent) { if (ts.isJsxElement(p) || ts.isJsxFragment(p) || ts.isJsxSelfClosingElement(p)) return true; if (ts.isFunctionLike(p)) return false; } return false; };
+  const trovati = [];
+  const visita = n => {
+    if (ts.isJsxText(n) && !ammesso(n.text)) trovati.push(n.text.trim());
+    if ((ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) && dentroJsx(n) && !ts.isJsxAttribute(n.parent)
+      && !(ts.isCallExpression(n.parent)) && !(ts.isBinaryExpression(n.parent) && /^[!=]==$/.test(n.parent.operatorToken.getText()))
+      && maiuscole(n.text)) trovati.push(n.text);
+    if (ts.isTemplateExpression(n) && dentroJsx(n) && !ammesso(n.head.text + ' ' + n.templateSpans.map(s => s.literal.text).join(' '))) trovati.push(n.getText());
+    ts.forEachChild(n, visita);
+  };
+  visita(sf);
+  assert.deepEqual(trovati, []);
 });

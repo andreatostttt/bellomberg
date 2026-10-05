@@ -97,6 +97,12 @@ def test_flag_veto_opzione_a(db):
 
     # il veto sta nel canale PRIMA e FUORI dalla finestra n: anche con n=1 e
     # una nota di esecuzione piu' recente sull'altra decisione, il veto c'e'
+    # (04/10, G6: una riga del parser senza esito del gate non e' eseguibile; qui il
+    # gate la dichiara OPERATIVE come farebbe la run settimanale)
+    db.record_action_assessments(memo_id, [
+        {"row_index": r["proposal_row_index"], "action": r["proposal_action"],
+         "ticker": r["proposal_ticker"], "status": "OPERATIVE", "reason": "prova"}
+        for r in db.get_recent_decisions(10) if r["memo_id"] == memo_id])
     assert db.update_decision(gamma_id, status="EXECUTED", pm_feedback="comprati 10k")
     fb = db.get_decisions_with_pm_feedback(1)
     assert fb[0]["id"] == alfa_id and fb[0]["veto"] == 1

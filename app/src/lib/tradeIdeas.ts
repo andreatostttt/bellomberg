@@ -1,4 +1,5 @@
 import { API_BASE, clearSessionAndReload, requestHeaders } from './api';
+import { t } from '../i18n/t';
 
 export type TradeIdeaJudgment = 'favorable' | 'rejected' | 'watch' | 'incomplete';
 export type TradeIdeaTechnicalStatus = 'accepted' | 'running' | 'completed' | 'incomplete' | 'failed' | 'cancelled' | 'interrupted';
@@ -132,6 +133,7 @@ export interface TradeIdeaProgress {
   specialists?: TradeIdeaProgressEntry[];
   tools?: TradeIdeaToolEntry[];
   events?: Array<{ at?: string | null; level?: string | null; message: string }>;
+  report_quality?: TradeIdeaReportQuality | null;
 }
 
 export interface TradeIdeaDestination {
@@ -183,13 +185,58 @@ export interface TradeIdeaEmail {
   accepted_at?: string | null;
 }
 
+/** Costo della catena di run (backend `_cost_summary`): importi in USD come stringhe decimali. */
+export interface TradeIdeaCostSummary extends TradeIdeaUsage {
+  budget_limit_usd?: string | number | null;
+  charged_usd?: string | null;
+  reserved_usd?: string | null;
+  unknown_requests?: number | null;
+  held_unknown_requests?: number | null;
+  unacknowledged_unknown_requests?: number | null;
+  unknown_reserved_usd?: string | null;
+  remaining_after_holds_usd?: string | null;
+  overrun?: boolean;
+}
+
+/** Esito di POST /runs/{id}/costs/reconcile per una richiesta dal costo incerto.
+ *  settleable = il provider ha la fattura misurata (anteprima, nulla scritto); settled = registrata;
+ *  pending = resta incerta, sempre con il motivo. */
+export interface TradeIdeaCostOutcome {
+  request_id: string;
+  status: 'settleable' | 'settled' | 'pending';
+  charged_usd?: string | number | null;
+  reason?: string | null;
+  run_id?: string;
+  role?: string | null;
+  model?: string | null;
+  reserved_usd?: string | number | null;
+}
+export interface TradeIdeaCostReconciliation {
+  run_id?: string;
+  apply?: boolean;
+  outcomes: TradeIdeaCostOutcome[];
+  settled: number;
+  pending: number;
+}
+
+/** Sezioni del PDF con la pagina in cui iniziano (manifest `pdf_quality.section_pages`,
+ *  progress `report_quality.section_pages`): chiavi del dossier più executive, recommendation,
+ *  thesis, risks, data_notes, sources, annex. Ogni chiave può mancare. */
+export type TradeIdeaSectionPages = Record<string, number>;
+export interface TradeIdeaReportQuality {
+  status?: string | null;
+  pages?: number | Record<string, number> | null;
+  section_pages?: TradeIdeaSectionPages | null;
+  reasons?: string[] | null;
+}
+
 export interface TradeIdeaDetail {
   run: TradeIdeaRun;
   progress?: TradeIdeaProgress | null;
   result?: TradeIdeaResult | null;
   artifacts?: TradeIdeaArtifact[];
   email?: TradeIdeaEmail | null;
-  cost?: TradeIdeaUsage | null;
+  cost?: TradeIdeaCostSummary | null;
   states?: Record<string, string> | null;
   artifact_availability?: { status?: string; reason?: string };
   recovery?: { successor_run_id?: string | null; can_continue?: boolean; can_recover_delivery?: boolean;
@@ -234,7 +281,7 @@ export async function tradeIdeaRequest<T>(path: string, body?: object, signal?: 
   if (response.status === 401 || response.status === 403) clearSessionAndReload();
   const value = await response.json().catch(() => null);
   if (!response.ok) throw new TradeIdeaApiError(errorMessage(value, response.status), response.status);
-  if (value === null) throw new TradeIdeaApiError(`HTTP ${response.status}: risposta JSON assente`, response.status);
+  if (value === null) throw new TradeIdeaApiError(`HTTP ${response.status}: ${t('tradeidea.apiNoJson')}`, response.status);
   return value as T;
 }
 
@@ -262,6 +309,11 @@ export const TradeIdeas = {
   stop: (runId: string) => tradeIdeaRequest<{ run_id: string; status: string }>(`/runs/${encodeURIComponent(runId)}/stop`, {}),
   resume: (runId: string, idempotencyKey: string, recoverTruncatedRequestId?: string, authorizePriceRefresh = false, recoverFailedRequestId?: string) => tradeIdeaRequest<{ run_id: string; status: string }>(`/runs/${encodeURIComponent(runId)}/resume`, { idempotency_key: idempotencyKey, cost_acknowledged: true, ...(recoverTruncatedRequestId ? { recover_truncated_request_id: recoverTruncatedRequestId } : {}), ...(authorizePriceRefresh ? { authorize_price_refresh: true } : {}), ...(recoverFailedRequestId ? { recover_failed_request_id: recoverFailedRequestId } : {}) }),
   recoverDelivery: (runId: string) => tradeIdeaRequest<TradeIdeaDetail>(`/runs/${encodeURIComponent(runId)}/delivery/recover`, {}),
+  /** Costi incerti: `apply: false` è l'anteprima (lettura gratuita della fattura del provider, nessuna
+   *  scrittura); `apply: true` registra gli importi verificati e va chiamata solo dopo la conferma esplicita
+   *  del PM. 409 se la run è in corso. */
+  reconcileCosts: (runId: string, apply: boolean) =>
+    tradeIdeaRequest<TradeIdeaCostReconciliation>(`/runs/${encodeURIComponent(runId)}/costs/reconcile`, { apply }),
   retryEmail: (runId: string, acknowledgeUncertain = false) => tradeIdeaRequest<TradeIdeaEmail>(`/runs/${encodeURIComponent(runId)}/email/retry`, { acknowledge_uncertain: acknowledgeUncertain }),
 };
 

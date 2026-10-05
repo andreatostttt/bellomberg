@@ -133,14 +133,41 @@ def test_i_job_linux_e_windows_restano_senza_condizione_di_costo():
     assert "if" not in _job("test") and "if" not in _job("desktop-windows")
 
 
-def test_research_ci_rifiuta_la_creazione_excel_prima_di_scrivere(tmp_path):
-    from tools.testing import research_ci
+_SONDA_HOOK_EXCEL = r"""
+import runpy, sys
+from pathlib import Path
+guard = runpy.run_path(sys.argv[1])
+sys.addaudithook(guard["forbid_excel_write"])
+base = Path(sys.argv[2])
+target = base / "forbidden.XLSX"
+try:
+    target.write_bytes(b"must never be written")
+except guard["ExcelGenerationForbidden"] as exc:
+    print("RIFIUTATO:" + str(exc))
+else:
+    print("SCRITTO")
+print("ESISTE:" + str(target.exists()))
+pdf = base / "research.pdf"
+pdf.write_bytes(b"synthetic PDF fixture")
+print("PDF:" + str(pdf.read_bytes() == b"synthetic PDF fixture"))
+"""
 
-    sys.addaudithook(research_ci.forbid_excel_write)
-    target = tmp_path / "forbidden.XLSX"
-    with pytest.raises(research_ci.ExcelGenerationForbidden, match="forbidden"):
-        target.write_bytes(b"must never be written")
-    assert not target.exists()
-    pdf = tmp_path / "research.pdf"
-    pdf.write_bytes(b"synthetic PDF fixture")
-    assert pdf.read_bytes() == b"synthetic PDF fixture"
+
+def test_research_ci_rifiuta_la_creazione_excel_prima_di_scrivere(tmp_path):
+    # L'audit hook vero si installa in un SOTTOPROCESSO: sys.addaudithook non si toglie piu', e
+    # nel processo pytest farebbe cadere con ExcelGenerationForbidden ogni test successivo che
+    # scrive un .xlsx (suite dipendente dall'ordine; rapporto IX, 04/10).
+    import subprocess
+
+    guard = os.path.join(REPO, "tools", "testing", "research_ci.py")
+    esito = subprocess.run(
+        [sys.executable, "-I", "-c", _SONDA_HOOK_EXCEL, guard, str(tmp_path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+    )
+    assert esito.returncode == 0, esito.stderr
+    righe = esito.stdout.splitlines()
+    assert len(righe) == 3, esito.stdout
+    assert righe[0].startswith("RIFIUTATO:") and "forbidden" in righe[0], righe
+    assert righe[1] == "ESISTE:False", righe
+    assert righe[2] == "PDF:True", righe
+    assert not (tmp_path / "forbidden.XLSX").exists()

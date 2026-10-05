@@ -7,14 +7,29 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Bellomberg, ValuationModel, ValuationDetail } from '@/lib/api';
 import { FileSpreadsheet, Download, AlertTriangle } from 'lucide-react';
 import { prepareValuationModel, valuationBadge } from '@/lib/sector-valuation';
-import FilingDiffPanel from '@/components/FilingDiffPanel';
+import FilingRiepilogo from '@/components/FilingRiepilogo';
 import { currentWorkbook, historicalWorkbook, requestModelRefresh, lockModel, createPersonalVariant, personalVariants, personalWorkbook } from '@/lib/valuation-download';
 import type { PersonalValuation } from '@/lib/valuation-download';
+import ModernPage from '@/components/ModernPage';
+import PagePresentation from '@/components/PagePresentation';
 import FundamentalsResearch from '@/components/FundamentalsResearch';
+import './research-modern.css';
+import './fundamentals-nuova.css';
 
-// The research view is the ordinary Fund page. The former workspace remains
-// preserved below as source history, never mounted by the application router.
-export default FundamentalsResearch;
+// The research view is the ordinary Fund page, shown in the Nuova page frame
+// (bb-page-modern + fundamentals-nuova.css, palette --bbn-*). FundamentalsResearch owns its own
+// polling controllers, so the frame is composition-only (no presentation
+// boundary above it). The former valuation workspace remains preserved below
+// as ArchivedValuationWorkspace, never mounted by the application router.
+export default function FundamentalsPage() {
+  return (
+    <ModernPage page="fundamentals" presentationBoundary={false}>
+      <div className="bbn-fund bbn-font">
+        <FundamentalsResearch selectedExtra={ticker => <FilingRiepilogo key={ticker} ticker={ticker} />} />
+      </div>
+    </ModernPage>
+  );
+}
 
 // F17 Fundamentals — OPZIONE B scelta dal PM (17/07, mockup renderizzato, regola
 // 15/07): master-detail stile terminal. Sinistra: tabella densa (un modello canonico
@@ -98,8 +113,8 @@ function MnavBar({ now, target }: { now: number | null; target?: number | null }
   return (
     <div className="relative h-12 mt-2 mb-1">
       <div className="absolute left-0 right-0 top-[18px] h-1.5"
-           style={{ background: 'linear-gradient(90deg,#5c1f1f 0%,#222 50%,#1f5c3a 100%)' }} />
-      <div className="absolute top-[14px] w-px h-3.5 bg-[#888]" style={{ left: '50%' }} />
+           style={{ background: 'linear-gradient(90deg,var(--bb-page-bar-bad, #5c1f1f) 0%,var(--bb-page-bar-track, #222) 50%,var(--bb-page-bar-good, #1f5c3a) 100%)' }} />
+      <div className="absolute top-[14px] w-px h-3.5 bg-[#888]" style={{ left: '50%', backgroundColor: 'var(--bb-page-muted, #888)' }} />
       {([[0, '−50%'], [25, '−25%'], [50, tr('fundamentals.f007')], [75, '+25%'], [100, '+50%']] as [number, string][]).map(([x, lb]) => (
         <span key={lb} className="absolute top-[38px] text-[9px] text-faint"
               style={{ left: `${x}%`, transform: 'translateX(-50%)' }}>{lb}</span>
@@ -283,7 +298,9 @@ export function ArchivedValuationWorkspace() {
   } as Record<string, string>)[quoteStatus] ?? tr('fundamentals.quoteUnknown');
 
   return (
-    <div className="space-y-4">
+    <ModernPage page="fundamentals" presentationBoundary={false} render={() => (
+    <div className="space-y-4 fundamentals-page">
+      <PagePresentation render={() => <>
       <div className="flex items-baseline justify-between border-b-2 border-[#ff8c00] pb-2">
         <h1 className={`text-lg font-bold font-mono ${ORANGE}`}>{tr('fundamentals.f010')}</h1>
         <span className="text-muted text-xs font-mono">
@@ -315,7 +332,7 @@ export function ArchivedValuationWorkspace() {
                 <tr key={`${m.dir}/${m.file}/${m.generation_id || m.ticker}`} onClick={() => setSelTicker(m.ticker)}
                     className={`border-b border-border/20 cursor-pointer hover:bg-bg/40 ${sel?.ticker === m.ticker ? 'bg-[#16202b]' : ''}`}>
                   <td className="py-1.5 px-2 font-semibold text-white whitespace-nowrap">
-                    {m.ticker}{sel?.ticker === m.ticker ? ' ◄' : ''}
+                    <button type="button" className="research-ticker-action" aria-pressed={sel?.ticker === m.ticker} onClick={event => { event.stopPropagation(); setSelTicker(m.ticker); }}>{m.ticker}{sel?.ticker === m.ticker ? ' ◄' : ''}</button>
                     {m.detail?.engine === 'rab' && <span className={CHIP}>RAB</span>}
                     {m.detail?.engine === 'mnav' &&
                       <span className={CHIP}>{m.detail?.profile_key === 'cef_nav' ? 'NAV' : 'mNAV'}</span>}
@@ -805,7 +822,11 @@ export function ArchivedValuationWorkspace() {
         </div>
       </div>
 
-      {sel?.ticker && <FilingDiffPanel key={sel.ticker} ticker={sel.ticker} />}
+      </>} />
+
+      {sel?.ticker && <div className="p3"><FilingRiepilogo key={sel.ticker} ticker={sel.ticker} /></div>}
+
+      <PagePresentation render={() => <>
 
       {vecchi.length > 0 && (
         <div className="panel">
@@ -832,6 +853,8 @@ export function ArchivedValuationWorkspace() {
         <FileSpreadsheet size={12} />
         {tr('fundamentals.f138')}
       </p>
+      </>} />
     </div>
+    )} />
   );
 }

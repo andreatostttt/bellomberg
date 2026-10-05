@@ -55,4 +55,5 @@ export const research = {
   ready: 'Pronto', blocked: 'Bloccato', stale: 'Dato vecchio', triggered: 'Condizione osservata', not_triggered: 'Condizione non osservata',
   review_required: 'Da rivalidare', observational_review: 'Revisione delle osservazioni', documented_attribution: 'Valutazione PM documentata',
   same_basis: 'Base omogenea', not_comparable: 'Non confrontabile', details: 'Dettaglio delle prove',
+  responseIncomplete: 'Risposta della ricerca incompleta', artifactUnavailable: 'Documento non disponibile',
 };

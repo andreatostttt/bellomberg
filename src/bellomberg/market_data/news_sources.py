@@ -103,6 +103,13 @@ _status_tls = threading.local()
 def reset_status() -> None:
     """Azzera il registro PRIMA di un giro di fetch (chiamare dal consumatore)."""
     _status_tls.esiti = {}
+    _status_tls.eta_cache = {}
+
+
+def last_cache_eta() -> Dict[str, float]:
+    """Opus 5.5 04/10: {fonte: eta' in secondi} delle fonti servite dalla cache condivisa
+    (stato "cache") nell'ultimo giro di QUESTO thread. Vuoto = nessuna fonte da cache."""
+    return dict(getattr(_status_tls, "eta_cache", {}) or {})
 
 
 def last_status() -> Dict[str, str]:
@@ -112,6 +119,12 @@ def last_status() -> Dict[str, str]:
     return dict(getattr(_status_tls, "esiti", {}) or {})
 
 
+def _eccezione_sicura(e):
+    """G3 (04/10): tipo + stato HTTP, mai il messaggio grezzo (l'URL porta la chiave API)."""
+    from bellomberg.core.errori_sicuri import descrivi_eccezione
+    return descrivi_eccezione(e)
+
+
 def _record_status(fonte: str, stato: str) -> None:
     if not hasattr(_status_tls, "esiti") or _status_tls.esiti is None:
         _status_tls.esiti = {}
@@ -119,7 +132,7 @@ def _record_status(fonte: str, stato: str) -> None:
 
 
 def _provider_skip_reason(provider: str, query: str):
-    """Motivo del blocco dal limiter condiviso (SKIP_BUDGET/SKIP_COOLDOWN/SKIP_DISABLED),
+    """Motivo del blocco dal limiter condiviso (SKIP_BUDGET/SKIP_PACING/SKIP_COOLDOWN/SKIP_DISABLED),
     o None se la chiamata puo' partire.
     ImportError -> None: si prova la chiamata, com'e' sempre stato (_rate_limiter fa lo
     stesso). Ogni ALTRO errore (es. stato su file con tipi corrotti) -> il limiter e'
@@ -193,7 +206,7 @@ def fetch_marketaux(ticker=None, query=None, max_news=10):
         _record_status("marketaux", "live")
         return risultati
     except Exception as e:
-        print("  [!] Errore Marketaux: " + str(e))
+        print("  [!] Errore Marketaux: " + _eccezione_sicura(e))   # G3: mai l'URL con la chiave
         _record_status("marketaux", "ERROR")
         return []
 
@@ -247,7 +260,7 @@ def fetch_thenewsapi(ticker=None, query=None, max_news=10):
         _record_status("thenewsapi", "live")
         return risultati
     except Exception as e:
-        print("  [!] Errore TheNewsAPI: " + str(e))
+        print("  [!] Errore TheNewsAPI: " + _eccezione_sicura(e))   # G3: mai l'URL con la chiave
         _record_status("thenewsapi", "ERROR")
         return []
 
@@ -280,6 +293,23 @@ def gnews_safe_query(query):
     return " ".join(out)
 
 
+def _mappa_gnews(articoli, query):
+    """Articoli grezzi GNews -> forma news_sources (condivisa fra risposta viva e cache)."""
+    risultati = []
+    for a in articoli or []:
+        if not isinstance(a, dict):
+            continue
+        risultati.append({
+            "ticker_associato": query,
+            "titolo": a.get("title", "") or "",
+            "descrizione": (a.get("description", "") or a.get("content", "") or "")[:500],
+            "fonte": "GNews (" + ((a.get("source") or {}).get("name", "Unknown") or "Unknown") + ")",
+            "url": a.get("url", ""),
+            "data": a.get("publishedAt", ""),
+        })
+    return risultati
+
+
 def fetch_gnews(query, max_news=10):
     """
     News da GNews (Google News API). 100/day gratis, real-time.
@@ -290,6 +320,25 @@ def fetch_gnews(query, max_news=10):
         return []
     _q = str(query or "")
     _skip = _provider_skip_reason("gnews", _q)
+    if _skip == "SKIP_COOLDOWN":
+        # Opus 5.5 04/10 (cache GNews condivisa): la query e' stata fatta da meno di 2h
+        # (da noi, dal feed o da un altro specialista) -> si servono gli articoli GREZZI
+        # salvati allora, dichiarati "cache" (non "live"). Cache assente/scaduta -> lo
+        # SKIP_COOLDOWN resta; cache ILLEGGIBILE -> stato proprio, mai zitta.
+        try:
+            from bellomberg.market_data import gnews_cache
+            _c = gnews_cache.leggi(_q, "en")
+            _err_cache = gnews_cache.stato_ultimo_errore() if _c is None else None
+        except Exception as e:
+            print("  [!] GNews cache non interrogabile: " + type(e).__name__)
+            _c, _err_cache = None, type(e).__name__
+        if _c is not None:
+            _record_status("gnews", "cache")
+            _status_tls.eta_cache = dict(getattr(_status_tls, "eta_cache", {}) or {})
+            _status_tls.eta_cache["gnews"] = round(float(_c["eta_s"]), 1)
+            return _mappa_gnews(_c["articles"][:min(max_news, 25)], query)
+        _record_status("gnews", "SKIP_COOLDOWN_CACHE_KO" if _err_cache else "SKIP_COOLDOWN")
+        return []
     if _skip:
         _record_status("gnews", _skip)
         return []
@@ -317,20 +366,19 @@ def fetch_gnews(query, max_news=10):
             return []
         data = r.json()
         articoli = data.get("articles", [])
-        risultati = []
-        for a in articoli:
-            risultati.append({
-                "ticker_associato": query,
-                "titolo": a.get("title", "") or "",
-                "descrizione": (a.get("description", "") or a.get("content", "") or "")[:500],
-                "fonte": "GNews (" + (a.get("source", {}).get("name", "Unknown")) + ")",
-                "url": a.get("url", ""),
-                "data": a.get("publishedAt", ""),
-            })
+        risultati = _mappa_gnews(articoli, query)
         _record_status("gnews", "live")
+        # Opus 5.5 04/10: grezzi in cache condivisa (2h) per chi trovera' la query in
+        # cooldown. scrivi() non solleva: un guasto lo dichiara lei (log + stato).
+        try:
+            from bellomberg.market_data import gnews_cache
+            if isinstance(articoli, list):
+                gnews_cache.scrivi(_q, "en", articoli)
+        except Exception as e:
+            print("  [!] GNews cache non scritta: " + type(e).__name__)
         return risultati
     except Exception as e:
-        print("  [!] Errore GNews: " + str(e))
+        print("  [!] Errore GNews: " + _eccezione_sicura(e))   # G3: mai l'URL con la chiave
         _record_status("gnews", "ERROR")
         return []
 

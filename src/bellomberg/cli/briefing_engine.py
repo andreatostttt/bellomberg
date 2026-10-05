@@ -166,7 +166,7 @@ def _fetch_recent_news(lookback_h: int = 8, limit: int = 50) -> List[Dict[str, A
         # Step 1: top relevance news (qualsiasi tipo)
         # FIX: colonna corretta = pulled_at (non saved_at)
         cur.execute("""
-            SELECT title, snippet, provider, sentiment, relevance, ticker_mentioned, published_at, theme
+            SELECT title, snippet, provider, sentiment, relevance, ticker_mentioned, published_at, theme, classified
             FROM news_feed
             WHERE pulled_at >= ?
             ORDER BY relevance DESC, pulled_at DESC
@@ -177,7 +177,7 @@ def _fetch_recent_news(lookback_h: int = 8, limit: int = 50) -> List[Dict[str, A
         # Step 2: news con theme macro/geopolitica (priorita' extra)
         # Catch news taggate per theme di guerra/Fed/ECB/crisi
         cur.execute("""
-            SELECT title, snippet, provider, sentiment, relevance, ticker_mentioned, published_at, theme
+            SELECT title, snippet, provider, sentiment, relevance, ticker_mentioned, published_at, theme, classified
             FROM news_feed
             WHERE pulled_at >= ?
               AND theme IS NOT NULL AND theme != ''
@@ -190,7 +190,7 @@ def _fetch_recent_news(lookback_h: int = 8, limit: int = 50) -> List[Dict[str, A
         # Step 3: pattern-match nei titoli per intercettare guerre/conflitti anche
         # se theme non e' stato settato (fallback safety net)
         cur.execute("""
-            SELECT title, snippet, provider, sentiment, relevance, ticker_mentioned, published_at, theme
+            SELECT title, snippet, provider, sentiment, relevance, ticker_mentioned, published_at, theme, classified
             FROM news_feed
             WHERE pulled_at >= ?
               AND (lower(title) LIKE '%iran%' OR lower(title) LIKE '%israel%'
@@ -229,13 +229,18 @@ def _fetch_recent_news(lookback_h: int = 8, limit: int = 50) -> List[Dict[str, A
                     break
             if len(rows) >= limit:
                 break
+        # Decisione PM (04/10): le non classificate (relevance NULL) restano, ma in coda
+        rows.sort(key=lambda r: r[4] is None)
         return [
             {
                 "title": r[0] or "",
                 "snippet": (r[1] or "")[:200],
                 "provider": r[2] or "",
-                "sentiment": r[3] or "neutral",
-                "relevance": r[4] or 5,
+                # G3 (04/10): NULL = notizia non classificata, mai un neutral/5 finto
+                "sentiment": r[3] or "n.d.",
+                "relevance": r[4],
+                # REV_G3 R6: dalla colonna; NULL = riga di prima (poteva essere un neutral/5 finto)
+                "classification_status": {1: "classified", 0: "not_classified"}.get(r[8], "unknown"),
                 "ticker": r[5] or "",
                 "published_at": r[6] or "",
             }
@@ -335,9 +340,14 @@ def _build_briefing_prompt(period: str, news: List[Dict[str, Any]],
 
     # Compatta news (top 20 per relevance)
     top_news = news[:20]
+    non_classificata = _lt("non classificata", "unclassified")   # G3: marcata, mai neutral/5
+    non_verificata = _lt("non verificata", "unverified")          # REV_G3 R6: righe di prima
     news_block = "\n".join([
-        f"  - [{n.get('sentiment','neutral')[:4]}|rel{n.get('relevance',5)}] "
-        f"{n.get('title','')[:140]} ({n.get('provider','')[:25]})"
+        (f"  - [{non_classificata}] " if n.get("classification_status") == "not_classified" else
+         f"  - [{n.get('sentiment','neutral')[:4]}|rel{n.get('relevance',5)}|{non_verificata}] "
+         if n.get("classification_status") == "unknown" else
+         f"  - [{n.get('sentiment','neutral')[:4]}|rel{n.get('relevance',5)}] ")
+        + f"{n.get('title','')[:140]} ({n.get('provider','')[:25]})"
         for n in top_news
     ]) or "  (no recent news)"
 

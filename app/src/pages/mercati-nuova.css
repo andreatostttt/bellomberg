@@ -1,0 +1,331 @@
+/* Mercati globali (palette consumer --bbn-*), stesso impianto di Notizie e Performance.
+   Layout per larghezza dell'area contenuti (container `bellomberg-content`):
+     < 1180 px   una o due colonne, la pagina scorre e le card hanno un'altezza massima;
+     ≥ 1180 px   tutto in una schermata: intestazione, 5 indici chiave, preferiti, poi due
+                 righe di tre card uguali che riempiono l'altezza (scorrono solo dentro);
+                 la scheda del titolo: grafico (2/3) + notizie, sotto tre card uguali.
+   Il <main> di /market non dichiara il container: lo dichiara questo foglio. */
+.bb-modern-main.bb-modern-main-classic-content:has(> .relative .bbn-mercati) {
+  container-type: inline-size; container-name: bellomberg-content;
+  background: var(--bbn-bg); color: var(--bbn-text); color-scheme: light;
+}
+.bb-modern-main.bb-modern-main-classic-content:has(> .relative .bbn-mercati) > .relative { background: var(--bbn-bg); }
+:root[data-bb-theme="dark"] .bb-modern-main.bb-modern-main-classic-content:has(> .relative .bbn-mercati),
+:root[data-bb-theme="dark"] .bb-modern-main.bb-modern-main-classic-content:has(> .relative .bbn-mercati) > .relative {
+  background: var(--bbn-bg); color: var(--bbn-text); color-scheme: dark;
+}
+.bb-page.bb-page-modern[data-page="market"],
+:root[data-bb-theme="dark"] .bb-page.bb-page-modern[data-page="market"] { background: var(--bbn-bg); color: var(--bbn-text); }
+
+/* pages-modern.css veste ogni bottone delle pagine moderne (bordo, padding, raggio 6px, accento
+   su aria-pressed) e i titoli: qui valgono i componenti della Nuova, quindi si azzera e si riveste. */
+.bb-page.bb-page-modern[data-page] .bbn-mercati button {
+  min-height: 0; padding: 0; border: 0; border-radius: 0; background: none; color: inherit; font: inherit; line-height: inherit; box-shadow: none;
+}
+.bb-page.bb-page-modern[data-page] .bbn-mercati :is(h1, h2, h3, h4, h6) { color: var(--bbn-text); letter-spacing: normal; text-transform: none; font-family: inherit; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.bbn-btn {
+  display: inline-flex; align-items: center; gap: 7px; min-height: 38px; padding: 0 16px; border-radius: 999px; background: var(--bbn-card);
+  color: var(--bbn-text); font-weight: 700; font-size: 13px; line-height: 1; box-shadow: var(--bbn-shadow); white-space: nowrap; cursor: pointer;
+}
+:root[data-bb-theme="dark"] .bb-page.bb-page-modern[data-page] .bbn-mercati button.bbn-btn:not(.is-primary) { background: var(--bbn-raised); }
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.bbn-btn.is-primary { background: var(--bbn-accent-fill); color: var(--bbn-on-accent); box-shadow: none; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.bbn-btn.mk-fav-btn.is-on { background: var(--bbn-warn-soft); color: var(--bbn-warn); box-shadow: none; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.bbn-btn:hover:not(:disabled) { filter: brightness(1.06); }
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.bbn-btn:disabled { opacity: .6; cursor: default; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.bbn-link { display: inline-flex; align-items: center; gap: 4px; color: var(--bbn-accent); font-weight: 700; font-size: 13px; line-height: 1.3; cursor: pointer; white-space: nowrap; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.bbn-link.mk-back { font-size: 15px; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati .bbn-seg button { padding: 4px 10px; border-radius: 999px; color: var(--bbn-muted); font-weight: 700; font-size: 12px; line-height: 1.2; cursor: pointer; white-space: nowrap; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati .bbn-seg button.is-on { background: var(--bbn-seg-on); color: var(--bbn-text); box-shadow: 0 1px 3px rgba(0, 0, 0, .12); }
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.bbn-switch { gap: 8px; color: var(--bbn-muted); font-weight: 700; font-size: 13px; cursor: pointer; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.bbn-switch[aria-checked="true"] { color: var(--bbn-text); }
+
+/* ── radice e tinte delle categorie (riconoscere i box a colpo d'occhio) ── */
+.bbn-mercati {
+  --mk-idx: #1d56f0; --mk-stk: #7c3aed; --mk-mov: #c2410c; --mk-cmd: #a16207; --mk-fx: #0f766e; --mk-rt: #be185d; --mk-fav: #8a5300;
+  box-sizing: border-box; display: flex; flex-direction: column; gap: 14px; min-width: 0;
+  padding: 4px 12px 12px; color: var(--bbn-text); font-size: 14px; line-height: 1.45;
+}
+:root[data-bb-theme="dark"] .bbn-mercati {
+  --mk-idx: #5b8cff; --mk-stk: #a78bfa; --mk-mov: #fb923c; --mk-cmd: #facc15; --mk-fx: #2dd4bf; --mk-rt: #f472b6; --mk-fav: #f0c062;
+  --bbn-bad: #ff6b6b;
+}
+.bbn-mercati *, .bbn-mercati *::before, .bbn-mercati *::after { box-sizing: border-box; }
+.bbn-mercati :where(button, input, a, [role="switch"]):focus-visible { outline: 2px solid var(--bbn-accent); outline-offset: 2px; }
+.bbn-mercati .num { font-variant-numeric: tabular-nums; }
+.bbn-mercati .mk-up { color: var(--bbn-good); }
+.bbn-mercati .mk-dn { color: var(--bbn-bad); }
+.bbn-mercati .mk-spin { animation: mk-spin 1s linear infinite; }
+@keyframes mk-spin { to { transform: rotate(360deg); } }
+
+/* ── intestazione ─────────────────────────────────────────────────── */
+.mk-top { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; flex: 0 0 auto; }
+.mk-top h1 { margin: 0; font-size: 22px; font-weight: 800; letter-spacing: -.01em; line-height: 1.25; white-space: nowrap; }
+.mk-updated { display: inline-flex; align-items: center; gap: 6px; }
+.mk-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bbn-muted); flex: 0 0 auto; }
+.mk-dot.is-live { background: var(--bbn-good); animation: mk-live 2s ease-out infinite; }
+@keyframes mk-live { from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--bbn-good) 70%, transparent); } to { box-shadow: 0 0 0 7px transparent; } }
+
+.mk-note { display: flex; align-items: center; gap: 10px; margin: 0; padding: 10px 14px; border-radius: 14px; font-size: 13px; font-weight: 600; flex: 0 0 auto; }
+.mk-note.is-bad { background: var(--bbn-bad-soft); color: var(--bbn-bad); }
+.mk-note-txt { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.mk-inline-err { margin: 0; color: var(--bbn-bad); font-size: 13px; font-weight: 600; }
+
+/* ── ricerca ──────────────────────────────────────────────────────── */
+.mk-search { position: relative; z-index: 20; flex: 1 1 300px; max-width: 560px; min-width: 240px; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati .mk-search input {
+  width: 100%; height: 42px; padding: 0 78px 0 42px; border: 1.5px solid transparent; border-radius: 999px;
+  background: var(--bbn-card); color: var(--bbn-text); box-shadow: var(--bbn-shadow); font-weight: 600; font-size: 14px; line-height: 1; font-family: inherit; outline: none;
+}
+:root[data-bb-theme="dark"] .bb-page.bb-page-modern[data-page] .bbn-mercati .mk-search input { background: var(--bbn-raised); }
+.bb-page.bb-page-modern[data-page] .bbn-mercati .mk-search input:focus { border-color: var(--bbn-accent); }
+.mk-search input::placeholder { color: var(--bbn-muted); font-weight: 500; }
+.mk-search-ico { position: absolute; left: 15px; top: 13px; color: var(--bbn-muted); pointer-events: none; }
+.mk-search-busy { position: absolute; right: 16px; top: 13px; color: var(--bbn-accent); animation: mk-spin 1s linear infinite; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati .mk-search kbd { position: absolute; right: 12px; top: 10px; padding: 2px 8px; border-radius: 7px; background: var(--bbn-bg); color: var(--bbn-muted); font-weight: 700; font-size: 11px; line-height: 18px; font-family: inherit; pointer-events: none; }
+.mk-search-err { position: absolute; top: calc(100% + 6px); left: 12px; right: 0; color: var(--bbn-bad); font-size: 12px; font-weight: 600; }
+.mk-menu {
+  position: absolute; top: calc(100% + 6px); left: 0; right: 0; max-height: 380px; overflow: auto; padding: 8px;
+  border-radius: 18px; background: var(--bbn-card); border: 1px solid var(--bbn-line); box-shadow: 0 20px 50px rgba(0, 0, 0, .28);
+}
+.mk-menu h6 { margin: 6px 10px 4px; color: var(--bbn-muted); font-size: 11px; font-weight: 700; }
+.mk-search-err.is-none { color: var(--bbn-muted); }
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.mk-hit {
+  display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 10px; align-items: center; width: 100%;
+  padding: 7px 10px; border-radius: 12px; text-align: left; cursor: pointer;
+}
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.mk-hit.is-act { background: var(--bbn-raised); }
+.mk-hit-name { display: grid; min-width: 0; }
+.mk-hit-name b { font-size: 13px; font-weight: 700; }
+.mk-hit-name span { color: var(--bbn-muted); font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mk-hit-ex { padding: 2px 8px; border-radius: 999px; background: var(--bbn-raised); color: var(--bbn-muted); font-size: 11px; font-weight: 700; white-space: nowrap; }
+.mk-hit.is-act .mk-hit-ex { background: var(--bbn-card); }
+
+/* ── 5 indici chiave ──────────────────────────────────────────────── */
+.mk-tiles { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 14px; flex: 0 0 auto; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.mk-tile {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; align-items: center; min-width: 0;
+  padding: 11px 16px; border-radius: 18px; background: var(--bbn-card); box-shadow: var(--bbn-shadow); text-align: left; cursor: pointer;
+}
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.mk-tile:hover { outline: 1.5px solid var(--bbn-line); }
+.mk-tile-k { color: var(--bbn-muted); font-size: 12px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mk-tile-reg { justify-self: end; padding: 1px 7px; border-radius: 999px; background: var(--bbn-raised); color: var(--bbn-muted); font-size: 10px; font-weight: 700; }
+.mk-tile-v { font-size: 22px; font-weight: 800; letter-spacing: -.02em; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ── striscia dei preferiti ───────────────────────────────────────── */
+.mk-favbar { --t: var(--mk-fav); display: flex; align-items: center; gap: 12px; flex: 0 0 auto; min-width: 0; padding: 8px 16px 8px 12px; border-radius: 18px; background: var(--bbn-card); box-shadow: var(--bbn-shadow); }
+.mk-favbar-lab { display: inline-flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 800; white-space: nowrap; }
+.mk-favs { display: flex; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.mk-favs-hint { color: var(--bbn-muted); font-size: 12px; font-weight: 600; white-space: nowrap; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.mk-fav {
+  display: inline-flex; align-items: center; gap: 8px; flex: 0 0 auto; padding: 4px 10px 4px 4px; border-radius: 999px;
+  background: var(--bbn-raised); font-size: 13px; font-weight: 700; white-space: nowrap; cursor: pointer;
+}
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.mk-fav:hover { filter: brightness(1.07); }
+.mk-fav b { max-width: 160px; overflow: hidden; text-overflow: ellipsis; font-weight: 700; }
+.mk-fav-px { color: var(--bbn-muted); font-weight: 600; }
+
+/* ── card con titolo riconoscibile ────────────────────────────────── */
+.mk-card { overflow: hidden; }
+.mk-card.is-idx { --t: var(--mk-idx); } .mk-card.is-stk { --t: var(--mk-stk); } .mk-card.is-mov { --t: var(--mk-mov); }
+.mk-card.is-cmd { --t: var(--mk-cmd); } .mk-card.is-fx { --t: var(--mk-fx); } .mk-card.is-rt { --t: var(--mk-rt); }
+.mk-card-head { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; min-width: 0; padding: 12px 16px 10px 18px; border-bottom: 1px solid var(--bbn-line); }
+.mk-card-head h2 { margin: 0; font-size: 17px; font-weight: 800; letter-spacing: -.01em; line-height: 1.3; white-space: nowrap; }
+.mk-card-head .bbn-seg { flex: 0 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.mk-ci { display: inline-grid; place-items: center; flex: 0 0 auto; width: 32px; height: 32px; border-radius: 10px;
+  background: color-mix(in srgb, var(--t) 16%, transparent); color: var(--t); }
+.mk-favbar .mk-ci { width: 28px; height: 28px; border-radius: 9px; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati .mk-seg-paesi button { padding: 4px 8px; }
+.mk-body { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 4px 10px 8px; scrollbar-width: thin; }
+.mk-empty { margin: 0; padding: 12px 8px; color: var(--bbn-muted); font-size: 13px; font-weight: 600; }
+.mk-empty.is-declared { color: var(--bbn-warn); }
+.mk-mov-src { margin: 6px 8px 0; color: var(--bbn-muted); font-size: 11px; font-weight: 600; }
+.mk-empty.mk-err, .mk-err { color: var(--bbn-bad); }
+.mk-grp { margin: 6px 8px 2px; color: var(--bbn-muted); font-size: 11px; font-weight: 700; }
+.mk-grp:first-child { margin-top: 2px; }
+.mk-grp span { font-weight: 600; }
+.mk-source { margin: 6px 8px 0; color: var(--bbn-muted); font-size: 11px; font-weight: 600; }
+
+/* righe */
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.mk-row {
+  display: grid; grid-template-columns: 22px minmax(0, 1fr) auto 82px; gap: 10px; align-items: center; width: 100%;
+  min-height: 28px; padding: 1px 8px; border-radius: 10px; text-align: left; cursor: pointer;
+}
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.mk-row:hover { background: var(--bbn-raised); }
+.mk-row-name { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
+.mk-row-name b { font-size: 13px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mk-row-name span { color: var(--bbn-muted); font-size: 11px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mk-row-px { font-size: 13px; font-weight: 700; text-align: right; white-space: nowrap; }
+.mk-row .bbn-pill, .mk-mv .bbn-pill { justify-self: end; padding: 2px 9px; }
+.mk-sigla { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--bbn-raised); color: var(--bbn-text); font-size: 8px; font-weight: 800; letter-spacing: .01em; }
+
+/* indici: un'area alla volta; più mossi: 5 per lato (sugli schermi alti tutto, v. sotto) */
+.mk-area:not(.is-on), .mk-area-lab { display: none; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati .mk-mov-col > button.mk-mv:nth-of-type(n+6) { display: none; }
+
+/* più mossi */
+.mk-movers { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 12px; }
+.mk-mov-col { min-width: 0; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati h3:is(.mk-mov-h, .mk-subh) { margin: 2px 8px; color: var(--bbn-muted); font-size: 11px; font-weight: 700; line-height: 1.4; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.mk-mv {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 8px; align-items: center; width: 100%;
+  padding: 4px 8px; border-radius: 10px; text-align: left; cursor: pointer;
+}
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.mk-mv:hover { background: var(--bbn-raised); }
+.mk-mv-name { display: grid; min-width: 0; line-height: 1.25; }
+.mk-mv-name b { font-size: 13px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mk-mv-name span { color: var(--bbn-muted); font-size: 11px; font-weight: 600; white-space: nowrap; }
+.mk-mv-bar { grid-column: 1 / -1; height: 3px; border-radius: 999px; background: var(--bbn-raised); overflow: hidden; }
+.mk-mv-bar i { display: block; height: 100%; border-radius: 999px; }
+.mk-mv-bar i.is-su { background: var(--bbn-good); } .mk-mv-bar i.is-giu { background: var(--bbn-bad); }
+
+/* ── scheda del titolo ────────────────────────────────────────────── */
+.mk-dhead { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; flex: 0 0 auto; min-width: 0; }
+.mk-dtitle { display: grid; gap: 1px; min-width: 0; }
+.mk-dtitle b { font-size: 22px; font-weight: 800; letter-spacing: -.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mk-dtitle span { color: var(--bbn-muted); font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mk-dprice { display: flex; align-items: center; gap: 10px; padding-left: 18px; border-left: 1px solid var(--bbn-line); }
+.mk-dprice-v { font-size: 30px; font-weight: 800; letter-spacing: -.03em; line-height: 1; white-space: nowrap; }
+.mk-dprice-v small { margin-left: 4px; color: var(--bbn-muted); font-size: 14px; font-weight: 700; letter-spacing: 0; }
+.mk-consensus::first-letter { text-transform: uppercase; }
+.mk-consensus { padding: 5px 12px; border-radius: 999px; background: var(--bbn-accent-soft); color: var(--bbn-accent); font-size: 12px; font-weight: 700; white-space: nowrap; }
+
+.mk-dgrid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+.mk-c-chart .mk-chart { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 380px; padding: 4px 8px 8px; }
+.mk-nw { display: grid; gap: 2px; padding: 8px; border-radius: 10px; color: inherit; text-decoration: none; }
+.mk-nw:hover { background: var(--bbn-raised); }
+.mk-nw b { font-size: 13px; font-weight: 700; line-height: 1.35; }
+.mk-nw span { color: var(--bbn-muted); font-size: 11px; font-weight: 600; }
+.mk-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 6px; margin: 4px 0 0; }
+.mk-stats div { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; min-width: 0; padding: 4px 10px; border-radius: 10px; background: var(--bbn-raised); }
+.mk-stats dt { color: var(--bbn-muted); font-size: 11px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mk-stats dd { margin: 0; font-size: 13px; font-weight: 800; white-space: nowrap; }
+.mk-range { display: flex; align-items: center; gap: 10px; padding: 8px 4px 2px; color: var(--bbn-muted); font-size: 11px; font-weight: 700; white-space: nowrap; }
+.mk-range b { color: var(--bbn-text); }
+.mk-range-tr { position: relative; flex: 1 1 auto; height: 6px; border-radius: 999px; background: linear-gradient(90deg, var(--bbn-bad-soft), var(--bbn-raised), var(--bbn-good-soft)); }
+.mk-range-tr i { position: absolute; top: -4px; width: 14px; height: 14px; margin-left: -7px; border-radius: 50%; background: var(--bbn-accent-fill); border: 3px solid var(--bbn-card); }
+.mk-tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+.mk-tbl th { padding: 4px 6px 6px; color: var(--bbn-muted); font-size: 11px; font-weight: 700; text-align: right; white-space: nowrap; }
+.mk-tbl td { padding: 6px; border-top: 1px solid var(--bbn-line); text-align: right; font-weight: 700; white-space: nowrap; }
+.mk-tbl :is(th, td):first-child { text-align: left; }
+.mk-tbl td:first-child { color: var(--bbn-muted); font-weight: 600; white-space: normal; }
+.mk-ob { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; margin: 4px 4px 10px; font-size: 13px; font-weight: 700; }
+.mk-ob-tr { grid-column: 1 / -1; height: 5px; border-radius: 999px; background: var(--bbn-raised); overflow: hidden; }
+.mk-ob-tr i { display: block; height: 100%; border-radius: 999px; background: var(--mk-fx); }
+.bb-page.bb-page-modern[data-page] .bbn-mercati h3.mk-subh { margin: 10px 4px 2px; }
+.mk-hold { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; padding: 7px 4px; border-top: 1px solid var(--bbn-line); font-size: 13px; }
+.mk-hold b { font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mk-hold span { color: var(--bbn-muted); font-weight: 600; }
+.mk-profile { margin: 4px; font-size: 13px; line-height: 1.55; color: var(--bbn-text); }
+
+/* grafico condiviso (TvChartPanel) nella palette Nuova, come nel dettaglio della Dashboard */
+.bbn-mercati .chart-tools-modern { display: flex; flex-wrap: wrap; align-items: center; min-height: 38px; padding: 4px 4px 8px; gap: 6px; border: 0; background: none; color: var(--bbn-muted); font-size: 12px; font-family: inherit; letter-spacing: 0; }
+.bbn-mercati .chart-tools-modern .tlab { color: var(--bbn-muted); font-weight: 600; letter-spacing: 0; }
+.bbn-mercati .chart-tools-modern .tfg { display: inline-flex; padding: 2px; border: 0; border-radius: 999px; background: var(--bbn-raised); overflow: hidden; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati .chart-tools-modern .tb { min-height: 26px; padding: 4px 9px; border-radius: 999px; color: var(--bbn-muted); font-weight: 700; font-size: 12px; font-family: inherit; letter-spacing: 0; cursor: pointer; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati .chart-tools-modern .tb:hover:not(:disabled) { color: var(--bbn-text); }
+.bb-page.bb-page-modern[data-page] .bbn-mercati .chart-tools-modern .tb.on { background: var(--bbn-seg-on); color: var(--bbn-text); box-shadow: 0 1px 3px rgba(0, 0, 0, .12); }
+.bb-page.bb-page-modern[data-page] .bbn-mercati .chart-tools-modern > .tb.ind { background: var(--bbn-raised); }
+.bb-page.bb-page-modern[data-page] .bbn-mercati .chart-tools-modern > .tb.ind.on,
+.bb-page.bb-page-modern[data-page] .bbn-mercati .chart-tools-modern > .tb.ind:not(.off) { color: var(--bbn-accent); background: var(--bbn-accent-soft); }
+.bbn-mercati .chart-tools-modern .tb.ind.off, .bbn-mercati .chart-tools-modern .tb.dis { opacity: .75; }
+.bbn-mercati .chart-tools-modern .tsel { display: inline-flex; align-items: center; gap: 6px; }
+.bbn-mercati .chart-tools-modern .tsel select { min-height: 30px; padding: 4px 8px; border: 1px solid var(--bbn-line); border-radius: 999px; background: var(--bbn-card); color: var(--bbn-text); font-weight: 600; font-size: 12px; font-family: inherit; cursor: pointer; }
+.bbn-mercati :is(.terminal-legend-modern, .terminal-indicators-modern) { font-size: 12px; }
+
+/* riepilogo filing (fase E): una riga con link alla pagina Filing */
+.bbn-mercati .mk-filing .filing-riepilogo { margin: 4px 2px; }
+.bbn-mercati .mk-filing .filing-riepilogo-link { font-size: 13px; }
+
+/* ── card larghe: l'elenco va su più colonne invece di righe lunghissime ──
+   Ogni card è un contenitore: da 720 px gli elenchi semplici (azioni, valute) vanno su due
+   colonne lette dall'alto in basso (--righe = metà degli elementi), i gruppi (materie prime,
+   tassi | futures) affiancati; da 1000 px tre gruppi per riga e gli indici mostrano tutte e
+   tre le aree affiancate, senza selettore. */
+.mk-card { container: mkcard / inline-size; }
+.mk-gblock { min-width: 0; }
+.mk-gblock > .mk-grp:first-child { margin-top: 2px; }
+@container mkcard (min-width: 720px) {
+  .mk-body.is-lista { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-flow: column;
+    grid-template-rows: repeat(var(--righe, 10), auto); column-gap: 28px; align-content: start; }
+  .mk-body.is-lista > .mk-empty { grid-column: 1 / -1; }
+  .mk-body.is-gruppi { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px 28px; align-content: start; align-items: start; }
+  .mk-body.is-aree > .mk-area.is-on { grid-column: 1 / -1; }
+  .mk-body.is-aree > .mk-area.is-on .mk-righe { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-flow: column;
+    grid-template-rows: repeat(var(--righe, 5), auto); column-gap: 28px; }
+}
+@container mkcard (min-width: 1000px) {
+  .mk-body.is-gruppi { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .mk-card.is-rt .mk-body.is-gruppi { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .mk-card.is-idx .mk-area, .mk-card.is-idx .mk-area-lab { display: block; }
+  .mk-body.is-aree > .mk-area.is-on { grid-column: auto; }
+  .mk-body.is-aree > .mk-area.is-on .mk-righe { display: block; }
+  .mk-card.is-idx .mk-seg-aree { display: none; }
+  /* tre colonne strette: solo il nome (il ticker è nel tooltip), pastiglia più stretta */
+  :is(.mk-card.is-idx, .mk-card.is-cmd) .mk-row-name span { display: none; }
+  .bb-page.bb-page-modern[data-page] .bbn-mercati :is(.mk-card.is-idx, .mk-card.is-cmd) button.mk-row { grid-template-columns: 22px minmax(0, 1fr) auto 74px; gap: 8px; }
+}
+
+/* ── larghezze ────────────────────────────────────────────────────── */
+@container bellomberg-content (max-width: 1500px) {
+  .bb-page.bb-page-modern[data-page] .bbn-mercati .mk-seg-paesi button { padding: 4px 6px; }
+}
+@container bellomberg-content (max-width: 1179px) {
+  .mk-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .bb-page.bb-page-modern[data-page] .bbn-mercati .mk-tiles > button:nth-child(n+4) { display: none; }
+  .mk-row3 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+  .mk-row3 > .mk-card { max-height: 440px; }
+  .mk-dgrid > .mk-card:not(.mk-c-chart) { max-height: 460px; }
+  .mk-search { order: 5; flex-basis: 100%; max-width: none; }
+}
+@container bellomberg-content (max-width: 760px) {
+  .mk-row3 { grid-template-columns: minmax(0, 1fr); }
+  .mk-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .bb-page.bb-page-modern[data-page] .bbn-mercati .mk-tiles > button:nth-child(n+3) { display: none; }
+}
+@container bellomberg-content (min-width: 1180px) {
+  .bbn-mercati { height: 100%; min-height: 760px; }
+  .mk-row3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; flex: 1 1 0; min-height: 0; }
+  .mk-dgrid {
+    flex: 1 1 0; min-height: 0;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-rows: minmax(0, 1.5fr) minmax(0, 1fr);
+  }
+  .mk-c-chart { grid-column: 1 / 3; }
+  .mk-c-chart .mk-chart { min-height: 0; }
+  .mk-c-news { grid-column: 3; grid-row: 1; }
+}
+@container bellomberg-content (min-width: 3000px) {
+  .bbn-mercati { padding: 4px 24px 16px; }
+}
+
+/* schermi molto alti (≥1600): tutte le aree degli indici raggruppate, 8 titoli per lato */
+@media (min-height: 1600px) {
+  .bbn-mercati .mk-area:not(.is-on), .bbn-mercati .mk-area-lab { display: block; }
+  .bbn-mercati .mk-area:first-child .mk-area-lab { margin-top: 2px; }
+  .bbn-mercati .mk-seg-aree { display: none; }
+  .bb-page.bb-page-modern[data-page] .bbn-mercati .mk-mov-col > button.mk-mv:nth-of-type(n+6) { display: grid; }
+}
+/* schermi alti: righe e testi più grandi, le card si riempiono invece di restare mezze vuote */
+@media (min-height: 1250px) {
+  .bb-page.bb-page-modern[data-page] .bbn-mercati .mk-mov-col > button.mk-mv:nth-of-type(6) { display: grid; }
+  .bb-page.bb-page-modern[data-page] .bbn-mercati button.mk-row { min-height: 37px; grid-template-columns: 26px minmax(0, 1fr) auto 90px; }
+  .bbn-mercati .mk-row-name b, .bbn-mercati .mk-row-px, .bbn-mercati .mk-mv-name b { font-size: 15px; }
+  .bbn-mercati .mk-row-name span, .bbn-mercati .mk-mv-name span { font-size: 12px; }
+  .bbn-mercati .mk-row .bbn-pill, .bbn-mercati .mk-mv .bbn-pill { font-size: 13px; padding: 3px 10px; }
+  .bbn-mercati .mk-row .bbn-ico.is-xs, .bbn-mercati .mk-row .mk-sigla { width: 26px; height: 26px; }
+  .bb-page.bb-page-modern[data-page] .bbn-mercati button.mk-mv { padding: 8px 8px; gap: 5px 8px; }
+  .bbn-mercati .mk-mv-bar { height: 4px; }
+  .bb-page.bb-page-modern[data-page] .bbn-mercati button.mk-tile { padding: 16px 20px; }
+  .bbn-mercati .mk-tile-v { font-size: 28px; }
+  .bbn-mercati .mk-tile-k { font-size: 13px; }
+  .bbn-mercati .mk-stats div { padding: 8px 12px; }
+  .bbn-mercati .mk-stats dt { font-size: 12px; } .bbn-mercati .mk-stats dd { font-size: 15px; }
+  .bbn-mercati .mk-nw b, .bbn-mercati .mk-tbl { font-size: 14px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .bbn-mercati *, .bbn-mercati *::before, .bbn-mercati *::after { animation: none !important; transition: none !important; }
+}
+
+/* pulsante «Traduci» nel box Notizie della scheda */
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.bbn-link.mk-tr-btn { gap: 5px; font-size: 12px; margin-right: 4px; }
+.bb-page.bb-page-modern[data-page] .bbn-mercati button.bbn-link.mk-tr-btn:disabled { opacity: .7; cursor: default; }

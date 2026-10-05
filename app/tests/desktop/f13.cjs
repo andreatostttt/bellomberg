@@ -39,6 +39,7 @@ async function runner() {
     else if(route==='/portfolio')out={positions:[],cash_disponibile_eur:null,cash_source:'uninitialized'};
     else if(route==='/fx')out={rates:{EUR:1}};
     else if(route==='/tasks/scheduled')out={tasks:[]};
+    else if(route==='/prices/update'){res.statusCode=409;out={detail:'Synthetic test: automatic price refresh intercepted'};}
     else if(route==='/db/backups')out={backups:[],count:0};
     else if(route==='/agents/list')out={agents:[],engines:{}};
     else if(route==='/mandato')out={dichiarato:true,causa:null,dettaglio:null,campi_mancanti:[],valori:{},origine:'esempio',impronta:'synthetic-f13',dichiarato_il:'2026-09-12',campi:[],errori:[],esempio:{}};
@@ -58,7 +59,7 @@ async function runner() {
     const code=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',resolve);});clearTimeout(timer);
     const line=output.split(/\r?\n/).find(x=>x.startsWith(MARK));assert.ok(line,output);const result=JSON.parse(line.slice(MARK.length));
     assert.equal(code,0,JSON.stringify(result));assert.equal(result.ok,true,JSON.stringify(result));
-    assert.ok(requests.filter(r=>r.method!=='GET').every(r=>r.route==='/preferences'&&r.method==='PUT'));
+    assert.ok(requests.filter(r=>r.method!=='GET').every(r=>(r.route==='/preferences'&&r.method==='PUT')||(r.method==='POST'&&r.route==='/prices/update')));
     console.log(JSON.stringify({temporary,...result,requests:requests.length}));
   }finally{fs.writeFileSync(path.join(temporary,'output.log'),output);fs.writeFileSync(path.join(temporary,'requests.json'),JSON.stringify(requests,null,2));server.closeAllConnections();await new Promise(r=>server.close(r));}
 }

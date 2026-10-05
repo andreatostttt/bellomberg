@@ -41,6 +41,8 @@ class DocumentationDemoTests(unittest.TestCase):
         self.assertEqual(decoded, self.fixture)
         self.assertEqual(json.dumps(decoded, ensure_ascii=False), json.dumps(self.fixture, ensure_ascii=False))
         # Authored snapshot after explicit timeline, display and VaR-precision corrections.
+        # 05/10/2026: back to the approved fixture bytes bound by the screenshot manifest (the
+        # Nuova scene notes return with the recapture of the screenshots).
         canonical = json.dumps(decoded, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
         self.assertEqual(hashlib.sha256(canonical.encode()).hexdigest(), "26b591ab79f03136f90a4d586cb019f0f4396eee8b195a24fa774f329a9d02df")
 

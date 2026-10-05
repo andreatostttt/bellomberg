@@ -7,19 +7,28 @@ interface State {
   hasError: boolean;
   error: Error | null;
   info: React.ErrorInfo | null;
+  propagateMode?: boolean;
 }
 
 export default class ErrorBoundary extends React.Component<
-  { children: React.ReactNode; label?: string },
+  { children: React.ReactNode; label?: string; propagate?: boolean },
   State
 > {
-  state: State = { hasError: false, error: null, info: null };
+  state: State = { hasError: false, error: null, info: null, propagateMode: false };
   private stopLanguage?: () => void;
   componentDidMount() { this.stopLanguage = sottoscriviLingua(() => this.forceUpdate()); }
   componentWillUnmount() { this.stopLanguage?.(); }
 
   static getDerivedStateFromError(error: Error): State {
     return { hasError: true, error, info: null };
+  }
+
+  static getDerivedStateFromProps(props: { propagate?: boolean }, state: State): Partial<State> | null {
+    const propagateMode = Boolean(props.propagate);
+    if (state.propagateMode === true && !propagateMode) {
+      return { hasError: false, error: null, info: null, propagateMode };
+    }
+    return state.propagateMode !== propagateMode ? { propagateMode } : null;
   }
 
   componentDidCatch(error: Error, info: React.ErrorInfo) {
@@ -31,6 +40,10 @@ export default class ErrorBoundary extends React.Component<
 
   render() {
     if (!this.state.hasError) return this.props.children;
+    // Keep the route wrapper stable across interface switches. Modern dashboard
+    // faults go to the enclosing recovery boundary; all other routes retain
+    // their existing local error UI.
+    if (this.props.propagate) throw this.state.error;
 
     return (
       <div className="min-h-[50vh] flex items-center justify-center p-4">

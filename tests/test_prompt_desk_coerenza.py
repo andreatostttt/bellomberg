@@ -84,11 +84,12 @@ def test_fundamentals_cita_prefissi_di_bucket_esistenti(prefisso):
     privato = cl.carica_veicoli()
     if privato["motivo"] is None:
         tipo = {"Fondo chiuso": "cef", "Crypto treasury": "dat"}[prefisso]
+        etichette_private = portfolio_sectors.settori_tema_del_negozio(privato)
         for t, v in privato["veicoli"].items():
             if v["tipo"] == tipo:
-                assert (v["settore_tema"] or "").startswith(prefisso), (
+                assert etichette_private.get(t, "").startswith(prefisso), (
                     "una voce di tipo %s del negozio privato ha settore_tema %r senza il prefisso %r: "
-                    "la regola del prompt non la trova" % (tipo, v["settore_tema"], prefisso))
+                    "la regola del prompt non la trova" % (tipo, etichette_private.get(t), prefisso))
 
 
 # --------------------------------------------------------------------------

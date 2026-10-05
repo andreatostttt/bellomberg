@@ -213,7 +213,11 @@ def test_extractor_and_reflection_use_approved_caps_without_thinking_change(monk
     assert "error" not in ae.extract_rows_structured("## ACTION TABLE\nNo actions")
     assert rf.generate_lesson("## ACTION TABLE\nNo actions")
     assert [call["max_tokens"] for call in calls] == [16000, 8000]
-    assert [call["thinking"] for call in calls] == [{"type": "disabled"}] * 2
+    # Integration of both features: the PM's approved caps (asserted above) and
+    # Andrea's effort policy, where the reflection reasons at effort low; the
+    # action extractor keeps thinking disabled.
+    assert [call["thinking"] for call in calls] == [{"type": "disabled"},
+                                                    {"type": "effort", "effort": "low"}]
     assert calls[0]["model"] == llm_client.modello("action_extractor")
     assert calls[1]["model"] == llm_client.modello("reflection")
     assert clients == [{"timeout": 450.0, "max_retries": 1}, {"timeout": 240.0, "max_retries": 1}]

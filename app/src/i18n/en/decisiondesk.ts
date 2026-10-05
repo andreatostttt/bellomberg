@@ -99,5 +99,9 @@ export const decisiondesk = {
   "f070": "No open research — the committee proposes new work in its memo.",
   "f071": "Research archive (",
   "f072": "closed, promoted or expired — reopenable",
-  "f073": "OPERATIONAL: automatic archive after 7 days; ARCHIVE/RESTORE overrides it. A row pinned active (📌) stays active. RESEARCH: ARCHIVE AND CLOSE removes the item from future committee research; RESTORE AND REOPEN includes it again. History remains in the DB. The committee reads research notes and replies here."
+  "f073": "OPERATIONAL: automatic archive after 7 days; ARCHIVE/RESTORE overrides it. A row pinned active (📌) stays active. RESEARCH: ARCHIVE AND CLOSE removes the item from future committee research; RESTORE AND REOPEN includes it again. History remains in the DB. The committee reads research notes and replies here.",
+  "manual_divergence_title": "Related manual trades · not execution of the proposal",
+  "manual_divergence_trade": "Trade #{id} · {action} {ticker} · {date} · {reason}",
+  "manual_divergence_isin": " · ISIN {isin}",
+  "record_manual_divergence": "Record manual divergence"
 };

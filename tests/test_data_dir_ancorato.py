@@ -19,7 +19,8 @@ def _env_pulito(env_extra=None):
     test misura il codice, non il .env del PM."""
     env = dict(os.environ)
     env["BELLOMBERG_DATA_DIR"] = ""
-    env["PYTHONPATH"] = REPO
+    # 02/10: il pacchetto vive in src/ (la radice resta per gli shim di root)
+    env["PYTHONPATH"] = os.pathsep.join([os.path.join(REPO, "src"), REPO])
     env.update(env_extra or {})
     return env
 

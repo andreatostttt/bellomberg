@@ -34,12 +34,20 @@ function harness(page, overrides = {}) {
     if (!(method in fixtures)) throw new Error('Unexpected API: ' + method);
     if (value instanceof Error) throw value; return typeof value === 'function' ? value(...args) : value;
   }; } }), API_BASE: 'http://synthetic.invalid', requestHeaders: () => ({}) };
-  const load = creaCaricatore({ stub: { react: hooks, '@/lib/api': api, './api': api } });
+  const load = creaCaricatore({ stub: { react: hooks, '@/lib/api': api, './api': api,
+  } });
   const module = load('pages/' + page + '.tsx');
   const Component = page === 'MandatoPage' ? module.MandatoForm : module.default;
   const language = load('i18n/lingua.ts');
   const nodes = (value, pred) => !value || typeof value !== 'object' ? [] : Array.isArray(value)
-    ? value.flatMap(x => nodes(x, pred)) : [...(pred(value) ? [value] : []), ...nodes(value.props?.children, pred)];
+    ? value.flatMap(x => nodes(x, pred)) : (() => {
+      const typeName = typeof value.type === 'function' ? value.type.displayName || value.type.name || '' : '';
+      // Follow only the shared/local pure render callbacks. This exposes
+      // controls without directly calling the stateful page/controller body.
+      const presentation = typeof value.props?.render === 'function'
+        && /ModernPage|Deferred|Boundary/.test(typeName) ? value.props.render() : null;
+      return [...(pred(value) ? [value] : []), ...nodes(value.props?.children, pred), ...nodes(presentation, pred)];
+    })();
   const render = () => { cursor = 0; tree = Component(); const html = renderToStaticMarkup(tree);
     while (effects.length) effects.shift()(); return html; };
   return { render, calls, load, language, async settle() { await Promise.resolve(); await Promise.resolve(); return render(); },

@@ -47,6 +47,7 @@ OUTPUT METRICS:
 """
 import hashlib
 import json
+import math
 import os
 import time
 from datetime import datetime
@@ -86,6 +87,17 @@ _CACHE: Dict[str, Any] = {}
 
 DEFAULT_DF_T = 4  # piu' fat-tailed di prima (era 5)
 MIN_OBSERVATIONS = 60
+
+# Voce 7c (04/10): sotto un anno di borsa (~250 obs) le code stimate (ES99, VaR99)
+# poggiano su 2-3 osservazioni oltre il 99-esimo percentile: il payload porta un
+# avviso esplicito di bassa affidabilita' (`tail_reliability_warning`).
+CALIBRATION_MIN_OBS_TAILS = 250
+
+# Voce 7g (04/10): quota del book data ai ticker aggiunti nel what-if legacy quando
+# il chiamante NON passa `new_alloc`. E' uno STRESS di concentrazione, NON la size
+# proposta: il payload lo dichiara sempre in `what_if_allocation`. Valore storico
+# (era cablato a 0.30 nel corpo di run_monte_carlo): invariato.
+WHAT_IF_STRESS_ALLOC = 0.30
 
 # Traiettorie campione: il motore ne mette SEMPRE in cache questo numero (il pool)
 # e all'uscita ne affetta quante ne ha chieste il chiamante (_vista_paths). Cosi'
@@ -625,15 +637,34 @@ def _compute_drift(mu_historical: np.ndarray, mode: str) -> np.ndarray:
 # RISK METRICS POST-SIMULATION
 # ============================================================
 
-def _cornish_fisher_var(returns_sim: np.ndarray, alpha: float = 0.01) -> float:
-    """Cornish-Fisher VaR: corregge VaR gaussian con skewness e kurtosis empirici."""
+def _cornish_fisher_var(returns_sim: np.ndarray, alpha: float = 0.01) -> Optional[float]:
+    """Cornish-Fisher VaR: corregge VaR gaussian con skewness e kurtosis empirici.
+    None su campione degenere (varianza nulla, es. replay deterministico in cui
+    ogni traiettoria ripete le stesse sedute): skew/kurtosis non definiti, CF
+    dichiarato null invece di un NaN che rompe il JSON dell'endpoint."""
+    returns_sim = np.asarray(returns_sim, dtype=float)
     mu = float(returns_sim.mean())
     sigma = float(returns_sim.std())
+    if not math.isfinite(sigma) or sigma <= 1e-12:
+        return None
     sk = float(stats.skew(returns_sim))
     kurt = float(stats.kurtosis(returns_sim))  # excess kurtosis
+    if not (math.isfinite(sk) and math.isfinite(kurt)):
+        return None
     z = stats.norm.ppf(alpha)
     z_cf = z + (z**2 - 1) * sk / 6 + (z**3 - 3*z) * kurt / 24 - (2*z**3 - 5*z) * (sk**2) / 36
     return float(mu + sigma * z_cf)
+
+
+def _json_safe(x):
+    """NaN/inf -> None ricorsivo (dict, liste, tuple, scalari numpy)."""
+    if isinstance(x, (float, np.floating)):
+        return float(x) if math.isfinite(float(x)) else None
+    if isinstance(x, dict):
+        return {k: _json_safe(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_json_safe(v) for v in x]
+    return x
 
 
 def _expected_shortfall(returns_sim: np.ndarray, alpha: float = 0.05) -> float:
@@ -643,6 +674,104 @@ def _expected_shortfall(returns_sim: np.ndarray, alpha: float = 0.05) -> float:
     if len(tail) == 0:
         return float(var_threshold)
     return float(tail.mean())
+
+
+def _data_iso(x) -> Optional[str]:
+    if x is None:
+        return None
+    try:
+        return pd.Timestamp(x).date().isoformat()
+    except Exception:
+        return str(x)
+
+
+def _calibration_sample(returns_df: "pd.DataFrame", available: List[str],
+                        rdf: "pd.DataFrame") -> Tuple[Dict[str, Any], Optional[str]]:
+    """Voce 7c (04/10): il campione di calibrazione dichiarato in forma strutturata.
+
+    Il campione e' l'INTERSEZIONE delle serie (`dropna(how='any')`): parte dal ticker
+    con la storia piu' corta e perde inoltre i giorni in cui almeno un titolo non
+    quotava (calendari di borsa diversi o buchi di dati). I due effetti si contano a
+    parte, e per costruzione n_obs + tolte_dal_limitante + tolte_dai_calendari ==
+    panel_obs (il pannello = righe con almeno un rendimento fra i ticker analizzati).
+
+    Ritorna (calibration_sample, tail_reliability_warning | None).
+    """
+    panel = returns_df[available].dropna(how="all")
+    n_obs = int(len(rdf))
+    panel_obs = int(len(panel))
+    starts = {t: panel[t].first_valid_index() for t in available}
+    starts = {t: s for t, s in starts.items() if s is not None}
+    limiting: List[str] = []
+    window_start = None
+    dropped_limit = 0
+    if starts and panel_obs > 0:
+        window_start = max(starts.values())
+        if window_start > panel.index[0]:
+            limiting = sorted(t for t, s in starts.items() if s == window_start)
+            dropped_limit = int((panel.index < window_start).sum())
+    dropped_cal = panel_obs - dropped_limit - n_obs
+    # Review RV-R 04/10: il residuo qui sopra mescola festivita' e buchi lunghi di un
+    # solo titolo. Si conta A PARTE, per ticker, quanti giorni manca DENTRO la finestra
+    # (dalla data di inizio del limitante in poi): un buco di 300 giorni ha un nome.
+    if window_start is not None:
+        _win = panel[panel.index >= window_start]
+        gaps_by_ticker = {t: int(_win[t].isna().sum()) for t in available}
+        gaps_by_ticker = {t: n for t, n in gaps_by_ticker.items() if n > 0}
+    else:
+        gaps_by_ticker = {}
+    start_date = _data_iso(rdf.index[0]) if n_obs else None
+    end_date = _data_iso(rdf.index[-1]) if n_obs else None
+    months = round(n_obs / 21.0, 1)
+    low = n_obs < CALIBRATION_MIN_OBS_TAILS
+
+    if n_obs >= 21:
+        durata = _message("circa {v0} mesi", "about {v0} months", v0=int(round(n_obs / 21.0)))
+    else:
+        durata = _message("circa {v0} giorni di borsa", "about {v0} trading days", v0=n_obs)
+    if limiting:
+        limite = _message("limitata da {v0} (storia dal {v1}: {v2} osservazioni in meno)",
+                          "limited by {v0} (history from {v1}: {v2} fewer observations)",
+                          v0=", ".join(limiting), v1=_data_iso(window_start), v2=dropped_limit)
+    else:
+        limite = _message("nessun titolo con storia piu' corta del pannello",
+                          "no ticker with a shorter history than the panel")
+    sentence = _message(
+        "calibrazione su {v0} ({v1} osservazioni, dal {v2} al {v3}), {v4}; altre {v5} tolte perche' almeno un titolo non quotava quel giorno (calendari di borsa diversi o buchi di dati)",
+        "Calibration on {v0} ({v1} observations, from {v2} to {v3}), {v4}; another {v5} dropped because at least one ticker did not trade that day (different exchange calendars or data gaps)",
+        v0=durata, v1=n_obs, v2=start_date or "n.d.", v3=end_date or "n.d.", v4=limite, v5=dropped_cal)
+    if gaps_by_ticker:
+        _peggiore = max(sorted(gaps_by_ticker), key=lambda t: gaps_by_ticker[t])
+        sentence = _message("{v0} (il titolo che manca piu' giorni nella finestra: {v1}, {v2})",
+                            "{v0} (ticker missing the most days in the window: {v1}, {v2})",
+                            v0=sentence, v1=_peggiore, v2=gaps_by_ticker[_peggiore])
+
+    warning = None
+    if low:
+        warning = _message(
+            "BASSA AFFIDABILITA' DELLE CODE: calibrazione su {v0} osservazioni, sotto la soglia di {v1} (circa un anno di borsa); ES99 e VaR99 poggiano su pochissimi giorni estremi e vanno citati con questa riserva",
+            "LOW TAIL RELIABILITY: calibration on {v0} observations, below the {v1} threshold (about one trading year); ES99 and VaR99 rest on very few extreme days and must be quoted with this caveat",
+            v0=n_obs, v1=CALIBRATION_MIN_OBS_TAILS)
+
+    sample = {
+        "n_obs": n_obs,
+        "start_date": start_date,
+        "end_date": end_date,
+        "approx_months": months,
+        "panel_obs": panel_obs,
+        "limiting_ticker": limiting[0] if limiting else None,
+        "limiting_tickers": limiting,
+        "limiting_ticker_start_date": _data_iso(window_start) if limiting else None,
+        "obs_dropped_by_limiting_ticker": dropped_limit,
+        "obs_dropped_by_calendars": int(dropped_cal),
+        # giorni mancanti per ticker DENTRO la finestra (solo >0): spiega il residuo
+        # sopra; i giorni possono sovrapporsi fra ticker, quindi la somma puo' superarlo
+        "missing_days_in_window_by_ticker": gaps_by_ticker,
+        "min_obs_reliable_tails": CALIBRATION_MIN_OBS_TAILS,
+        "low_tail_reliability": bool(low),
+        "sentence": sentence,
+    }
+    return sample, warning
 
 
 # ============================================================
@@ -661,6 +790,11 @@ def run_monte_carlo(
     equal_weight_added: bool = True,
     seed: Optional[int] = None,
     force_refresh: bool = False,
+    # Quota del book (frazione 0-1) data INSIEME ai ticker di add_tickers nel what-if
+    # legacy (voce 7g, 04/10). None = valore fisso di STRESS WHAT_IF_STRESS_ALLOC (30%),
+    # che NON e' la size proposta: il payload lo dichiara in `what_if_allocation`.
+    # Chi conosce la size proposta (es. 2,5% del NAV) la passa qui.
+    new_alloc: Optional[float] = None,
     # Quante delle n_sims traiettorie spedire nel payload (richiesta PM 26/07 via
     # ponte: "perche' solo 10?"). Il DEFAULT RESTA 10 di proposito: `sample_paths`
     # non lo legge solo la UI — finisce anche nel tool result degli agenti
@@ -702,6 +836,24 @@ def run_monte_carlo(
     # in piu' (e a 500x33 punti siamo gia' a ~130 KB di JSON)
     sample_paths_n = max(1, min(int(sample_paths_n), SAMPLE_PATHS_POOL))
 
+    # Voce 7g: `new_alloc` fuori da (0, 1) o senza add_tickers e' un errore DICHIARATO,
+    # mai un clamp zitto (un 2.5 passato per "2,5%" diventerebbe il 100% del book).
+    if new_alloc is not None:
+        try:
+            new_alloc = float(new_alloc)
+        except (TypeError, ValueError):
+            return {"error": _message("new_alloc non numerico: {v0}", "new_alloc is not numeric: {v0}", v0=repr(new_alloc)),
+                    "timestamp": datetime.now().isoformat()}
+        if not (0.0 < new_alloc < 1.0):
+            return {"error": _message("new_alloc={v0} fuori da (0, 1): e' una FRAZIONE del book (0.025 = 2,5%)", "new_alloc={v0} outside (0, 1): it is a FRACTION of the book (0.025 = 2.5%)", v0=new_alloc),
+                    "timestamp": datetime.now().isoformat()}
+        if not add_tickers:
+            return {"error": _message('new_alloc passato senza add_tickers: non c\'e\' nessun ticker a cui darlo', 'new_alloc given without add_tickers: there is no ticker to give it to'),
+                    "timestamp": datetime.now().isoformat()}
+        if _override_weights is not None:
+            return {"error": _message('new_alloc non vale nel percorso v3 (pesi da importi EUR)', 'new_alloc does not apply to the v3 path (weights from EUR amounts)'),
+                    "timestamp": datetime.now().isoformat()}
+
     # audit/11 §2: la chiave DEVE includere anche gli override v3 (pesi/NAV del what-if)
     # e il seed — prima due what-if diversi condividevano la stessa entry di cache.
     _ow_key = ""
@@ -719,7 +871,8 @@ def run_monte_carlo(
     # diversi, e il PM avrebbe letto un ES99 su F5 e un altro nel memo.
     cache_key = (f"mc:v3:{horizon_days}:{n_sims}:{lookback_years}:{method}:{drift_mode}:"
                  f"{stress_scenario}:{sorted(add_tickers or [])}:{sorted(remove_tickers or [])}:"
-                 f"{_ow_key}:{_override_nav}:{seed}:{sorted(return_currencies.items()) if return_currencies is not None else 'local'}")
+                 f"{_ow_key}:{_override_nav}:{seed}:{sorted(return_currencies.items()) if return_currencies is not None else 'local'}:"
+                 f"alloc={new_alloc}")
     if not force_refresh and cache_key in _CACHE:
         entry = _CACHE[cache_key]
         if time.time() - entry["ts"] < CACHE_TTL_SEC:
@@ -737,6 +890,11 @@ def run_monte_carlo(
 
     if seed is not None:
         np.random.seed(int(seed))
+
+    # Voce 7g: dichiarazione dell'allocazione what-if (None = nessun ticker aggiunto
+    # nel percorso legacy). Compilata sotto, completata col peso EFFETTIVO dopo il
+    # download (un ticker senza rendimenti esce e i pesi si rinormalizzano).
+    what_if_allocation: Optional[Dict[str, Any]] = None
 
     # V3 path: override weights provided directly (already preprocessed by run_monte_carlo_v3)
     if _override_weights is not None:
@@ -762,12 +920,35 @@ def run_monte_carlo(
                 if sym and sym in weights:
                     del weights[sym]
         if add_tickers:
-            added = [_yf_ticker(t, salta) for t in add_tickers if _yf_ticker(t, salta)]
+            # dedup nell'ordine (review RV-R): ['X', 'x'] dimezzava la quota per ticker
+            added = list(dict.fromkeys(_yf_ticker(t, salta) for t in add_tickers if _yf_ticker(t, salta)))
+            # i ticker nella lista SKIP uscivano zitti dal what-if: ora sono dichiarati
+            _added_skipped = [str(t).strip().upper() for t in add_tickers if not _yf_ticker(t, salta)]
+            if new_alloc is None:
+                _alloc, _origine = WHAT_IF_STRESS_ALLOC, "stress_fisso"
+                _nota = _message("valore fisso di stress {v0:g}% del book: NON e' la size proposta (il chiamante non ha passato new_alloc)", "Fixed stress value {v0:g}% of the book: NOT the proposed size (the caller did not pass new_alloc)", v0=WHAT_IF_STRESS_ALLOC * 100)
+            else:
+                _alloc, _origine = new_alloc, "parametro_chiamante"
+                _nota = _message("quota {v0:g}% del book passata dal chiamante (new_alloc)", "Book share {v0:g}% passed by the caller (new_alloc)", v0=round(new_alloc * 100, 4))
+            what_if_allocation = {
+                "added_weight_pct_requested": round(_alloc * 100, 4),
+                "origin": _origine,
+                "is_proposed_size": _origine == "parametro_chiamante",
+                "note": _nota,
+                "added_tickers_applied": list(added),
+                "added_tickers_skipped": _added_skipped,
+            }
             if added:
-                new_alloc = 0.30
-                per_new = new_alloc / len(added)
-                scale = 1 - new_alloc
-                weights = {t: w * scale for t, w in weights.items()}
+                per_new = _alloc / len(added)
+                # Il resto del book scala a (1 - alloc) del SUO totale: prima lo scalava
+                # per (1 - alloc) e basta, e con un remove_tickers nello stesso giro la
+                # rinormalizzazione portava il candidato SOPRA la quota dichiarata.
+                # Un ticker gia' nel book riceve la quota (come prima: sovrascritto),
+                # quindi esce dal "resto" prima di scalare.
+                _resto_w = {t: w for t, w in weights.items() if t not in added}
+                _resto = sum(_resto_w.values())
+                scale = (1 - _alloc) / _resto if _resto > 0 else 0.0
+                weights = {t: w * scale for t, w in _resto_w.items()}
                 for t in added:
                     weights[t] = per_new
 
@@ -801,25 +982,82 @@ def run_monte_carlo(
                     "fx_conversion": fx_meta or {"qualified": False}, "missing_tickers": absent,
                     "timestamp": datetime.now().isoformat()}
 
-    available = [t for t in tickers if t in returns_df.columns]
+    # Review RV-R 04/10: un simbolo fallito arriva come colonna tutta NaN e restava in
+    # `available`, svuotando l'intersezione (crash nel bootstrap). Entra solo chi ha
+    # almeno MIN_OBSERVATIONS rendimenti validi; gli altri sono DICHIARATI col conteggio.
+    _obs_per_ticker = {t: int(returns_df[t].notna().sum()) for t in tickers if t in returns_df.columns}
+    available = [t for t in tickers if _obs_per_ticker.get(t, 0) >= MIN_OBSERVATIONS]
+    tickers_excluded = [{"ticker": t, "n_obs": _obs_per_ticker.get(t, 0)}
+                        for t in tickers if t not in available]
+    if tickers_excluded:
+        _log("ESCLUSI per storia insufficiente (< %d obs): %s" % (MIN_OBSERVATIONS, tickers_excluded))
+    if what_if_allocation is not None:
+        what_if_allocation["added_tickers_without_returns"] = [
+            t for t in what_if_allocation["added_tickers_applied"] if t not in available]
+        if what_if_allocation["added_tickers_applied"] and not any(
+                t in available for t in what_if_allocation["added_tickers_applied"]):
+            # un pro-forma senza il candidato sarebbe il book attuale travestito
+            return {"error": _message("nessun ticker aggiunto ha almeno {v0} rendimenti validi: pro-forma non calcolabile", "no added ticker has at least {v0} valid returns: pro-forma cannot be computed", v0=MIN_OBSERVATIONS),
+                    "what_if_allocation": what_if_allocation,
+                    "tickers_excluded_insufficient_history": tickers_excluded,
+                    "timestamp": datetime.now().isoformat()}
     if len(available) < 2:
         return {"error": _message('solo {v0} ticker con rendimenti', 'only {v0} ticker(s) with returns', v0=len(available)),
+                "tickers_excluded_insufficient_history": tickers_excluded,
                 "timestamp": datetime.now().isoformat()}
 
     rdf = returns_df[available].dropna(how="any")
     rr = rdf.values
+    if len(rr) < MIN_OBSERVATIONS:
+        # MIN_OBSERVATIONS valeva sulle righe del PANNELLO, non sull'intersezione:
+        # un candidato con pochi giorni faceva girare il MC su quei pochi giorni
+        _cs, _ = _calibration_sample(returns_df, available, rdf)
+        return {"error": _message("campione di calibrazione di {v0} osservazioni dopo l'intersezione delle serie, sotto il minimo di {v1}: simulazione non eseguita", "Calibration sample of {v0} observations after intersecting the series, below the minimum of {v1}: simulation not run", v0=len(rr), v1=MIN_OBSERVATIONS),
+                "calibration_sample": _cs,
+                "tickers_excluded_insufficient_history": tickers_excluded,
+                **({"what_if_allocation": what_if_allocation} if what_if_allocation is not None else {}),
+                "timestamp": datetime.now().isoformat()}
     w = np.array([weights[t] for t in available])
     w = w / w.sum()
+
+    if what_if_allocation is not None:
+        # peso EFFETTIVO nella simulazione: un ticker senza rendimenti esce da
+        # `available` e il resto si rinormalizza, quindi puo' differire dal richiesto
+        _eff = {t: round(float(w[i]) * 100, 4) for i, t in enumerate(available)
+                if t in what_if_allocation["added_tickers_applied"]}
+        what_if_allocation["added_weight_pct_effective"] = round(sum(_eff.values()), 4)
+        what_if_allocation["added_weight_pct_by_ticker"] = _eff
+        _log("WHAT-IF: quota aggiunti %.2f%% (richiesta %.2f%%, origine %s)" % (
+            what_if_allocation["added_weight_pct_effective"],
+            what_if_allocation["added_weight_pct_requested"], what_if_allocation["origin"]))
 
     # DICHIARAZIONE campione (regola no-fallback 14/07): il dropna(how='any')
     # allinea tutto al ticker piu' giovane; se il taglio e' pesante va detto.
     calibration_note = None
     _panel_len = len(returns_df)
-    if _panel_len > 0 and len(rr) < 0.6 * _panel_len:
-        _youngest = min(available, key=lambda t: int(returns_df[t].notna().sum()))
+    # Voce 7c (04/10): il campione dichiarato in forma STRUTTURATA, sempre (non solo
+    # sotto il 60%): n, date, chi limita la finestra e quante obs toglie, quante ne
+    # tolgono i calendari, frase per il PM, avviso sulle code sotto un anno.
+    calibration_sample, tail_reliability_warning = _calibration_sample(returns_df, available, rdf)
+    # il ticker che limita la finestra (data di inizio piu' tarda), lo stesso di
+    # calibration_sample: col conteggio delle obs un buco a meta' serie faceva
+    # nominare un altro titolo e la nota si contraddiceva (review RV-R)
+    _youngest = calibration_sample["limiting_ticker"]
+    if _panel_len > 0 and len(rr) < 0.6 * _panel_len and not _youngest:
+        # nessun ticker parte tardi: il taglio viene da giorni mancanti DENTRO le serie,
+        # e la frase «dal ticker piu' giovane» sarebbe falsa
+        calibration_note = _message("campione di calibrazione TAGLIATO a {v0} obs su {v1} del panel {v2}y da giorni mancanti dentro le serie (non da un ticker giovane): {v3}", "Calibration sample TRUNCATED to {v0} observations out of {v1} in the {v2}y panel by missing days inside the series (not by a young ticker): {v3}", v0=len(rr), v1=_panel_len, v2=lookback_years, v3=calibration_sample["sentence"])
+        _log("CALIBRAZIONE: " + calibration_note)
+    elif _panel_len > 0 and len(rr) < 0.6 * _panel_len:
         calibration_note = (
             _message("campione di calibrazione TAGLIATO a {v0} obs dal ticker piu' giovane ({v1}: {v2} obs su {v3} del panel {v4}y): vol e correlazioni stimate su finestra corta", 'Calibration sample TRUNCATED to {v0} observations by the youngest ticker ({v1}: {v2} observations out of {v3} in the {v4}y panel): volatility and correlations estimated over a short window', v0=len(rr), v1=_youngest, v2=int(returns_df[_youngest].notna().sum()), v3=_panel_len, v4=lookback_years))
+        # i due effetti separati (prima i giorni tolti dai calendari non erano spiegati);
+        # in CODA, cosi' la frase di prima resta leggibile per chi la analizza
+        calibration_note = _message("{v0}; {v1}", "{v0}; {v1}", v0=calibration_note,
+                                    v1=calibration_sample["sentence"])
         _log("CALIBRAZIONE: " + calibration_note)
+    if tail_reliability_warning:
+        _log("CALIBRAZIONE: " + tail_reliability_warning)
 
     mu_daily_historical = rr.mean(axis=0)
     cov_daily = np.cov(rr.T)
@@ -892,7 +1130,8 @@ def run_monte_carlo(
     es99 = _expected_shortfall(returns_at_horizon, alpha=0.01) * 100
     var95 = float(np.percentile(returns_at_horizon, 5) * 100)
     var99 = float(np.percentile(returns_at_horizon, 1) * 100)
-    cf_var99 = float(_cornish_fisher_var(returns_at_horizon, alpha=0.01) * 100)
+    cf_raw = _cornish_fisher_var(returns_at_horizon, alpha=0.01)
+    cf_var99 = None if cf_raw is None else float(cf_raw * 100)
 
     # Max drawdown
     rolling_max = np.maximum.accumulate(cum, axis=1)
@@ -968,6 +1207,14 @@ def run_monte_carlo(
         "horizon_years": round(horizon_days / 252, 2),
         "n_assets": len(available),
         "calibration_note": calibration_note,
+        # voce 7c (04/10): campione strutturato + avviso code (None se n >= soglia)
+        "calibration_sample": calibration_sample,
+        "tail_reliability_warning": tail_reliability_warning,
+        # voce 7g (04/10): quota data ai ticker aggiunti e sua ORIGINE (None = nessun
+        # what-if add nel percorso legacy; il v3 dichiara weights_pre/post)
+        "what_if_allocation": what_if_allocation,
+        # review RV-R: ticker esclusi per meno di MIN_OBSERVATIONS rendimenti validi
+        "tickers_excluded_insufficient_history": tickers_excluded,
         # DICHIARAZIONE base valutaria (review 14/07): i rendimenti (calibrazione
         # E finestre stress) sono in VALUTA LOCALE per-asset; i campi *_eur usano
         # il NAV EUR solo come SCALA. Per il replay GFC (USD in apprezzamento
@@ -1001,7 +1248,7 @@ def run_monte_carlo(
         # Coherent risk metrics
         "var_95_pct": round(var95, 2),
         "var_99_pct": round(var99, 2),
-        "var_99_cornish_fisher_pct": round(cf_var99, 2),
+        "var_99_cornish_fisher_pct": None if cf_var99 is None else round(cf_var99, 2),
         "es_95_pct": round(es95, 2),
         "es_99_pct": round(es99, 2),
         "es_95_eur": round(es95 / 100 * base_nav, 0),
@@ -1021,6 +1268,9 @@ def run_monte_carlo(
     if _extra_meta:
         result.update(_extra_meta)
 
+    # il payload va in JSON (FastAPI rifiuta NaN/inf): ogni non-finito diventa
+    # null DICHIARATO, anche in cache cosi' i cache hit restano serializzabili
+    result = _json_safe(result)
     # in cache va il pool intero; al chiamante solo il campione che ha chiesto
     _CACHE[cache_key] = {"ts": time.time(), "data": result}
     _log(f"MC done: method={method} E[R]={expected:.2f}% ES99={es99:.2f}% "

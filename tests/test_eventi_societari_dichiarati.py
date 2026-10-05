@@ -312,7 +312,8 @@ def test_lookup_cik_dice_PERCHE_non_ha_trovato_il_cik(monkeypatch):
     monkeypatch.setattr(sec_edgar.requests, "get", lambda *a, **k: _R())
 
     motivo = []
-    assert sec_edgar.lookup_cik("SIGMA.MI", motivo=motivo) is None
+    # senza suffisso: dal 04/10 un suffisso senza alias si ferma prima (test_sec_suffisso_omonimo)
+    assert sec_edgar.lookup_cik("SIGMA", motivo=motivo) is None
     testo = " ".join(motivo).lower()
     assert "filer" in testo or "elenco" in testo, (
         "il motivo non distingue 'assente dall'elenco SEC' dagli altri due "

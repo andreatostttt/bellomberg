@@ -121,10 +121,10 @@ def test_alias_esempio_si_carica_col_caricatore_vero():
     assert r["alias"]["finnhub"]["ACME.MI"] == "ACM" and r["alias"]["sec"]["ACME"] == "ACM"
 
 
-def test_alias_negozio_assente_da_quattro_sezioni_vuote_dichiarate(tmp_path):
+def test_alias_negozio_assente_da_cinque_sezioni_vuote_dichiarate(tmp_path):
     r = np_.carica_alias(str(tmp_path / "no.json"))
     assert r["alias"] == {"finnhub": {}, "sec": {}, "yfinance": {},
-                          "correlazione": {}} and r["origine"] == "assente"
+                          "correlazione": {}, "tradegate": {}} and r["origine"] == "assente"
 
 
 def test_alias_una_sezione_sconosciuta_e_malformata(tmp_path):

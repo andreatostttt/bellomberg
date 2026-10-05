@@ -5,7 +5,7 @@ source-plan approvals or instructions. Raw bytes and text are rechecked through
 the existing primary-document collector before the worker can reuse them.
 """
 from copy import deepcopy
-from datetime import date
+from datetime import date, datetime
 from hashlib import sha256
 from html.parser import HTMLParser
 import http.client
@@ -292,15 +292,20 @@ def download_public_document(url, destination, *, issuer_website=None, resolver=
         visited.add(current)
         address = _public_address(policy["host"], resolver=resolver)
         headers = {"User-Agent": "Bellomberg-Public-Document/1.0", "Accept": "application/pdf,text/html,text/plain,application/xhtml+xml", "Accept-Encoding": "identity"}
+        sec_edgar = None
         if policy["host"] in ("www.sec.gov", "sec.gov", "data.sec.gov"):
-            from bellomberg.market_data.sec_edgar import _headers
-            headers["User-Agent"] = _headers()["User-Agent"]
+            from bellomberg.market_data import sec_edgar
+            headers["User-Agent"] = sec_edgar._headers()["User-Agent"]
         connection = (connection_factory or _PinnedHTTPSConnection)(policy["host"], address, TIMEOUT_SECONDS)
         try:
             parts = urlsplit(current)
             target = parts.path or "/"
             if parts.query:
                 target += "?" + parts.query
+            if sec_edgar is not None:
+                # Ritmo SEC condiviso fra processi (<= 8 req/s in totale), a ogni GET e a ogni
+                # salto di redirect: lo stesso di sec_edgar, non una copia. RitmoBloccato sale.
+                sec_edgar.attendi_sec()
             connection.request("GET", target, headers=headers)
             response = connection.getresponse()
             if response.status in (301, 302, 303, 307, 308):
@@ -603,10 +608,246 @@ def _html_publication_context(raw, text):
     return [(value, quote) for value, quote in dict.fromkeys(result) if text.count(quote) == 1]
 
 
+_DEPOSIT_CONTRACT = "trade-idea-emarket-deposit-receipt/1"
+_DEPOSIT_BASIS = "emarket_sdir_deposit_receipt"
+_PUBLICATION_AMBIGUOUS = ('Publication requires one unambiguous primary header or cover date; optional claims cannot '
+                          'resolve contradictory publication facts')
+_DEPOSIT_PM_HINT = "data di pubblicazione da fornire dal PM"
+# Nome del documento nella copertina -> tipo di relazione cercato su eMarket SDIR.
+_DEPOSIT_DOCUMENT_TYPES = {
+    "semestrale": (r"relazione\s+finanziaria\s+semestrale", r"half[\s-]*year(?:ly)?\s+financial\s+report"),
+    "annuale": (r"relazione\s+finanziaria\s+annuale", r"annual\s+financial\s+report"),
+    "trimestrale": (r"resoconto\s+intermedio\s+di\s+gestione",
+                    r"interim\s+(?:financial|management)\s+(?:report|statement)"),
+}
+_DEPOSIT_FIELDS = ("ticker", "isin", "emarket_id", "tipo", "periodo_fine", "stato", "stato_originale",
+                   "data_deposito", "ora_deposito",
+                   "titolo", "url", "protocollo", "categoria", "lingua", "fonte", "categorie_cercate", "url_liste",
+                   "sha256_liste", "letto_il", "limiti", "prova", "sha256_pdf", "voce_da", "isin_resolution")
+_ISIN_RESOLUTION_FIELDS = ("stato", "isin", "emarket", "negozio", "fonte_url", "letto_il")
+
+
+def _deposit_document_type(text):
+    """Tipo della relazione dalla copertina (primi 2.000 caratteri); None se assente o non univoco."""
+    header = " ".join(text[:2000].split())
+    kinds = [kind for kind, patterns in _DEPOSIT_DOCUMENT_TYPES.items()
+             if any(re.search(pattern, header, re.I) for pattern in patterns)]
+    return kinds[0] if len(kinds) == 1 else None
+
+
+def _deposit_declaration(value):
+    day = date.fromisoformat(value["data_deposito"])
+    text = ("data di deposito eMarket SDIR del %s, documento \u00ab%s\u00bb (protocollo %s)"
+            % (day.strftime("%d/%m/%Y"), " ".join(str(value["titolo"]).split()), value["protocollo"]))
+    if value.get("stato") == "STALE":
+        read = datetime.fromisoformat(str(value["letto_il"]))
+        text += "; data di deposito letta il %s, fonte ora non raggiungibile" % read.strftime("%d/%m")
+    if value.get("prova") == "testo_pdf":
+        text += "; nome e periodo del documento letti nel PDF del comunicato (titolo generico di deposito)"
+    if value.get("voce_da") == "automatico":
+        text += "; ISIN %s risolto automaticamente su Borsa Italiana" % value.get("isin")
+    return text
+
+
+def _deposit_pdf_text(root, sha):
+    """Testo del PDF del comunicato archiviato (stadio 2 di eMarket), dai byte sigillati."""
+    from io import BytesIO
+    from pypdf import PdfReader
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+        raise ValueError("eMarket SDIR deposit PDF digest is missing; " + _DEPOSIT_PM_HINT)
+    path = Path(root) / "publication-receipts" / (sha + ".pdf")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ValueError("Archived eMarket SDIR deposit PDF is missing or unreadable") from exc
+    if sha256(raw).hexdigest() != sha:
+        raise ValueError("Archived eMarket SDIR deposit PDF bytes changed")
+    try:
+        return "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(raw)).pages)
+    except Exception as exc:
+        raise ValueError("Archived eMarket SDIR deposit PDF cannot be read (" + type(exc).__name__ + ")") from exc
+
+
+def _check_deposit_value(value, ticker, tipo, report_date, as_of, root):
+    """Riverifica PURA del deposito sigillato: stesso emittente, tipo e periodo; deposito dopo la fine
+    del periodo e non dopo il cutoff; il titolo passa ancora la regola di eMarket (nome + periodo)."""
+    from bellomberg.market_data.emarket_sdir import candidati_deposito
+    stale = isinstance(value, dict) and value.get("stato") == "STALE" and value.get("stato_originale") == "ok"
+    if stale:
+        try:
+            datetime.fromisoformat(str(value.get("letto_il")))
+        except ValueError:
+            stale = False
+    if (not isinstance(value, dict) or value.get("contract") != _DEPOSIT_CONTRACT
+            or not (value.get("stato") == "ok" or stale)
+            or value.get("ticker") != (ticker or "").strip().upper() or value.get("tipo") != tipo
+            or value.get("periodo_fine") != report_date
+            or any(not isinstance(value.get(key), str) or not value[key].strip()
+                   for key in ("data_deposito", "titolo", "url", "protocollo"))
+            or not isinstance(value.get("url_liste"), list) or not value["url_liste"]
+            or not isinstance(value.get("sha256_liste"), dict)
+            or set(value["sha256_liste"]) != set(value["url_liste"])):
+        raise ValueError("eMarket SDIR deposit receipt conflicts with the document issuer, type or period; "
+                         + _DEPOSIT_PM_HINT)
+    if not date.fromisoformat(report_date) < date.fromisoformat(value["data_deposito"]) <= date.fromisoformat(as_of):
+        raise ValueError("eMarket SDIR deposit date is not after the reporting period or is after the cutoff; "
+                         + _DEPOSIT_PM_HINT)
+    row = {"data": value["data_deposito"], "ora": value.get("ora_deposito"), "titolo": value["titolo"],
+           "url_pdf": value["url"], "protocollo": value["protocollo"], "categoria": value.get("categoria")}
+    texts = None
+    if value.get("prova") == "testo_pdf":
+        # Titolo generico: nome + periodo si ricontrollano nel PDF del comunicato archiviato.
+        texts = {value["url"]: _deposit_pdf_text(root, (value.get("sha256_pdf") or {}).get(value["url"]))}
+    elif value.get("prova") not in ("titolo", None):
+        raise ValueError("eMarket SDIR deposit evidence kind is unknown; " + _DEPOSIT_PM_HINT)
+    isin = value.get("isin_resolution")
+    if isin is not None and (not isinstance(isin, dict) or isin.get("stato") != "ok" or isin.get("isin") != value.get("isin")):
+        raise ValueError("Automatic ISIN resolution differs from the eMarket SDIR deposit issuer; " + _DEPOSIT_PM_HINT)
+    verdict = candidati_deposito([row], tipo, date.fromisoformat(report_date), testi_pdf=texts)
+    if (verdict["stato"] != "ok" or verdict["scelto"]["protocollo"] != value["protocollo"]
+            or verdict.get("prova") != (value.get("prova") or "titolo")):
+        raise ValueError("eMarket SDIR deposit does not name this document and period; " + _DEPOSIT_PM_HINT)
+
+
+def _fetch_deposit_pdf(url):
+    from bellomberg.market_data.borsa_italiana import _scarica
+    status, raw, _final = _scarica(url)
+    if status != 200:
+        raise ValueError("eMarket SDIR deposit PDF HTTP %s; %s" % (status, _DEPOSIT_PM_HINT))
+    return raw
+
+
+def _acquire_deposit_companion(ticker, tipo, report_date, as_of, root, lookup=None, *, issuer_name=None,
+                               isin_lookup=None, pdf_fetch=None):
+    """Una lettura della fonte ufficiale; solo l'esito ok viene sigillato in archivio.
+
+    In produzione (nessuno strumento iniettato) prima risolve l'ISIN (negozio confermato ->
+    automatico -> Borsa Italiana col nome dell'emittente), poi legge il deposito."""
+    resolution = None
+    if isin_lookup is None and lookup is None:
+        from bellomberg.market_data.borsa_italiana import risolvi_isin as isin_lookup
+    if isin_lookup is not None:
+        found = isin_lookup(ticker, nome=issuer_name)
+        if not isinstance(found, dict) or found.get("stato") != "ok":
+            detail = found if isinstance(found, dict) else {}
+            raise ValueError("%s; ISIN resolution %s (%s): %s; %s" % (_PUBLICATION_AMBIGUOUS,
+                detail.get("stato", "malformed"), detail.get("errore"), str(detail.get("motivo"))[:300], _DEPOSIT_PM_HINT))
+        resolution = {key: deepcopy(found.get(key)) for key in _ISIN_RESOLUTION_FIELDS}
+    if lookup is None:
+        from bellomberg.market_data.emarket_sdir import get_data_deposito as lookup
+    result = lookup(ticker, tipo=tipo, periodo_fine=report_date)
+    if not isinstance(result, dict) or not (result.get("stato") == "ok"
+            or (result.get("stato") == "STALE" and result.get("stato_originale") == "ok")):
+        detail = result if isinstance(result, dict) else {}
+        raise ValueError("%s; eMarket SDIR deposit %s (%s): %s; %s" % (_PUBLICATION_AMBIGUOUS,
+            detail.get("stato", "malformed"), detail.get("errore"), str(detail.get("motivo"))[:300], _DEPOSIT_PM_HINT))
+    value = {"contract": _DEPOSIT_CONTRACT, **{key: deepcopy(result.get(key)) for key in _DEPOSIT_FIELDS}}
+    value["isin_resolution"] = resolution
+    if value.get("prova") == "testo_pdf":
+        # Si archiviano i byte del PDF del comunicato: devono essere quelli letti dalla fonte.
+        expected = (value.get("sha256_pdf") or {}).get(value.get("url"))
+        pdf = (pdf_fetch or _fetch_deposit_pdf)(value.get("url"))
+        if not isinstance(pdf, bytes) or sha256(pdf).hexdigest() != expected:
+            raise ValueError("eMarket SDIR deposit PDF differs from the bytes read by the source; " + _DEPOSIT_PM_HINT)
+        _archive_bytes(root / "publication-receipts", pdf, ".pdf")
+    _check_deposit_value(value, ticker, tipo, report_date, as_of, root)
+    raw = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    _path, digest = _archive_bytes(root / "publication-receipts", raw, ".json")
+    return {**value, "sha256": digest}
+
+
+def verify_deposit_companion(sealed, root, ticker, tipo, report_date, as_of):
+    """Senza rete: byte archiviati == sigillo, contenuto == sigillo, regola ripassata."""
+    if not isinstance(sealed, dict) or not isinstance(sealed.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", sealed["sha256"]):
+        raise ValueError("eMarket SDIR deposit receipt is malformed")
+    path = (Path(root) / "publication-receipts" / (sealed["sha256"] + ".json")).resolve()
+    if not path.is_relative_to((Path(root) / "publication-receipts").resolve()):
+        raise ValueError("eMarket SDIR deposit receipt escaped the server archive")
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_BYTES + 1)
+    except OSError as exc:
+        raise ValueError("eMarket SDIR deposit receipt archive is missing or unreadable") from exc
+    if len(raw) > MAX_BYTES or sha256(raw).hexdigest() != sealed["sha256"]:
+        raise ValueError("Archived eMarket SDIR deposit receipt bytes changed")
+    value = json.loads(raw)
+    if not same_exact_value(value, {key: sealed.get(key) for key in ("contract", *_DEPOSIT_FIELDS)}):
+        raise ValueError("Archived eMarket SDIR deposit receipt metadata changed")
+    _check_deposit_value(value, ticker, tipo, report_date, as_of, root)
+    return deepcopy(sealed)
+
+
+_COVER_PERIOD_LOCATOR = "cover_report_title_period/1"
+_ISSUER_FULL_TEXT_LOCATOR = "confirmed_issuer_name_in_full_text/1"
+_ISSUER_NAME_SOURCE = ("confirmed issuer identity (identity resolver); the isin_it store holds ISIN and eMarket id "
+                       "only, no issuer-name field")
+
+
+def _cover_period_context(text):
+    """Nome della relazione + periodo nella copertina (primi 2.000 caratteri), es. «Relazione finanziaria
+    semestrale al 30 giugno 2026» / «HALF-YEAR FINANCIAL REPORT AT 30 JUNE 2026». Ritorna [(data, citazione)];
+    la citazione e' unica nel testo intero (altrimenti il prefisso dall'inizio del documento)."""
+    names = "|".join(pattern for patterns in _DEPOSIT_DOCUMENT_TYPES.values() for pattern in patterns)
+    pattern = re.compile(r"(?:" + names + r")\s+(?:al|at|as\s+at|as\s+of)\s+(?P<date>" + _DATE_PATTERN + r")", re.I)
+    result = []
+    for match in pattern.finditer(text[:2000]):
+        try:
+            value = _parse_date_token(" ".join(match.group("date").split()))
+        except (ValueError, KeyError):
+            continue
+        quote = match.group(0)
+        result.append((value, quote if text.count(quote) == 1 else text[:match.end()]))
+    return result
+
+
+def _issuer_full_text_locator(text, name):
+    """Prima occorrenza del nome confermato (tutti i token, in ordine) in TUTTO il testo; None se assente."""
+    tokens = re.findall(r"[^\W_]+", name or "")
+    if not tokens:
+        return None
+    pattern = r"(?<!\w)" + r"[\W_]+".join(re.escape(token) for token in tokens) + r"(?!\w)"
+    for match in re.finditer(pattern, text, re.I):
+        for width in (60, 200, 1000):
+            start, end = max(0, match.start() - width), min(len(text), match.end() + width)
+            if text.count(text[start:end]) == 1:
+                return text[start:end]
+    return None
+
+
+def _page_of_offset(extracted, offset):
+    for row in extracted.get("riferimenti") or []:
+        if row["inizio"] <= offset <= row["fine"]:
+            return row["pagina"]
+    return None
+
+
+def verify_european_locators(text, extracted, verification, metadata):
+    """Riverifica senza rete delle prove dichiarate per periodo (copertina) ed emittente (testo intero)."""
+    period = verification.get("report_date_locator")
+    if period is not None:
+        rows = _cover_period_context(text)
+        if (not isinstance(period, dict) or period.get("basis") != _COVER_PERIOD_LOCATOR
+                or len({row[0] for row in rows}) != 1 or rows[0][0] != metadata.get("report_date")
+                or period.get("value") != metadata.get("report_date") or period.get("quote") != rows[0][1]):
+            raise ValueError("declared cover reporting period differs from the document cover")
+    issuer = verification.get("issuer_locator")
+    if issuer is not None:
+        quote = issuer.get("quote") if isinstance(issuer, dict) else None
+        name = issuer.get("name") if isinstance(issuer, dict) else None
+        if (issuer.get("basis") != _ISSUER_FULL_TEXT_LOCATOR or not isinstance(quote, str) or not isinstance(name, str)
+                or text.count(quote) != 1 or _issuer_full_text_locator(text, name) != quote
+                or text.find(quote) != issuer.get("offset")
+                or _page_of_offset(extracted, issuer["offset"]) != issuer.get("page")
+                or name != metadata.get("issuer")):
+            raise ValueError("declared issuer full-text locator differs from the document text")
+
+
 def _resolve_metadata_claims(source, text, identity, publication_receipt=None, legal_identity_resolver=None,
-                             *, legacy_locators=False, publication_matches=None):
+                             *, legacy_locators=False, publication_matches=None, deposit_resolver=None,
+                             european_locators=False):
     resolved = deepcopy(source)
     origins = {}
+    deposit_pending = False
     sec_cover = None if legacy_locators else _primary_sec_cover(text)
     if sec_cover:
         if _normalized(sec_cover['issuer']) != _normalized(identity.get('name') or ''):
@@ -626,7 +867,11 @@ def _resolve_metadata_claims(source, text, identity, publication_receipt=None, l
         if kind == 'publication':
             matches = _primary_publication_context(text) if publication_matches is None else publication_matches
             if len({item[0] for item in matches}) != 1:
-                raise ValueError('Publication requires one unambiguous primary header or cover date; optional claims cannot resolve contradictory publication facts')
+                if deposit_resolver is None or legacy_locators:
+                    raise ValueError('Publication requires one unambiguous primary header or cover date; optional claims cannot resolve contradictory publication facts')
+                # Copertina senza data univoca: la data la da' il deposito ufficiale (dopo il periodo).
+                deposit_pending = True
+                continue
             if quote:
                 _proof(text, quote)
                 matches = [item for item in matches if item[1].strip() in quote]
@@ -644,6 +889,18 @@ def _resolve_metadata_claims(source, text, identity, publication_receipt=None, l
             date.fromisoformat(claimed)
             matches = [item for item in matches if item[0] == claimed]
         dates = {item[0] for item in matches}
+        if kind == 'report_date' and european_locators and (len(dates) != 1 or not matches):
+            # Decisione PM 04/10: nome della relazione + periodo IN COPERTINA, solo se univoco.
+            cover = _cover_period_context(text)
+            if len({item[0] for item in cover}) > 1:
+                raise ValueError('Reporting period is contradictory on the document cover')
+            if cover and (not claimed or cover[0][0] == claimed):
+                resolved[field], resolved[kind + '_quote'] = cover[0]
+                if quote:
+                    resolved['request_report_date_quote'] = quote
+                _proof(text, resolved[kind + '_quote'])
+                origins[kind] = _COVER_PERIOD_LOCATOR
+                continue
         if len(dates) != 1 or not matches:
             raise ValueError(("Publication" if kind == "publication" else "Reporting period")
                 + " requires a unique explicit dated primary-text disclosure; optional claims must be verified")
@@ -652,7 +909,21 @@ def _resolve_metadata_claims(source, text, identity, publication_receipt=None, l
         resolved[kind + "_quote"] = quote or extracted_quote
         _proof(text, resolved[kind + "_quote"])
         origins[kind] = "verified_pm_locator" if quote or claimed else "automatic_primary_text_locator"
-    if resolved["publication_quote"] and resolved["publication_quote"] == resolved["report_date_quote"]:
+    if deposit_pending:
+        tipo = _deposit_document_type(text)
+        if tipo is None:
+            raise ValueError(_PUBLICATION_AMBIGUOUS + "; eMarket SDIR deposit not searched: report type not unique on "
+                             "the cover; " + _DEPOSIT_PM_HINT)
+        sealed = deposit_resolver(resolved["report_date"], tipo)
+        if source.get("published_at") and source["published_at"] != sealed["data_deposito"]:
+            raise ValueError("PM publication date conflicts with the eMarket SDIR deposit date")
+        resolved["published_at"], resolved["publication_quote"] = sealed["data_deposito"], None
+        resolved["deposit_receipt"] = sealed
+        if source.get("publication_quote"):
+            # La citazione del PM non e' una data di pubblicazione: dichiarata, non usata come prova.
+            resolved["request_publication_quote"] = source["publication_quote"]
+        origins["publication"] = _DEPOSIT_BASIS
+    if resolved.get("publication_quote") and resolved["publication_quote"] == resolved["report_date_quote"]:
         raise ValueError("Publication and reporting period require distinct contextual evidence")
     issuer_quote = source.get("issuer_quote") or (sec_cover['issuer_quote'] if sec_cover else None)
     name = identity.get("name") or ""
@@ -677,6 +948,10 @@ def _resolve_metadata_claims(source, text, identity, publication_receipt=None, l
             quote=text[max(0,offset-30):min(len(text),offset+len(explicit)+80)]
         legal_identity=deepcopy(binding)
         return quote
+    if european_locators and issuer_quote and text.count(issuer_quote) != 1:
+        # Citazione facoltativa non trovata: dichiarata, non usata come prova.
+        resolved['request_issuer_quote'] = issuer_quote
+        issuer_quote = None
     if not issuer_quote:
         # SEC catalog/display names differ in commas and periods. Match every
         # name token in order; never remove a legal suffix or insert an alias.
@@ -687,6 +962,10 @@ def _resolve_metadata_claims(source, text, identity, publication_receipt=None, l
             match = matches[0]
             start, end = max(0, match.start() - 60), min(len(text), match.end() + 60)
             issuer_quote = text[start:end]
+        elif european_locators and _issuer_full_text_locator(text, name):
+            # Decisione PM 04/10: il nome confermato si cerca in TUTTO il documento.
+            issuer_quote = _issuer_full_text_locator(text, name)
+            origins['issuer'] = _ISSUER_FULL_TEXT_LOCATOR
         else:
             issuer_quote=legal_quote()
     _proof(text, issuer_quote)
@@ -698,13 +977,140 @@ def _resolve_metadata_claims(source, text, identity, publication_receipt=None, l
     if legal_identity is not None:
         resolved['primary_legal_identity']=legal_identity
         origins['issuer']='verified_primary_legal_identity'
-    else:
+    elif origins.get('issuer') != _ISSUER_FULL_TEXT_LOCATOR:
         origins["issuer"] = "verified_pm_locator" if source.get("issuer_quote") else "automatic_primary_text_locator"
     return resolved, origins
 
 
+TEXTLESS_PAGES_MAX_PERCENT = 5
+TEXTLESS_PAGES_POLICY = "pdf_textless_pages_max_5_percent_no_images/1"
+
+
+def _pdf_page_image_count(page, reader):
+    """Images a physical page can paint: Image XObjects, also nested in Form
+    XObjects, tiling patterns, Type3 glyphs and annotation appearances, plus
+    inline images (BI) in every content stream reached. Conservative: an image
+    declared in a reachable resource counts even if never painted."""
+    from pypdf.generic import ContentStream, StreamObject
+    seen, count = set(), 0
+
+    def resolved(value):
+        value = value.get_object() if hasattr(value, "get_object") else value
+        return value if value is not None else {}
+
+    def inline(stream):
+        nonlocal count
+        if isinstance(stream, StreamObject) and stream.get_data().strip():
+            count += sum(1 for _operands, operator in ContentStream(stream, reader).operations
+                         if operator == b"INLINE IMAGE")
+
+    def stream_and_resources(obj, depth):
+        obj = obj.get_object() if obj is not None else None
+        if obj is None or not hasattr(obj, "get"):
+            return
+        if depth > 32:
+            raise ValueError("PDF resource nesting is too deep to verify images")
+        key = getattr(getattr(obj, "indirect_reference", None), "idnum", None) or id(obj)
+        if key in seen:
+            return
+        seen.add(key)
+        inline(obj)
+        resources(obj.get("/Resources"), depth + 1)
+
+    def resources(res, depth):
+        nonlocal count
+        res = resolved(res)
+        if not res:
+            return
+        if depth > 32:
+            raise ValueError("PDF resource nesting is too deep to verify images")
+        for group in ("/XObject", "/Pattern"):
+            for value in resolved(res.get(group)).values():
+                value = resolved(value)
+                if value.get("/Subtype") == "/Image":
+                    count += 1
+                else:
+                    stream_and_resources(value, depth + 1)
+        for state in resolved(res.get("/ExtGState")).values():
+            # Una scansione puo' essere dipinta come soft mask (/SMask /G).
+            state = resolved(state)
+            smask = resolved(state.get("/SMask"))
+            if hasattr(smask, "get"):
+                stream_and_resources(smask.get("/G"), depth + 1)
+            font_entry = state.get("/Font")  # [font size]: anche un Type3 puo' arrivare da qui
+            if font_entry is not None:
+                resources({"/Font": {"/F": resolved(font_entry)[0]}}, depth + 1)
+        for font in resolved(res.get("/Font")).values():
+            font = resolved(font)
+            if font.get("/Subtype") == "/Type3":
+                resources(font.get("/Resources"), depth + 1)
+                for glyph in resolved(font.get("/CharProcs")).values():
+                    stream_and_resources(glyph, depth + 1)
+
+    contents = page.get_contents()
+    if contents is not None:
+        count += sum(1 for _operands, operator in ContentStream(contents, reader).operations
+                     if operator == b"INLINE IMAGE")
+    resources(page.get("/Resources"), 0)
+    for annotation in resolved(page.get("/Annots")) or []:
+        for appearance in resolved(resolved(annotation).get("/AP")).values():
+            appearance = resolved(appearance)
+            if isinstance(appearance, StreamObject):
+                stream_and_resources(appearance, 1)
+            else:
+                for state in appearance.values():
+                    stream_and_resources(state, 1)
+    return count
+
+
+def same_exact_value(left, right):
+    """Uguaglianza con TIPI esatti: 0 != 0.0 != False, 41 != 41.0 (== di Python li confonde)."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(same_exact_value(left[key], right[key]) for key in left)
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(same_exact_value(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def textless_pages_declaration(raw, extracted):
+    """None when every page has text; else the exact declaration of accepted
+    PDF pages without extractable text. Raises when a threshold is crossed.
+
+    Accepted only for PDFs whose pages without text are <= 5% of all pages
+    (integer arithmetic) and each paints no image: a textless page with an
+    image may be a scan and still requires OCR, so it remains a rejection.
+    """
+    pages = extracted.get("pagine_senza_testo") or []
+    if not pages:
+        return None
+    total = extracted.get("pagine")
+    if extracted.get("formato") != "pdf" or type(total) is not int or total < 1:
+        raise ValueError("Document contains pages without extractable text outside a measured PDF")
+    if len(pages) * 100 > TEXTLESS_PAGES_MAX_PERCENT * total:
+        raise ValueError("PDF pages without extractable text exceed the 5%% limit: %d of %d pages %s"
+                         % (len(pages), total, pages))
+    from io import BytesIO
+    from pypdf import PdfReader
+    try:
+        reader = PdfReader(BytesIO(raw))
+        images = {number: _pdf_page_image_count(reader.pages[number - 1], reader) for number in pages}
+    except Exception as exc:
+        raise ValueError("Images on PDF pages without extractable text cannot be verified ("
+                         + type(exc).__name__ + ")") from exc
+    with_images = [number for number, value in images.items() if value]
+    if with_images:
+        raise ValueError("PDF pages without extractable text contain images (possible scan, OCR required): pages %s"
+                         % with_images)
+    return {"pages": list(pages), "pages_total": total, "images_on_pages": 0,
+            "policy": TEXTLESS_PAGES_POLICY,
+            "limitation": "Content of these pages is not verified without OCR; accepted only because they are "
+                          "at most 5% of the pages and contain no image."}
+
+
 def _verified_candidate(source, fetched, identity, as_of, root, publication_receipt=None,
-                        *, text_extraction=None):
+                        *, text_extraction=None, deposit_resolver=None):
     from bellomberg.market_data.lettore_trimestrali import (estrai_testo, HTML_TEXT_EXTRACTOR,
         LEGACY_HTML_TEXT_EXTRACTOR, COMPANY_TEXT_EXTRACTOR)
     if text_extraction is None:
@@ -733,8 +1139,10 @@ def _verified_candidate(source, fetched, identity, as_of, root, publication_rece
     extracted = estrai_testo(str(path), contenuto=raw, html_extractor=text_extraction)
     text = extracted.get("testo", "")
     if (extracted.get("stato") != "ok" or not text.strip() or len(text) > MAX_TEXT
-            or extracted.get("pagine_senza_testo") or (extracted.get("pagine") or 0) > MAX_PAGES):
+            or (extracted.get("pagine") or 0) > MAX_PAGES):
         raise ValueError("Document extraction is incomplete or exceeds the text/page limit")
+    # Pagine senza testo: ammesse solo <=5% e senza immagini, poi DICHIARATE.
+    textless_pages = textless_pages_declaration(raw, extracted)
     publication_matches = (_html_publication_context(raw, text)
         if text_extraction == COMPANY_TEXT_EXTRACTOR and extracted.get('formato') == 'html' else None)
     def legal_identity_resolver(located):
@@ -750,7 +1158,13 @@ def _verified_candidate(source, fetched, identity, as_of, root, publication_rece
         body=json.loads(compiled['documents'][0]['text'])
         return body.get('legal_identity')
     source, origins = _resolve_metadata_claims(source, text, identity, publication_receipt,legal_identity_resolver,
-        legacy_locators=legacy, publication_matches=publication_matches)
+        legacy_locators=legacy, publication_matches=publication_matches,
+        deposit_resolver=deposit_resolver if publication_receipt is None else None,
+        european_locators=(not legacy and str(identity.get('ticker', '')).upper().endswith('.MI')))
+    unused_report_quote = source.pop('request_report_date_quote', None)
+    unused_issuer_quote = source.pop('request_issuer_quote', None)
+    deposit = source.pop("deposit_receipt", None)
+    unused_publication_quote = source.pop("request_publication_quote", None)
     published = date.fromisoformat(source["published_at"])
     report = date.fromisoformat(source["report_date"])
     cutoff = date.fromisoformat(as_of)
@@ -763,6 +1177,8 @@ def _verified_candidate(source, fetched, identity, as_of, root, publication_rece
         raise ValueError("Publication claim lacks this document's dated primary header or cover evidence")
     report_proofs = _dated_context(source["report_date_quote"], "report_date")
     report_proofs += [row for row in _primary_financial_report_context(text) if row[1] == source["report_date_quote"]]
+    if origins.get("report_date") == _COVER_PERIOD_LOCATOR:
+        report_proofs += [row for row in _cover_period_context(text) if row[1] == source["report_date_quote"]]
     if not _date_in_quote(source["report_date"], source["report_date_quote"]) or not any(row[0] == source["report_date"] for row in report_proofs):
         raise ValueError("Economic reporting date lacks dated primary text evidence")
     issuer = _normalized(identity.get("name") or "")
@@ -774,6 +1190,9 @@ def _verified_candidate(source, fetched, identity, as_of, root, publication_rece
     metadata = {"issuer": identity["name"], "form": form, "report_date": source["report_date"], "pm_source_verification": {"contract": CONTRACT, "ticker": identity["ticker"], "publisher": fetched["publisher"], "publication_basis": "dated_primary_text_quote", "report_date_basis": "dated_primary_text_quote", "issuer_basis": "confirmed_issuer_name_in_primary_text", "claim_origins": origins, "proofs": proofs, "security_identity_verified": False, "limitation": "Document publisher, bytes and quoted metadata are checked; economic sufficiency and the selected security remain separate gates."}}
     if not legacy:
         metadata['pm_source_verification']['text_extraction'] = text_extraction
+    if textless_pages is not None:
+        # Solo se non vuoto: le ricevute senza pagine mute restano identiche.
+        metadata['pm_source_verification']['textless_pages'] = textless_pages
     if publication_matches is not None:
         metadata['pm_source_verification']['publication_locator'] = 'html_article_header/1'
     if legal_identity is not None:
@@ -791,6 +1210,32 @@ def _verified_candidate(source, fetched, identity, as_of, root, publication_rece
             ("contract", "source_url", "sha256", "entry", "catalog_status")}
         verification["proofs"].setdefault("publication", {"source_url": publication_receipt["source_url"],
             "sha256": publication_receipt["sha256"], "locator": "/entry/filed_date", "value": source["published_at"]})
+    if origins.get("report_date") == _COVER_PERIOD_LOCATOR:
+        # Dichiarazioni solo quando usate: le ricevute vecchie restano identiche.
+        metadata["pm_source_verification"]["report_date_basis"] = _COVER_PERIOD_LOCATOR
+        metadata["pm_source_verification"]["report_date_locator"] = {"basis": _COVER_PERIOD_LOCATOR,
+            "value": source["report_date"], "quote": source["report_date_quote"],
+            "page": _page_of_offset(extracted, text.find(source["report_date_quote"]))}
+        if unused_report_quote:
+            metadata["pm_source_verification"]["pm_report_date_quote_not_evidence"] = unused_report_quote
+    if origins.get("issuer") == _ISSUER_FULL_TEXT_LOCATOR:
+        offset = text.find(source["issuer_quote"])
+        metadata["pm_source_verification"]["issuer_basis"] = _ISSUER_FULL_TEXT_LOCATOR
+        metadata["pm_source_verification"]["issuer_locator"] = {"basis": _ISSUER_FULL_TEXT_LOCATOR,
+            "name": identity["name"], "name_source": _ISSUER_NAME_SOURCE, "quote": source["issuer_quote"],
+            "offset": offset, "page": _page_of_offset(extracted, offset)}
+    if unused_issuer_quote:
+        metadata["pm_source_verification"]["pm_issuer_quote_not_evidence"] = unused_issuer_quote
+    if deposit is not None:
+        # Solo quando usato: le ricevute con data in copertina restano identiche.
+        verification = metadata["pm_source_verification"]
+        verification["publication_basis"] = _DEPOSIT_BASIS
+        verification["deposit_receipt"] = deepcopy(deposit)
+        verification["publication_declaration"] = _deposit_declaration(deposit)
+        if unused_publication_quote:
+            verification["pm_publication_quote_not_evidence"] = unused_publication_quote
+        verification["proofs"]["publication"] = {"source_url": deposit["url"], "sha256": deposit["sha256"],
+            "locator": "/data_deposito", "value": deposit["data_deposito"]}
     candidate = {"stato": "verificato", "url": source["url"], "path": str(path), "sha256": fetched["sha256"], "filed_date": source["published_at"], "metadati": metadata}
     return candidate, text
 
@@ -887,7 +1332,8 @@ def _verify_publication_companion(receipt, url, ticker, identity, as_of, root):
 
 
 def ingest_document_sources(ticker, identity, as_of, sources, *, archive_root, issuer_website=None, download=None,
-                            publication_catalog=None, publisher_proofs=None, allow_partial=False):
+                            publication_catalog=None, publisher_proofs=None, allow_partial=False,
+                            deposit_lookup=None, isin_lookup=None, deposit_pdf_fetch=None):
     if (not isinstance(identity, dict) or identity.get("status") != "confirmed"
             or identity.get("ticker") != ticker or not identity.get("name")
             or not identity.get("exchange") or not identity.get("currency")):
@@ -917,7 +1363,12 @@ def ingest_document_sources(ticker, identity, as_of, sources, *, archive_root, i
             if _host(fetched["url_finale"]) != _host(source["url"]):
                 raise ValueError("Public acquisition changed the publisher host")
             publication = _acquire_publication_companion(source["url"], ticker, identity, as_of, root, publication_catalog)
-            candidate, text = _verified_candidate(source, fetched, identity, as_of, root, publication)
+            deposit_resolver = ((lambda report_date, tipo: _acquire_deposit_companion(
+                ticker, tipo, report_date, as_of, root, deposit_lookup, issuer_name=identity["name"],
+                isin_lookup=isin_lookup, pdf_fetch=deposit_pdf_fetch))
+                if str(ticker).upper().endswith(".MI") else None)
+            candidate, text = _verified_candidate(source, fetched, identity, as_of, root, publication,
+                deposit_resolver=deposit_resolver)
             candidates.append({**candidate, "publication_receipt": publication, "status": "verified", "request": source, "url_finale": fetched["url_finale"], "bytes": fetched["bytes"], "content_type": fetched["content_type"], "text_sha256": sha256(text.encode()).hexdigest(),
                 **({"publisher_proof": deepcopy(proof)} if proof is not None else {})})
         except (ValueError, OSError, http.client.HTTPException, KeyError) as exc:
@@ -970,8 +1421,11 @@ def verify_document_receipt(receipt, ticker, identity, as_of, *, archive_root, i
         # Re-extract and reprove the original contract from the sealed raw bytes;
         # never silently rewrite the accepted fingerprint after a parser change.
         from bellomberg.market_data.lettore_trimestrali import LEGACY_HTML_TEXT_EXTRACTOR
+        sealed_deposit = metadata.get("deposit_receipt")
         candidate, text = _verified_candidate(source, {**row, "publisher": policy}, identity, as_of, root, publication,
-            text_extraction=metadata.get('text_extraction', LEGACY_HTML_TEXT_EXTRACTOR))
+            text_extraction=metadata.get('text_extraction', LEGACY_HTML_TEXT_EXTRACTOR),
+            deposit_resolver=(None if sealed_deposit is None else (lambda report_date, tipo:
+                verify_deposit_companion(sealed_deposit, root, ticker, tipo, report_date, as_of))))
         if candidate != {key: row[key] for key in candidate} or sha256(text.encode()).hexdigest() != row["text_sha256"]:
             raise ValueError("Accepted primary document text, metadata or locators changed")
         checked.append(candidate)
@@ -999,7 +1453,13 @@ def document_receipt_summary(receipt):
             "bytes": row.get("bytes"), "publisher_basis": (verification.get("publisher") or {}).get("basis"),
             "publication_basis": verification.get("publication_basis"),
             "publication_source_url": (verification.get("publication_receipt") or {}).get("source_url", row.get("url")),
-            "metadata_origins": verification.get("claim_origins"), "classification": row.get("classification", "unqualified")})
+            "metadata_origins": verification.get("claim_origins"), "classification": row.get("classification", "unqualified"),
+            **({"publication_declaration": verification["publication_declaration"]}
+               if verification.get("publication_declaration") else {}),
+            "pages_without_text": ((verification.get("textless_pages") or {}).get("pages", [])
+                                   if row.get("status") == "verified" else None),
+            **({"pages_without_text_limitation": verification["textless_pages"]["limitation"]}
+               if verification.get("textless_pages") else {})})
     return {"status": "verified" if all(row.get("status") == "verified" for row in receipt["documents"]) else "needs_verification",
             "contract": receipt['contract'], "fingerprint": receipt["fingerprint"], "documents": documents,
             "limitation": "Verified public documents are evidence for method-specific qualification, not approval of the investment thesis."}

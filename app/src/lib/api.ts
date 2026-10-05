@@ -4,6 +4,7 @@ import type { SalvaPreferenza } from '../i18n/preferenze';
 import type { TradeRequest, TradeResult, TradePreview } from './trade-entry';
 import type { OpeningPreview, OpeningRequest, OpeningResult } from './position-opening';
 import type { AnteprimaMandato, StatoMandato, ValoriMandato } from './mandato';
+import type { NewsRefreshJob, NewsRefreshJobResponse, NewsRefreshResponse } from './news-refresh';
 
 export const API_BASE = (window as any).bellomberg?.apiUrl || 'http://127.0.0.1:8765';
 
@@ -71,19 +72,32 @@ export interface FilingDiff {
   cambiamenti?: { tipo: string; prima?: FilingCitation; dopo?: FilingCitation }[];
   segmenti_non_confrontabili?: { prima?: FilingCitation; dopo?: FilingCitation }[];
   ambito?: string;
+  /** Fase F: «sequenziale» = trimestre precedente (emittente SEC nuovo, manca l'anno prima). */
+  regola?: 'sequenziale';
 }
 export interface FilingResult {
+  controllo_leggero?: boolean; run_riferimento?: number;
   stato: string; motivi?: string[]; candidati?: { fonte?: string; url?: string; stato: string; motivi?: string[]; sha256?: string; metadati?: Record<string, string> }[];
   copertura?: { stato?: string; limiti?: string[]; candidati_osservati?: number; max_documenti?: number; documenti_tentati?: number };
   freschezza?: { stato: string; checked_at?: string; ultimo_periodo?: string; next_report_date?: string; next_report_source?: string; verificato_il?: string; motivi?: string[] };
   fonti?: { nome?: string; stato?: string; motivi?: string[] }[];
-  coppia?: { ambito?: string; prima?: { url?: string; sha256?: string; metadati?: Record<string, string> }; dopo?: { url?: string; sha256?: string; metadati?: Record<string, string> } } | null;
+  coppia?: { ambito?: string; regola?: 'sequenziale'; prima?: { url?: string; sha256?: string; metadati?: Record<string, string> }; dopo?: { url?: string; sha256?: string; metadati?: Record<string, string> } } | null;
   confronto_corrente?: FilingDiff | null; confronto_storico?: FilingDiff | null;
   ultimo_non_verificato?: boolean;
+  /** Numeri chiave della coppia (filing_numeri.variazioni); `variante` se vengono da un'altra variante. */
+  numeri?: { stato: string; valuta?: string | null; voci?: { voce: string; prima: number; dopo: number; delta_pct: number | null }[];
+    fonte?: string; variante?: string; motivo?: string;
+    /** Fase F: numeri sul trimestre precedente, non sullo stesso periodo dell'anno prima. */
+    confronto?: 'trimestre_precedente' } | null;
+  /** Tipo della variante mostrata (annuale, semestrale, trimestrale, nove_mesi) e varianti del profilo. */
+  variante?: string;
+  varianti?: { tipo?: string; primaria?: boolean; regola?: 'sequenziale'; coppia_periodi?: (string | null)[]; completo?: boolean; motivi?: string[] }[];
 }
 export interface FilingRun {
   id: number; ticker: string; status: string; started_at?: string | null; finished_at?: string | null;
   trigger?: string; profile_version?: number | null; reason?: string | null;
+  /** Controllo periodico leggero: nessun deposito nuovo, nessun download ne' confronto. */
+  controllo_leggero?: boolean;
 }
 export interface FilingProfile {
   ticker: string; profile: Record<string, unknown>; version: number; enabled: boolean;
@@ -92,6 +106,132 @@ export interface FilingProfile {
 export interface FilingListing {
   ticker: string; status: string; reason?: string | null; profile: FilingProfile | null;
   runs: FilingRun[]; active_run: FilingRun | null;
+  /** Ultimo run completo (anche oltre i 20 run elencati); status/reason lo descrivono. */
+  ultimo_completo?: FilingRun | null;
+  /** Ultimo controllo leggero, se e' il run piu' recente. */
+  ultimo_controllo?: { at: string | null; esito: string | null } | null;
+  /** Ultimo run in errore successivo al confronto mostrato (dichiarato a parte). */
+  ultimo_errore?: { id: number; at: string | null; reason: string | null } | null;
+}
+export interface FilingCandidate { cik: string; ticker: string; nome: string; origine: 'ticker' | 'alias' | 'nome' | 'nome_simile' }
+export interface FilingEsefCandidate { lei: string; nome: string; origine: 'negozio' | 'nome' | 'nome_simile' }
+export interface FilingProposal {
+  ticker: string; nome?: string | null; profilo_attivo: boolean; escluso: boolean;
+  sec: { stato: 'univoco' | 'ambiguo' | 'nessuno' | 'errore'; candidati: FilingCandidate[]; motivo: string };
+  /** Presente solo quando SEC non e' univoco: emittente ESEF (filings.xbrl.org) per LEI. */
+  esef?: { stato: 'univoco' | 'ambiguo' | 'nessuno' | 'errore'; candidati: FilingEsefCandidate[]; motivo: string };
+  /** Fonte da proporre; assente sui backend precedenti (allora ESEF solo se SEC e' «nessuno»). */
+  preferita?: 'sec' | 'esef' | null;
+}
+/** `GET /filings/{t}/ai-estimate`: misure dell'input e costo massimo, nessuna chiamata al modello. */
+export interface FilingAiEstimate {
+  stato: 'ok' | 'not_configured'; ticker: string; url: string; sha256: string; pagine: number;
+  caratteri_input: number; righe: number; pagine_indice: number[]; troncato: number;
+  lingua_rilevata?: string | null; cache: boolean; modello?: string | null; variabile?: string;
+  token_input_stimati?: number; token_output_max?: number; costo_max_eur?: number | null;
+  costo_max_usd?: number | null; tariffe_origine?: 'listino' | 'openrouter' | 'n.d.'; motivo?: string | null;
+}
+export interface FilingAiSezione { nome: string; inizio: string; fine: string; caratteri: number; pagine: number[]; anteprima: string }
+/** `POST /filings/{t}/ai-proposal`: l'unica chiamata AI (pulsante); niente e' salvato prima dell'accettazione. */
+export interface FilingAiProposal {
+  /** in_corso/refused: contratto G2b 04/10 (lavoro sul server; rifiuto con `motivo`). */
+  stato: 'done' | 'not_configured' | 'error' | 'in_corso' | 'refused'; sha256?: string; url?: string; tipo?: string; lingua?: string;
+  job_id?: string | null; avviato_il?: string | null; secondi?: number | null; motivo?: string | null;
+  /** «Riprova» costa una nuova chiamata? (assente = non dichiarato: si tratta come a pagamento) */
+  riprova_paga?: boolean;
+  /** rifiuto per intervallo minimo fra due proposte dello stesso titolo: secondi da attendere */
+  riprova_tra_s?: number | null;
+  periodo?: { inizio: string; fine: string } | null; verificate?: FilingAiSezione[];
+  scartate?: { nome: string; motivo: string }[]; salvabile?: boolean; motivi?: string[];
+  /** Regole di verifica di ripiego usate al posto di quelle proposte (dichiarate). */
+  avvisi?: string[];
+  /** Le stesse regole provate sugli altri PDF indicati (es. anno prima): solo verifica locale. */
+  altri?: { url: string; stato: 'ok' | 'non_verificato'; periodo?: { inizio: string; fine: string } | null;
+    sezioni_ok: string[]; sezioni_mancanti: Record<string, string>; motivi: string[] }[];
+  modello?: string | null; costo_eur?: number | null; costo_usd?: number | null; cached?: boolean;
+  dettaglio?: string; variabile?: string;
+  /** Risposta pagata ma illeggibile: una nuova chiamata solo con «Riprova» (`riprova: true`). */
+  riprovabile?: boolean;
+}
+/** `GET /filings/{t}/ai-proposal`: ultima proposta in cache, senza download ne' chiamata AI. */
+export interface FilingAiProposalSalvata extends FilingAiProposal {
+  at?: string | null; da_riverificare?: boolean; accettata?: boolean;
+}
+export interface FilingAiAccept {
+  ticker: string; esito: 'salvato' | 'variante_aggiunta'; versione: number; sezioni: string[]; aggiornamento?: string;
+}
+export interface FilingActivation {
+  ticker: string; esito: 'attivato' | 'da_confermare' | 'senza_fonte' | 'escluso' | 'gia_attivo' | 'errore';
+  motivo?: string; profilo_versione?: number; fonte?: 'sec' | 'esef';
+}
+/** `GET /filings`: copertura del portafoglio vista dal Consigliere (filing_routes.overview). */
+export interface FilingOverviewTitolo {
+  ticker: string;
+  /** 0 novita' dall'ultima run del comitato, 1 cambiamenti, 2 nessun cambiamento, 3 senza confronto */
+  gruppo: 0 | 1 | 2 | 3;
+  stato_riga: string; fonte: string | null; ultimo_confronto: string | null;
+  /** run del confronto citato nella riga di stato (get_filing_changes run_id), null senza confronto */
+  run_id?: number | null;
+  novita: boolean; profilo: boolean; escluso: boolean;
+  /** Fase F: freschezza della riga di stato (null senza profilo); assente con un backend precedente. */
+  freschezza?: 'aggiornato' | 'non_aggiornato' | 'senza_confronto' | null;
+  /** Fase E (pagina Filing): stato canonico per la UI (filing_stato_ui.stato_ui) e suo gruppo. */
+  nome?: string | null;
+  stato?: FilingStatoUi;
+  gruppo_ui?: FilingGruppoUi;
+  /** «SEC 10-Q», «ESEF annuale», «ESEF annuale + IR semestrale» (filing_stato_ui.documento) */
+  documento?: string | null;
+  /** cambiamenti del confronto citato */
+  cambiamenti?: number;
+  run_attivo?: { id: number; started_at?: string | null; trigger?: string | null } | null;
+  ultimo_errore?: { at?: string | null; reason?: string | null } | null;
+  /** ultimo esito di attivazione salvato (attiva, attiva i mancanti, rifiuto, scollegamento) */
+  attivazione?: { esito: string; motivo?: string | null; candidati?: number | null; at?: string | null } | null;
+  /** Fase F: PDF IR trovati sul sito (ultima esplorazione in cache), solo per i titoli senza profilo */
+  pdf_ir?: FilingPdfIr | null;
+  /** proposta AI in cache non ancora salvata ne' scartata */
+  proposta_ai?: { sha256: string; url: string; at?: string | null; salvabile: boolean; verificate: number } | null;
+  /** solo il portafoglio entra nel contesto del Consigliere */
+  nel_contesto?: boolean;
+  prossimo_at?: string | null;
+}
+/** Fase F: documento periodico scelto tra i PDF del sito (tipo e periodo dedotti dal nome). */
+export interface FilingPdfDoc { url: string; testo: string; tipo: 'annuale' | 'semestrale' | 'trimestrale'; periodo: string }
+export interface FilingPdfIr {
+  tipo: FilingPdfDoc['tipo']; ultimo: FilingPdfDoc; precedente: FilingPdfDoc | null; candidati: number;
+  at?: string | null; sito?: string | null;
+}
+export type FilingStatoUi = 'novita' | 'aggiornato' | 'invariato' | 'in_corso' | 'primo_confronto' | 'errore'
+  | 'da_confermare' | 'proposta_ai' | 'senza_fonte' | 'non_attivo' | 'escluso';
+export type FilingGruppoUi = 'novita' | 'da_sistemare' | 'aggiornati' | 'senza_fonte';
+export interface FilingControlloGiornaliero {
+  attivo: boolean; forzato_spento_da_env: boolean; prossimo_at?: string | null; ultimo_fine_at?: string | null;
+}
+export interface FilingOverview {
+  ambito?: 'portafoglio' | 'preferiti';
+  controllo_giornaliero?: FilingControlloGiornaliero | null;
+  titoli: FilingOverviewTitolo[];
+  /** aggiornati / non_aggiornati / senza_confronto: la freschezza della riga di stato di ogni titolo con profilo */
+  copertura: { totale: number; con_confronto: number; aggiornati: number; non_aggiornati: number; senza_confronto?: number; senza_profilo: number; esclusi: number };
+  contesto: { caratteri: number; budget: number; omessi_totali: number };
+  /** stato del manager di aggiornamento (`status` = 'running' | 'idle' | ...), null se assente */
+  aggiornamento: { status?: string; trigger?: string; started_at?: string | null; finished_at?: string | null; error?: string | null } | null;
+}
+/** `POST /filings/activate-missing`: riepilogo per esito (filing_attivazione.attiva_mancanti). */
+export interface FilingActivateMissing {
+  attivati: string[]; da_confermare: string[]; senza_fonte: string[]; esclusi: string[]; gia_attivi: string[];
+  /** titoli scollegati dall'utente: saltati dall'attivazione in blocco (fase E) */
+  scollegati?: string[];
+  errori: { ticker: string; motivo: string }[];
+  /** presente solo quando il manager e' gia' al lavoro: testo del backend, sempre in italiano */
+  aggiornamento?: string;
+}
+/** `GET /filings/{t}/context-preview`: la riga che il Consigliere riceve per quel titolo. */
+export interface FilingContextPreview {
+  ticker: string; testo: string; caratteri: number; omessi: number;
+  /** ID dei cambiamenti («C3») nell'ordine del punteggio del contesto (fase E) */
+  in_evidenza?: string[];
+  contesto_totale: { caratteri: number; budget: number }; nota: string;
 }
 export interface FilingRunDetail extends FilingRun {
   result?: FilingResult | null;
@@ -187,6 +327,9 @@ export interface Position {
   // il fx). Campi assenti (backend vecchio) o null = n.d. DICHIARATO, mai 0.
   prev_close?: number | null;
   prev_close_ts?: string | null;
+  // 17/09: da dove viene prev_close — "tradegate" (chiusura di sede, orologio
+  // TR) | "position_prices" | "carico" | null (n.d. dichiarato).
+  prev_close_source?: string | null;
   fx_to_eur?: number;
   // regola no-fallback 14/07: senza snapshot prezzo la riga vale il COSTO
   price_stale?: boolean;
@@ -233,6 +376,18 @@ export interface Decision {
   timestamp: string;
   action: string;
   ticker: string;
+  proposal_action?: string | null;
+  proposal_ticker?: string | null;
+  proposal_ticker_cell?: string | null;
+  proposal_row_index?: number | null;
+  assessment_status?: 'OPERATIVE' | 'BLOCKED' | 'OVERRIDE_PENDING' | 'CHECK_UNAVAILABLE' | null;
+  assessment_reason?: string | null;
+  assessment_override_rationale?: string | null;
+  manual_divergences?: Array<{
+    id: number; actor: string; reason: string; created_at: string;
+    details: { trade_id: number; ticker_proposto: string; ticker_eseguito: string;
+      trade_action: string; trade_data: string; isin?: string | null };
+  }>;
   eur_amount: number | null;
   timing: string;
   confidence: string;
@@ -620,6 +775,12 @@ export interface PortfolioRisk {
     var_95_1d_eur: number; var_99_1d_eur: number;
     beta_vs_spy: number; max_dd_1y_pct: number;
   };
+  /** Stesse metriche su SPY (EUR, stessi giorni). Assente/null = backend vecchio o SPY n.d. */
+  benchmark?: {
+    ticker: string; vol_annual_pct: number; sharpe: number;
+    var_95_1d_pct: number; var_99_1d_pct: number;
+    beta_vs_spy: number; max_dd_1y_pct: number; n_obs: number;
+  } | null;
   per_asset: Record<string, AssetRisk>;
   correlation: { tickers: string[]; matrix: number[][] };
   alerts: RiskAlert[];
@@ -650,10 +811,26 @@ export interface UltimoGiro {
   age_minutes?: number | null;
   fetched?: number;
   classified?: number;
+  classification_attempted?: number;
+  classification_failed?: number;
   saved?: number;
   skipped_duplicates?: number;
   providers_blocked?: Record<string, string> | null;
   motivo?: string | null;
+}
+
+/** Consumo del budget di un provider contingentato (backend 02/10/2026, zero rete). */
+export interface NewsProviderBudget {
+  used: number; daily: number; allowed_now: number | null; pace: [number, number] | null; next_call_at: string | null;
+}
+
+export interface NewsProvidersResponse extends FontiMuteFields {
+  providers_contingentati?: string[];
+  budget?: Record<string, NewsProviderBudget>;
+  ultimo_giro?: UltimoGiro | null;
+  refresh_job?: NewsRefreshJob | null;
+  nota?: string;
+  timestamp: string;
 }
 
 export interface NewsItem {
@@ -718,6 +895,16 @@ export interface GlobalNewsItem {
   published_at: string | null;
 }
 
+/** Riassunto AI di un articolo (backend: market_data/article_summary.py). Cache per notizia e lingua. */
+export type ArticleSummaryResult =
+  | { status: 'none' }
+  | { status: 'done'; news_id: number; summary: string; points: string[]; key_numbers: string[]; portfolio: string;
+      model: string; cost_eur: number | null; cost_usd: number | null; cost_status: string; words: number;
+      duration_s: number; created_at: string; language: 'it' | 'en'; cached: boolean }
+  | { status: 'not_configured'; variable: string }
+  | { status: 'unreadable'; reason: 'paywall' | 'blocked' | 'too_short' | 'not_html' | 'fetch' | 'unsafe_url' | 'no_url'; detail: string }
+  | { status: 'error'; detail: string };
+
 export interface BriefingData {
   error_code?: string | null;
   language?: 'it' | 'en' | null;
@@ -747,6 +934,12 @@ export interface EconomicEvent {
   estimate?: number | string | null;
   actual?: number | string | null;
   unit?: string;
+  /** true when the date is estimated from a recurring release window, not an official date */
+  date_estimated?: boolean;
+  /** Earnings only: the portfolio ticker the release belongs to */
+  ticker?: string;
+  /** Earnings only: where the date comes from */
+  source?: 'finnhub' | 'yfinance';
 }
 
 export interface NewsTopicMeta {
@@ -855,15 +1048,52 @@ export interface MktQuote { ticker: string; name: string; exchange?: string; cur
   high_52w?: number; low_52w?: number; volume?: number; avg_volume?: number; sector?: string; industry?: string;
   target_mean?: number; recommendation?: string; short_pct_float?: number; summary?: string;
   ev?: number; ev_ebitda?: number; ev_sales?: number; peg?: number; pb?: number; fcf?: number; }
-export interface MktNewsItem { title: string; link?: string; publisher?: string; published?: string | number; }
+export interface MktNewsItem {
+  title: string; link?: string; publisher?: string; published?: string | number;
+  /** where the item comes from: Yahoo news of the symbol, or Yahoo search */
+  source?: 'yahoo_ticker_news' | 'yahoo_search';
+  /** how it was matched: by symbol, or by company NAME (may concern another company) */
+  match?: 'simbolo' | 'nome';
+  /** the company name used for a by-name match */
+  match_query?: string;
+}
+/** /market/news: `errori` lists every route that failed (never an empty list in silence) */
+export interface MktNewsResponse { ticker: string; symbol?: string; items: MktNewsItem[]; errori?: string[] | null; }
 export interface FinBlock { years: (number | string)[]; rows: Record<string, (number | null)[]>; }
 export interface MktFinancials { ticker: string; statements?: { income: FinBlock; balance: FinBlock; cashflow: FinBlock }; error?: string; }
 export interface MktHolders { ticker: string; major: { label: string; value: number | string | null }[]; institutional: Record<string, any>[]; }
 export interface MktOverviewRow { ticker: string; name: string; price?: number | null; change_pct?: number | null; }
+/** Stato dichiarato di una fonte di mercato: `ok` oppure `non_disponibile` con il motivo. */
+export interface MktFonteStato { stato: 'ok' | 'non_disponibile' | string; motivo?: string | null; fonte?: string | null; n?: number }
 export interface MktOverview { country: string; countries: string[]; indici: MktOverviewRow[]; azioni: MktOverviewRow[];
-  commodities: MktOverviewRow[]; valute: MktOverviewRow[]; obbligazioni: MktOverviewRow[]; futures: MktOverviewRow[]; }
+  commodities: MktOverviewRow[]; valute: MktOverviewRow[]; obbligazioni: MktOverviewRow[]; futures: MktOverviewRow[];
+  /** Fonte delle azioni del paese (screener): con `non_disponibile` le azioni possono essere []. */
+  azioni_fonte?: MktFonteStato; }
+export interface MktMoverRow extends MktOverviewRow { country: string; }
+/** Le azioni più grandi per capitalizzazione di ogni paese (fino a 20, dal provider). Nulla disponibile:
+ *  `azioni: []` e `motivo` valorizzato; `paesi` dichiara lo stato paese per paese. */
+export interface MktMovers { azioni: MktMoverRow[]; paesi?: Record<string, MktFonteStato>; fonte?: string; motivo?: string | null; }
+export interface MktNewsTranslation { status: 'done' | 'not_configured' | 'error'; titles?: string[]; language?: string;
+  cached?: boolean; complete?: boolean; model?: string | null; cost_eur?: number | null; variable?: string; detail?: string; }
 export interface OhlcBar { t: number; o: number; h: number; l: number; c: number; v: number; }
 export interface OhlcResponse { ticker: string; period: string; interval: string; bars: OhlcBar[]; error?: string; }
+
+// Gap-days 17/09: una riga per seduta di borsa della finestra. `forming` = la
+// close di oggi non e' ancora ufficiale (live snapshot vs ultima chiusura);
+// `missing` = nomi senza close su quel giorno (n.d. dichiarato, mai 0).
+export interface GapDay {
+  pnl_eur: number; pnl_pct: number | null; invested_start_eur: number;
+  forming: boolean; missing: string[]; tickers: Record<string, number>;
+}
+export interface GapDaysResponse {
+  window: { start: string; end: string; today: string } | null;
+  days: Record<string, GapDay>;
+  stub_eur: number | null; window_check_eur: number | null; window_live_eur: number | null;
+  baseline_gap_eur?: number | null;
+  qty_stable: boolean | null; qty_nota: string | null;
+  unpriced: string[]; no_baseline: string[]; approx_today?: string[];
+  sources: string | null; nota?: string | null; error?: string | null;
+}
 
 export interface NavHistory {
   dates: string[];
@@ -900,6 +1130,20 @@ export interface AttributionPosition {
   cross_pct: number;
   avg_weight_pct: number;
   currency: string;
+}
+export type AttributionPeriod = 'MTD' | '30D' | '1W' | '3M' | 'YTD' | 'INCEPTION';
+/** Episodio di drawdown sull'indice TWR (portfolio_tearsheet._drawdown_episodes). */
+export interface TearsheetDrawdown {
+  start_date: string; trough_date: string; depth_pct: number; days_to_trough: number;
+  recovery_date: string | null; days_total: number | null; open: boolean;
+}
+export interface TearsheetPayload {
+  drawdowns?: {
+    top: TearsheetDrawdown[];
+    current: (Omit<TearsheetDrawdown, 'recovery_date'> & { current_dd_pct: number }) | null;
+    n_episodes_total: number;
+  };
+  error?: string;
 }
 export interface AttributionPayload {
   period?: { label: string; base_day: string; end: string; n_trading_days: number };
@@ -1210,6 +1454,47 @@ export const Bellomberg = {
   filingList: (ticker: string) => api.get<FilingListing>(`/filings/${encodeURIComponent(ticker)}`).then(r => r.data),
   filingRun: (runId: number) => api.get<FilingRunDetail>(`/filings/runs/${encodeURIComponent(runId)}`).then(r => r.data),
   filingRefresh: (ticker: string) => api.post<{run_id: number; status: 'queued'}>(`/filings/${encodeURIComponent(ticker)}/refresh`).then(r => r.data),
+  filingProposal: (ticker: string) => api.get<FilingProposal>(`/filings/${encodeURIComponent(ticker)}/proposal`).then(r => r.data),
+  /** Senza scelta attiva la fonte univoca; `cik` conferma un emittente SEC, `lei` uno ESEF (mai entrambi). */
+  filingActivate: (ticker: string, scelta?: { cik?: string; lei?: string }) =>
+    api.post<FilingActivation>(`/filings/${encodeURIComponent(ticker)}/activate`,
+      scelta?.cik ? { cik: scelta.cik } : scelta?.lei ? { lei: scelta.lei } : {}).then(r => r.data),
+  /** Stima gratuita (scarica il PDF indicato e misura l'input); nessuna chiamata AI. */
+  filingAiEstimate: (ticker: string, url: string) =>
+    api.get<FilingAiEstimate>(`/filings/${encodeURIComponent(ticker)}/ai-estimate`, { params: { url } }).then(r => r.data),
+  /** Fase F: esplora il sito e sceglie i PDF IR (gratis, nessuna AI, nessun PDF scaricato). */
+  filingSearchPdf: (ticker: string) =>
+    api.post<{ ticker: string; pdf_ir: FilingPdfIr | null; sito: string | null; pagine: number; motivi: string[] }>(
+      `/filings/${encodeURIComponent(ticker)}/search-pdf`, {}).then(r => r.data),
+  /** UNICA chiamata AI del filing: solo dal pulsante «Proponi con AI». Il server attende ~20 s; se il
+   *  lavoro continua risponde {stato:'in_corso', job_id} e si legge filingAiProposalJob (lib/filing-ai-job). */
+  filingAiProposal: (ticker: string, url: string, altri: string[] = [], riprova = false) =>
+    api.post<FilingAiProposal>(`/filings/${encodeURIComponent(ticker)}/ai-proposal`,
+      { url, ...(altri.length ? { altri_url: altri } : {}), ...(riprova ? { riprova: true } : {}) }).then(r => r.data),
+  /** Stato del lavoro della proposta AI (contratto G2b 04/10: 404 se job sconosciuto o di un altro titolo). */
+  filingAiProposalJob: (ticker: string, jobId: string) =>
+    api.get<FilingAiProposal>(`/filings/${encodeURIComponent(ticker)}/ai-proposal/job/${encodeURIComponent(jobId)}`).then(r => r.data),
+  filingAiAccept: (ticker: string, body: { sha256: string; ir_urls: string[]; sostituisci?: boolean; aggiungi_variante?: boolean }) =>
+    api.post<FilingAiAccept>(`/filings/${encodeURIComponent(ticker)}/ai-proposal/accept`, body).then(r => r.data),
+  filingOverview: () => api.get<FilingOverview>('/filings').then(r => r.data),
+  filingActivateMissing: () => api.post<FilingActivateMissing>('/filings/activate-missing').then(r => r.data),
+  filingContextPreview: (ticker: string) =>
+    api.get<FilingContextPreview>(`/filings/${encodeURIComponent(ticker)}/context-preview`).then(r => r.data),
+  filingOverviewAmbito: (ambito: 'portafoglio' | 'preferiti') =>
+    api.get<FilingOverview>('/filings', { params: { ambito } }).then(r => r.data),
+  filingNovita: () => api.get<{ n: number; tickers: string[] }>('/filings/novita').then(r => r.data),
+  filingAutoRefresh: (attivo: boolean) => api.put<{ attivo: boolean }>('/filings/auto-refresh', { attivo }).then(r => r.data),
+  filingReject: (ticker: string, scelta: { cik?: string | string[]; lei?: string | string[] }) =>
+    api.post<{ ticker: string; proposta: FilingProposal; esito: string }>(`/filings/${encodeURIComponent(ticker)}/reject`, scelta).then(r => r.data),
+  filingUnlink: (ticker: string) =>
+    api.post<{ ticker: string; esito: 'scollegato'; versione: number }>(`/filings/${encodeURIComponent(ticker)}/unlink`, {}).then(r => r.data),
+  filingExclude: (ticker: string, escluso: boolean) =>
+    api.post<{ ticker: string; escluso: boolean }>(`/filings/${encodeURIComponent(ticker)}/exclude`, { escluso }).then(r => r.data),
+  /** Ultima proposta AI in cache: gratis, nessun download ne' chiamata al modello. */
+  filingAiSaved: (ticker: string) =>
+    api.get<FilingAiProposalSalvata>(`/filings/${encodeURIComponent(ticker)}/ai-proposal`).then(r => r.data),
+  filingAiDiscard: (ticker: string, sha256: string) =>
+    api.post<{ ticker: string; sha256: string; scartata: boolean }>(`/filings/${encodeURIComponent(ticker)}/ai-proposal/discard`, { sha256 }).then(r => r.data),
   filingSaveProfile: (ticker: string, data: { profile: Record<string, unknown>; enabled: boolean; interval_hours: number; qualitative_enabled: boolean }) =>
     api.put<FilingProfile>(`/filings/${encodeURIComponent(ticker)}/profile`, data).then(r => r.data),
   memoById: (id: number) => api.get<Memo>(`/memos/${id}`).then(r => r.data),
@@ -1242,6 +1527,9 @@ export const Bellomberg = {
   // F10-C (PM 17/07): archivia / riporta in pagina (true/false; null = automatico)
   setDecisionArchive: (id: number, archived: boolean | null) =>
     api.post(`/decisions/${id}/archive`, { archived }).then(r => r.data),
+  // Verifica ISIN e divergenza manuale NON hanno piu' chiamate proprie qui:
+  // viaggiano nel corpo di previewTrade/logTrade e il backend le scrive nella
+  // transazione del trade confermato (tabelle append-only: mai prima della conferma).
   // La risposta porta `cash_note`: e' il campo con cui il backend dichiara di
   // NON essere riuscito ad aggiornare la cassa dopo aver scritto il trade
   // (bellomberg_api.py:1654-1682). Tipizzato apposta: finche' era `any`, un
@@ -1306,7 +1594,7 @@ export const Bellomberg = {
     method?: 'parametric_t'|'fhs'|'block_bootstrap';
     drift_mode?: 'zero'|'shrinkage'|'historical';
     stress?: 'none'|'gfc_2008'|'covid_2020'|'shock_3sigma';
-    add?: string; remove?: string; force?: boolean;
+    add?: string; remove?: string; force?: boolean; sample_paths_n?: number;
   } = {}) =>
     api.get<MonteCarloResult>('/portfolio/montecarlo', { params, timeout: 120000 }).then(r => r.data),
   portfolioMonteCarloV3: (body: {
@@ -1351,18 +1639,30 @@ export const Bellomberg = {
     api.get<BenchmarkPayload>('/portfolio/analytics/benchmark', { params: force ? { ticker, force: true } : { ticker }, timeout: 120000 }).then(r => r.data),
   // Quant fase 1b (36): contribution attribution (Carino) per posizione/bucket/valuta.
   // Prima chiamata puo' scaricare candele (lenta), poi cache server 10min day-aware.
-  attribution: (period: 'MTD' | '30D' | 'YTD' | 'INCEPTION' = 'YTD') =>
+  attribution: (period: AttributionPeriod = 'YTD') =>
     api.get<AttributionPayload>('/portfolio/attribution', { params: { period }, timeout: 120000 }).then(r => r.data),
+  // Tearsheet sul TWR ufficiale (fase 1c): qui servono gli episodi di drawdown sull'indice TWR.
+  tearsheet: (force = false) =>
+    api.get<TearsheetPayload>('/portfolio/tearsheet', { params: force ? { force: true } : {}, timeout: 90000 }).then(r => r.data),
   ohlc: (ticker: string, period = '1y', interval = '1d') =>
     api.get<OhlcResponse>('/market/ohlc', { params: { ticker, period, interval }, timeout: 60000 }).then(r => r.data),
+  // Gap-days 17/09: scomposizione della finestra multi-seduta per seduta di
+  // borsa (chiusure Yahoo + live). Prima chiamata scarica lo storico (lenta),
+  // poi cache server 10min. Solo giorni con sedute, mai un finto daily.
+  gapDays: (force = false) =>
+    api.get<GapDaysResponse>('/portfolio/gap_days', { params: force ? { force: true } : {}, timeout: 120000 }).then(r => r.data),
   mktSearch: (q: string) =>
     api.get<{results: MktSearchHit[]}>('/market/search', { params: { q }, timeout: 15000 }).then(r => r.data),
   mktOverview: (country = 'US') =>
     api.get<MktOverview>('/market/overview', { params: { country }, timeout: 30000 }).then(r => r.data),
+  mktMovers: () =>
+    api.get<MktMovers>('/market/movers', { timeout: 45000 }).then(r => r.data),
+  mktNewsTranslate: (titles: string[]) =>
+    api.post<MktNewsTranslation>('/market/news/translate', { titles }, { timeout: 60000 }).then(r => r.data),
   mktQuote: (ticker: string) =>
     api.get<MktQuote>('/market/quote', { params: { ticker }, timeout: 30000 }).then(r => r.data),
   mktNews: (ticker: string) =>
-    api.get<{ticker: string; items: MktNewsItem[]}>('/market/news', { params: { ticker }, timeout: 30000 }).then(r => r.data),
+    api.get<MktNewsResponse>('/market/news', { params: { ticker }, timeout: 30000 }).then(r => r.data),
   favorites: () => api.get<{favorites: FavCompany[]}>('/favorites').then(r => r.data),
   favAdd: (f: FavCompany) => api.post('/favorites', null, { params: f }).then(r => r.data),
   favDel: (ticker: string) => api.delete(`/favorites/${ticker}`).then(r => r.data),
@@ -1383,11 +1683,13 @@ export const Bellomberg = {
     api.get<{ count: number; items: NewsItem[]; timestamp: string } & FontiMuteFields>('/news/feed', { params }).then(r => r.data),
   // lettura LEGGERA: il backend legge data/news_feed_status.json, zero provider
   newsProviders: () =>
-    api.get<{ providers_contingentati?: string[]; ultimo_giro?: UltimoGiro | null;
-              nota?: string; timestamp: string } & FontiMuteFields>('/news/providers').then(r => r.data),
+    api.get<NewsProvidersResponse>('/news/providers').then(r => r.data),
+  /** Stato di un job di refresh (contratto G3 04/10: 404 se l'id è sconosciuto; tiene gli ultimi 20). */
+  newsRefreshJob: (jobId: string) =>
+    api.get<NewsRefreshJobResponse>('/news/feed/refresh', { params: { job_id: jobId } }).then(r => r.data),
   newsFeedRefresh: (days = 1, classify = true) =>
-    api.post<{ fetched: number; classified: number; saved: number; skipped_duplicates: number } & FontiMuteFields>(
-      '/news/feed/refresh', null, { params: { days, classify }, timeout: 180000 }
+    api.post<NewsRefreshResponse & FontiMuteFields>(
+      '/news/feed/refresh', null, { params: { days, classify }, timeout: 30000 }
     ).then(r => r.data),
   // ===== NEW: Bloomberg-style news terminal =====
   newsMacro: (params: {
@@ -1414,9 +1716,14 @@ export const Bellomberg = {
     api.post<BriefingData>('/news/briefing/refresh', null, {
       params: period ? { period } : {}, timeout: 90000,
     }).then(r => r.data),
-  economicCalendar: (days_ahead = 7) =>
+  economicCalendar: (days_ahead = 7, earnings_days_ahead?: number) =>
     api.get<{ count: number; items: EconomicEvent[]; timestamp: string }>(
-      '/news/economic-calendar', { params: { days_ahead } }
+      '/news/economic-calendar', { params: earnings_days_ahead ? { days_ahead, earnings_days_ahead } : { days_ahead } }
+    ).then(r => r.data),
+  /** Company logos as data: URLs (downloaded once by the backend, kept in data/loghi). */
+  marketLogos: (tickers: string[]) =>
+    api.get<{ logos: Record<string, string | null>; motivi?: Record<string, string>; fonti?: Record<string, string> }>(
+      '/market/logos', { params: { tickers: tickers.join(',') }, timeout: 60000 }
     ).then(r => r.data),
   newsTopicsList: () =>
     api.get<{ categories: Record<string, string>; topics: NewsTopicMeta[] }>('/news/topics').then(r => r.data),
@@ -1429,6 +1736,11 @@ export const Bellomberg = {
     }>}>('/news/alerts/unnotified', { params: { min_relevance, limit } }).then(r => r.data),
   newsAlertsMarkNotified: (ids: number[]) =>
     api.post<{ updated: number }>('/news/alerts/mark-notified', ids).then(r => r.data),
+  // Riassunto AI dell'articolo: GET legge solo la cache (gratis), POST lo genera (crediti OpenRouter).
+  newsArticleSummary: (newsId: number) =>
+    api.get<ArticleSummaryResult>(`/news/${newsId}/article-summary`).then(r => r.data),
+  newsArticleSummaryRun: (newsId: number, regenerate = false) =>
+    api.post<ArticleSummaryResult>(`/news/${newsId}/article-summary`, null, { params: { regenerate }, timeout: 120000 }).then(r => r.data),
   // Database backups
   dbBackupCreate: () =>
     api.post<{ ok: boolean; backup_path: string; size_mb: number; files_count: number; files: string[]; db_quick_check: Record<string, string>; timestamp: string }>(

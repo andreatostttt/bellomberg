@@ -80,6 +80,9 @@ async function runner() {
     } else if (route === '/portfolio') out = { positions: [], cash_disponibile_eur: null, cash_source: 'uninitialized' };
     else if (route === '/fx') out = { rates: { EUR: 1 } };
     else if (route === '/tasks/scheduled') out = { tasks: [] };
+    // The shell's global price refresh (Layout -> lib/price-refresh) may attempt its pull; the fixture refuses it,
+    // as in desktop/trade/f13/f18.
+    else if (route === '/prices/update' && req.method === 'POST') { status = 409; out = { detail: 'Synthetic test: automatic price refresh intercepted' }; }
     else if (route === '/db/backups') out = { backups: [], count: 0 };
     else if (route === '/agents/list') out = { agents: [], engines: {} };
     else if (route === '/mandato') out = { dichiarato: true, causa: null, dettaglio: null, campi_mancanti: [], valori: {}, origine: 'synthetic', impronta: 'fixture', campi: [], errori: [], esempio: {} };
@@ -160,7 +163,8 @@ async function runner() {
     const report = JSON.parse(line.slice(MARK.length));
     assert.equal(code, 0, JSON.stringify(report)); assert.equal(report.ok, true, JSON.stringify(report));
     assert.equal(requests.filter(request => request.route === '/trade-ideas/runs' && request.method === 'POST').length, 1);
-    assert.ok(requests.filter(request => request.method === 'POST' || request.method === 'PUT').every(request => ['/trade-ideas/preflight', '/trade-ideas/runs', '/trade-ideas/runs/fixture-running/stop', '/trade-ideas/runs/fixture-rejected/email/retry', '/trade-ideas/runs/fixture-incomplete/email/retry', '/preferences'].includes(request.route)));
+    assert.ok(requests.filter(request => request.method === 'POST' || request.method === 'PUT').every(request => ['/trade-ideas/preflight', '/trade-ideas/runs', '/trade-ideas/runs/fixture-running/stop', '/trade-ideas/runs/fixture-rejected/email/retry', '/trade-ideas/runs/fixture-incomplete/email/retry', '/preferences'].includes(request.route)
+      || (request.method === 'POST' && request.route === '/prices/update')));
     fs.writeFileSync(path.join(proof, 'qa.json'), JSON.stringify({ ...report, requests }, null, 2));
     console.log(JSON.stringify({ ...report, proof, requests: requests.length }));
   } finally {

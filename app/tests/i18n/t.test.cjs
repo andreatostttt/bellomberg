@@ -104,3 +104,39 @@ test('sottoscrizioni: cambio lingua notificato senza remount, nessun evento per 
   assert.equal(lingua.linguaCorrente(), 'en');
   lingua.impostaLinguaCorrente('it');
 });
+
+test('trade manuale correlato e identita ISIN hanno testi completi in italiano e inglese', () => {
+  const chiavi = [
+    'trade.manual_divergence_label', 'trade.manual_divergence_not_execution',
+    'trade.manual_divergence_none', 'trade.manual_divergence_explanation',
+    'trade.manual_divergence_requires_blocked',
+    'trade.manual_divergence_reason_required', 'trade.manual_divergence_identity_required',
+    'trade.manual_divergence_recorded', 'trade.manual_divergence_failed',
+    'trade.manual_divergence_missing_trade_id', 'trade.identity_different_tickers',
+    'trade.identity_same_ticker', 'trade.identity_check_required_short',
+    'trade.identity_isin_label', 'trade.identity_source_label',
+    'trade.identity_verified_at_label', 'trade.identity_reason_label',
+    'decisiondesk.manual_divergence_title', 'decisiondesk.manual_divergence_trade',
+    'decisiondesk.manual_divergence_isin', 'decisiondesk.record_manual_divergence',
+  ];
+  const parametri = {
+    ticker: 'ZETA.L', reason: 'test reason', proposal: 'ZETA.L', execution: 'ZETA1.DE',
+    id: 41, action: 'BUY', date: '22/09/2026', isin: 'GB0000000001',
+  };
+  const renderizzati = {};
+  const errori = conConsoleError(() => {
+    for (const codice of ['it', 'en']) {
+      renderizzati[codice] = Object.fromEntries(chiavi.map(k => [k, t.traduci(codice, k, parametri)]));
+      for (const [chiave, testo] of Object.entries(renderizzati[codice])) {
+        assert.ok(!testo.includes('⟦'), `${codice}:${chiave} deve esistere nel catalogo`);
+      }
+    }
+  });
+  assert.deepEqual(errori, [], 'le chiavi usate dalla UI non devono generare fallback mancanti');
+  assert.match(renderizzati.it['trade.identity_different_tickers'], /ticker proposta.*broker/i);
+  assert.match(renderizzati.en['trade.identity_different_tickers'], /proposed ticker.*broker ticker/i);
+  assert.match(renderizzati.it['decisiondesk.manual_divergence_title'], /non esecuzione/i);
+  assert.match(renderizzati.en['decisiondesk.manual_divergence_title'], /not execution/i);
+  assert.notEqual(renderizzati.it['trade.manual_divergence_label'], renderizzati.en['trade.manual_divergence_label']);
+  assert.ok(!t.traduci('en', 'trade.manual_divergence_failed', { reason: 'backend refused' }).includes('{reason}'));
+});

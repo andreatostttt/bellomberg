@@ -70,6 +70,127 @@ _SYSTEM = (
 _WINDOW_CHARS = 12000  # ampiezza invariata: e' il contratto di costo (~5k token in)
 
 
+def _split_markdown_row(line: str) -> list[str]:
+    """Split a Markdown table row while respecting escaped pipes."""
+    value = (line or "").strip()
+    if value.startswith("|"):
+        value = value[1:]
+    if value.endswith("|") and not value.endswith("\\|"):
+        value = value[:-1]
+    return [part.replace(r"\|", "|").strip() for part in _re.split(r"(?<!\\)\|", value)]
+
+
+def _header_key(value: str) -> str:
+    value = _re.sub(r"[*_`]+", "", str(value or "")).strip().lower()
+    value = _re.sub(r"[^a-zà-ÿ0-9]+", " ", value)
+    value = " ".join(value.split())
+    aliases = {
+        "action": {"action", "azione", "decision", "decisione"},
+        "ticker": {"ticker", "symbol", "strumento", "titolo"},
+        "size": {"size", "eur", "amount", "importo", "taglia", "dimensione", "peso"},
+        "timing": {"timing", "when", "orizzonte", "tempo"},
+        "confidence": {"confidence", "conviction", "confidenza"},
+    }
+    return next((key for key, values in aliases.items()
+                 if value in values or any(value.startswith(alias + " ") for alias in values)), value)
+
+
+def _ticker_from_cell(value: str) -> str:
+    """Extract the leading security symbol without changing its spelling."""
+    cell = str(value or "").strip()
+    # Markdown link label, bold/italic and inline code wrappers are presentation.
+    link = _re.match(r"^\[([^\]]+)\]\([^)]*\)", cell)
+    if link:
+        cell = link.group(1).strip()
+    cell = _re.sub(r"^\*{1,3}|\*{1,3}$|^_{1,3}|_{1,3}$|^`+|`+$", "", cell).strip()
+    match = _re.match(r"([A-Za-z0-9^][A-Za-z0-9.^=_-]{0,19})", cell)
+    return match.group(1) if match else ""
+
+
+def parse_action_table_rows(memo_markdown: str) -> dict:
+    """Parse ACTION TABLE rows locally, preserving the ticker written in each cell.
+
+    04/10 (G6, review 04 G1/G5): this is the ONLY ACTION TABLE parser. The
+    validator, the publication gate, the projection and the decision register
+    all read these rows, so a row index means the same row everywhere.
+    Rules: the table is the FIRST Markdown table after the heading and ends at
+    the first blank or non-table line (a second table in the section, e.g. a
+    watchlist, is not proposals); indented lines continue the previous row;
+    header and action cells lose their Markdown decoration (`**BUY**` is BUY).
+
+    Returns rows with a zero-based index over all data rows, `ticker_cell` as
+    the source cell, `line_index` (position in ``memo_markdown.splitlines()``),
+    `raw` (the source line) and `action_cell`. `table_lines` is the
+    [start, end) line range of the table. A header that does not name the
+    action, ticker and size columns returns no rows and a declared `error`.
+    """
+    text = memo_markdown or ""
+    lines = text.splitlines()
+    heading = next((i for i, line in enumerate(lines)
+                    if _re.match(r"^##\s*ACTION\s+TABLE\b", line, _re.IGNORECASE)), None)
+    if heading is None:
+        return {"rows": [], "table_found": False, "table_lines": None, "error": None}
+    table_rows = []          # (line_index, cells, raw)
+    start = end = None
+    for i in range(heading + 1, len(lines)):
+        raw_line = lines[i]
+        if _re.match(r"^##\s+", raw_line):
+            break
+        if raw_line.strip().startswith("|"):
+            if start is None:
+                start = i
+            table_rows.append((i, _split_markdown_row(raw_line), raw_line))
+            end = i + 1
+        elif start is not None and raw_line and raw_line[0].isspace() and raw_line.strip():
+            # Markdown continuation lines are attached to the trailing cell of
+            # the previous row. The ticker cell remains exactly as written.
+            table_rows[-1][1][-1] += " <br> " + raw_line.strip()
+            end = i + 1
+        elif start is not None:
+            break            # blank line or prose: the ACTION TABLE is over
+    table_lines = [start, end] if start is not None else None
+    if len(table_rows) < 2:
+        return {"rows": [], "table_found": True, "table_lines": table_lines, "error": None}
+
+    header_cells = table_rows[0][1]
+    header = [_header_key(c) for c in header_cells]
+    # Il gate ha bisogno di azione, ticker e importo; timing e confidence (le altre due
+    # colonne del formato del Capo) restano vuote se mancano, non rendono illeggibile la tabella.
+    required = {"action", "ticker", "size"}
+    if not required.issubset(set(header)):
+        missing = sorted(required - set(header))
+        return {"rows": [], "table_found": True, "table_lines": table_lines,
+                "error": "intestazione ACTION TABLE illeggibile: colonne mancanti " + ", ".join(missing)}
+    indices = {key: header.index(key) for key in required | ({"timing", "confidence"} & set(header))}
+    rows = []
+    for line_index, cells, raw_line in table_rows[1:]:
+        if not cells or not any(c.strip() for c in cells):
+            continue
+        if all(_re.fullmatch(r":?-{3,}:?", c.replace(" ", "")) for c in cells):
+            continue
+        if len(cells) <= max(indices.values()):
+            cells = cells + [""] * (max(indices.values()) + 1 - len(cells))
+        action_cell = cells[indices["action"]].strip()
+        action = _re.sub(r"[*_`]+", "", action_cell).strip()
+        ticker_cell = cells[indices["ticker"]].strip()
+        ticker = _ticker_from_cell(ticker_cell)
+        rows.append({
+            "row_index": len(rows),
+            "line_index": line_index,
+            "raw": raw_line,
+            "action_cell": action_cell,
+            "action": action.upper(),
+            "ticker": ticker,
+            "ticker_cell": ticker_cell,
+            "size_raw": cells[indices["size"]].strip(),
+            "timing": cells[indices["timing"]].strip() if "timing" in indices else "",
+            "confidence": cells[indices["confidence"]].strip() if "confidence" in indices else "",
+            "cells": list(cells),
+        })
+    return {"rows": rows, "table_found": True, "table_lines": table_lines, "error": None,
+            "columns": dict(indices)}
+
+
 @scoped_language
 def extract_rows_structured(memo_markdown: str, usage_out: dict = None) -> dict:
     """Ritorna {'rows': [...], 'table_found': bool} o {'error': str}. Non solleva.

@@ -1,8 +1,6 @@
 """Offline, synthetic editorial fixtures: no issuer research or live side effects."""
 from copy import deepcopy
 import re
-import os
-from pathlib import Path
 
 import pytest
 from pypdf import PdfReader, PdfWriter
@@ -174,9 +172,11 @@ def test_real_pdf_text_loss_is_rejected_even_with_all_source_sections(tmp_path):
     assert quality["content_integrity"] == "incomplete"
 
 
-def test_preview_artifact_and_source_chart_are_explicitly_synthetic():
+def test_preview_artifact_and_source_chart_are_explicitly_synthetic(tmp_path):
     run, result = editorial_fixture()
-    path = Path(os.environ["BELLOMBERG_REPORT_DIR"]) / "trade-idea-v2-preview.pdf"
+    # Sandbox del test: la variabile BELLOMBERG_REPORT_DIR la imposta solo il
+    # runner offline; senza di essa il pytest nudo cadeva in KeyError.
+    path = tmp_path / "trade-idea-v2-preview.pdf"
     artifact = build_trade_idea_report(run, result, output_path=path)
     assert artifact["status"] == "ready", artifact["reason"]
     text = extract(path)

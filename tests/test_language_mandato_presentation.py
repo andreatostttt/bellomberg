@@ -8,11 +8,12 @@ from bellomberg.core.presentation import render_payload
 from bellomberg.core.presentation import error_text, join_messages
 
 
-def test_schema_descriptions_are_bilingual_without_changing_the_47_field_contracts():
+def test_schema_descriptions_are_bilingual_without_changing_the_48_field_contracts():
     with language_context('it'):
         schema = mp.descrizione_campi()
     english = render_payload(schema, language='en')
-    assert len(schema) == len(english) == 47
+    # 48: +tolleranza_sforo_sizing_pct (04/10, G6: era SIZING_TOLERANCE_EUR nel codice)
+    assert len(schema) == len(english) == 48
     assert english['orizzonte_anni']['descrizione'] == 'Average holding period of a position.'
     assert schema['orizzonte_anni']['descrizione'] == 'Orizzonte medio di detenzione di una posizione.'
     for name, original in mp.CAMPI.items():

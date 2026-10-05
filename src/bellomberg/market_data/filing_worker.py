@@ -23,7 +23,7 @@ def main(argv=None):
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--due', action='store_true', help='Esegue i profili abilitati e scaduti (default)')
     modes.add_argument('--status', action='store_true', help='Legge profili e scadenze, nessuna acquisizione')
-    modes.add_argument('--ticker', help='Aggiornamento manuale di un profilo configurato')
+    modes.add_argument('--ticker', help='Aggiornamento di un profilo configurato senza AI (percorso programmato: nulla se il profilo non e\' dovuto o ha il controllo programmato disattivato; il giudizio AI si chiede solo con "Verifica ora" nell\'app)')
     modes.add_argument('--recover-run', type=int, help='Conclude un run interrotto; verificare prima che il worker sia fermo')
     parser.add_argument('--reason', help='Motivo obbligatorio del recupero')
     args = parser.parse_args(argv)
@@ -35,7 +35,17 @@ def main(argv=None):
         elif args.recover_run is not None:
             output = store.recover_run(args.recover_run, args.reason)
         elif args.ticker:
-            output = service.run(args.ticker)
+            from bellomberg.storage.filing_store import RunAlreadyActive, RunNotDue
+            try:  # percorso programmato: mai il giudice a pagamento (solo pulsante nell'app)
+                output = service.run_programmato(args.ticker)
+            except (RunAlreadyActive, RunNotDue) as exc:
+                output = {'ticker': args.ticker, 'status': 'skipped', 'reason': str(exc)}
+            except ValueError as exc:
+                profilo = store.get_profile(args.ticker)
+                if not profilo or profilo.get('enabled'):
+                    raise
+                output = {'ticker': args.ticker, 'status': 'skipped',
+                          'reason': 'controllo programmato disattivato per il profilo'}
         else:
             output = execute_due(service)
         code = 0 if output.get('status', 'ok') in ('ok', 'skipped') else 1

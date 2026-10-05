@@ -100,7 +100,29 @@ def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[st
         return r.json()
     except Exception as e:
         _log_eccezione(e, url)
-        return {"error": _senza_chiave(str(e))}
+        # 05/10 (Opus 5.5): mai il TESTO dell'eccezione, nemmeno mascherato. Il
+        # price_updater.log conteneva 48 righe «[IV] ... KO dichiarato: expirations:
+        # HTTPSConnectionPool(...) url: ...&apiKey=<chiave in chiaro>»: il testo di
+        # requests porta l'URL con la querystring, e la maschera vale solo se la
+        # chiave compare identica (codificata, ruotata o di un'altra fonte: no).
+        # Tipo + path senza query bastano a dire cosa e' caduto.
+        return {"error": f"{type(e).__name__} on {_path_log(url)}"}
+
+
+def _opzioni_non_coperte(underlying: Optional[str], source: str) -> Optional[Dict[str, Any]]:
+    """Polygon/OPRA copre solo opzioni USA (P1, 04/10, Opus 5.5). Un `XXX.MI`
+    faceva ~4 chiamate a vuoto e tornava «no data», senza dire che il mercato non
+    e' coperto: ora si risponde PRIMA della rete (v. `copertura.copertura_opzioni`).
+    Ne beneficiano tutti i chiamanti delle funzioni pubbliche (GEX, summary, chat);
+    chi chiama `_get` direttamente (vol_surface) ha la sua. None = si interroga.
+    Si ferma solo `non_coperto`: un `indeterminato` (suffisso fuori registro, es.
+    una classe di azioni USA col punto) passa col simbolo INTATTO, come chiedono
+    i test dei simboli col punto di options_download/options_routes."""
+    from bellomberg.market_data.copertura import copertura_opzioni, risposta_non_coperta
+    esito = copertura_opzioni(underlying)
+    if esito["stato"] != "non_coperto":
+        return None
+    return risposta_non_coperta(esito, source)
 
 
 def get_option_expirations(underlying: str, limit: int = 60) -> Dict[str, Any]:
@@ -108,6 +130,9 @@ def get_option_expirations(underlying: str, limit: int = 60) -> Dict[str, Any]:
     Paginata (#179 fix): 1000 contratti coprono solo le prime scadenze di un
     sottostante liquido — seguiamo next_url per la lista completa."""
     from datetime import timedelta
+    fuori = _opzioni_non_coperte(underlying, "polygon /v3/reference/options/contracts")
+    if fuori:
+        return fuori
     exps: set = set()
     last = None
 
@@ -155,6 +180,9 @@ def get_options_chain(underlying: str, expiry: Optional[str] = None,
     """Chain snapshot con IV, greeks, OI, volume.
     expiry: 'YYYY-MM-DD' opzionale — se None Polygon ritorna tutte (cap max_contracts).
     """
+    fuori = _opzioni_non_coperte(underlying, "polygon /v3/snapshot/options")
+    if fuori:
+        return fuori
     params: Dict[str, Any] = {"limit": 250}
     if expiry:
         params["expiration_date"] = expiry
@@ -207,6 +235,9 @@ def get_options_summary_polygon(ticker: str, expiry: Optional[str] = None) -> Di
     di IBKR come fonte primaria): spot, ATM IV call/put, P/C OI ratio, max pain.
     Se expiry e' None usa la prima scadenza >= 2 giorni (evita 0DTE distorti)."""
     src = "polygon options summary"
+    fuori = _opzioni_non_coperte(ticker, src)
+    if fuori:
+        return fuori
     try:
         if not polygon_available():
             return {"error": "POLYGON_API_KEY mancante", "_source": src}
@@ -295,7 +326,8 @@ def get_options_summary_polygon(ticker: str, expiry: Optional[str] = None) -> Di
             "_timestamp": datetime.now().isoformat(),
         }
     except Exception as e:
-        return {"error": str(e), "_source": src}
+        # mai str(e): v. _get (05/10)
+        return {"error": type(e).__name__, "_source": src}
 
 
 def get_stock_daily(ticker: str, days: int = 120) -> Dict[str, Any]:

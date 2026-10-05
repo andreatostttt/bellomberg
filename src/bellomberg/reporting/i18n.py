@@ -132,6 +132,7 @@ LABELS = {
     "Azione": ("Azione", "Action"),
     "Timing": ("Tempistica", "Timing"),
     "Confidence": ("Convinzione", "Confidence"),
+    "Automated checks": ("Controlli automatici", "Automated checks"),
     "Metrica": ("Metrica", "Metric"),
     "Valore": ("Valore", "Value"),
     "Lettura": ("Lettura", "Interpretation"),

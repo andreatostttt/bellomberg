@@ -445,6 +445,55 @@ def test_adaptive_su_glm_omette_il_parametro(monkeypatch):
     assert "reasoning" not in t.richieste[0]
 
 
+def test_minimal_esplicito_parte_con_una_sola_richiesta(monkeypatch):
+    """Il recupero report non deve prima provocare un 400 con reasoning spento."""
+    llm_client.RAGIONAMENTO_OBBLIGATORIO.clear()
+    t = _Trasporto([httpx.Response(200, json=_risposta_json(usage=_usage_pieno()))])
+    c = _client(monkeypatch, t, max_retries=0)
+
+    c.messages.create(model="deepseek/finto-flash", max_tokens=10, system="s",
+                      messages=[{"role": "user", "content": "u"}],
+                      thinking={"type": "minimal"})
+
+    assert len(t.richieste) == 1
+    assert t.richieste[0]["reasoning"] == llm_client.REASONING_MINIMO
+    assert not llm_client.RAGIONAMENTO_OBBLIGATORIO
+
+
+def test_minimal_esplicito_su_glm_non_manda_effort(monkeypatch):
+    """G7/M4 (04/10): anche il tipo «minimal» passa dalla guardia z-ai/. Misurato 05/09:
+    su GLM QUALUNQUE effort esplicito azzera la deliberazione interna; a uno slug z-ai/
+    non parte mai un campo reasoning con effort, nemmeno «minimal»."""
+    llm_client.RAGIONAMENTO_OBBLIGATORIO.clear()
+    t = _Trasporto([httpx.Response(200, json=_risposta_json(usage=_usage_pieno()))])
+    c = _client(monkeypatch, t, max_retries=0)
+
+    c.messages.create(model="z-ai/glm-finto", max_tokens=10, system="s",
+                      messages=[{"role": "user", "content": "u"}],
+                      thinking={"type": "minimal"})
+
+    assert len(t.richieste) == 1
+    assert "reasoning" not in t.richieste[0]
+    assert not llm_client.RAGIONAMENTO_OBBLIGATORIO
+
+
+@pytest.mark.parametrize(("model", "agente", "round_n", "expected"), [
+    ("openai/gpt-6-luna", "macro", 0, {"type": "effort", "effort": "low"}),
+    ("openai/gpt-6-luna", "macro", 1, {"type": "effort", "effort": "high"}),
+    ("openai/gpt-6-luna", "eventdesk", 1, {"type": "adaptive"}),
+    ("google/gemini-3.8-flash", "fundamentals", 1,
+     {"type": "effort", "effort": "high"}),
+    ("openai/gpt-6-luna", "quant", 1, {"type": "effort", "effort": "high"}),
+    ("openai/gpt-6-luna", "options", 2, {"type": "effort", "effort": "high"}),
+    ("openai/gpt-6-luna", "crypto", 1, {"type": "adaptive"}),
+])
+def test_effort_consigliere_per_desk_e_round(model, agente, round_n, expected):
+    """Ricognizione leggera, analisi selettive approfondite e desk standard medium."""
+    assert llm_client.thinking_consigliere(
+        model, agente=agente, round_n=round_n
+    ) == expected
+
+
 def test_ragionamento_obbligatorio_ritenta_con_minimal_e_lo_dichiara(monkeypatch):
     """Misurato 05/09: GLM e Gemini rispondono 400 «Reasoning is mandatory for this endpoint
     and cannot be disabled» a {"enabled": false}; con `effort: minimal` ragionano 0 token.

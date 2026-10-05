@@ -92,6 +92,11 @@ function response(text) {
 async function main() {
   const mainSource = fs.readFileSync(path.join(root, 'electron/main.ts'), 'utf8');
   const mainTree = ts.createSourceFile('main.ts', mainSource, ts.ScriptTarget.Latest, true);
+  const timeoutDeclaration = mainTree.statements
+    .flatMap(statement => ts.isVariableStatement(statement) ? [...statement.declarationList.declarations] : [])
+    .find(declaration => declaration.name.getText(mainTree) === 'BACKEND_START_TIMEOUT_MS');
+  const backendStartTimeoutMs = Number(timeoutDeclaration?.initializer?.getText(mainTree).replaceAll('_', ''));
+  check(Number.isFinite(backendStartTimeoutMs), 'backend startup timeout is declared');
   const backendFunctions = {};
   for (const node of mainTree.statements) {
     if (ts.isFunctionDeclaration(node) && ['startPythonBackend', 'stopOwnedBackend'].includes(node.name?.text)) {
@@ -102,6 +107,7 @@ async function main() {
     const errors = []; let killed = 0; let spawned = 0; let pings = 0;
     const context = vm.createContext({
       PROJECT_ROOT: '/synthetic/backend', API_PORT: 8765, quitting: false, pythonBackend: null, backendOwned: false,
+      BACKEND_START_TIMEOUT_MS: backendStartTimeoutMs,
       console: { log() {}, error() {} }, process: { platform: 'win32', env: { BELLOMBERG_PYTHON: 'synthetic-python' } },
       path, fs: { existsSync() { return true; } }, backendError(message) { errors.push(message); },
       pingBackend: async () => alreadyUp || pings++ > 0 && !fail,
@@ -136,6 +142,9 @@ async function main() {
   const dialogWords = (text, set) => String(text ?? '').toLowerCase().split(/[^\p{L}]+/u).filter(word => set.has(word)).length;
   const italian = text => dialogWords(text, IT_WORDS) >= 2 && dialogWords(text, EN_WORDS) === 0;
   const english = text => dialogWords(text, EN_WORDS) >= 2 && dialogWords(text, IT_WORDS) === 0;
+  const messageText = node => ts.isTemplateExpression(node)
+    ? node.head.text + node.templateSpans.map(span => span.literal.text).join('')
+    : ts.isStringLiteralLike(node) ? node.text : '';
   const bilingualLabel = line => { const m = /^([^/:\n]+) \/ ([^/:\n]+): /.exec(line); return !!m && m[1].trim() !== m[2].trim(); };
 
   const errorFunction = mainTree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'backendError');
@@ -163,8 +172,8 @@ async function main() {
     expectDialog(composed, where + ' must pass bilingue(it, en, ...details), got: ' + call.arguments.map(a => a.getText(mainTree)).join(', ').slice(0, 120));
     if (!composed) continue;
     const [it, en, ...details] = call.arguments[0].arguments;
-    expectDialog(!!it && ts.isStringLiteralLike(it) && italian(it.text), where + ': first paragraph is a fixed Italian sentence: ' + it?.getText(mainTree));
-    expectDialog(!!en && ts.isStringLiteralLike(en) && english(en.text), where + ': second paragraph is a fixed English sentence: ' + en?.getText(mainTree));
+    expectDialog(!!it && italian(messageText(it)), where + ': first paragraph is Italian: ' + it?.getText(mainTree));
+    expectDialog(!!en && english(messageText(en)), where + ': second paragraph is English: ' + en?.getText(mainTree));
     for (const detail of details) {
       let head = detail;
       while (ts.isBinaryExpression(head) && head.operatorToken.kind === ts.SyntaxKind.PlusToken) head = head.left;
@@ -231,6 +240,9 @@ async function main() {
   Object.assign(slow.context, { pingBackend: async () => false, Date: { now: () => (syntheticClock += 20000) } });
   await slow.context.startPythonBackend();
   expectLayout('backend not ready in time', slow, [], false);
+  expectDialog(slow.errors[0]?.includes(`dopo ${backendStartTimeoutMs / 1000} secondi`)
+    && slow.errors[0]?.includes(`after ${backendStartTimeoutMs / 1000} seconds`),
+  'startup timeout is reported using the configured duration');
   const thrown = backendScope(); thrown.context.pingBackend = async () => { throw new Error('synthetic ping failure'); };
   await thrown.context.startPythonBackend();
   expectLayout('unexpected startup failure', thrown, ['synthetic ping failure']);

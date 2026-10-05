@@ -21,8 +21,7 @@ action can take you.
    Linear and logarithmic axes tell different visual stories.
 5. Inspect income statement, balance sheet, cash flow, ownership and news
    sections as available for that instrument.
-6. Save a favourite to [Watchlist](03-watchlist.md) or select instruments for
-   Macro Pulse when using those controls.
+6. Save a favourite to [Watchlist](03-watchlist.md).
 
 ![Global Markets selected security — English DEMO screenshot](../../assets/screenshots/market-security-en.png)
 

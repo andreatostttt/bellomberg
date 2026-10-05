@@ -10,10 +10,36 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEMPLATE = os.path.join(REPO, ".env.example")
 LETTURA = re.compile(r"""os\.(?:getenv|environ\.get)\(\s*["']([A-Z][A-Z0-9_]+)["']|os\.environ\[\s*["']([A-Z][A-Z0-9_]+)["']\s*\](?!\s*=)""")
 RUNTIME_PATH = re.compile(r'_runtime_path\("([A-Z][A-Z0-9_]+)"')
+# 04/10 (import Andrea): letture col nome passato a un helper di validazione
+# (assente = default; vuota o non valida = errore col nome) e la forma
+# `nome = "X"` + `os.environ.get(nome)` di news_refresh_manager.
+HELPER_ENV = re.compile(r"""\b(?:effort_env|_secondi_da_env|_secondi_env|_numero_env|_env_positive_int)\(\s*["']([A-Z][A-Z0-9_]+)["']\s*[,)]""")
+NOME_IN_VARIABILE = re.compile(r'\bnome\s*=\s*"([A-Z][A-Z0-9_]+)"\s*\n\s*raw\s*=\s*os\.environ\.get\(nome\)')
 # Variabili di sistema lette dal codice ma che NON si configurano in .env
 SISTEMA = {"TEMP", "TMP", "USERPROFILE", "PATH", "PYTHONIOENCODING"}
 # Le uniche righe del template a cui e' permesso un valore: sono DEFAULT dichiarati
 CON_DEFAULT = {"PM_NAME", "CONSIGLIERE_PARALLEL", "CONSIGLIERE_R0_MODEL"}
+# 04/10 (import Andrea): variabili di taratura col DEFAULT DEL CODICE scritto nel template.
+# Nel codice nuovo una riga presente ma vuota e' un errore col nome, quindi un template
+# vuoto copiato in .env fermerebbe comitato, notizie, filing e coda email: il valore
+# e' il default, fissato qui perche' un cambio sia sempre deliberato.
+DEFAULT_TARATURA = {
+    "CONSIGLIERE_R0_EFFORT": "low", "CONSIGLIERE_R1_EFFORT": "high", "CONSIGLIERE_R2_EFFORT": "high",
+    "CONSIGLIERE_MACRO_EFFORT": "high", "CONSIGLIERE_QUANT_EFFORT": "high",
+    "CONSIGLIERE_OPTIONS_EFFORT": "high", "CONSIGLIERE_FUNDAMENTALS_EFFORT": "high",
+    "CONSIGLIERE_CRYPTO_EFFORT": "adaptive", "CONSIGLIERE_EVENTDESK_EFFORT": "adaptive",
+    "CAPO_EFFORT": "high", "RED_TEAM_EFFORT": "high", "REFLECTION_EFFORT": "low",
+    "VALUATION_PREPARER_EFFORT": "high",
+    "NEWS_AUTO_REFRESH_ENABLED": "true", "NEWS_REFRESH_INTERVAL_MINUTES": "15",
+    "NEWS_REFRESH_FIRST_DELAY_MINUTES": "10", "NEWS_REFRESH_QUIET_HOURS": "22:00-07:00",
+    "NEWS_REFRESH_QUIET_DAYS": "none", "NEWS_REFRESH_WEEKEND_INTERVAL_MINUTES": "120",
+    "FILING_AUTO_REFRESH_ENABLED": "true", "FILING_AUTO_REFRESH_INTERVAL_S": "86400",
+    "FILING_AUTO_REFRESH_DELAY_S": "600", "FILING_AI_INTERVALLO_TICKER_S": "300",
+    "FILING_AI_TETTO_GIORNO_EUR": "1.0",
+    "VENUE_POLL_MIN_SECONDS": "120", "VENUE_BACKOFF_MAX_SECONDS": "1800",
+    "EMAIL_SMTP_TIMEOUT": "120", "EMAIL_SEND_ATTEMPTS": "3", "EMAIL_RETRY_DELAY_SECONDS": "15",
+    "EMAIL_OUTBOX_TTL_HOURS": "24", "EMAIL_OUTBOX_RETENTION_DAYS": "7",
+}
 # 05/09 (OpenRouter, ordine PM): le variabili MODELLO portano la tabella scelta dal PM
 # (uno slug `provider/modello` per funzione) e CHAT_MAX_TOKENS il tetto: sono la
 # configurazione consigliata, NON un default nel codice (assente = errore col nome).
@@ -38,6 +64,8 @@ def _lette_dal_codice():
         for a, b in LETTURA.findall(source):
             nomi.add(a or b)
         nomi.update(RUNTIME_PATH.findall(source))
+        nomi.update(HELPER_ENV.findall(source))
+        nomi.update(NOME_IN_VARIABILE.findall(source))
     return nomi - SISTEMA
 
 
@@ -54,8 +82,16 @@ def _nel_template():
 
 def test_template_esiste_e_non_ha_valori():
     con_valore = [nome for nome, valore in _righe_template()
-                  if valore and nome not in CON_DEFAULT and not MODELLI_OPENROUTER.match(nome)]
+                  if valore and nome not in CON_DEFAULT and nome not in DEFAULT_TARATURA
+                  and not MODELLI_OPENROUTER.match(nome)]
     assert not con_valore, f"valori nel template (una chiave vera?): {con_valore}"
+
+
+def test_i_valori_di_taratura_sono_esattamente_i_default_fissati():
+    valori = dict(_righe_template())
+    diversi = {nome: (valori.get(nome), atteso) for nome, atteso in DEFAULT_TARATURA.items()
+               if valori.get(nome) != atteso}
+    assert not diversi, f"taratura del template diversa dai default fissati: {diversi}"
 
 
 def test_i_default_dichiarati_coincidono_col_codice():

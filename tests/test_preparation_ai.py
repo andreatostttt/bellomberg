@@ -20,10 +20,82 @@ def test_configured_preparer_cap_preserves_specialists_model_and_budget(tmp_path
     monkeypatch.setattr(llm_client, 'modello', lambda *args: model)
     proposer = configured_proposer(tmp_path / 'configured.sqlite3', authorized_usd='1.25')
     assert proposer.max_tokens == expected_cap
-    assert proposer.model == model and proposer.thinking == llm_client.thinking_consigliere(model)
+    # G7/C2: valore FISSATO (non la stessa funzione richiamata): default di Andrea = high.
+    assert proposer.model == model and proposer.thinking == {"type": "effort", "effort": "high"}
     assert proposer.automatic_sections and MAX_TOKENS_SPECIALIST == 128000
     assert proposer.summary() == {'authorized_usd': 1.25, 'requests': 0, 'unknown_requests': 0,
         'spent_usd': 0, 'known_cost_usd': 0, 'reserved_usd': 0}
+
+
+def test_preparer_effort_ha_la_sua_variabile_e_non_segue_i_desk(tmp_path, monkeypatch):
+    """G7/C2 (04/10): l'effort del preparer viene da VALUATION_PREPARER_EFFORT (default high,
+    il valore di Andrea), non piu' di nascosto da CONSIGLIERE_FUNDAMENTALS/R1_EFFORT."""
+    from bellomberg.core import llm_client
+    from bellomberg.valuation.preparation_ai import configured_proposer
+    monkeypatch.setattr(llm_client, 'modello', lambda *args: 'synthetic/other-model')
+    for nome in llm_client.DEFAULT_EFFORT:
+        monkeypatch.delenv(nome, raising=False)
+    monkeypatch.setenv("CONSIGLIERE_FUNDAMENTALS_EFFORT", "low")
+    monkeypatch.setenv("CONSIGLIERE_R1_EFFORT", "minimal")
+    p = configured_proposer(tmp_path / 'a.sqlite3', authorized_usd='1')
+    assert p.thinking == {"type": "effort", "effort": "high"}
+    monkeypatch.setenv("VALUATION_PREPARER_EFFORT", "max")
+    p = configured_proposer(tmp_path / 'b.sqlite3', authorized_usd='1')
+    assert p.thinking == {"type": "effort", "effort": "max"}
+    monkeypatch.setenv("VALUATION_PREPARER_EFFORT", "")
+    with pytest.raises(llm_client.ConfigurazioneLLMMancante, match="VALUATION_PREPARER_EFFORT"):
+        configured_proposer(tmp_path / 'c.sqlite3', authorized_usd='1')
+
+
+def _legacy_preparer(path, cap, thinking, call):
+    from bellomberg.valuation.preparation_ai import BudgetedProposer
+    return BudgetedProposer(path, authorized_usd="10", model="synthetic/model",
+        max_tokens=cap, thinking=thinking, call=call,
+        metadata=lambda _: {"id": "synthetic/model", "context_length": 1000000,
+            "top_provider": {"max_completion_tokens": 200000},
+            "pricing": {"prompt": "0.000001", "completion": "0.000002"}})
+
+
+@pytest.mark.parametrize("old_thinking", [{"type": "effort", "effort": "max"}, {"type": "adaptive"}])
+@pytest.mark.parametrize("old_cap", [16000, 128000])
+@pytest.mark.parametrize("outcome", ["received", "unknown"])
+def test_preparazione_gia_pagata_riconosciuta_dopo_il_cambio_di_effort(tmp_path, old_thinking,
+                                                                     old_cap, outcome):
+    """G7/C2: una preparazione pagata con la policy storica (Muse max / adaptive) o con un
+    effort diverso da quello di oggi NON si ricompra: stessa riga, stesso costo, 0 chiamate."""
+    calls = []
+    def call(**body):
+        calls.append(deepcopy(body))
+        if outcome == "unknown":
+            raise TimeoutError("synthetic lost receipt")
+        return SimpleNamespace(id="paid-" + str(len(calls)), model="synthetic/model", provider="synthetic",
+            stop_reason="end_turn", usage=SimpleNamespace(cost_usd=.2),
+            content=[SimpleNamespace(type="text", text='{"approved":false}')])
+    path = tmp_path / "preparer.sqlite"
+    dossier, contract = {"ticker": "SYNTH", "evidence": "frozen"}, {}
+    old = _legacy_preparer(path, old_cap, old_thinking, call)
+    if outcome == "received":
+        assert old(dossier, contract) == {"approved": False}
+    else:
+        with pytest.raises(TimeoutError):
+            old(dossier, contract)
+    with old._db() as db:
+        before = [dict(row) for row in db.execute("SELECT * FROM requests")]
+    new = _legacy_preparer(path, 128000, {"type": "effort", "effort": "high"}, call)
+    for _ in range(2):
+        if outcome == "received":
+            assert new(dossier, contract) == {"approved": False}
+            assert new.cached_response(dossier, contract) == {"approved": False}
+        else:
+            with pytest.raises(RuntimeError):
+                new(dossier, contract)
+        assert len(calls) == 1
+    with new._db() as db:
+        assert [dict(row) for row in db.execute("SELECT * FROM requests")] == before
+    if outcome == "received":
+        # lavoro DIVERSO: si paga, col thinking di oggi
+        assert new({**dossier, "evidence": "other"}, contract) == {"approved": False}
+        assert len(calls) == 2 and calls[1]["thinking"] == {"type": "effort", "effort": "high"}
 
 
 def _proposer(tmp_path, *, limit=10, call=None):

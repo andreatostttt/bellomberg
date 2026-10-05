@@ -27,6 +27,7 @@ API publica:
   fetch_finnhub_intel(ticker) -> dict (aggregator: news + earnings + insider + sentiment
       + press; con `fonti_mute` {path: motivo} e `avviso` — chiave dedicata, C1 del ponte)
 """
+import time
 import os
 from datetime import date, datetime, timedelta
 from typing import Dict, Any, List, Optional
@@ -121,11 +122,16 @@ def _api_get(path: str, params: Optional[Dict[str, Any]] = None,
             _muto(motivo, "429 rate limited (60 req/min free tier)")
             return None
         if r.status_code != 200:
-            _muto(motivo, f"HTTP {r.status_code} on {path}: {r.text[:120]}")
+            # G8 seguito: un intermediario (proxy, portale wifi) puo' rimandare l'URL con il token
+            _muto(motivo, f"HTTP {r.status_code} on {path}: {(r.text or '').replace(key, '***')[:120]}")
             return None
         return r.json()
     except Exception as e:
-        _muto(motivo, f"error on {path}: {e}")
+        # G8 (04/10/2026, Opus 5.5): MAI il testo grezzo dell'eccezione: quello di requests porta
+        # l'URL con la querystring, cioe' `token=<chiave>`. Integrazione: si usa il ripulitore
+        # comune di G3 (tipo + stato + messaggio senza segreti).
+        from bellomberg.core.errori_sicuri import descrivi_eccezione   # G3: l'URL porta token=
+        _muto(motivo, f"error on {path}: {descrivi_eccezione(e, key)}")
         return None
 
 
@@ -186,6 +192,12 @@ def fetch_company_news(ticker: str, days: int = 7,
             "provider": "Finnhub",
             "source": n.get("source") or "",
             "published_at": datetime.fromtimestamp(ts).isoformat() if ts else "",
+            # Opus 5.5 04/10 (review RV-N P3): l'epoch ORIGINALE di Finnhub (secondi UTC).
+            # published_at e' ora locale senza fuso: nell'ora ripetuta del cambio d'ora
+            # (es. 25/10) non si riconverte in UTC senza ambiguita'. None = Finnhub non
+            # l'ha dato (o non numerico): assente dichiarato, mai 0.
+            "published_epoch": (ts if isinstance(ts, (int, float)) and not isinstance(ts, bool)
+                                and ts else None),
             "ticker_mentioned": ticker,
             "image": n.get("image") or "",
             "category": n.get("category") or "company",
@@ -196,6 +208,31 @@ def fetch_company_news(ticker: str, days: int = 7,
 # ============================================================
 # EARNINGS CALENDAR
 # ============================================================
+# (simbolo, from, to) -> (istante, eventi): solo le risposte riuscite, per 6 ore.
+_CACHE_EARNINGS: Dict[tuple, tuple] = {}
+_TTL_EARNINGS_S = 6 * 3600
+
+
+def svuota_cache_earnings() -> None:
+    _CACHE_EARNINGS.clear()
+
+
+def _earnings_del_simbolo(simbolo: str, frm: str, to: str,
+                          motivo: Optional[List[str]]) -> List[Dict[str, Any]]:
+    chiave = (simbolo, frm, to)
+    salvato = _CACHE_EARNINGS.get(chiave)
+    if salvato and time.time() - salvato[0] < _TTL_EARNINGS_S:
+        return list(salvato[1])
+    data = _api_get("/calendar/earnings", {"from": frm, "to": to, "symbol": simbolo}, motivo=motivo)
+    if not isinstance(data, dict):
+        if data is not None:
+            _muto(motivo, f"/calendar/earnings: risposta inattesa per {simbolo} ({type(data).__name__})")
+        return []
+    eventi = data.get("earningsCalendar", []) or []
+    _CACHE_EARNINGS[chiave] = (time.time(), list(eventi))
+    return eventi
+
+
 def fetch_earnings_calendar(days_ahead: int = 14,
                               days_back: int = 0,
                               symbols: Optional[List[str]] = None,
@@ -206,20 +243,35 @@ def fetch_earnings_calendar(days_ahead: int = 14,
     today = datetime.now().date()
     frm = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
     to = (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
-    data = _api_get("/calendar/earnings", {"from": frm, "to": to}, motivo=motivo)
-    if not isinstance(data, dict):
-        if data is not None:
-            _muto(motivo, f"/calendar/earnings: risposta inattesa ({type(data).__name__})")
-        return []
-    events = data.get("earningsCalendar", [])
     if symbols:
+        # 02/10/2026 (misurato): la richiesta GLOBALE si ferma a 1500 voci e restituisce
+        # la CODA della finestra (a 30 giorni partiva dal 20/10, a 60 dal 09/11), quindi
+        # filtrarla dopo perdeva in silenzio le trimestrali del portafoglio. Con dei
+        # simboli si chiede un simbolo per volta (`symbol=`), con una cache di 6 ore.
         sym_set = {_norm_ticker(s) for s in symbols}
-        events = [e for e in events if e.get("symbol", "") in sym_set]
+        # Finnhub risponde col simbolo della quotazione PRIMARIA (es. ACMY -> ACME.PA,
+        # misurato 02/10 su titoli reali): la richiesta e' per un simbolo solo, quindi
+        # l'evento appartiene al simbolo chiesto, non a quello che torna.
+        events, visti = [], set()
+        for simbolo in sorted(sym_set):
+            for e in _earnings_del_simbolo(simbolo, frm, to, motivo):
+                chiave = (simbolo, e.get("date", ""))
+                if chiave not in visti:
+                    visti.add(chiave)
+                    events.append({**e, "symbol": simbolo, "listed_symbol": e.get("symbol")})
+    else:
+        data = _api_get("/calendar/earnings", {"from": frm, "to": to}, motivo=motivo)
+        if not isinstance(data, dict):
+            if data is not None:
+                _muto(motivo, f"/calendar/earnings: risposta inattesa ({type(data).__name__})")
+            return []
+        events = data.get("earningsCalendar", [])
     out = []
     for e in events:
         out.append({
             "date": e.get("date", ""),
             "symbol": e.get("symbol", ""),
+            "listed_symbol": e.get("listed_symbol"),
             "eps_actual": e.get("epsActual"),
             "eps_estimate": e.get("epsEstimate"),
             "revenue_actual": e.get("revenueActual"),
@@ -235,13 +287,67 @@ def fetch_earnings_for_portfolio(portfolio_tickers: List[str],
                                     days_ahead: int = 14,
                                     motivo: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """Earnings dei prossimi N giorni filtrati per i ticker del portfolio.
-    Senza ticker (book senza nomi US) NON si interroga: si dichiara (review 27/08)."""
+    Senza ticker (book senza nomi US) NON si interroga: si dichiara (review 27/08).
+
+    Finnhub viene interrogato col proprio simbolo, ma il campo ``symbol`` restituito resta
+    l'identita' del portafoglio; ``source_symbol`` conserva il simbolo del provider. Questo
+    evita che una posizione Xetra (per esempio ``ALFA.DE``) diventi ``ALFA`` nei payload.
+    """
     if not portfolio_tickers:
         _muto(motivo, "/calendar/earnings: nessun ticker da interrogare (book senza ticker US): "
                       "non interrogato")
         return []
-    return fetch_earnings_calendar(days_ahead=days_ahead, symbols=portfolio_tickers,
-                                   motivo=motivo)
+    try:
+        from bellomberg.storage.negozi_privati import carica_alias
+        esito_alias = carica_alias()
+        alias_finnhub = (esito_alias["alias"]["finnhub"]
+                         if esito_alias["origine"] not in {"assente", "illeggibile"}
+                         else {})
+    except Exception as exc:
+        esito_alias = {"origine": "illeggibile",
+                       "motivo": "%s: %s" % (type(exc).__name__, exc)}
+        alias_finnhub = {}
+
+    per_simbolo_fonte: Dict[str, List[str]] = {}
+    esteri_senza_alias: List[str] = []
+    identita_viste = set()
+    for ticker in portfolio_tickers:
+        identita = (ticker or "").upper().strip()
+        if not identita or identita in identita_viste:
+            continue
+        identita_viste.add(identita)
+        if "." in identita:
+            simbolo_fonte = alias_finnhub.get(identita)
+            if not simbolo_fonte:
+                esteri_senza_alias.append(identita)
+                continue
+        else:
+            simbolo_fonte = identita
+        per_simbolo_fonte.setdefault(simbolo_fonte, []).append(identita)
+
+    if esteri_senza_alias:
+        stato = esito_alias.get("origine")
+        dettaglio = ("; alias_fonti %s: %s" %
+                     (stato, esito_alias.get("motivo") or "causa non dichiarata")
+                     if stato in {"assente", "illeggibile"} else "")
+        _muto(motivo, "/calendar/earnings: alias Finnhub mancante per %s; simbolo estero "
+                      "non dedotto e non interrogato%s" %
+                      (", ".join(esteri_senza_alias), dettaglio))
+    if not per_simbolo_fonte:
+        return []
+
+    eventi = fetch_earnings_calendar(days_ahead=days_ahead,
+                                     symbols=list(per_simbolo_fonte),
+                                     motivo=motivo)
+    rimappati: List[Dict[str, Any]] = []
+    for evento in eventi:
+        simbolo_fonte = (evento.get("symbol") or "").upper().strip()
+        for identita in per_simbolo_fonte.get(simbolo_fonte, [simbolo_fonte]):
+            voce = dict(evento)
+            voce["source_symbol"] = simbolo_fonte
+            voce["symbol"] = identita
+            rimappati.append(voce)
+    return rimappati
 
 
 def next_earnings_date(ticker: str, today: Optional[str] = None) -> Optional[str]:

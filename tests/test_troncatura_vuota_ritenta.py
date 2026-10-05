@@ -30,8 +30,8 @@ def _vuoto_poi_report(n, kw):
 
 
 @pytest.mark.parametrize("model,thinking", [
-    ("google/gemini-3.8-flash", {"type": "adaptive"}),
-    ("meta/muse-spark-1.3", {"type": "effort", "effort": "max"}),
+    ("google/gemini-3.8-flash", {"type": "effort", "effort": "high"}),
+    ("meta/muse-spark-1.3", {"type": "effort", "effort": "high"}),
 ])
 def test_troncatura_a_zero_char_ritenta_una_volta_senza_ragionamento(bb, capsys, monkeypatch, model, thinking):
     monkeypatch.setenv("CONSIGLIERE_QUANT_MODEL", model)

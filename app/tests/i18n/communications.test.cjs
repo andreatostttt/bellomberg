@@ -69,7 +69,8 @@ test('chat labels change while historical prose, source language and a draft rem
     { id: 3, role: 'assistant', content: 'Original legacy reply', storico: true, output_language: null },
   ], 10: 'Draft 158,50 untouched' });
   const it = page.render('it'), en = page.render('en');
-  assert.match(it, /Desk conversazionale/); assert.match(en, /Conversational desk/);
+  // The desk heading is a UI label: it follows the selected language.
+  assert.match(it, /1 specialisti/); assert.match(en, /1 specialists/);
   assert.match(en, /Original output · Italian/);
   assert.match(en, /Original output · language unknown/);
   for (const html of [it, en]) {
@@ -156,6 +157,17 @@ test('execution tape localises accessible measurements while preserving tool IDs
   const geometry = html => [...html.matchAll(/<(?:rect|line|path)\b[^>]*>/g)].map(m => m[0]);
   assert.deepEqual(geometry(en), geometry(it));
   assert.match(en, /get_synthetic_data/);
+});
+
+test('execution tape names a successful outcome in the selected language', () => {
+  // G9c (Opus 5.5): the successful branch printed a fixed 'ok' next to translated siblings.
+  const page = component('components/NastroEsecuzione.tsx');
+  const props = { calls: [{ n: 1, id: 'tool-synthetic', name: 'get_synthetic_data', iteration: 1,
+    t0: 10, t1: 1510, ok: true, bytes: 1536 }], flow: [], durata: 1510, streaming: false,
+    disponibile: true, hot: 1, pin: null, onHot() {}, onPin() {} };
+  const it = page.render('it', props), en = page.render('en', props);
+  assert.match(it, /<span>esito: riuscito<\/span>/); assert.match(en, /<span>outcome: succeeded<\/span>/);
+  assert.match(it, /iterazione 1, riuscito, /); assert.match(en, /iteration 1, succeeded, /);
 });
 
 

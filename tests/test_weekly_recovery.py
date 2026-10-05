@@ -118,14 +118,22 @@ def test_capo_failure_cannot_write_completed_memo(run_offline, monkeypatch, faul
                  "complete": False, "error": "original timeout" if fault == "error" else fault,
                  "stop_reason": "max_tokens" if fault == "truncated" else None})
     monkeypatch.setattr(cm, "run_capo", capo)
-    with pytest.raises(WeeklyRunBlocked, match="Capo non completo"):
-        cm.run_multi_agent(send_email=False)
+    # Decisione PM 04/10 (comitato a lacune): Capo fallito = memo PARZIALE marcato
+    # INCOMPLETO, nessuna decisione, nessuna email automatica (prima: run ferma).
+    result = cm.run_multi_agent(send_email=True)
     store = _store()
-    assert store.status()["status"] == "incomplete"
-    assert store.status()["first_error"]["phase"] == "capo"
+    assert result["status"] == "incomplete" and result["analytical_status"] == "partial"
+    assert result["first_error"]["phase"] == "capo"
+    assert result["first_error"]["message"].startswith("Capo non completo")
     assert store.get("capo") is None and store.get("memo_validated") is None
+    assert store.get("decisions_finalized") is None
+    assert run_offline.inviati == []
+    partial = result["capo_partial"]
+    assert Path(partial["markdown_path"]).read_text(encoding="utf-8").startswith("# MEMO INCOMPLETO")
+    assert partial["decisions"] == "none" and partial["email"] == "not_sent"
     with store.db._conn() as conn:
         assert conn.execute("SELECT full_markdown FROM memos").fetchone()[0] == "[IN PROGRESS]"
+        assert conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0] == 0
 
 
 def test_pdf_failure_preserves_memo_and_recovery_uses_real_renderer_without_ai(run_offline, monkeypatch):

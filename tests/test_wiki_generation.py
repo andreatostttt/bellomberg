@@ -318,6 +318,6 @@ def test_real_handbook_texts_build_nineteen_pages_whose_destinations_all_resolve
                 stand_in.touch()
     sha = commit(tmp_path)
     result = generator().build_wiki(guide, sha, '0.8.0')
-    assert len([name for name in result if name.startswith('Page-')]) == 19
+    assert len([name for name in result if name.startswith('Page-')]) == len(list(real_guide.glob('pages/*.md'))) == 20
     kinds = resolve_every_destination(result, tmp_path, sha, sources)
     assert kinds['blob'] and kinds['tree'] and kinds['raw'] and kinds['wiki']

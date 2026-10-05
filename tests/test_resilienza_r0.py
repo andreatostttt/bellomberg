@@ -122,10 +122,6 @@ def bb(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, 'bellomberg.agents.chat_tools', ct)
     import bellomberg.agents
     monkeypatch.setattr(bellomberg.agents, "chat_tools", ct, raising=False)
-    # pause a zero: il collaudo non deve dormire i backoff veri
-    # (raising=False: prima della cura la costante non esiste e il rosso deve
-    # venire dal COMPORTAMENTO, non dal setup della fixture)
-    monkeypatch.setattr(base_mod, "RETRY_529_BACKOFF_S", (0.0, 0.0), raising=False)
     board = Blackboard()  # memory_db=None: nessuna scrittura DB
     yield board
     llm_pricing.reset_fx_memo()
@@ -173,6 +169,116 @@ def test_errore_non_529_resta_immediato(bb):
 
     assert out.startswith("[ERROR quant round 1]")
     assert len(client.calls) == 1
+
+
+def _disconnessione():
+    from bellomberg.core.llm_client import APIConnectionError
+    return APIConnectionError(
+        "RemoteProtocolError: Server disconnected without sending a response.")
+
+
+def test_disconnessione_non_si_ritenta_al_desk(bb):
+    """Run 01/10 (memo #8): fundamentals R1 morto a meta' round su
+    «Server disconnected without sending a response» dopo ~200 s di call.
+    Aggiornato 04/10 (decisione maintainer D): NESSUN secondo strato di retry
+    sopra llm_client. Il retry di rete vive solo in core/llm_client (_RetryBudget,
+    spento sotto un request journal: la richiesta puo' essere stata pagata). Il
+    desk non rimanda la call: errore dichiarato, una sola call contata."""
+    def script(n, kwargs):
+        if n == 2:
+            raise _disconnessione()
+        return _tool_resp() if n == 1 else _text_resp(REPORT_VERO)
+
+    client = _FakeClient(script)
+    out = _MockSpecialist(bb, client=client).run(1)
+
+    assert out.startswith("[ERROR quant round 1]")
+    assert "Server disconnected" in out
+    # tool + caduta: nessun ritentativo al desk
+    assert len(client.calls) == 2
+    assert bb.usage_log[-1]["api_calls"] == 2
+    assert bb.usage_log[-1]["status"] == "api_error"
+    assert not hasattr(base_mod, "RETRY_RETE_BACKOFF_S")
+
+
+def test_disconnessione_ripetuta_resta_errore_dichiarato(bb):
+    """Una connessione caduta resta un errore dichiarato, alla prima call.
+    Aggiornato 04/10 (decisione D): niente retry di rete al desk, quindi una call."""
+    def script(n, kwargs):
+        raise _disconnessione()
+
+    client = _FakeClient(script)
+    out = _MockSpecialist(bb, client=client).run(1)
+
+    assert out.startswith("[ERROR quant round 1]")
+    assert len(client.calls) == 1
+    assert bb.usage_log[-1]["status"] == "api_error"
+
+
+def test_timeout_del_client_non_si_ritenta_al_desk(bb):
+    """Un timeout ha gia' bruciato TIMEOUT_SPECIALIST_S: ripeterlo al desk
+    raddoppierebbe l'attesa. Resta immediato."""
+    from bellomberg.core.llm_client import APITimeoutError
+
+    def script(n, kwargs):
+        raise APITimeoutError("timeout dopo 450.0 s: ReadTimeout")
+
+    client = _FakeClient(script)
+    out = _MockSpecialist(bb, client=client).run(1)
+
+    assert out.startswith("[ERROR quant round 1]")
+    assert len(client.calls) == 1
+
+
+def test_desk_col_client_vero_chiama_in_streaming(bb):
+    """Col client vero (OpenRouter) la call del desk va in streaming: i byte
+    arrivano mentre il modello lavora e la connessione non resta muta. Tool
+    loop completo su SSE finto: un giro tool, poi il report."""
+    import json
+    import httpx
+    from bellomberg.core.llm_client import OpenRouterClient
+
+    def _sse(*chunk):
+        righe = [": OPENROUTER PROCESSING", ""]
+        for c in chunk:
+            righe += ["data: " + json.dumps(c), ""]
+        righe += ["data: [DONE]", ""]
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              content="\n".join(righe).encode("utf-8"))
+
+    def _c(delta=None, finish=None, usage=None):
+        c = {"id": "gen-finto", "model": "finto/modello",
+             "choices": [{"index": 0, "delta": delta or {}, "finish_reason": finish}]}
+        if usage:
+            c["usage"] = usage
+        return c
+
+    # Integrazione streaming (Andrea) + gate costi (PM): come OpenRouter, il
+    # chunk finale dello stream porta la usage CON il costo; senza costo noto il desk
+    # (correttamente) non esegue i tool. Lo stesso parser riempie usage.cost_usd.
+    _u = {"prompt_tokens": 100, "completion_tokens": 50, "cost": 0.0004,
+          "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}}
+    risposte = [
+        _sse(_c({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                                 "function": {"name": "read_blackboard",
+                                              "arguments": "{}"}}]}),
+             _c(finish="tool_calls", usage=_u)),
+        _sse(_c({"content": REPORT_VERO}), _c(finish="stop", usage=_u)),
+    ]
+    corpi = []
+
+    def gestore(req):
+        corpi.append(json.loads(req.content))
+        return risposte[len(corpi) - 1]
+
+    client = OpenRouterClient(api_key="finta", max_retries=0,
+                              trasporto=httpx.MockTransport(gestore))
+    out = _MockSpecialist(bb, client=client).run(1)
+
+    assert out == REPORT_VERO
+    assert len(corpi) == 2
+    assert all(c.get("stream") is True for c in corpi)
+    assert bb.usage_log[-1]["status"] == "ok"
 
 
 # ============================================================

@@ -71,3 +71,24 @@ def test_il_classificatore_riconosce_il_guasto_dichiarato(bb):
     testo = bb.data["_red_team"][1]
     motivo = rt.motivo_critica_non_utilizzabile(testo)
     assert motivo and "403" in motivo, motivo
+
+
+def test_red_team_richiede_effort_high(bb, monkeypatch):
+    import bellomberg.core.llm_client as lc
+    calls = []
+
+    class _CaptureThenBoom:
+        def __init__(self, *a, **k):
+            self.messages = self
+
+        def create(self, **kw):
+            calls.append(kw)
+            raise RuntimeError("synthetic stop after capturing request")
+
+    monkeypatch.setattr(lc, "OpenRouterClient", _CaptureThenBoom)
+    rt.run_red_team(bb, portfolio_data=None, memory_db=None)
+    assert calls[0]["thinking"] == {"type": "effort", "effort": "high"}
+    # Integration of both features: Andrea's effort high (asserted above) needs more
+    # output room than the old 4200 (his 10000); the PM's weekly cap of 128000
+    # already covers it and is the one sent.
+    assert calls[0]["max_tokens"] == rt.WEEKLY_RED_MAX_TOKENS == 128000

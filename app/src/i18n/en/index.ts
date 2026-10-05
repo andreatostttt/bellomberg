@@ -20,6 +20,14 @@ import { trade } from './trade.js';
 import { dashboard } from './dashboard.js';
 import { tradeidea } from './tradeidea.js';
 import { research as tradeIdeaResearch } from './tradeideaResearch.js';
+import { agentsPage } from './agentsPage.js';
+import { chatPage } from './chatPage.js';
+import { dashboardPage } from './dashboardPage.js';
+import { filingPage } from './filingPage.js';
+import { marketsPage } from './marketsPage.js';
+import { newsPage } from './newsPage.js';
+import { performancePage } from './performancePage.js';
+import { tradePage } from './tradePage.js';
 
 export const en = {
   ui,
@@ -44,6 +52,14 @@ export const en = {
   dashboard,
   tradeidea,
   tradeIdeaResearch,
+  agentsPage,
+  chatPage,
+  dashboardPage,
+  filingPage,
+  marketsPage,
+  newsPage,
+  performancePage,
+  tradePage,
   lingua: {
     italiano: 'ITALIAN', inglese: 'ENGLISH', titolo: 'Choose your language',
     descrizione: 'The interface and new content will follow your choice. You can change it in settings. Existing documents stay in their original language.',

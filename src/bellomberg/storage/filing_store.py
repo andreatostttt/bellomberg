@@ -47,6 +47,28 @@ GUARDS = ("filing_profiles_no_update", "filing_profiles_no_delete",
           "filing_runs_final_immutable", "filing_runs_no_delete")
 
 
+ORE_RITENTATIVO = 2  # primo nuovo tentativo dopo un run in errore (anche orfani recuperati)
+_ULTIMI = "SELECT started_at,status,profile_sha256 FROM filing_runs WHERE ticker=? ORDER BY id DESC LIMIT 8"
+
+
+def _scadenza(ultimi, interval_hours, profilo_sha256=None):
+    """Prossimo run dovuto dopo gli ultimi run [(started_at, status, profile_sha256)], dal piu' recente.
+
+    Dopo n errori consecutivi: 2, 4, 8... ore (2 × 2^(n-1)), mai oltre l'intervallo del profilo.
+    Profilo cambiato dopo l'ultimo run (es. variante IR aggiunta): dovuto subito.
+    """
+    if profilo_sha256 is not None and len(ultimi[0]) > 2 and ultimi[0][2] != profilo_sha256:
+        return datetime.fromisoformat(ultimi[0][0])
+    errori = 0
+    for riga in ultimi:
+        stato = riga[1]
+        if stato != "errore":
+            break
+        errori += 1
+    ore = interval_hours if not errori else min(interval_hours, ORE_RITENTATIVO * 2 ** (errori - 1))
+    return datetime.fromisoformat(ultimi[0][0]) + timedelta(hours=ore)
+
+
 class RunAlreadyActive(RuntimeError):
     pass
 
@@ -74,6 +96,23 @@ def _expected_signature():
         return _schema_signature(conn)
 
 
+_FORME_SEC = ("10-K", "10-Q", "20-F", "40-F", "6-K")
+_CHIAVI_VARIANTE = {"tipo", "forme_sec", "sezioni", "verifica", "sezioni_salta_indice",
+                    "sezioni_intero", "periodo_regola", "stesso_periodo"}
+# Fase C: solo nei profili ESEF a blocchi, la variante IR infrannuale (PDF) accanto all'annuale.
+_CHIAVI_VARIANTE_IR = {"fonti", "ir_urls", "lingua", "proposta_ai"}
+
+
+def unisci_variante(profilo, variante):
+    """Profilo completo di una variante: base senza `varianti`, variante sopra, verifica fusa."""
+    base = {k: v for k, v in profilo.items() if k != "varianti"}
+    out = {**base, **{k: v for k, v in variante.items() if k != "verifica"}}
+    out["verifica"] = {**base.get("verifica", {}), **variante.get("verifica", {})}
+    if "fonti" in variante and "esef" not in variante["fonti"]:
+        out.pop("esef_modo", None)  # variante IR di un profilo ESEF: PDF, non text block
+    return out
+
+
 def _validate_profile(ticker, profile, interval_hours):
     def public_host(host):
         if not host or host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
@@ -96,8 +135,36 @@ def _validate_profile(ticker, profile, interval_hours):
         raise ValueError("tipo relazione non valido")
     if not re.fullmatch(r"[a-z]{2}", profile["lingua"]):
         raise ValueError("lingua non valida")
-    if not isinstance(profile.get("verifica"), dict) or not isinstance(profile.get("sezioni"), dict) or not profile["sezioni"]:
+    if not isinstance(profile.get("verifica"), dict) or not isinstance(profile.get("sezioni"), dict):
         raise ValueError("verifica e sezioni obbligatorie")
+    for key in ("sezioni_intero", "sezioni_salta_indice"):
+        if key in profile and type(profile[key]) is not bool:
+            raise ValueError(f"{key} deve essere booleano")
+    if "esef_modo" in profile:
+        # Fase B: confronto sui text block dello xBRL-JSON; le sezioni sono i concetti IFRS.
+        if profile["esef_modo"] != "blocchi":
+            raise ValueError("esef_modo non valido")
+        if not profile["emittente_id"].startswith("LEI:") or profile.get("fonti") != ["esef"]:
+            raise ValueError("esef_modo richiede emittente LEI e fonti [esef]")
+        if profile["tipo"] != "annuale":
+            raise ValueError("esef_modo: solo relazioni annuali")
+        if "varianti" in profile:
+            # Fase C: l'annuale ESEF piu' infrannuali da PDF IR (proposta AI accettata).
+            varianti = profile["varianti"] if isinstance(profile["varianti"], list) else []
+            esef_v = [v for v in varianti if isinstance(v, dict) and v.get("fonti", ["esef"]) == ["esef"]]
+            ir_v = [v for v in varianti if isinstance(v, dict) and v.get("fonti") == ["ir"]]
+            if (len(esef_v) != 1 or esef_v[0].get("tipo") != "annuale" or len(esef_v) + len(ir_v) != len(varianti)
+                    or any(v.get("tipo") == "annuale" for v in ir_v)):
+                raise ValueError("esef_modo: varianti ammesse solo come annuale ESEF piu' infrannuali IR")
+    if not profile["sezioni"] and profile.get("sezioni_intero") is not True and "esef_modo" not in profile:
+        raise ValueError("verifica e sezioni obbligatorie")
+    if "periodo_regola" in profile and profile["periodo_regola"] != "piu_recente":
+        raise ValueError("periodo_regola non valida")
+    if "stesso_periodo" in profile and profile["stesso_periodo"] != "piu_lungo":
+        raise ValueError("stesso_periodo non valido")
+    if "forme_sec" in profile and (not isinstance(profile["forme_sec"], list) or not profile["forme_sec"]
+                                   or any(f not in _FORME_SEC for f in profile["forme_sec"])):
+        raise ValueError("forme_sec non valide")
     for key in ("lingua", "tipo", "perimetro"):
         pat = profile["verifica"].get(key)
         if not isinstance(pat, str) or not pat:
@@ -127,6 +194,20 @@ def _validate_profile(ticker, profile, interval_hours):
     hosts = profile.get("host_documenti", [])
     if not isinstance(hosts, list) or any(not isinstance(h, str) or not re.fullmatch(r"[A-Za-z0-9.-]+", h) or not public_host(h.lower()) for h in hosts):
         raise ValueError("host_documenti non validi")
+    if "varianti" in profile:
+        varianti = profile["varianti"]
+        if not isinstance(varianti, list) or not 1 <= len(varianti) <= 3:
+            raise ValueError("varianti: da 1 a 3")
+        tipi = [v.get("tipo") if isinstance(v, dict) else None for v in varianti]
+        if len(set(tipi)) != len(tipi):
+            raise ValueError("varianti: tipi ripetuti")
+        for v in varianti:
+            ammesse = _CHIAVI_VARIANTE | (_CHIAVI_VARIANTE_IR if "esef_modo" in profile else set())
+            if not isinstance(v, dict) or not set(v) <= ammesse or "tipo" not in v:
+                raise ValueError("variante non valida")
+            if "verifica" in v and not isinstance(v["verifica"], dict):
+                raise ValueError("variante: verifica non valida")
+            _validate_profile(ticker, unisci_variante(profile, v), interval_hours)
     if type(interval_hours) is not int or not 1 <= interval_hours <= 8760:
         raise ValueError("interval_hours fuori intervallo")
     raw = _json(profile)
@@ -204,8 +285,8 @@ class FilingStore:
             if conn.execute("SELECT 1 FROM filing_runs WHERE ticker=? AND status IN ('queued','running')", (ticker,)).fetchone():
                 raise RunAlreadyActive("run già attivo: recovery esplicito necessario se il processo è terminato")
             if trigger == "scheduled":
-                last = conn.execute("SELECT started_at FROM filing_runs WHERE ticker=? ORDER BY id DESC LIMIT 1", (ticker,)).fetchone()
-                if last and datetime.fromisoformat(last[0]) + timedelta(hours=p["interval_hours"]) > datetime.now(timezone.utc):
+                ultimi = conn.execute(_ULTIMI, (ticker,)).fetchall()
+                if ultimi and _scadenza(ultimi, p["interval_hours"], p["profile_sha256"]) > datetime.now(timezone.utc):
                     raise RunNotDue("run schedulato non ancora dovuto: deadline ricontrollata nel claim atomico")
             cur = conn.execute("INSERT INTO filing_runs(ticker,profile_version,profile_sha256,profile_json,qualitative_enabled,judgment_language,trigger,started_at,status) VALUES(?,?,?,?,?,?,?,?,'queued')",
                                (ticker, p["version"], p["profile_sha256"], p["profile_json"], p["qualitative_enabled"], language, trigger, _now()))
@@ -243,6 +324,58 @@ class FilingStore:
             ids = conn.execute("SELECT id FROM filing_runs WHERE ticker=? ORDER BY id DESC LIMIT ?", (ticker, limit)).fetchall()
             return [self.get_run_from_conn(conn, r[0]) for r in ids]
 
+    def ultimo_run_completo(self, ticker, *, senza_errori=False):
+        """Run concluso piu' recente che non e' un controllo leggero, senza limite di finestra.
+
+        `senza_errori`: esclude anche i run in errore (riferimento del controllo leggero)."""
+        esclusi = "('queued','running','errore')" if senza_errori else "('queued','running')"
+        with self._connect() as conn:
+            row = conn.execute(f"SELECT id FROM filing_runs WHERE ticker=? AND status NOT IN {esclusi} "
+                               "AND (result_json IS NULL OR json_extract(result_json,'$.controllo_leggero') IS NULL) "
+                               "ORDER BY id DESC LIMIT 1", (ticker,)).fetchone()
+            return self.get_run_from_conn(conn, row[0]) if row else None
+
+    def confronto_ed_errore(self, ticker):
+        """(run del confronto, errore successivo): la selezione comune a tutti i lettori.
+
+        Run del confronto: ultimo run concluso, non leggero, con un confronto (corrente o
+        storico); senza, l'ultimo run completo. Errore: l'ultimo run completo, se e' in errore
+        e successivo al run del confronto (altrimenti None, anche senza confronto).
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM filing_runs WHERE ticker=? AND status NOT IN ('queued','running') "
+                "AND result_json IS NOT NULL AND json_extract(result_json,'$.controllo_leggero') IS NULL "
+                "AND (json_extract(result_json,'$.confronto_corrente') IS NOT NULL "
+                "OR json_extract(result_json,'$.confronto_storico') IS NOT NULL) ORDER BY id DESC LIMIT 1",
+                (ticker,)).fetchone()
+            confronto = self.get_run_from_conn(conn, row[0]) if row else None
+        completo = self.ultimo_run_completo(ticker)
+        errore = completo if (confronto and completo and completo["status"] == "errore"
+                              and completo["id"] > confronto["id"]) else None
+        return confronto or completo, errore
+
+    def coppia_al(self, ticker, istante):
+        """Coppia (sha prima, sha dopo) del run del confronto corrente a `istante` (datetime
+        con fuso): ultimo run con un confronto concluso entro quell'istante. None se assente."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT finished_at, json_extract(result_json,'$.coppia.prima.sha256'), "
+                "json_extract(result_json,'$.coppia.dopo.sha256') FROM filing_runs WHERE ticker=? "
+                "AND status NOT IN ('queued','running') AND result_json IS NOT NULL "
+                "AND json_extract(result_json,'$.controllo_leggero') IS NULL "
+                "AND (json_extract(result_json,'$.confronto_corrente') IS NOT NULL "
+                "OR json_extract(result_json,'$.confronto_storico') IS NOT NULL) ORDER BY id DESC",
+                (ticker,)).fetchall()
+        for fatto, prima, dopo in rows:
+            try:
+                t = datetime.fromisoformat(fatto)
+            except (TypeError, ValueError):
+                continue
+            if t.tzinfo is not None and t <= istante:
+                return (prima, dopo)
+        return None
+
     def finish_run(self, run_id, *, status, reason=None, evidence_key=None, result=None, judgment=None, index=None):
         if status not in ("ok", "parziale", "errore", "non_disponibile", "skipped"):
             raise ValueError("status finale non valido")
@@ -276,9 +409,10 @@ class FilingStore:
             for p in self.list_profiles():
                 if not p["enabled"]:
                     continue
-                last = conn.execute("SELECT started_at FROM filing_runs WHERE ticker=? ORDER BY id DESC LIMIT 1", (p["ticker"],)).fetchone()
+                ultimi = conn.execute(_ULTIMI, (p["ticker"],)).fetchall()
+                last = ultimi[0] if ultimi else None
                 active = conn.execute("SELECT 1 FROM filing_runs WHERE ticker=? AND status IN ('queued','running')", (p["ticker"],)).fetchone()
-                next_at = datetime.fromisoformat(last[0]) + timedelta(hours=p["interval_hours"]) if last else None
+                next_at = _scadenza(ultimi, p["interval_hours"], p["profile_sha256"]) if last else None
                 if not active and (next_at is None or next_at <= now):
                     due.append({"ticker": p["ticker"], "next_due": next_at.isoformat() if next_at else None,
                                 "last_attempt": last[0] if last else None})
@@ -289,5 +423,12 @@ class FilingStore:
         if not profile or not profile["enabled"]:
             return None
         with self._connect() as conn:
-            last = conn.execute("SELECT started_at FROM filing_runs WHERE ticker=? ORDER BY id DESC LIMIT 1", (ticker,)).fetchone()
-        return (datetime.fromisoformat(last[0]) + timedelta(hours=profile["interval_hours"])).isoformat() if last else _now()
+            ultimi = conn.execute(_ULTIMI, (ticker,)).fetchall()
+        return _scadenza(ultimi, profile["interval_hours"], profile["profile_sha256"]).isoformat() if ultimi else _now()
+
+    def active_runs(self):
+        """Run queued/running: id, ticker, status, started_at, trigger."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT id,ticker,status,started_at,trigger FROM filing_runs "
+                                "WHERE status IN ('queued','running') ORDER BY id").fetchall()
+            return [dict(r) for r in rows]

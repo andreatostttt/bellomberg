@@ -1,0 +1,5 @@
+{
+  "_leggimi": "Copia questo file in data/isin_it.json e mettici i TUOI titoli italiani. Il file in data/ e' privato e non viene mai pubblicato. Ogni voce e' SIMBOLO di listino (MAIUSCOLO, come nel book) -> {isin, emarket}. `isin`: l'ISIN verificato sulla scheda di Borsa Italiana (forma e cifra di controllo si controllano: un ISIN copiato male rende illeggibile il negozio intero). `emarket`: l'id dell'emittente su eMarket Storage (il numero dopo azienda= nell'URL della sua pagina comunicati), OPPURE null per DICHIARARE che l'emittente non sta su eMarket (usa un altro SDIR, es. 1Info): allora l'internal dealing risulta 'non_coperto'. La chiave emarket e' obbligatoria anche quando e' null. Lo leggono market_data/borsa_italiana.py (eventi societari) e market_data/emarket_sdir.py (internal dealing). Un ticker assente NON si cerca per nome: la funzione risponde KO 'ticker_non_mappato'. I valori qui sotto sono INVENTATI. Le chiavi con `_` davanti sono note.",
+  "ACME.MI": {"isin": "ITZZACME0007", "emarket": 4242},
+  "ZZTEST.MI": {"isin": "ITZZTEST0001", "emarket": null}
+}

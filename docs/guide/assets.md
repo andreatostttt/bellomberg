@@ -58,6 +58,7 @@ content in the running application can differ.
 | [F4 Global Markets](pages/04-global-markets.md) | [Open SVG](../assets/product/04-global-markets.svg) |
 | [F5 News Desk](pages/05-news-desk.md) | [Open SVG](../assets/product/05-news-desk.svg) |
 | [F6 Fundamentals](pages/06-fundamentals.md) | [Open SVG](../assets/product/06-fundamentals.svg) |
+| [F20 Filing](pages/20-filing.md) | [Open SVG](../assets/product/20-filing.svg) |
 | [F7 Factor Lab](pages/07-factor-lab.md) | [Open SVG](../assets/product/07-factor-lab.svg) |
 | [F8 Monte Carlo](pages/08-monte-carlo.md) | [Open SVG](../assets/product/08-monte-carlo.svg) |
 | [F9 Vol Deck](pages/09-vol-deck.md) | [Open SVG](../assets/product/09-vol-deck.svg) |
@@ -82,7 +83,7 @@ python docs/guide/verify_docs.py
 ```
 
 Both scripts use only the Python standard library. The generator contains its
-own invented display values and writes the nineteen SVG files; it reads no
+own invented display values and writes the twenty SVG files; it reads no
 application configuration, database, report, provider or user portfolio.
 The verifier checks local links, the navigation inventory and SVG structure.
 Neither script starts the application or runs financial calculations.

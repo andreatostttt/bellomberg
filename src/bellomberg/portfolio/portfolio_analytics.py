@@ -730,7 +730,9 @@ def compute_nav_history(start_date: Optional[str] = None,
     if end_date is None:
         end_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    _log(f"NAV history: {len(tickers)} tickers, {start_date} -> {end_date}")
+    # fix 04/10 (A7, Opus 5.5): end_date e' il limite ESCLUSO passato a yfinance (domani),
+    # non la fine della serie — il log diceva «-> 05/10» il 04/10. La data vera e' a fine calcolo.
+    _log(f"NAV history: {len(tickers)} tickers, richiesta [{start_date}, {end_date}) (fine esclusa)")
 
     try:
         prices = _download_prices_for_history(tickers, start_date, end_date, salta)
@@ -929,7 +931,8 @@ def compute_nav_history(start_date: Optional[str] = None,
     }
     _ANALYTICS_CACHE[cache_key] = {"ts": time.time(), "data": result}
     _log(f"NAV history done: {len(dates_iso)} days, "
-         f"final NAV = EUR {nav_total[-1]:,.0f}")
+         f"{dates_iso[0] if dates_iso else 'n.d.'} -> {dates_iso[-1] if dates_iso else 'n.d.'}, "
+         f"final NAV = EUR {nav_total[-1]:,.0f} al {dates_iso[-1] if dates_iso else 'n.d.'}")
     return render_payload(result)
 
 

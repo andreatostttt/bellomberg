@@ -1,6 +1,6 @@
 # F6 — Fundamentals
 
-[Handbook](../README.md) · [Previous: F5](./05-news-desk.md) · [Next: F7](./07-factor-lab.md)
+[Handbook](../README.md) · [Previous: F5](./05-news-desk.md) · [Next: F20](./20-filing.md)
 
 ![F6 Fundamentals: Valuations — English DEMO screenshot](../../assets/screenshots/fundamentals-en.png)
 

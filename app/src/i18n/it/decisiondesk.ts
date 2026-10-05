@@ -99,5 +99,9 @@ export const decisiondesk = {
   "f070": "Nessuna ricerca aperta — la run ne propone di nuove nel memo.",
   "f071": "Archivio research (",
   "f072": "chiuse, promosse o scadute — recuperabili",
-  "f073": "OPERATIVE: archivio automatico a 7 giorni; ARCHIVIA/RIPORTA prevale sulla regola. Una riga fissata attiva (📌) resta attiva. RESEARCH: ARCHIVIA E CHIUDI esclude la voce dalle ricerche delle run successive; RIPORTA IN PAGINA E RIAPRI la include nuovamente. Lo storico resta nel DB. Il comitato legge le note di ricerca e risponde qui."
+  "f073": "OPERATIVE: archivio automatico a 7 giorni; ARCHIVIA/RIPORTA prevale sulla regola. Una riga fissata attiva (📌) resta attiva. RESEARCH: ARCHIVIA E CHIUDI esclude la voce dalle ricerche delle run successive; RIPORTA IN PAGINA E RIAPRI la include nuovamente. Lo storico resta nel DB. Il comitato legge le note di ricerca e risponde qui.",
+  "manual_divergence_title": "Trade manuali correlati · non esecuzione della proposta",
+  "manual_divergence_trade": "Operazione manuale n. {id} · {action} {ticker} · {date} · {reason}",
+  "manual_divergence_isin": " · codice ISIN {isin}",
+  "record_manual_divergence": "Registra divergenza manuale"
 };

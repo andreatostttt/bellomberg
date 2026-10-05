@@ -60,7 +60,7 @@ def test_news_prompt_selects_generated_language_only(monkeypatch, language, head
         calls.append(kwargs["messages"][0]["content"])
         return NS(content=[lc.ThinkingBlock("private"), lc.TextBlock(json.dumps({"sentiment": "neutral", "sentiment_score": 0, "relevance": 7, "headline_it": headline, "why_matters": "Test reason"}))])
     monkeypatch.setattr(lc, "modello", lambda *a: "fake-model")
-    monkeypatch.setattr(lc, "OpenRouterClient", lambda: NS(messages=NS(create=create)))
+    monkeypatch.setattr(lc, "OpenRouterClient", lambda **k: NS(messages=NS(create=create)))
     item = {"title": "Titolo originale 32%", "snippet": "Citazione originale 41", "ticker_mentioned": "SYNTH"}
     before = copy.deepcopy(item)
     result = news._classify_with_haiku(item, ["SYNTH (3.2%)"], language=language)
@@ -74,8 +74,8 @@ def test_news_prompt_selects_generated_language_only(monkeypatch, language, head
 def news_db(tmp_path, monkeypatch):
     path = tmp_path / "news.sqlite"
     with sqlite3.connect(path) as conn:
-        conn.execute("CREATE TABLE news_feed (id INTEGER PRIMARY KEY, title, snippet, source, url, published_at, pulled_at, ticker_mentioned, theme, provider, sentiment, sentiment_score, relevance, headline_it, why_matters)")
-        conn.execute("INSERT INTO news_feed VALUES (1, 'Original title', 'Original quotation', 'fake', 'https://example.invalid/story', '', ?, 'SYNTH', '', 'fake', 'neutral', 0, 7, 'Titolo storico IT', 'Motivo storico IT')", (datetime.now().isoformat(),))
+        conn.execute("CREATE TABLE news_feed (id INTEGER PRIMARY KEY, title, snippet, source, url, published_at, pulled_at, ticker_mentioned, theme, provider, sentiment, sentiment_score, relevance, headline_it, why_matters, classified)")
+        conn.execute("INSERT INTO news_feed VALUES (1, 'Original title', 'Original quotation', 'fake', 'https://example.invalid/story', '', ?, 'SYNTH', '', 'fake', 'neutral', 0, 7, 'Titolo storico IT', 'Motivo storico IT', NULL)", (datetime.now().isoformat(),))
     monkeypatch.setattr(news, "MemoryDB", lambda: NS(db_path=str(path)))
     monkeypatch.setattr(news, "_portfolio_weights_cached", lambda: {})
     monkeypatch.setattr(news, "_favorites_tickers", lambda: set())
@@ -131,7 +131,8 @@ def test_news_pull_persists_english_only_in_generated_cache(news_db, monkeypatch
     def classify(*args):
         languages.append(current_language())
         return {'language':current_language(), 'headline':'New English summary', 'headline_it':'',
-                'why_matters':'New English reason', 'sentiment':'bullish', 'sentiment_score':.25, 'relevance':7}
+                'why_matters':'New English reason', 'sentiment':'bullish', 'sentiment_score':.25, 'relevance':7,
+                '_classification_status':'classified'}
     monkeypatch.setattr(news, '_classify_with_haiku', classify)
     result = news.auto_pull_feed(language='en')
     assert result['saved'] == 1 and result['language'] == 'en' and not result['summary_errors']

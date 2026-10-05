@@ -25,6 +25,9 @@ def request_scope(journal, *, phase, agent=None, round_n=None):
     """Bind a run in this thread/task. ``None`` means externally journaled.
 
 Explicit scopes always disable transport retries, including an external owner.
+The only exception (KA 04/10, PM decision, same rule as Trade Idea): with an own
+journal, ONE new attempt after a provably unbilled failure (connection never
+established, OpenRouter 402 admission), whose row is closed as ``released``.
 Workers must bind their blackboard's journal; ContextVar is not thread-global.
 """
     parent = _REQUEST_SCOPE.get() or {}
@@ -111,6 +114,18 @@ def _nano(value):
         raise ValueError("invalid request cost") from exc
 
 
+# Every reasoning field llm_client._reasoning_openai can send for an effort variable,
+# including none (adaptive or any effort on z-ai/). Used only to recognise paid Capo work.
+_CAPO_REASONING_ON_WIRE = (None, {"enabled": False}, *({"effort": e} for e in
+                           ("minimal", "low", "medium", "high", "xhigh", "max")))
+
+
+# REV G7/R2 (04/10): a legacy form is recognised only when it stands for money spent with
+# an answer or for an outcome still unresolved (which rightly blocks). A ``settled`` row
+# (paid, no usable answer, reconciled) follows the rule of the new key: a new attempt.
+_LEGACY_STATES = ("received", "reserved", "unknown", "incomplete", "overrun")
+
+
 class RequestBlocked(RuntimeError):
     def __init__(self, message, request_id=None):
         super().__init__(message)
@@ -136,6 +151,9 @@ class RequestJournal:
         self._quotes = {}
         self._inflight = set()
         self._external_inflight = set()
+        # RV-KA (05/10): failed requests whose outcome could not be written (DB locked...).
+        # Fail closed: they block every further request of this run in this process.
+        self._write_failures = {}
         self._lock = threading.RLock()
         cap = None if authorized_usd is None else _nano(authorized_usd)
         auth = _json(authorization)
@@ -254,14 +272,15 @@ class RequestJournal:
 
     def _attempt_labels(self, body, labels):
         """A request settled from the provider's bill (paid, no usable answer) is closed:
-        the same work becomes a new attempt with its own key, never a replay or a block."""
+        the same work becomes a new attempt with its own key, never a replay or a block.
+        KA (04/10): a ``released`` request (provably never billed) is closed the same way."""
         attempt = 0
         with self._db() as db:
             while True:
                 current = {**labels, **({"attempt": attempt} if attempt else {})}
                 key = sha256(_json({"request": body, "scope": current}).encode()).hexdigest()
                 row = db.execute("SELECT state FROM requests WHERE key=?", (key,)).fetchone()
-                if row is None or row["state"] != "settled":
+                if row is None or row["state"] not in ("settled", "released"):
                     return current
                 attempt += 1
 
@@ -283,11 +302,38 @@ class RequestJournal:
             legacy_body = {**body, "max_tokens": legacy_cap}
             legacy_key = sha256(_json({"request": legacy_body, "scope": labels}).encode()).hexdigest()
             candidates.append((legacy_key, _json(legacy_body)))
+        # Reflection moved from thinking disabled to effort low (integration of the
+        # effort-by-phase policy): a request journaled before that change is replayed
+        # with its original reasoning (and cap), never paid a second time.
+        if ((labels["phase"], labels["agent"], labels["round_n"]) == ("reflection", "_reflection", None)
+                and body.get("reasoning") == {"effort": "low"}):
+            for old_cap in dict.fromkeys((body.get("max_tokens"), 1000)):
+                for old_reasoning in ({"enabled": False}, {"effort": "minimal"}):
+                    old_body = {**body, "max_tokens": old_cap, "reasoning": old_reasoning}
+                    old_key = sha256(_json({"request": old_body, "scope": labels}).encode()).hexdigest()
+                    candidates.append((old_key, _json(old_body)))
+        # G7/C1 (04/10): the Capo is the most expensive call of the run. Its effort moved
+        # from adaptive to CAPO_EFFORT, and checkpoints written before that change carry no
+        # effort. A Capo request identical in every field but its reasoning (any value an
+        # effort variable can put on the wire, or none) is the same paid work: replayed with
+        # its original body, never paid a second time.
+        if labels["phase"] == "capo":
+            for old_reasoning in _CAPO_REASONING_ON_WIRE:
+                if old_reasoning == body.get("reasoning"):
+                    continue
+                old_body = {k: v for k, v in body.items() if k != "reasoning"}
+                if old_reasoning is not None:
+                    old_body["reasoning"] = old_reasoning
+                old_key = sha256(_json({"request": old_body, "scope": labels}).encode()).hexdigest()
+                candidates.append((old_key, _json(old_body)))
         with self._lock, self._db() as db:
-            for candidate_key, candidate_source in candidates:
-                row = db.execute("SELECT * FROM requests WHERE key=?", (candidate_key,)).fetchone()
-                if row is not None:
-                    return self._replay(row, candidate_source, labels)
+            found = self._find(db, candidates)
+            if found is not None:
+                return self._replay(found[0], found[1], labels)
+        if getattr(self, "_write_failures", None):
+            request_id, cause = next(iter(self._write_failures.items()))
+            raise RequestBlocked("outcome of a failed request was not written to the journal (" + cause
+                                 + "); further spending blocked until reconciled", request_id)
         for row in self._external_rows():
             if (row["state"] in ("unknown", "overrun")
                     or row["state"] == "reserved" and row["request_id"] not in self._external_inflight):
@@ -297,10 +343,9 @@ class RequestJournal:
         wire.setdefault("provider", {})["max_price"] = quote["max_price"]
         with self._lock, self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            for candidate_key, candidate_source in candidates:
-                row = db.execute("SELECT * FROM requests WHERE key=?", (candidate_key,)).fetchone()
-                if row is not None:
-                    return self._replay(row, candidate_source, labels)
+            found = self._find(db, candidates)
+            if found is not None:
+                return self._replay(found[0], found[1], labels)
             rows = db.execute("SELECT * FROM requests").fetchall()
             for row in rows:
                 self._verify_row(row)
@@ -323,6 +368,20 @@ class RequestJournal:
         return request_id, wire, None
 
     @staticmethod
+    def _find(db, candidates):
+        """The exact request first; among known legacy forms a received answer wins over an
+        unresolved one (two legacy rows mean the same work was already paid twice)."""
+        rows = []
+        for candidate_key, candidate_source in candidates:
+            row = db.execute("SELECT * FROM requests WHERE key=?", (candidate_key,)).fetchone()
+            if row is not None:
+                if candidate_key == candidates[0][0]:
+                    return row, candidate_source
+                if row["state"] in _LEGACY_STATES:
+                    rows.append((row, candidate_source))
+        return next((item for item in rows if item[0]["state"] == "received"), rows[0] if rows else None)
+
+    @staticmethod
     def _replay(row, source, labels):
         RequestJournal._verify_row(row)
         if row["request"] != source or row["scope"] != _json(labels):
@@ -333,20 +392,34 @@ class RequestJournal:
         response = json.loads(row["response"])
         if receipt.get("response_sha256") != sha256(row["response"].encode()).hexdigest():
             raise ValueError("saved response checksum differs")
+        settlement = receipt.get("settlement")
+        if settlement and isinstance(response, dict) and (response.get("usage") or {}).get("cost") is None:
+            # REV G7/R3: the stream carried no bill; the cost is the provider's MEASURED bill
+            # recorded by the reconciliation, labelled as such (never invented, never zero).
+            response["usage"] = {**(response.get("usage") or {}), "cost": row["cost"] / 1e9,
+                                 "cost_source": settlement.get("source")}
         return row["request_id"], json.loads(source), response
 
     @staticmethod
     def _verify_row(row):
-        if (row["state"] not in ("reserved", "received", "unknown", "incomplete", "overrun", "settled")
+        if (row["state"] not in ("reserved", "received", "unknown", "incomplete", "overrun", "settled",
+                                 "released")
                 or type(row["reserved"]) is not int or row["reserved"] < 0
                 or row["cost"] is not None and (type(row["cost"]) is not int or row["cost"] < 0)):
             raise ValueError("invalid stored request accounting")
         request, scope, receipt = (json.loads(row[key]) for key in ("request", "scope", "receipt"))
+        if row["state"] == "released":
+            # KA (04/10): closed without a bill only with its evidence; never a response.
+            release = receipt.get("release") or {}
+            if (row["cost"] != 0 or row["response"] is not None or release.get("billable") is not False
+                    or not release.get("reason") or not release.get("evidence")):
+                raise ValueError("released request lacks its unbilled evidence")
         if sha256(_json({"request": request, "scope": scope}).encode()).hexdigest() != row["key"]:
             raise ValueError("stored request checksum differs")
         if (receipt.get("quote") or {}).get("reserve_nano_usd") != row["reserved"]:
             raise ValueError("stored reservation differs from its quote")
-        if row["state"] == "settled":
+        settled_bill = row["state"] == "settled" or (row["state"] == "received" and "settlement" in receipt)
+        if settled_bill:
             settlement = receipt.get("settlement") or {}
             if row["cost"] is None or settlement.get("cost_nano") != row["cost"] or not settlement.get("generation_id"):
                 raise ValueError("settled request lacks its provider bill")
@@ -354,7 +427,7 @@ class RequestJournal:
             if receipt.get("response_sha256") != sha256(row["response"].encode()).hexdigest():
                 raise ValueError("saved response checksum differs")
             response = json.loads(row["response"])
-            if (row["state"] != "settled" and row["cost"] is not None
+            if (not settled_bill and row["cost"] is not None
                     and _nano((response.get("usage") or {}).get("cost")) != row["cost"]):
                 raise ValueError("stored cost differs from its original provider receipt")
         if row["state"] == "received" and (row["response"] is None or row["cost"] is None
@@ -363,6 +436,15 @@ class RequestJournal:
 
     def checkpoint(self, request_id, payload):
         """Append stream evidence immediately; a partial stream is never a result."""
+        self.checkpoint_many(request_id, [payload])
+
+    def checkpoint_many(self, request_id, payloads):
+        """Append several stream chunks in ONE transaction, one row per chunk in order.
+
+        G7/M2 (04/10): one BEGIN IMMEDIATE per SSE chunk, with four desks streaming into
+        the same journal, risked a lock past the 15 s timeout (-> unknown request, run
+        blocked). Evidence is still never a result: resume relies on the durable
+        reservation written before the POST, not on these rows."""
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT state FROM requests WHERE request_id=?", (request_id,)).fetchone()
@@ -370,8 +452,9 @@ class RequestJournal:
                 raise ValueError("stream checkpoint lacks an active request")
             seq = db.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM checkpoints WHERE request_id=?",
                              (request_id,)).fetchone()[0]
-            evidence, issues = _evidence(payload)
-            db.execute("INSERT INTO checkpoints VALUES(?,?,?)", (request_id, seq, _json(evidence)))
+            db.executemany("INSERT INTO checkpoints VALUES(?,?,?)",
+                           [(request_id, seq + offset, _json(_evidence(payload)[0]))
+                            for offset, payload in enumerate(payloads)])
 
     def receive(self, request_id, response, *, complete=True, diagnostic=None):
         response, evidence_issues = _evidence(response)
@@ -412,11 +495,25 @@ class RequestJournal:
             self._inflight.discard(request_id)
         return state
 
+    def _write_failed(self, request_id, exc):
+        """The failure could not be recorded: the row stays 'reserved' on disk. Never leave it
+        counted as in flight (that would let the next request through): block, declared."""
+        self._inflight.discard(request_id)
+        self._write_failures.setdefault(request_id, type(exc).__name__ + ": " + str(exc)[:160])
+
     def fail(self, request_id, error, *, response=None):
         """Store the first cause. A missing bill keeps the full reservation."""
+        try:
+            self._fail(request_id, error, response=response)
+        except Exception as exc:
+            self._write_failed(request_id, exc)
+            raise
+
+    def _fail(self, request_id, error, *, response=None):
         if response is not None:
             self.receive(request_id, response, complete=False,
-                         diagnostic={"type": type(error).__name__, "message": str(error)[:1000]})
+                         diagnostic={"type": type(error).__name__, "message": str(error)[:1000],
+                                     "generation_id": getattr(error, "generation_id", None)})
         else:
             with self._lock, self._db() as db:
                 db.execute("UPDATE requests SET state='unknown',error=COALESCE(error,?) "
@@ -430,12 +527,56 @@ class RequestJournal:
         except (AttributeError, TypeError):
             pass
 
+    def release_unbilled(self, request_id, error, *, reason):
+        """reserved -> released: the request provably never reached a model (KA 04/10).
+
+        Only the caller's pure classifier (core/unbilled.provably_unbilled) may decide it;
+        the evidence (exception type, message, transport phase, status) is stored with the
+        row, the cost is 0 and the same work becomes a new attempt (_attempt_labels).
+        Returns False, writing nothing, when the row is no longer reserved.
+        A failed write blocks the run's further requests (fail closed, RV-KA 05/10)."""
+        try:
+            return self._release_unbilled(request_id, error, reason=reason)
+        except Exception as exc:
+            self._write_failed(request_id, exc)
+            raise
+
+    def _release_unbilled(self, request_id, error, *, reason):
+        evidence = {"type": type(error).__name__, "message": str(error)[:1000],
+                    "status_code": getattr(error, "status_code", None),
+                    "transport_phase": getattr(error, "transport_phase", None),
+                    # RV-KA P2: an id the provider opened stays reconcilable (GET /generation).
+                    "generation_id": getattr(error, "generation_id", None)}
+        with self._lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT state,receipt FROM requests WHERE request_id=?", (request_id,)).fetchone()
+            if row is None:
+                raise ValueError("release has no durable reservation")
+            if row["state"] != "reserved":
+                return False
+            receipt = json.loads(row["receipt"])
+            receipt["release"] = {"billable": False, "reason": str(reason)[:300], "evidence": evidence}
+            db.execute("UPDATE requests SET state='released',cost=0,receipt=?,error=COALESCE(error,?) "
+                       "WHERE request_id=? AND state='reserved'",
+                       (_json(receipt), _json(evidence), request_id))
+            self._inflight.discard(request_id)
+        try:
+            error.request_id = request_id
+        except (AttributeError, TypeError):
+            pass
+        return True
+
     @staticmethod
     def unknown_requests(path):
-        """Read-only: unknown native requests with model and the provider id captured for them."""
+        """Read-only: unknown native requests with model and the provider id captured for them.
+
+        REV G7/R5 (04/10): a ``reserved`` row is listed too. Read from another process it is
+        a request whose outcome nobody recorded (hard crash after the POST): it blocks the
+        run like an unknown one and must be visible to the reconciliation. Call it only when
+        no run is executing (the HTTP endpoint already refuses a running run)."""
         with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=15)) as db:
             db.row_factory = sqlite3.Row
-            rows = db.execute("SELECT * FROM requests WHERE state='unknown'").fetchall()
+            rows = db.execute("SELECT * FROM requests WHERE state IN ('unknown','reserved')").fetchall()
             out = []
             for row in rows:
                 receipt = json.loads(row["receipt"] or "{}")
@@ -444,10 +585,12 @@ class RequestJournal:
                                    (row["request_id"],)).fetchall()
                 chunk_ids = [json.loads(item["payload"]).get("id") for item in first
                              if isinstance(json.loads(item["payload"]), dict)]
+                diagnostic = receipt.get("diagnostic") if isinstance(receipt.get("diagnostic"), dict) else {}
                 out.append({"request_id": row["request_id"], "model": json.loads(row["request"]).get("model"),
-                            "reserved": row["reserved"],
-                            "receipt": {**receipt, "generation_id": error.get("generation_id") or
-                                        next((value for value in chunk_ids if value), None)}})
+                            "reserved": row["reserved"], "state": row["state"],
+                            "receipt": {**receipt, "generation_id": error.get("generation_id")
+                                        or diagnostic.get("generation_id")
+                                        or next((value for value in chunk_ids if value), None)}})
         return out
 
     @staticmethod
@@ -468,13 +611,25 @@ class RequestJournal:
                     if same:
                         return False
                     raise ValueError("request already settled with a different bill")
-                if row["state"] != "unknown":
+                if row["state"] == "received" and "settlement" in receipt:
+                    same = receipt["settlement"].get("generation_id") == generation_id and row["cost"] == cost
+                    db.execute("COMMIT")
+                    if same:
+                        return False
+                    raise ValueError("request already settled with a different bill")
+                if row["state"] not in ("unknown", "reserved"):
                     raise ValueError("only an unknown request can be settled from the provider bill")
                 receipt["settlement"] = {"source": "OpenRouter GET /api/v1/generation",
                                          "generation_id": generation_id, "cost_nano": cost,
                                          "lookup_sha256": lookup_sha256, "provider_generation": provider_generation}
-                db.execute("UPDATE requests SET state='settled',cost=?,receipt=? WHERE request_id=? AND state='unknown'",
-                           (cost, _json(receipt), request_id))
+                # REV G7/R3 (04/10): a COMPLETE answer with verified identity whose only gap was
+                # the bill (stream closed without usage) is the paid work: once the provider's
+                # measured bill is recorded it becomes ``received`` and is replayed, never paid
+                # again. Without a complete answer the row is ``settled`` (work redone as before).
+                complete = (row["response"] is not None and receipt.get("complete") is True
+                            and receipt.get("identity_verified") is True)
+                db.execute("UPDATE requests SET state=?,cost=?,receipt=? WHERE request_id=? AND state=?",
+                           ("received" if complete else "settled", cost, _json(receipt), request_id, row["state"]))
                 db.execute("COMMIT")
                 return True
             except BaseException:
@@ -500,7 +655,16 @@ class RequestJournal:
         native = [{**{key: row[key] for key in ("request_id", "state", "reserved", "cost")},
                    **json.loads(row["scope"]), "response_id": json.loads(row["receipt"]).get("response_id"),
                    "accounting_owner": "run"} for row in rows]
+        # KA (04/10): every request closed as provably unbilled, in journal order; an empty
+        # list is a measurement (none), not a missing value.
+        released = []
+        for row in sorted((r for r in rows if r["state"] == "released"), key=lambda r: r["created"]):
+            scope = json.loads(row["scope"])
+            released.append({"request_id": row["request_id"], "agent": scope.get("agent"),
+                             "phase": scope.get("phase"), "round_n": scope.get("round_n"),
+                             "reason": (json.loads(row["receipt"]).get("release") or {}).get("reason")})
         return {"run_id": self.run_id, "request_count": len(rows) + len(external_owned),
+                "released_requests": released,
                 "native_request_count": len(rows), "known_cost_usd": (known + external_known) / 1e9,
                 "cost_usd": None if unknown or external_unknown else (known + external_known) / 1e9,
                 "unknown_requests": len(unknown) + sum(row["owned"] for row in external_unknown),

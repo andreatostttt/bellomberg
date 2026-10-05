@@ -218,8 +218,8 @@ def test_T1_il_ritentativo_chiude_i_messaggi_con_un_nudge_dichiarato(bb_fund):
 
 
 @pytest.mark.parametrize("model,thinking", [
-    ("google/gemini-3.8-flash", {"type": "adaptive"}),
-    ("meta/muse-spark-1.3", {"type": "effort", "effort": "max"}),
+    ("google/gemini-3.8-flash", {"type": "effort", "effort": "high"}),
+    ("meta/muse-spark-1.3", {"type": "effort", "effort": "high"}),
 ])
 def test_T1_dopo_il_ritentativo_il_ragionamento_torna_acceso(bb_fund, monkeypatch, model, thinking):
     """Recon 12/09 par. 2.3: `_thinking` restava `disabled` per il resto del round. La
@@ -280,7 +280,6 @@ def test_T3_il_registro_usage_distingue_il_ritentativo_dal_retry_529(bb_fund, mo
     """`api_calls = iteration + _retry_529 + _retry_vuoto`: una riga con api_calls=2 era
     identica per un 529 e per un ritentativo a 0 char. Il campo dedicato le separa, e
     l'aggregato per desk che va nel heartbeat (Agents Live) lo porta."""
-    monkeypatch.setattr(base, "RETRY_529_BACKOFF_S", (0.0, 0.0))   # niente pause vere nel test
 
     client = _ClientCheRispettaIlContratto(_copione_vuoto_poi_riassunto)
     _MockFundamentals(bb_fund, client=client).run(2)

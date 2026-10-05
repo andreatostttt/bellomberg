@@ -1,0 +1,388 @@
+/* Research and portfolio views. Every rule is limited to ModernPage opt-ins;
+   the existing dark presentation remains the Classic fallback. */
+
+.bb-page-modern[data-page="performance"] .performance-page {
+  min-height: 100%;
+  gap: 12px;
+  padding: 12px;
+  overflow: auto;
+  color: var(--bb-page-text);
+}
+
+.bb-page-modern[data-page="performance"] .performance-page > .p3 {
+  overflow: visible;
+}
+
+.bb-page-modern[data-page="performance"] .performance-page .p3.hero {
+  border-left: 1px solid var(--bb-page-line);
+}
+
+.bb-page-modern[data-page="performance"] .performance-page .hmx {
+  table-layout: fixed;
+  min-width: 760px;
+}
+
+.bb-page-modern[data-page="performance"] .performance-page :is(.hmx th, .p3 table thead th) {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  color: var(--bb-page-muted);
+  border-color: var(--bb-page-line);
+  background: var(--bb-page-soft);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .035em;
+  text-transform: none;
+}
+
+.bb-page-modern[data-page="performance"] .performance-page .performance-stat-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(155px, 100%), 1fr)) !important;
+}
+
+.bb-page-modern[data-page="performance"] .performance-page .performance-k {
+  border-right-color: var(--bb-page-line) !important;
+  border-bottom-color: var(--bb-page-line) !important;
+}
+
+.bb-page-modern[data-page="performance"] .performance-page .performance-k-label {
+  overflow: visible !important;
+  white-space: normal !important;
+  color: var(--bb-page-muted) !important;
+  font-size: 12px !important;
+  font-weight: 600 !important;
+  letter-spacing: .025em !important;
+  line-height: 1.35;
+  text-transform: none !important;
+}
+
+.bb-page-modern[data-page="performance"] .performance-page .performance-k-sub {
+  overflow: visible !important;
+  white-space: normal !important;
+  color: var(--bb-page-muted) !important;
+  font-size: 12px !important;
+  font-weight: 450 !important;
+  line-height: 1.35;
+}
+
+.bb-page-modern[data-page="performance"] .performance-page .hmx th:first-child {
+  width: 112px;
+}
+
+.bb-page-modern[data-page="performance"] .performance-page .hmx th.ytdh,
+.bb-page-modern[data-page="performance"] .performance-page .hmx td.ytdc {
+  width: 120px;
+  border-left: 1px solid var(--bb-page-line);
+}
+
+.bb-page-modern[data-page="performance"] .performance-page .hmx td {
+  height: 46px;
+  border-color: var(--bb-page-line);
+  text-align: center;
+}
+
+.bb-page-modern[data-page="performance"] .performance-page .hmx td.rowlab {
+  color: var(--bb-page-text);
+  background: var(--bb-page-soft);
+  border-right-color: var(--bb-page-line);
+}
+
+.bb-page-modern[data-page="performance"] .performance-page .hmx td.rowlab small,
+.bb-page-modern[data-page="performance"] .performance-page .hmx td .pl {
+  color: var(--bb-page-muted);
+}
+
+.bb-page-modern[data-page="performance"] .performance-page .p3panel {
+  border: 1px solid var(--bb-page-line);
+  border-radius: 8px;
+  background: var(--bb-page-soft);
+}
+
+.bb-page-modern[data-page="watchlist"] .watchlist-page {
+  min-height: 100%;
+  gap: 12px;
+  padding: 12px;
+  overflow: auto;
+}
+
+.bb-page-modern[data-page="watchlist"] .watchlist-page .panel {
+  min-width: 0;
+  border: 1px solid var(--bb-page-line);
+  border-radius: 9px;
+  background: var(--bb-page-panel);
+  box-shadow: none;
+}
+
+.bb-page-modern[data-page="watchlist"] .watchlist-page textarea {
+  min-height: 54px;
+  resize: vertical;
+}
+
+.bb-page-modern[data-page="watchlist"] .watchlist-page tbody tr:hover {
+  background: var(--bb-page-accent-soft);
+}
+
+.bb-page-modern[data-page="watchlist"] .watchlist-page td[colspan] {
+  background: var(--bb-page-soft);
+}
+
+.bb-page-modern[data-page="watchlist"] .watchlist-page > .panel:first-child .text-amber-bright {
+  color: var(--bb-page-text);
+  font-size: 16px !important;
+  font-weight: 650;
+  letter-spacing: normal !important;
+  text-shadow: none;
+}
+
+.bb-page-modern[data-page="news"] .news-page {
+  min-height: 0;
+  height: 100%;
+  gap: 10px;
+  padding: 12px;
+  overflow: auto;
+  color: var(--bb-page-text);
+}
+
+.bb-page-modern[data-page="news"] .news-page > .p3.hero {
+  border-left: 1px solid var(--bb-page-line);
+  overflow: visible;
+}
+
+.bb-page-modern[data-page="news"] .news-page .scanx::after {
+  display: none;
+}
+
+.bb-page-modern[data-page="news"] .news-page .nwir {
+  min-height: 520px;
+  overflow: visible;
+}
+
+/* Keep Desk panels usable when the summary wraps on shorter windows. */
+.bb-page-modern[data-page="news"] .news-page .nwdesk {
+  min-height: 600px;
+  flex-shrink: 0;
+}
+
+@media (max-width: 1100px) {
+  .bb-page-modern[data-page="news"] .news-page .nwdesk {
+    flex: none;
+    min-height: 0;
+    overflow: visible;
+  }
+}
+
+.bb-page-modern[data-page="news"] .news-page .nwir > .p3 {
+  overflow: auto;
+}
+
+.bb-page-modern[data-page="news"] .news-page .nwir .nwmain {
+  min-width: 0;
+  min-height: 500px;
+}
+
+.bb-page-modern[data-page="news"] .news-page .nwir .nwright {
+  min-width: 250px;
+}
+
+.bb-page-modern[data-page="news"] .news-page .tapex {
+  min-height: 30px;
+  height: auto;
+  border: 1px solid var(--bb-page-line);
+  border-radius: 7px;
+  background: var(--bb-page-panel);
+}
+
+.bb-page-modern[data-page="news"] .news-page .scpx .swp {
+  display: none;
+}
+
+.bb-page-modern[data-page="news"] .news-page .news-briefing-md h2 {
+  color: var(--bb-page-accent);
+  border-color: var(--bb-page-line);
+  font-size: 14px;
+}
+
+.bb-page-modern[data-page="news"] .news-page .news-briefing-md :is(p, ul) {
+  color: var(--bb-page-text);
+  font-size: 14px;
+}
+
+.bb-page-modern[data-page="news"] .news-page .news-briefing-md strong,
+.bb-page-modern[data-page="news"] .news-page .news-briefing-md code {
+  color: var(--bb-page-warn);
+}
+
+.bb-page-modern[data-page="news"] .news-page .news-briefing-md em {
+  color: var(--bb-page-accent);
+}
+
+.bb-page-modern[data-page="fundamentals"] .fundamentals-page {
+  min-height: 100%;
+  gap: 12px;
+  padding: 12px;
+  overflow: auto;
+  color: var(--bb-page-text);
+}
+
+.bb-page-modern[data-page="fundamentals"] .fundamentals-page h1 {
+  color: var(--bb-page-text);
+  font-family: inherit;
+  font-size: 24px !important;
+  font-weight: 650;
+  letter-spacing: -.02em;
+}
+
+.bb-page-modern[data-page="fundamentals"] .fundamentals-page :is(th, [class~="tracking-[2px]"]) {
+  font-family: inherit;
+  letter-spacing: .04em !important;
+}
+
+.bb-page-modern[data-page="fundamentals"] .fundamentals-page th {
+  color: var(--bb-page-muted);
+  font-size: 12px !important;
+  text-transform: none;
+}
+
+.bb-page-modern[data-page="fundamentals"] .fundamentals-page > .flex.gap-0 {
+  min-height: 420px;
+  align-items: stretch;
+  border: 1px solid var(--bb-page-line);
+  border-radius: 9px;
+  background: var(--bb-page-panel);
+}
+
+.bb-page-modern[data-page="fundamentals"] .fundamentals-page :is([class~="bg-black/40"], [class~="bg-[#141414]"], [class~="bg-[#0a0a0a]"], [class~="bg-[#0d0d0d]"], [class~="bg-[#101010]"], [class~="bg-[#0a1220]"]) {
+  background-color: var(--bb-page-panel);
+}
+
+.bb-page-modern[data-page="fundamentals"] .fundamentals-page :is([class~="bg-[#16202b]"], [class~="bg-[#161006]"]) {
+  background-color: var(--bb-page-accent-soft);
+}
+
+.bb-page-modern[data-page="fundamentals"] .fundamentals-page :is([class~="bg-[#1c1305]"], [class~="bg-[#33240a]"]) {
+  background-color: var(--bb-page-warn-soft);
+}
+
+.bb-page-modern[data-page="fundamentals"] .fundamentals-page :is([class~="text-[#ff8c00]"], [class~="text-[#8ab4f8]"]) {
+  color: var(--bb-page-accent);
+}
+
+.bb-page-modern[data-page="fundamentals"] .fundamentals-page :is([class~="text-[#c89a3f]"], [class~="text-[#ffb000]"]) {
+  color: var(--bb-page-warn);
+}
+
+.bb-page-modern[data-page="fundamentals"] .fundamentals-page [class~="text-white/85"] {
+  color: var(--bb-page-muted);
+}
+
+.bb-page-modern[data-page="fundamentals"] .fundamentals-page [class~="border-[#ff8c00]"] {
+  border-color: var(--bb-page-accent);
+}
+
+.bb-page-modern[data-page="fundamentals"] .fundamentals-page :is([class~="border-[#2c4a7a]"], [class~="border-[#7a5b1e]"]) {
+  border-color: var(--bb-page-line);
+}
+
+.bb-page-modern[data-page="fundamentals"] .fundamentals-page .border-r.border-border {
+  border-color: var(--bb-page-line);
+}
+
+.bb-page-modern[data-page="fundamentals"] .fundamentals-page tbody tr:hover {
+  background: var(--bb-page-accent-soft);
+}
+
+@media (max-width: 900px) {
+  .bb-page-modern[data-page="fundamentals"] .fundamentals-page > .flex.gap-0 {
+    flex-direction: column;
+  }
+
+  .bb-page-modern[data-page="fundamentals"] .fundamentals-page > .flex.gap-0 > .border-r {
+    border-right: 0;
+    border-bottom: 1px solid var(--bb-page-line);
+  }
+}
+
+@media (max-width: 760px) {
+  .bb-page-modern[data-page="performance"] .performance-page,
+  .bb-page-modern[data-page="watchlist"] .watchlist-page,
+  .bb-page-modern[data-page="news"] .news-page,
+  .bb-page-modern[data-page="fundamentals"] .fundamentals-page {
+    padding: 8px;
+  }
+
+  .bb-page-modern[data-page="news"] .news-page .nwir {
+    flex-direction: column;
+  }
+
+  .bb-page-modern[data-page="news"] .news-page .nwir > .w-44 {
+    width: auto;
+    max-height: 240px;
+    flex: none;
+  }
+
+  .bb-page-modern[data-page="news"] .news-page .nwir .nwmain,
+  .bb-page-modern[data-page="news"] .news-page .nwir .nwright {
+    width: 100%;
+    min-width: 0;
+  }
+}
+
+/* Visual review: readable quote values, balanced TWR metrics and wire context. */
+.bb-page-modern[data-page="performance"] .performance-page .performance-stat-grid-twr {
+  grid-template-columns: repeat(auto-fit, minmax(min(130px, 100%), 1fr)) !important;
+}
+.bb-page-modern[data-page="performance"] .performance-k [data-missing="true"] {
+  color: var(--bb-page-muted) !important;
+}
+.bb-page-modern[data-page="news"] .news-page .tapein :is(.tt, .tk, .tl, .sep) {
+  font-size: 12px;
+  color: var(--bb-page-muted);
+}
+.bb-page-modern[data-page="news"] .news-page .tapein .tk { color: var(--bb-page-accent); }
+.bb-page-modern[data-page="news"] .news-page .tapein .tl { color: var(--bb-page-text); }
+.bb-page-modern[data-page="news"] .news-page :is(.scleg, .runline, .chx, .rkn) {
+  font-size: 12px;
+  letter-spacing: normal;
+  color: var(--bb-page-muted);
+}
+.bb-page-modern[data-page="news"] .news-page .runline {
+  flex-wrap: wrap;
+  color: var(--bb-page-accent);
+  border-color: var(--bb-page-line);
+  background: var(--bb-page-accent-soft);
+  border-radius: 6px;
+}
+.bb-page-modern[data-page="news"] .news-page .chx .mt {
+  color: var(--bb-page-bad);
+  font-size: 12px;
+}
+.bb-page-modern[data-page="fundamentals"] .fundamentals-page h1 { color: var(--bb-page-text) !important; }
+
+/* Native keyboard actions retain the previous ticker typography in Classic. */
+:where(.watchlist-page, .fundamentals-page) button.research-ticker-action {
+  border: 0;
+  padding: 0;
+  min-height: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.bb-page-modern[data-page] button.research-ticker-action {
+  border: 0;
+  padding: 4px 0;
+  min-height: 28px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+/* ===== Dark Nuova · Research pages ======================================
+   The page palette (--bb-page-*) is already remapped to the --bbt-* tokens by
+   pages-modern.css, so the rules above follow the theme. Only the leftovers
+   that are not palette-driven are adjusted here. Light rules are unchanged. */
+:root[data-bb-theme="dark"] .bb-page-modern[data-page="performance"] .performance-page .ribx .band { opacity: .5; }
+:root[data-bb-theme="dark"] .bb-page-modern[data-page="news"] .news-page .news-briefing-md strong,
+:root[data-bb-theme="dark"] .bb-page-modern[data-page="news"] .news-page .news-briefing-md code { color: var(--bbt-warn-text); }
+:root[data-bb-theme="dark"] .bb-page-modern[data-page="fundamentals"] .fundamentals-page :is([class~="bg-black/40"], [class~="bg-[#141414]"], [class~="bg-[#0a0a0a]"], [class~="bg-[#0d0d0d]"], [class~="bg-[#101010]"], [class~="bg-[#0a1220]"]) { background-color: var(--bbt-surface); }
+:root[data-bb-theme="dark"] .bb-page-modern[data-page="fundamentals"] .fundamentals-page [class~="text-white/85"] { color: var(--bbt-text-2); }

@@ -46,6 +46,19 @@ class _TextBlock:
         self.text = text
 
 
+class _ThinkingBlock:
+    type = "thinking"
+
+
+class _ToolBlock:
+    type = "tool_use"
+
+    def __init__(self):
+        self.id = "tool-vietato"
+        self.name = "get_portfolio_live"
+        self.input = {}
+
+
 class _Resp:
     def __init__(self, stop_reason, content, usage=None):
         self.stop_reason = stop_reason
@@ -93,7 +106,7 @@ def bb(tmp_path, monkeypatch):
              "input_schema": {"type": "object", "properties": {}}}
     ct.get_tools_for_agent = lambda name: [dict(_tool)]
     ct.TOOL_DEFINITIONS = [dict(_tool)]
-    ct.dispatch = lambda name, args=None: {"ok": True, "mock": name}
+    ct.dispatch = lambda name, args=None, **kwargs: {"ok": True, "mock": name}
     monkeypatch.setitem(sys.modules, 'bellomberg.agents.chat_tools', ct)
     import bellomberg.agents
     monkeypatch.setattr(bellomberg.agents, "chat_tools", ct, raising=False)
@@ -126,8 +139,20 @@ def test_all_native_specialist_phases_send_128k_without_changing_model_or_effort
     actor = actor_type(bb, client=client)
     monkeypatch.setattr(actor, "_build_round_context", lambda _: "Frozen offline analyst context.")
     expected_model = actor._model_for_round(round_n)
-    expected_effort = ({"type": "effort", "effort": "max"} if scope == "trade_idea"
-                       else base.thinking_consigliere(expected_model))
+    # Integration of both features: the PM's 128k cap for every phase (asserted
+    # below, unchanged) + Andrea's effort-by-phase policy for weekly desks
+    # (R0 low; R1/R2 high for fundamentals/quant/options/macro; adaptive otherwise).
+    # Trade Idea keeps its frozen execution-policy effort.
+    if scope == "trade_idea":
+        expected_effort = {"type": "effort", "effort": "max"}
+    elif round_n == 0:
+        expected_effort = {"type": "effort", "effort": "low"}
+    elif desk in {"fundamentals", "quant", "options", "macro"}:
+        expected_effort = {"type": "effort", "effort": "high"}
+    else:
+        expected_effort = {"type": "adaptive"}
+    assert expected_effort == (base.thinking_consigliere(expected_model, agente=desk, round_n=round_n)
+                               if scope == "weekly" else expected_effort)
 
     result = actor.run(round_n, task_context=task, publish_report=task is None)
 
@@ -267,14 +292,127 @@ def test_la_troncatura_dichiara_cap_output_tokens_testo_e_secondi(bb, capsys):
     client = _FakeClient(
         lambda n, kw: _Resp("max_tokens", [_TextBlock(testo)], _Usage(out=16000)))
 
-    _MockSpecialist(bb, client=client).run(2)
+    out = _MockSpecialist(bb, client=client).run(2)
 
     riga = _riga_warn(capsys.readouterr().out)
+    assert out.endswith(testo)
+    assert out.startswith("[ROUND 2 SENZA TOOL")
+    assert len(client.calls) == 1, "un testo troncato ma utilizzabile non va ripagato"
     assert "cap %d token" % client.calls[0]["max_tokens"] in riga, riga
     assert "output_tokens=16000" in riga, riga
     assert "9578 char" in riga, riga
     assert "ragionamento" in riga, riga
     assert re.search(r"call di \d+\.\d s", riga), riga
+
+
+def test_max_tokens_senza_testo_ritenta_una_volta_con_tool_disponibili(bb, capsys):
+    """Regressione run 10/09: GLM ha speso 16k token solo in reasoning.
+
+    Il round non deve trasformarsi subito in ``No output produced``: concede un
+    solo recupero, senza reasoning adattivo e con i tool ancora disponibili,
+    usando lo stesso contesto gia' raccolto.
+    """
+    def script(n, kw):
+        if n == 1:
+            return _Resp("max_tokens", [_ThinkingBlock()], _Usage(out=16000))
+        return _Resp("end_turn", [_TextBlock("REPORT FUNDAMENTALS RECUPERATO")],
+                     _Usage(out=1200))
+
+    client = _FakeClient(script)
+    out = _MockSpecialist(bb, client=client).run(2)
+
+    assert "REPORT FUNDAMENTALS RECUPERATO" in out
+    assert out.startswith("[ROUND 2 SENZA TOOL")
+    assert len(client.calls) == 2
+    assert client.calls[0]["thinking"] == {"type": "effort", "effort": "high"}
+    assert client.calls[1]["thinking"] == {"type": "disabled"}
+    assert client.calls[1].get("tool_choice") != {"type": "none"}
+    assert bb.specialist_status["quant"] == "done"
+    log = capsys.readouterr().out
+    assert "RITENTO" in log and "tool disponibili" in log
+    assert "2 call API" in log
+
+
+def test_doppio_max_tokens_vuoto_si_ferma_e_marca_il_desk_in_errore(bb):
+    """Il paracadute non deve diventare un loop ne' uno stato ``done`` falso."""
+    client = _FakeClient(
+        lambda n, kw: _Resp("max_tokens", [_ThinkingBlock()], _Usage(out=16000)))
+
+    out = _MockSpecialist(bb, client=client).run(2)
+
+    assert len(client.calls) == 2
+    assert out.startswith("[ERROR quant round 2]")
+    assert "max_tokens" in out and "zero testo" in out
+    assert bb.specialist_status["quant"] == "error"
+    assert bb.usage_log[-1]["status"] == "api_error"
+    _by, total = bb._usage_aggregates()
+    assert total["error_agents"] == ["quant"]
+
+
+def test_recupero_vuoto_in_r1_e_terminale_e_non_riapre_i_tool(bb):
+    """Il recupero one-shot non deve cadere nel retry anti-annuncio di R0/R1."""
+    def script(n, kw):
+        if n == 1:
+            return _Resp("max_tokens", [_ThinkingBlock()], _Usage(out=16000))
+        if n == 2:
+            return _Resp("end_turn", [], _Usage(out=12))
+        return _Resp("end_turn", [_TextBlock("TERZA CALL VIETATA")], _Usage(out=20))
+
+    client = _FakeClient(script)
+    out = _MockSpecialist(bb, client=client).run(1)
+
+    assert len(client.calls) == 2
+    assert out.startswith("[ERROR quant round 1]")
+    assert bb.specialist_status["quant"] == "error"
+
+
+def test_recupero_di_soli_spazi_resta_output_mancante(bb):
+    def script(n, kw):
+        if n == 1:
+            return _Resp("max_tokens", [_ThinkingBlock()], _Usage(out=16000))
+        return _Resp("end_turn", [_TextBlock("   \n\t")], _Usage(out=8))
+
+    client = _FakeClient(script)
+    out = _MockSpecialist(bb, client=client).run(2)
+
+    assert len(client.calls) == 2
+    assert out.startswith("[ERROR quant round 2]")
+    assert bb.specialist_status["quant"] == "error"
+
+
+def test_recupero_whitespace_dopo_ultima_iterazione_forzata_resta_errore(
+        bb, monkeypatch):
+    monkeypatch.setattr(base, "MAX_TOOL_ITERS_SPECIALIST", 1)
+
+    def script(n, kw):
+        if n == 1:
+            return _Resp("max_tokens", [_ThinkingBlock()], _Usage(out=16000))
+        return _Resp("end_turn", [_TextBlock("  \n")], _Usage(out=4))
+
+    client = _FakeClient(script)
+    out = _MockSpecialist(bb, client=client).run(2)
+
+    assert len(client.calls) == 2
+    assert out.startswith("[ERROR quant round 2]")
+    assert "REPORT FORZATO" not in out
+    assert bb.specialist_status["quant"] == "error"
+
+
+def test_recupero_puo_eseguire_tool_e_produrre_il_report(bb):
+    def script(n, kw):
+        if n == 1:
+            return _Resp("max_tokens", [_ThinkingBlock()], _Usage(out=16000))
+        if n == 2:
+            return _Resp("tool_use", [_ToolBlock()], _Usage(out=20))
+        return _Resp("end_turn", [_TextBlock("REPORT DOPO TOOL")], _Usage(out=20))
+
+    client = _FakeClient(script)
+    out = _MockSpecialist(bb, client=client).run(2)
+
+    assert len(client.calls) == 3
+    assert bb.tool_log and bb.tool_log[-1]["tool"] == "get_portfolio_live"
+    assert "REPORT DOPO TOOL" in out
+    assert bb.specialist_status["quant"] == "done"
 
 
 def test_usage_assente_la_troncatura_dichiara_nd_non_zero(bb, capsys):

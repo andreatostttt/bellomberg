@@ -25,6 +25,8 @@ import hashlib
 import ipaddress
 import socket
 import tempfile
+import threading
+import time
 from io import BytesIO
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
@@ -212,14 +214,117 @@ def _richiedi_indirizzi_pubblici(host: str, port: int) -> None:
             raise ValueError("DNS risolve a indirizzo IP non pubblico")
 
 
+MAX_DOCUMENTO = 200 * 1024 * 1024  # tetto di ogni download (fase F; prima nessuno)
+# REV_G2a R-1: tempo TOTALE di un download (il `timeout` di requests vale per ogni lettura:
+# un server «a gocce» teneva fermo il worker senza limite). Valori da confermare dal PM.
+TEMPO_MAX_DOWNLOAD_S = 120
+TEMPO_MAX_DOWNLOAD_ESEF_S = 600  # xBRL-JSON delle banche su filings.xbrl.org: decine di MB
+
+
+class DocumentoTroppoGrande(ValueError):
+    pass
+
+
+def _contenuto_limitato(risposta, max_bytes, fh, scadenza=None):
+    """Scrive il corpo in `fh` a flusso, fermandosi oltre `max_bytes`; restituisce
+    (sha256, byte). Content-Length dichiarato oltre il tetto: nessuna lettura.
+
+    `scadenza` (time.monotonic): tempo TOTALE. Un timer chiude la risposta allo scadere
+    (sblocca la lettura in corso, anche se il server manda un byte ogni tanto) e si
+    solleva TimeoutError dichiarato (REV_G2a R-1)."""
+    dichiarato = (getattr(risposta, "headers", None) or {}).get("Content-Length")
+    if dichiarato and str(dichiarato).isdigit() and int(dichiarato) > max_bytes:
+        raise DocumentoTroppoGrande(f"documento oltre il limite di {max_bytes // (1024 * 1024)} MB "
+                                    f"({int(dichiarato) // (1024 * 1024)} MB dichiarati)")
+    digest, letti = hashlib.sha256(), 0
+    a_flusso = getattr(risposta, "raw", None) is not None and hasattr(risposta, "iter_content")
+    scaduto, timer = threading.Event(), None
+
+    def oltre():
+        return TimeoutError("download oltre il tempo massimo di "
+                            f"{(scadenza - inizio):.0f} s (server lento): documento non scaricato")
+    inizio = time.monotonic()
+    if a_flusso and scadenza is not None:
+        def taglia():
+            scaduto.set()
+            # Ne' close() della risposta ne' shutdown() sbloccano una recv gia' in corso su Windows
+            # (misurato: si resta fermi fino al byte dopo). Serve chiudere DAVVERO il socket:
+            # socket.close() aspetta i riferimenti di makefile, _real_close() no.
+            sock = getattr(getattr(getattr(risposta, "raw", None), "_connection", None), "sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    getattr(sock, "_real_close", sock.close)()
+                except OSError:
+                    pass
+            try:
+                risposta.close()
+            except Exception:
+                pass
+        timer = threading.Timer(max(0.0, scadenza - inizio), taglia)
+        timer.daemon = True
+        timer.start()
+    try:
+        if a_flusso and hasattr(risposta.raw, "read1"):
+            # read1: torna appena arriva qualcosa (iter_content aspetta il blocco intero, e a gocce
+            # il controllo della scadenza non arrivava mai); decode_content come iter_content.
+            def _pezzi():
+                while True:
+                    pezzo = risposta.raw.read1(64 * 1024, decode_content=True)
+                    if not pezzo:
+                        return
+                    yield pezzo
+            pezzi = _pezzi()
+        else:
+            pezzi = risposta.iter_content(chunk_size=64 * 1024) if a_flusso else [risposta.content or b""]
+        try:
+            for pezzo in pezzi:
+                if scaduto.is_set() or (scadenza is not None and time.monotonic() > scadenza):
+                    raise oltre()
+                letti += len(pezzo)
+                if letti > max_bytes:
+                    raise DocumentoTroppoGrande(f"documento oltre il limite di {max_bytes // (1024 * 1024)} MB")
+                digest.update(pezzo)
+                fh.write(pezzo)
+        except (TimeoutError, DocumentoTroppoGrande):
+            raise
+        except Exception as exc:
+            if scaduto.is_set():  # la lettura e' caduta perche' il timer ha chiuso la risposta
+                raise oltre() from exc
+            raise
+        if scaduto.is_set():  # chiusura a meta': il corpo letto e' troncato, mai uno snapshot buono
+            raise oltre()
+    finally:
+        if timer is not None:
+            timer.cancel()
+    return digest.hexdigest(), letti
+
+
+def _chiudi(risposta):
+    """Libera la connessione di una risposta a flusso (le risposte finte non hanno `raw`)."""
+    if risposta is not None and getattr(risposta, "raw", None) is not None:
+        risposta.close()
+
+
 def scarica_documento(url: str, dest_dir: str, timeout: int = 30, *,
-                      host_consentiti=None, public_only: bool = False) -> dict:
+                      host_consentiti=None, public_only: bool = False,
+                      max_bytes: int = MAX_DOCUMENTO, solo_https: bool = False,
+                      tempo_max_s: float = None) -> dict:
     """Snapshot immutabili; host curati opzionali, controllati prima di ogni GET.
 
     Senza host_consentiti resta il download legacy con redirect automatici.
     Con allowlist: massimo 6 redirect HTTP(S), nessuna credenziale negli URL.
+    Download a flusso con tetto `max_bytes` (oltre: errore, niente file parziali).
+    `tempo_max_s`: tempo TOTALE dall'inizio (default TEMPO_MAX_DOWNLOAD_S, ESEF piu' lungo);
+    oltre, TimeoutError dichiarato nel motivo (REV_G2a R-1).
     """
     temporaneo = None
+    inizio = time.monotonic()
+    risposta = None
+    creata = False
     try:
         if public_only and host_consentiti is None:
             raise ValueError("public_only richiede host_consentiti espliciti")
@@ -228,9 +333,11 @@ def scarica_documento(url: str, dest_dir: str, timeout: int = 30, *,
                 raise ValueError("URL HTTP(S) richiesto")
             headers = {"User-Agent": UA}
             if urlsplit(url).hostname in ("www.sec.gov", "sec.gov", "data.sec.gov"):
+                from bellomberg.market_data import sec_edgar
                 from bellomberg.market_data.sec_edgar import _headers
+                sec_edgar.attendi_sec()  # ritmo SEC condiviso anche sui download
                 headers = {**_headers(), "Accept": "*/*"}
-            risposta = requests.get(url, timeout=timeout, headers=headers)
+            risposta = requests.get(url, timeout=timeout, headers=headers, stream=True)
         else:
             if not isinstance(host_consentiti, (list, tuple, set, frozenset)):
                 raise ValueError("host_consentiti richiede una lista o un insieme di hostname")
@@ -244,6 +351,8 @@ def scarica_documento(url: str, dest_dir: str, timeout: int = 30, *,
                 parti = urlsplit(corrente)
                 if parti.scheme not in ("http", "https"):
                     raise ValueError("URL HTTP(S) richiesto anche nei redirect")
+                if solo_https and parti.scheme != "https":
+                    raise ValueError("solo HTTPS, anche nei redirect")
                 if parti.username is not None or parti.password is not None:
                     raise ValueError("credenziali negli URL non consentite")
                 if not parti.hostname or parti.hostname not in consentiti:
@@ -254,11 +363,20 @@ def scarica_documento(url: str, dest_dir: str, timeout: int = 30, *,
                     raise ValueError("redirect circolare: URL gia' visitato")
                 visitati.add(corrente)
                 headers = {"User-Agent": UA}
+                attesa_max = timeout
                 if parti.hostname in ("www.sec.gov", "sec.gov", "data.sec.gov"):
+                    from bellomberg.market_data import sec_edgar
                     from bellomberg.market_data.sec_edgar import _headers
+                    sec_edgar.attendi_sec()  # ritmo SEC condiviso, a ogni salto di redirect
                     headers = {**_headers(), "Accept": "*/*"}
-                risposta = requests.get(corrente, timeout=timeout, headers=headers,
-                                        allow_redirects=False)
+                elif parti.hostname == "filings.xbrl.org":
+                    from bellomberg.market_data import esef
+                    esef.attendi_esef()  # ritmo prudente condiviso tra processi
+                    headers = {**esef._headers(), "Accept": "*/*"}
+                    attesa_max = max(timeout, 300)  # xBRL-JSON delle banche: decine di MB
+                _chiudi(risposta)  # redirect precedente: connessione liberata
+                risposta = requests.get(corrente, timeout=attesa_max, headers=headers,
+                                        allow_redirects=False, stream=True)
                 if risposta.status_code not in (301, 302, 303, 307, 308):
                     break
                 posizione = risposta.headers.get("Location")
@@ -268,18 +386,21 @@ def scarica_documento(url: str, dest_dir: str, timeout: int = 30, *,
                     raise ValueError(f"limite di {limite_redirect} redirect superato")
                 corrente = urljoin(corrente, posizione)
         risposta.raise_for_status()
-        contenuto = risposta.content
-        if not contenuto:
-            raise ValueError("documento vuoto")
-        digest = hashlib.sha256(contenuto).hexdigest()
         nome = re.sub(r"[^A-Za-z0-9._-]", "_",
                       urlsplit(url).path.rstrip("/").rsplit("/", 1)[-1]) or "documento"
         radice, est = os.path.splitext(nome[:100])
+        if tempo_max_s is None:
+            ospite = urlsplit(getattr(risposta, "url", None) or url).hostname
+            tempo_max_s = TEMPO_MAX_DOWNLOAD_ESEF_S if ospite == "filings.xbrl.org" else TEMPO_MAX_DOWNLOAD_S
+        scadenza = inizio + tempo_max_s
+        creata = not os.path.isdir(dest_dir)
         os.makedirs(dest_dir, exist_ok=True)
-        percorso = os.path.join(dest_dir, f"{radice}-{digest}{est}")
         with tempfile.NamedTemporaryFile(dir=dest_dir, delete=False) as fh:
             temporaneo = fh.name
-            fh.write(contenuto)
+            digest, n_bytes = _contenuto_limitato(risposta, max_bytes, fh, scadenza=scadenza)
+        if not n_bytes:
+            raise ValueError("documento vuoto")
+        percorso = os.path.join(dest_dir, f"{radice}-{digest}{est}")
         try:
             os.link(temporaneo, percorso)  # pubblicazione atomica, MAI sovrascrivere
         except FileExistsError:
@@ -287,14 +408,23 @@ def scarica_documento(url: str, dest_dir: str, timeout: int = 30, *,
                 if hashlib.sha256(fh.read()).hexdigest() != digest:
                     raise ValueError("archivio alterato: hash del file esistente incoerente")
         return {"stato": "ok", "url": url, "url_finale": getattr(risposta, "url", None),
-                "path": percorso, "sha256": digest, "bytes": len(contenuto),
-                "content_type": risposta.headers.get("Content-Type")}
+                "path": percorso, "sha256": digest, "bytes": n_bytes,
+                "content_type": risposta.headers.get("Content-Type"),
+                # firma del file remoto (REV_G2a R-5: pacchetti invalidi riverificati senza riscaricare)
+                "etag": risposta.headers.get("ETag"), "last_modified": risposta.headers.get("Last-Modified"),
+                "content_length": risposta.headers.get("Content-Length")}
     except Exception as e:
         return {"stato": "errore", "url": url,
                 "motivo": f"{type(e).__name__}: {e}"}
     finally:
+        _chiudi(risposta)
         if temporaneo and os.path.isfile(temporaneo):
             os.unlink(temporaneo)
+        if creata:  # download fallito (vuoto, oltre il tetto): nessuna cartella lasciata
+            try:
+                os.rmdir(dest_dir)
+            except OSError:
+                pass  # non vuota: c'e' lo snapshot
 
 
 class _Ancore(HTMLParser):

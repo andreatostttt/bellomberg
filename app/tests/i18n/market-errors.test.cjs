@@ -5,15 +5,15 @@ const { renderToStaticMarkup } = require('react-dom/server');
 const { creaCaricatore, ambienteBrowser } = require('./_carica.cjs');
 ambienteBrowser(); globalThis.sessionStorage = { getItem() { return null; }, removeItem() {} };
 const words = n => n == null ? '' : Array.isArray(n) ? n.map(words).join(' ') : typeof n === 'object' ? words(n.props?.children) : String(n);
-function retained(fail = {}) {
+function retained(fail = {}, extra = {}) {
   let si = 0, mi = 0, ei = 0, ri = 0;
   const states = [], memos = [], effects = [], deps = [], refs = [], nodes = [], calls = [];
   const remember = (fn, d) => { const at = mi++, before = memos[at]; if (!before || !d || d.some((v, i) => !Object.is(v, before.d[i]))) memos[at] = { d, value: fn() }; return memos[at].value; };
   const jsx = name => (type, props, ...args) => { nodes.push({ type, props }); return JSX[name](type, props, ...args); };
-  const data = { mktOverview: {}, mktSearch: { results: [] }, favorites: { favorites: [] },
+  const data = { mktOverview: { azioni: [{ ticker: 'ZZTEST', name: 'Zeta Test Synthetic' }] }, mktMovers: { azioni: [] }, marketLogos: { logos: {} }, mktSearch: { results: [] }, favorites: { favorites: [] },
     mktQuote: { ticker: 'SYNTH.X', name: 'Synthetic', sector: 'Settore originale', summary: 'Profilo originale 158,50', price: 12.5, prev_close: 10 },
     mktNews: { items: [] }, mktFinancials: { ticker: 'SYNTH.X', statements: { income: { years: ['2025'], rows: { 'Ricavi originali': [1234.5] } } } },
-    mktHolders: { ticker: 'SYNTH.X', major: [], institutional: [] }, favAdd: {}, favDel: {} };
+    mktHolders: { ticker: 'SYNTH.X', major: [], institutional: [] }, favAdd: {}, favDel: {}, ...extra };
   const api = Object.fromEntries(Object.entries(data).map(([name, result]) => [name, async (...args) => {
     calls.push([name, ...args]); if (name in fail) throw fail[name]; return result;
   }]));
@@ -27,7 +27,8 @@ function retained(fail = {}) {
   const render = lang => { si = mi = ei = ri = 0; effects.length = nodes.length = 0; language.impostaLinguaCorrente(lang); return renderToStaticMarkup(React.createElement(Page)); };
   const settle = async (delay = 0) => { for (const fn of effects.splice(0)) fn(); await new Promise(resolve => setTimeout(resolve, delay)); };
   const ready = async lang => { render(lang); await settle(); return render(lang); };
-  const select = async lang => { nodes.find(n => n.type === 'button' && words(n.props.children) === 'AAPL').props.onClick(); render(lang); await settle(); return render(lang); };
+  // senza preferiti la striscia propone le azioni più grandi del paese (dal cruscotto, nessun elenco fisso): ZZTEST apre la scheda
+  const select = async lang => { nodes.find(n => n.type === 'button' && n.props['data-ticker'] === 'ZZTEST').props.onClick(); render(lang); await settle(); return render(lang); };
   return { ready, render, settle, select, nodes, calls };
 }
 const detail = msg => ({ response: { data: { detail: [{ msg }] } } });
@@ -42,7 +43,7 @@ test('failed favorite reads keep the state unknown and financial failures retain
   const ui = retained({ favorites: detail('Original favorite read error'), mktFinancials: detail('Original financial error') });
   await ui.ready('it'); const it = await ui.select('it'), en = ui.render('en');
   for (const html of [it, en]) { assert.match(html, /Original favorite read error/); assert.match(html, /Original financial error/); }
-  const favorite = ui.nodes.find(n => n.type === 'button' && n.props.title?.includes('favorites'));
+  const favorite = ui.nodes.find(n => n.type === 'button' && n.props['data-azione'] === 'preferito');
   assert.equal(favorite.props.disabled, true); assert.equal(ui.calls.filter(c => c[0] === 'favorites').length, 1);
 });
 // 13/09 (Claude Opus 5): azionariato vuoto era 'n/d' in entrambe le lingue e le frasi EN dicevano 'n.d.'.
@@ -61,9 +62,52 @@ test('empty or failed ownership and a failed overview are declared with the abbr
 });
 test('favorite mutation failures report uncertainty and preserve provider prose with an original-source label', async () => {
   const ui = retained({ favAdd: detail('Original mutation error') }); await ui.ready('it'); await ui.select('en');
-  await ui.nodes.find(n => n.type === 'button' && n.props.title?.includes('Add to favorites')).props.onClick();
+  const add = ui.nodes.find(n => n.type === 'button' && n.props['data-azione'] === 'preferito');
+  assert.match(add.props.title, /Add to favorites/); await add.props.onClick();
   const en = ui.render('en'); assert.match(en, /Original mutation error/); assert.match(en, /Favorite change not confirmed/);
   assert.match(en, /Original source text/); assert.match(en, /Ricavi originali/); assert.match(en, /Settore originale/);
-  ui.nodes.find(n => n.type === 'button' && /company profile/i.test(words(n.props.children))).props.onClick();
+  ui.nodes.find(n => n.type === 'button' && /company profile/i.test(n.props.title || '')).props.onClick();
   assert.match(ui.render('it'), /Profilo originale 158,50/); assert.equal(ui.calls.filter(c => c[0] === 'favAdd').length, 1);
+});
+
+test('headline translation starts only from its button, once, and keeps the original in the tooltip', async () => {
+  const ui = retained({}, { mktNews: { items: [{ title: 'Synthetic beats estimates', link: 'https://example.com/a', publisher: 'Wire' }] },
+    mktNewsTranslate: { status: 'done', titles: ['Synthetic batte le stime'], cost_eur: 0.0002, cached: false } });
+  await ui.ready('it'); const before = await ui.select('it');
+  assert.match(before, /Synthetic beats estimates/);
+  assert.equal(ui.calls.filter(c => c[0] === 'mktNewsTranslate').length, 0, 'opening the security never translates');
+  await ui.nodes.find(n => n.type === 'button' && n.props['data-azione'] === 'traduci').props.onClick();
+  const it = ui.render('it');
+  assert.match(it, /Synthetic batte le stime/); assert.match(it, /title="Synthetic beats estimates"/);
+  assert.match(it, /tradotti con AI/);
+  assert.deepEqual(ui.calls.filter(c => c[0] === 'mktNewsTranslate'), [['mktNewsTranslate', ['Synthetic beats estimates']]]);
+  assert.doesNotMatch(ui.render('en'), /data-azione="traduci"/);
+});
+
+test('market movers and country equities declare the backend state instead of an empty silent panel', async () => {
+  const ui = retained({}, { mktMovers: { azioni: [], fonte: 'Synthetic screener', motivo: 'Original screener outage',
+      paesi: { US: { stato: 'non_disponibile', motivo: 'Original US limit', n: 0 }, IT: { stato: 'ok', motivo: null, n: 3 } } },
+    mktOverview: { country: 'US', countries: ['US'], indici: [], azioni: [], commodities: [], valute: [], obbligazioni: [], futures: [],
+      azioni_fonte: { stato: 'non_disponibile', motivo: 'Original overview screener down', fonte: 'Synthetic screener' } } });
+  const it = await ui.ready('it'), en = ui.render('en');
+  assert.match(it, /Classifica non disponibile: Original screener outage/); assert.match(en, /Ranking unavailable: Original screener outage/);
+  assert.match(it, /USA non disponibile: Original US limit/); assert.match(en, /USA unavailable: Original US limit/);
+  assert.doesNotMatch(en, /Italy unavailable|IT unavailable/);
+  assert.match(it, /Azioni del paese non disponibili: Original overview screener down/);
+  assert.match(en, /Equities for this country unavailable: Original overview screener down/);
+  // nessun suggerimento inventato quando il provider non manda azioni
+  assert.equal(ui.nodes.filter(n => n.type === 'button' && /is-suggested/.test(n.props.className || '')).length, 0);
+});
+
+// 04/10/2026 (G9b): un aggiornamento fallito dei più mossi non lascia la classifica vecchia a schermo.
+test('a failed movers refresh drops the previous ranking and shows the error instead', async () => {
+  const fail = {};
+  const ui = retained(fail, { mktMovers: { azioni: [{ ticker: 'ACMEMOV', name: 'Acme Mover Synthetic', country: 'US', change_pct: 4.2 }], paesi: {} } });
+  let it = await ui.ready('it');
+  assert.match(it, /Acme Mover Synthetic/);
+  fail.mktMovers = new Error('Screener sintetico giù');
+  ui.nodes.find(n => n.type === 'button' && n.props.className === 'bbn-btn' && typeof n.props.onClick === 'function').props.onClick();
+  ui.render('it'); await ui.settle(); it = ui.render('it');
+  assert.doesNotMatch(it, /Acme Mover Synthetic/);
+  assert.match(it, /Classifica non disponibile: Screener sintetico giù/);
 });

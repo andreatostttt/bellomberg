@@ -117,7 +117,8 @@ def save_daily_snapshot(db_path: Optional[str] = None,
     try:
         conn = _connect(db_path)
     except Exception as e:
-        return {"error": "DB non raggiungibile: " + str(e)}
+        # 05/10: mai il testo dell'eccezione nei messaggi (puo' portare URL con chiave)
+        return {"error": "DB non raggiungibile: " + type(e).__name__}
     try:
         for t in tickers:
             t = t.upper()
@@ -132,7 +133,8 @@ def save_daily_snapshot(db_path: Optional[str] = None,
                 from bellomberg.portfolio.vol_surface import build_vol_surface
                 vs = build_vol_surface(t, max_expiries=MAX_EXPIRIES)
             except Exception as e:
-                out["errors"][t] = "vol_surface: " + str(e)
+                # 05/10: il TIPO, mai str(e): un'eccezione di requests porta l'URL con apiKey
+                out["errors"][t] = "vol_surface: " + type(e).__name__
                 continue
             if vs.get("error"):
                 # provider giu'/key mancante: buco DICHIARATO, nessuna riga inventata
@@ -193,7 +195,7 @@ def get_iv_context(ticker: str, db_path: Optional[str] = None) -> Dict[str, Any]
     try:
         conn = _connect(db_path)
     except Exception as e:
-        return {**base, "error": "DB non raggiungibile: " + str(e)}
+        return {**base, "error": "DB non raggiungibile: " + type(e).__name__}
     try:
         try:
             rows = conn.execute(
@@ -201,7 +203,7 @@ def get_iv_context(ticker: str, db_path: Optional[str] = None) -> Dict[str, Any]
                 "WHERE ticker=? ORDER BY snap_date", (ticker.upper(),)).fetchall()
         except sqlite3.OperationalError as e:
             # tabella assente = migrazione 6 non ancora applicata: dichiarato
-            return {**base, "error": "iv_history non disponibile: " + str(e)}
+            return {**base, "error": "iv_history non disponibile: " + type(e).__name__}
     finally:
         conn.close()
     front = _front_series(rows)

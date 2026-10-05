@@ -63,9 +63,6 @@
 /* P&L GG dell'intero portafoglio: metrica in vetrina accanto al gauge INVESTITO */
 :is(.f1c,.obsx) .kside .kvx{font-size:14px;font-weight:700;letter-spacing:.01em}
 :is(.f1c,.obsx) .kside .kvx .kvs{font-size:10px;font-weight:600}
-/* MACRO PULSE: x di rimozione dei pick personali (aggiunti da F15) */
-:is(.f1c,.obsx) .pxdel{color:#73829F;font-weight:700;cursor:pointer;padding:0 2px}
-:is(.f1c,.obsx) .pxdel:hover{color:#FF3D60}
 :is(.f1c,.obsx) .gaugebox{display:flex;align-items:center;gap:14px;padding:8px 14px 10px;border-top:1px solid #1A2440}
 :is(.f1c,.obsx) .gauge{position:relative;width:116px;height:116px;flex-shrink:0}
 :is(.f1c,.obsx) .gauge svg{position:absolute;inset:0;overflow:visible}

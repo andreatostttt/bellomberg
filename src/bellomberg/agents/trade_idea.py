@@ -15,6 +15,7 @@ from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
 
 from bellomberg.core.llm_client import OpenRouterClient, costruisci_corpo
+from bellomberg.core.unbilled import provably_unbilled as _core_provably_unbilled
 from bellomberg.core.research_analysis import (RESEARCH_ANALYSIS_MODE, is_research_mode,
     seal_research_thesis, research_reference, research_context)
 from bellomberg.core.trade_idea_policy import (RESEARCH_POLICIES, EXECUTION_POLICY_V3, EXECUTION_POLICY_V4, execution_policy,
@@ -915,23 +916,14 @@ def _restore_provider_message(payload):
 def _provably_unbilled(exc):
     """Seconds to wait before ONE retry when the failure provably never reached a model, else None.
 
-    Only (a) a connection that was never established and (b) OpenRouter's documented
-    pre-provider admission rejection (HTTP 402 in_flight_budget_exhausted, provider_name
-    null). Timeouts after sending, 5xx, 429 and mid-stream errors may be billed and stay
-    unknown (run blocked until reconciled).
+    KA (05/10, main): the rule lives in core/unbilled.provably_unbilled, shared with the
+    weekly path, so the two can no longer diverge. Stricter than before: an error carrying
+    a provider generation id, or a 402 whose HTTP status was not measured as 402 by
+    llm_client._invia (http_status), is NOT provably unbilled and stays unknown.
+    TI's inner client is llm_client.OpenRouterClient, so create() and stream().__enter__
+    failures come from _invia with http_status measured; a missing status is unknown.
     """
-    if getattr(exc, "partial_response", None):
-        return None  # something was generated: possibly billed
-    if getattr(exc, "transport_phase", None) == "connect":
-        return 5
-    try:
-        from bellomberg.core.preprovider_receipt import _failure_metadata
-        metadata = _failure_metadata({"exception_type": type(exc).__name__,
-                                      "message": type(exc).__name__ + ": " + str(exc)})
-    except Exception:
-        return None
-    retry_after = (metadata.get("headers") or {}).get("Retry-After")
-    return min(int(retry_after), 120) if retry_after else 30
+    return _core_provably_unbilled(exc)
 
 
 def _settle_unbilled_or_unknown(gate, request_id, exc):
@@ -3165,6 +3157,126 @@ def _compile_fundamentals_candidate(blackboard, input_, output_dir, *, evaluator
     return {"ok": bool(refs), "data": payload, "_source": "get_valuation: compiled Fundamentals authored plan"}
 
 
+# E7 (04/10/2026, Opus 5.5): vincoli e mandato del PM per Red Team e desk della Trade Idea.
+# Il Red Team e la Blackboard girano con memory_db=None (commit 1326312): la run non deve
+# scrivere sul DB e la ripresa deve rileggere SOLO il checkpoint. Effetto collaterale: il
+# blocco «parole vincolanti del PM» (feedback e veti) restava vuoto e lo diceva solo il log.
+# Cura: una lettura in SOLA LETTURA all'avvio (connessione sqlite mode=ro, nessuna DDL,
+# nessuno store vettoriale), fotografata in blackboard.data e quindi nel checkpoint; Red Team
+# e desk ricevono TESTO, mai il DB. Un buco e' una frase dichiarata, mai una stringa vuota.
+PM_CONSTRAINTS_KEY = "_pm_constraints"
+
+
+def _pm_binding_reader(db_path):
+    """Un MemoryDB che sa solo LEGGERE: stessi metodi del Consigliere
+    (`build_pm_binding_block`), connessione `mode=ro`. Una scrittura solleva."""
+    import sqlite3
+    from pathlib import Path
+    from bellomberg.storage.memory_db import MemoryDB
+
+    class _SolaLettura(MemoryDB):
+        def __init__(self, path):  # niente _init_sqlite/_init_chroma: zero scritture
+            self.db_path = path
+            self.chroma_path = None
+            self.chroma_client = self.col_memos = self.col_decisions = self.col_feedback = None
+
+        @contextmanager
+        def _conn(self):
+            if not Path(self.db_path).is_file():
+                raise FileNotFoundError("database assente: " + Path(self.db_path).name)
+            conn = sqlite3.connect(Path(self.db_path).resolve().as_uri() + "?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("PRAGMA busy_timeout=5000")
+                yield conn
+            finally:
+                conn.close()
+
+    return _SolaLettura(db_path)
+
+
+def _pm_constraints_snapshot(db_path, mandate, *, origin):
+    from bellomberg.agents.specialists.base import blocco_vincoli_pm, stato_vincoli_pm
+    from bellomberg.core import mandato_pm
+    try:
+        text = blocco_vincoli_pm(_pm_binding_reader(db_path))
+        reason = None
+        if not text.strip():
+            reason = "blocco vuoto dal registro"
+        elif "NON DISPONIBILI" in text.splitlines()[0]:
+            found = re.search(r"\(motivo: (.*?)\)\. NON dedurre", text, re.S)
+            reason = "registro non ha risposto (" + (found.group(1) if found else "motivo non letto") + ")"
+    except Exception as exc:
+        text, reason = "", type(exc).__name__ + ": " + str(exc)[:300]
+    if reason is not None:
+        text = ("=== PAROLE DIRETTE DEL PM — NON DISPONIBILI in questa run ===\n"
+                "vincoli del PM non disponibili: " + reason + ". NON dedurre che non ci siano "
+                "vincoli: se un'idea somiglia a qualcosa che il PM puo' aver gia' rifiutato o "
+                "vietato, dichiaralo invece di riproporla come nuova.\n\n")
+    binding = {"status": "unavailable" if reason else "available", "text": text,
+               "state": stato_vincoli_pm(text)[0], "reason": reason}
+    try:
+        if not isinstance(mandate, dict):
+            raise ValueError("mandato non caricato")
+        mandate_row = {"status": "available", "text": mandato_pm.blocco_prompt(mandate),
+                       "fingerprint": mandato_pm.impronta(mandate), "reason": None}
+    except Exception as exc:
+        reason = type(exc).__name__ + ": " + str(exc)[:300]
+        mandate_row = {"status": "unavailable", "fingerprint": None, "reason": reason,
+                       "text": mandato_pm.riga_senza_mandato() + "\n[MANDATO n.d.] " + reason}
+    return {"version": 1, "origin": origin, "read_at": datetime.now(timezone.utc).isoformat(),
+            "binding": binding, "mandate": mandate_row}
+
+
+def _bind_pm_constraints(blackboard, db_path, mandate, *, resumed=False):
+    """Fotografia unica per run. Alla ripresa vale quella del checkpoint; un checkpoint
+    precedente alla cura (chiave assente) riceve una lettura NUOVA, dichiarata come tale."""
+    saved = blackboard.data.get(PM_CONSTRAINTS_KEY)
+    if isinstance(saved, dict) and saved.get("version") == 1:
+        return saved
+    origin = "letti alla ripresa: il checkpoint precedente non li conteneva" if resumed else "run_start"
+    snapshot = _pm_constraints_snapshot(db_path, mandate, origin=origin)
+    blackboard.data[PM_CONSTRAINTS_KEY] = snapshot
+    print("[TRADE_IDEA] vincoli PM: " + snapshot["binding"]["state"]
+          + " | mandato: " + snapshot["mandate"]["status"] + " | origine: " + origin)
+    return snapshot
+
+
+def pm_constraints_text(blackboard):
+    """(vincoli, mandato) come testo per i prompt; mai stringhe vuote."""
+    snapshot = (getattr(blackboard, "data", None) or {}).get(PM_CONSTRAINTS_KEY)
+    if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
+        from bellomberg.core import mandato_pm
+        why = "fotografia dei vincoli assente dalla blackboard di questa run"
+        return (("=== PAROLE DIRETTE DEL PM — NON DISPONIBILI in questa run ===\n"
+                 "vincoli del PM non disponibili: " + why + ". NON dedurre che non ci siano vincoli.\n\n"),
+                mandato_pm.riga_senza_mandato() + "\n[MANDATO n.d.] " + why)
+    return snapshot["binding"]["text"], snapshot["mandate"]["text"]
+
+
+def pm_constraints_gaps(blackboard):
+    """Le frasi per data_gaps quando vincoli o mandato mancano; [] se entrambi presenti."""
+    snapshot = (getattr(blackboard, "data", None) or {}).get(PM_CONSTRAINTS_KEY)
+    if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
+        return ["vincoli del PM non disponibili: fotografia assente dalla run",
+                "mandato del PM non disponibile al Red Team: fotografia assente dalla run"]
+    gaps = []
+    if snapshot["binding"]["status"] != "available":
+        gaps.append("vincoli del PM non disponibili: " + str(snapshot["binding"]["reason"]))
+    if snapshot["mandate"]["status"] != "available":
+        gaps.append("mandato del PM non disponibile al Red Team: " + str(snapshot["mandate"]["reason"]))
+    if blackboard.data.get("_red_team_system_pre_vincoli"):
+        # Review RV-E7 (P1): critica gia' pagata riusata col system originale, senza mandato.
+        gaps.append("critica del Red Team ripresa da checkpoint precedente: "
+                    "non conteneva il mandato del PM")
+    if snapshot.get("origin") != "run_start":
+        # Review RV-E7 (P2): ripresa da un checkpoint senza fotografia. I vincoli sono quelli
+        # di ADESSO (possono contenere veti nuovi) e i round chiusi prima non li avevano.
+        gaps.append("vincoli del PM letti alla ripresa (" + str(snapshot.get("read_at"))[:16]
+                    + " UTC): i round completati prima della ripresa non li avevano ricevuti")
+    return gaps
+
+
 def _run_research_red_team(blackboard, portfolio, runner):
     from bellomberg.agents.red_team import motivo_critica_non_utilizzabile
     reference = research_reference(blackboard)
@@ -3176,6 +3288,8 @@ def _run_research_red_team(blackboard, portfolio, runner):
         for key in ('red_team', '_red_team', '_red_research_review', '_red_team_native_terminal',
                     '_red_team_citation_correction'):
             blackboard.data.pop(key, None)
+    # E7: memory_db resta None (nessun DB al Red Team); vincoli e mandato del PM arrivano
+    # come testo dalla fotografia PM_CONSTRAINTS_KEY (v. _bind_pm_constraints).
     returned = runner(blackboard, portfolio_data=portfolio, memory_db=None)
     report = (blackboard.get_latest('red_team') or {}).get('report')
     terminal = blackboard.data.get('_red_team_native_terminal')
@@ -3383,6 +3497,7 @@ def _run_exact_model_red_team(blackboard, portfolio, runner):
                 "review": deepcopy(previous), "attestation": deepcopy(blackboard.data.get("_red_model_review"))})
         for key in ("red_team", "_red_team", "_red_model_review", "_red_team_native_terminal", "_red_team_citation_correction"):
             blackboard.data.pop(key, None)
+    # E7: come sopra, testo dalla fotografia PM_CONSTRAINTS_KEY, mai il DB.
     returned = runner(blackboard, portfolio_data=portfolio, memory_db=None)
     published = blackboard.get_latest("red_team")
     report = (published or {}).get("report")
@@ -5119,6 +5234,12 @@ def _numeric_claim_gaps(result, blackboard, ticker, cutoff, sizing, *, portfolio
     return gaps[:20]
 
 
+def _load_market_pack(ref):
+    """Riferimento del checkpoint -> pacchetto verificato (None per le run senza pacchetto)."""
+    from bellomberg.market_data.trade_idea_market_pack import load_market_pack
+    return load_market_pack(ref)
+
+
 def _preview_quality(run, result, directory, blackboard):
     from bellomberg.reporting.trade_idea_report import build_trade_idea_report
     from bellomberg.reporting.trade_idea_delivery import _candidate_workbooks
@@ -5131,7 +5252,10 @@ def _preview_quality(run, result, directory, blackboard):
         "cutoff": blackboard.data.get("_data_cutoff") or run.get("started_at"),
         "desk_annex": _desk_annex(blackboard.data) if is_research_mode(blackboard) else None,
         "facts": (_memo_facts({"tool_receipts": blackboard.tool_receipts, "data": blackboard.data},
-                              blackboard.data.get("_data_cutoff")) if is_research_mode(blackboard) else None)}
+                              blackboard.data.get("_data_cutoff")) if is_research_mode(blackboard) else None),
+        # Lotto 3: pacchetto di mercato riletto dal file della run (sha verificato)
+        "market_pack": (_load_market_pack(blackboard.data.get("_market_pack"))
+                        if is_research_mode(blackboard) else None)}
     checked = {'valuations': []} if is_research_mode(blackboard) else _candidate_workbooks(run["ticker"], blackboard.valuation_generations,
         blackboard.valuation_attempts, [MODELS_DIR, REPORT_DIR, *getattr(blackboard, "model_roots", ())],
         result.get("valuation_refs") or ())
@@ -5444,7 +5568,10 @@ def _deliver_trade_idea(store, run_id, *, valuation_results=None, valuation_atte
                        if run.get("analysis_mode") == RESEARCH_ANALYSIS_MODE else None),
         "facts": (_memo_facts(((detail.get("progress") or {}).get("checkpoint") or {}),
                               (detail.get("progress") or {}).get("data_cutoff"))
-                  if run.get("analysis_mode") == RESEARCH_ANALYSIS_MODE else None)}
+                  if run.get("analysis_mode") == RESEARCH_ANALYSIS_MODE else None),
+        "market_pack": (_load_market_pack(((((detail.get("progress") or {}).get("checkpoint") or {})
+                                             .get("data") or {}).get("_market_pack")))
+                        if run.get("analysis_mode") == RESEARCH_ANALYSIS_MODE else None)}
     persisted_manifest = detail.get("artifacts") is not None
     if valuation_results is None:
         progress = detail.get("progress") or {}
@@ -5569,6 +5696,54 @@ def _deliver_trade_idea(store, run_id, *, valuation_results=None, valuation_atte
     return store.get_run(run_id)["email"]
 
 
+# Tetto di _numeric_claim_gaps / _numeric_claim_gaps_v4 (`return gaps[:20]`): oltre il
+# tetto il totale vero non e' noto e la frase lo dichiara ("almeno").
+_NUMERIC_GAPS_CAP = 20
+_NUMERIC_GAP_NAMES = {
+    "summary": "sintesi", "pm_view_response": "risposta alla tua tesi", "horizon": "orizzonte",
+    "proposal": "proposta operativa", "pros": "pro", "cons": "contro", "risks": "rischio",
+    "catalysts": "catalizzatore", "invalidation": "condizione di invalidazione",
+    "data_gaps": "dato mancante", "review_conditions": "condizione di revisione",
+    "decisive_questions": "domanda decisiva", "pillars": "pilastro",
+    "variant_view": "stima divergente dal consenso", "scenarios": "scenario",
+    "risk_exits": "rischio e uscita", "review_triggers": "evento di revisione", "objections": "obiezione",
+}
+
+
+def _numeric_gaps_phrase(numeric_gaps, result):
+    """Una sola voce leggibile per data_gaps dalla lista tecnica dei numeric_claim_gaps.
+
+    La lista ripete la stessa posizione (una riga per frase o per valore): qui si
+    raggruppa per posizione leggibile, si conta e si dichiara il totale vero della
+    lista (se la lista e' al tetto, "almeno"). Una posizione che non si sa tradurre
+    resta visibile con la sua chiave tecnica, dichiarata come non riconosciuta.
+    """
+    titles = {str(section.get("key")): str(section.get("title") or "").strip()
+              for section in (result or {}).get("dossier") or [] if isinstance(section, dict)}
+    counts = {}
+    for gap in numeric_gaps:
+        location = str(gap).split(": ", 1)[0].strip()
+        dossier = re.match(r"dossier\.([A-Za-z0-9_]+)", location)
+        item = re.fullmatch(r"([a-z_]+)(?:\[(\d+)\])?(?:\..*)?", location)
+        if dossier:
+            key = dossier.group(1)
+            name = "sezione «" + (titles.get(key) or key) + "»"
+        elif item and item.group(1) in _NUMERIC_GAP_NAMES:
+            name = _NUMERIC_GAP_NAMES[item.group(1)]
+            if item.group(2) is not None:
+                name += " " + str(int(item.group(2)) + 1)
+        else:
+            name = "posizione non riconosciuta «" + location + "»"
+        counts[name] = counts.get(name, 0) + 1
+    total = len(numeric_gaps)
+    capped = total >= _NUMERIC_GAPS_CAP
+    return ("Numeri non attestati da una fonte verificata, quindi non usabili per l'operativita': "
+            + ("almeno " if capped else "") + str(total)
+            + " (" + ", ".join(name + " " + str(count) for name, count in counts.items()) + ")"
+            + ("; il conteggio si ferma al tetto di " + str(_NUMERIC_GAPS_CAP) + " dell'elenco tecnico"
+               if capped else "") + ".")
+
+
 def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                        output_dir=None, portfolio_loader=None, mandate_loader=None,
                        preparer_binder=None, round_runner=None, red_runner=None,
@@ -5578,7 +5753,7 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                        catalog_fetcher=None, isolated_tool_dispatcher=None,
                        isolated_facts_loader=None, source_qualifier=None,
                        model_reviser=None, document_archive_root=None, model_input_loader=None,
-                       source_session_factory=None):
+                       source_session_factory=None, market_pack_loader=None):
     """Claim one accepted candidate and run R0/R1/Red/R2/Capo exactly once."""
     from bellomberg.storage.trade_idea_store import TradeIdeaStore
     from bellomberg.core import mandato_pm
@@ -5729,6 +5904,10 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                         blackboard, inputs, artifact_dir / "model", evaluator=valuation_evaluator)
                 _configure_native_recovery(blackboard, store, token,
                     inherited=initial_detail["progress"] if run.get("continuation") else None)
+                # E7: DOPO la ripresa (che sostituisce blackboard.data con il checkpoint);
+                # sola lettura, nessun memory_db consegnato a Red Team o desk.
+                _bind_pm_constraints(blackboard, store.db_path, mandate,
+                                     resumed=bool(run.get("continuation")))
                 if research_native:
                     _bind_trade_idea_source_research(blackboard,
                         archive_root=document_archive_root or (DATA_DIR / 'filing_archive'),
@@ -5866,6 +6045,15 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                 blackboard.data.setdefault("_candidate_quote_initial", _candidate_quote_receipt(
                     blackboard, run["ticker"]))
                 blackboard.data.setdefault("_data_cutoff", datetime.now(timezone.utc).isoformat())
+                if is_research_mode(blackboard) and "_market_pack" not in blackboard.data:
+                    # Lotto 3 (L1, Opus 5.5): pacchetto di mercato su FILE accanto alla run, nel
+                    # checkpoint solo il riferimento {path, sha256, status, as_of}; in ripresa il
+                    # riferimento sopravvive e non si riscarica. DB alternativo senza loader: niente rete.
+                    from bellomberg.market_data.trade_idea_market_pack import PACK_FILENAME, run_market_pack
+                    blackboard.data["_market_pack"] = run_market_pack(
+                        run=run, cutoff=blackboard.data["_data_cutoff"],
+                        path=Path(output_dir or (DATA_DIR / "trade_ideas" / run_id)) / PACK_FILENAME,
+                        loader=market_pack_loader, network_allowed=default_risk_db_matches)
                 failures = []
                 declared_gaps = (blackboard.data.get("_desk_gaps") or {}) if is_research_mode(blackboard) else {}
                 for name in ("macro", "eventdesk", "crypto", "fundamentals", "quant", "options"):
@@ -5922,8 +6110,11 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                        if execution_policy(run) == EXECUTION_POLICY_V4 else {}))
                 blackboard.data["_numeric_claim_gaps"] = numeric_gaps
                 if numeric_gaps and len(result["data_gaps"]) < 80:
-                    result["data_gaps"].append("Fonti numeriche non attestate per operativita': "
-                        + "; ".join(numeric_gaps[:5]))
+                    # Una voce leggibile col totale vero; la lista tecnica resta nel blackboard.
+                    result["data_gaps"].append(_numeric_gaps_phrase(numeric_gaps, result))
+                for pm_gap in pm_constraints_gaps(blackboard):  # E7: vincoli/mandato PM mancanti
+                    if pm_gap not in result["data_gaps"] and len(result["data_gaps"]) < 80:
+                        result["data_gaps"].append(pm_gap)
                 if numeric_gaps and result["judgment"] == "favorable" and result.get("proposal"):
                     failures.append("claim quantitativi senza binding alle ricevute dei tool")
                 try:

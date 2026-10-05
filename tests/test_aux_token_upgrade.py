@@ -117,3 +117,31 @@ def test_compatibility_does_not_hide_tampered_legacy_cost(tmp_path, phase, agent
     with pytest.raises(ValueError, match="cost"):
         request(client, journal(tmp_path), phase, agent, new)
     assert len(dispatches) == 1
+
+
+# Integration of both sides: the PM's journaled cap upgrade + Andrea's reflection
+# effort low. A reflection journaled with thinking disabled (old or new cap) must be
+# replayed with its original reasoning after a crash, never paid twice; an uncertain
+# old request stays blocked.
+@pytest.mark.parametrize("old_cap", [1000, 8000])
+def test_reflection_disabled_thinking_replays_after_effort_low_upgrade(tmp_path, old_cap):
+    store, dispatches = journal(tmp_path), []
+    client = client_with_receipts(dispatches)
+    original = request(client, store, "reflection", "_reflection", old_cap, thinking={"type": "disabled"})
+    for _ in range(2):
+        replay = request(client, journal(tmp_path), "reflection", "_reflection", 8000,
+                         thinking={"type": "effort", "effort": "low"})
+        assert replay.request_id == original.request_id and replay.replayed is True
+    assert len(dispatches) == 1 and dispatches[0]["reasoning"] == {"enabled": False}
+    assert store.summary()["request_count"] == 1
+
+
+def test_reflection_uncertain_disabled_request_is_not_repaid_with_effort_low(tmp_path):
+    store, dispatches = journal(tmp_path), []
+    client = client_with_receipts(dispatches, fault="disconnect")
+    with pytest.raises(llm_client.APIConnectionError):
+        request(client, store, "reflection", "_reflection", 1000, thinking={"type": "disabled"})
+    with pytest.raises(RequestBlocked):
+        request(client, journal(tmp_path), "reflection", "_reflection", 8000,
+                thinking={"type": "effort", "effort": "low"})
+    assert len(dispatches) == 1

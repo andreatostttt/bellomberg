@@ -62,7 +62,13 @@ function harness(page, overrides = {}) {
   const nodes = (value, predicate) => {
     if (!value || typeof value !== 'object') return [];
     if (Array.isArray(value)) return value.flatMap(item => nodes(item, predicate));
-    return [...(predicate(value) ? [value] : []), ...nodes(value.props?.children, predicate)];
+    const typeName = typeof value.type === 'function' ? value.type.displayName || value.type.name || '' : '';
+    // These are pure presentation callbacks. Walking them exposes the actual
+    // JSX controls below ModernPage and local recovery wrappers without
+    // invoking page/controller components or their effects.
+    const presentation = typeof value.props?.render === 'function'
+      && /ModernPage|Deferred|Boundary/.test(typeName) ? value.props.render() : null;
+    return [...(predicate(value) ? [value] : []), ...nodes(value.props?.children, predicate), ...nodes(presentation, predicate)];
   };
   return { calls, language, render, settle, listeners,
     elements: predicate => nodes(tree, predicate) };
@@ -119,7 +125,8 @@ test('a file on the same date does not establish which job created it or what fa
 
 test('a scheduler error in an HTTP-success payload is declared with its original diagnostic', async () => {
   const h = harness('SettingsPanel', { scheduledTasks: { tasks: [], error: 'Original scheduler diagnostic' } });
-  h.render(); const html = await h.settle();
+  // The read clears its loading flag in `.finally`: settle twice so the error, not the spinner, is painted.
+  h.render(); await h.settle(); const html = await h.settle();
   assert.match(html, /Original scheduler diagnostic/); assert.match(html, /DATI NON CARICATI/);
   assert.doesNotMatch(html, /Nessun lavoro schedulato/);
 });
@@ -135,7 +142,8 @@ test('Settings does not invent the cause of a failed job or a backup directory a
 
 test('delete confirmation follows language changes, preserves the original filename and does not delete on translation or cancel', async () => {
   const h = harness('SettingsPanel'); h.render(); await h.settle();
-  h.elements(n => n.type === 'button' && n.props['aria-label'] === 'Elimina synthetic_backup.zip')[0].props.onClick();
+  const trigger = h.elements(n => n.type === 'button' && n.props['aria-label'] === 'Elimina synthetic_backup.zip')[0];
+  trigger.props.onClick({ currentTarget: { focus() {} } });
   assert.match(h.render(), /Eliminazione definitiva/);
   const count = h.calls.length; h.language.impostaLinguaCorrente('en');
   const en = h.render(); assert.match(en, /Permanent deletion/); assert.match(en, /2\.50 MB/); assert.match(en, /synthetic_backup\.zip/);

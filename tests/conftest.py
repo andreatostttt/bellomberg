@@ -22,10 +22,26 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+# 02/10: il pacchetto vive in src/ e la suite non deve dipendere dal .pth
+# dell'install editable: macOS (Desktop in iCloud) lo rimarca "hidden" e
+# Python 3.14 salta i .pth nascosti. Stessa cura del launcher; PYTHONPATH
+# arriva anche ai sottoprocessi lanciati dai test.
+SRC = os.path.join(ROOT, "src")
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
+_pp = os.environ.get("PYTHONPATH", "")
+if SRC not in _pp.split(os.pathsep):
+    os.environ["PYTHONPATH"] = SRC + (os.pathsep + _pp if _pp else "")
 
 # In CI non c'e' .env: una chiave fittizia basta perche' NESSUN test deve
 # mai creare un client Anthropic vero (setdefault: quella vera non si tocca).
 os.environ.setdefault("ANTHROPIC_API_KEY", "dummy-offline-test-suite")
+# Il lifecycle dell'API viene esercitato da alcuni TestClient: il pull automatico
+# deve restare spento nella suite offline, mentre i test del manager lo riattivano
+# esplicitamente con un puller finto.
+os.environ["NEWS_AUTO_REFRESH_ENABLED"] = "false"   # G3: assegnazione forte, un true del .env non accende il timer
+# Idem per il controllo filing: nei test del lifespan non deve toccare il DB reale.
+os.environ.setdefault("FILING_AUTO_REFRESH_ENABLED", "false")
 # 02/09 (pubblicazione B2): SEC_CONTACT_EMAIL e' letta A OGNI CHIAMATA da
 # sec_edgar._headers()/esef._headers(); senza, sollevano ContattoMancante PRIMA
 # della richiesta e i test che simulano la rete non arrivano al mock. Un
@@ -58,8 +74,24 @@ for _nome in ("CHAT_CAPO_MODEL", "CHAT_MACRO_MODEL", "CHAT_QUANT_MODEL", "CHAT_O
               "CHAT_POLITICS_MODEL", "CHAT_NEWS_MODEL", "CONSIGLIERE_MACRO_MODEL",
               "CONSIGLIERE_QUANT_MODEL", "CONSIGLIERE_OPTIONS_MODEL",
               "CONSIGLIERE_FUNDAMENTALS_MODEL", "CONSIGLIERE_CRYPTO_MODEL",
-              "CONSIGLIERE_EVENTDESK_MODEL"):
+              "CONSIGLIERE_EVENTDESK_MODEL", "NEWS_SUMMARY_MODEL"):
     os.environ.setdefault(_nome, "")
+
+
+@pytest.fixture(autouse=True)
+def niente_rete_siti_emittenti(monkeypatch, tmp_path):
+    """TRIPWIRE di rete (fase F, 04/10/2026): GLEIF e il sito della societa' (yfinance) non si
+    toccano nei test. GLEIF «irraggiungibile» lascia l'esito di prima (nessun candidato); senza
+    sito noto l'esplorazione non parte. I test di questi moduli passano `cerca=`/`info_fn=`."""
+    import bellomberg.market_data.esef_sito as _sito
+
+    def _gleif(nome):
+        raise ConnectionError("rete GLEIF nei test: passa cerca=")
+
+    monkeypatch.setattr(_sito, "gleif_lei_records", _gleif)
+    monkeypatch.setattr(_sito, "_info_yfinance", lambda ticker: {})
+    monkeypatch.setattr(_sito, "CARTELLA", tmp_path / "filing_sito")
+    monkeypatch.setattr(_sito, "consigliere_in_corso", lambda: False)  # i processi veri non contano
 
 
 @pytest.fixture(autouse=True)
@@ -85,6 +117,83 @@ def niente_rete_openrouter(monkeypatch):
 
     monkeypatch.setattr(_lc, "_nuovo_client_http", _vietato)
     monkeypatch.setattr(_lc, "_nuovo_client_http_async", _vietato_async)
+
+
+# G3 (04/10/2026): i test delle notizie non toccano la rete (Yahoo, provider news, siti).
+# Nome del file di test che contiene una di queste parole = test delle notizie.
+_TEST_NOTIZIE = ("news", "notizie", "headline", "briefing")
+# REV_G3 R4: anche i file che NOMINANO un modulo delle notizie (import o monkeypatch per stringa),
+# qualunque sia il loro nome. Letto dal sorgente del file di test, una volta per file.
+_MODULI_NOTIZIE = ("news_aggregator", "news_sources", "finnhub_news", "tiingo_news", "reddit_news",
+                   "news_topics", "article_summary", "headline_translation", "news_refresh_manager",
+                   "briefing_engine", "errori_sicuri")
+_COPERTI: dict = {}
+
+
+def _test_delle_notizie(path) -> bool:
+    if any(parola in path.name.lower() for parola in _TEST_NOTIZIE):
+        return True
+    if path not in _COPERTI:
+        try:
+            sorgente = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            sorgente = ""
+        _COPERTI[path] = any(nome in sorgente for nome in _MODULI_NOTIZIE)
+    return _COPERTI[path]
+
+
+@pytest.fixture(autouse=True)
+def niente_rete_notizie(request, monkeypatch):
+    """TRIPWIRE di rete per i test delle notizie (G3, 04/10/2026). Prima nessuna guardia
+    generale: un test di search_news_for_ticker con ticker col punto poteva interrogare
+    Yahoo davvero (_nome_emittente_yahoo, _ticker_us_yahoo_univoco).
+    - socket di Python: connect/getaddrinfo verso host non locali (requests, urllib, feedparser);
+    - yfinance: Ticker/Tickers/download/Search, perche' con curl_cffi esce dal socket di Python.
+    La chiamata fallisce con ConnectionError (i fetcher la inghiottono come guasto) e il test
+    FALLISCE in chiusura con l'host: un except del codice non puo' nasconderla. 127.0.0.1/::1
+    restano liberi (socketpair di asyncio su Windows, TestClient). Chi prova la rete monta i
+    suoi finti con monkeypatch: vincono su questa fixture."""
+    if not _test_delle_notizie(request.node.path):
+        yield
+        return
+    import socket
+
+    violazioni = []
+    locali = ("127.0.0.1", "::1", "localhost")
+
+    def _vieta(host):
+        if host in locali or str(host).startswith("127."):
+            return
+        violazioni.append(str(host))
+        raise ConnectionError("rete vera in un test delle notizie: %r (monta un finto)" % (host,))
+
+    def _connect(sock, address, _orig=socket.socket.connect):
+        _vieta(address[0] if isinstance(address, tuple) else address)
+        return _orig(sock, address)
+
+    def _connect_ex(sock, address, _orig=socket.socket.connect_ex):
+        _vieta(address[0] if isinstance(address, tuple) else address)
+        return _orig(sock, address)
+
+    def _getaddrinfo(host, *args, _orig=socket.getaddrinfo, **kwargs):
+        _vieta(host)
+        return _orig(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket.socket, "connect", _connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", _connect_ex)
+    monkeypatch.setattr(socket, "getaddrinfo", _getaddrinfo)
+    try:
+        import yfinance
+    except ImportError:
+        yfinance = None
+    if yfinance is not None:
+        for nome in ("Ticker", "Tickers", "download", "Search"):
+            if hasattr(yfinance, nome):
+                monkeypatch.setattr(yfinance, nome,
+                                    lambda *a, _n=nome, **k: _vieta("yfinance." + _n))
+    yield violazioni          # la prova del tripwire la legge e la svuota
+    if violazioni:
+        pytest.fail("test delle notizie che usa la rete vera: %s" % sorted(set(violazioni)))
 
 
 # ============================================================================
@@ -228,6 +337,7 @@ def mai_la_produzione(monkeypatch, tmp_path):
     from bellomberg.market_data import market_inputs
     from bellomberg.storage import memory_db
     from bellomberg.agents import scorekeeper
+    from bellomberg.reporting import email_sender
 
     tmp_radice = str(tmp_path)
 
@@ -271,7 +381,13 @@ def mai_la_produzione(monkeypatch, tmp_path):
     #     lecito per un test, e' il PATH a non doverlo essere.
     monkeypatch.setattr(_Blackboard, "HEARTBEAT_PATH", str(tmp_path / "current_run.json"))
 
-    # (a-quinquies) la cache in-process dell'edge scanner (22/08 sera, decisione
+    # (a-quinquies) l'outbox durevole delle email. Il mittente accoda il MIME
+    # prima della consegna SMTP, quindi anche i test con SMTP finto scriverebbero
+    # sotto data/email_outbox del checkout. L'accodamento e' lecito e viene
+    # provato, ma deve restare nel sandbox del singolo test.
+    monkeypatch.setattr(email_sender, "OUTBOX_DIR", tmp_path / "email_outbox")
+
+    # (a-sexies) la cache in-process dell'edge scanner (22/08 sera, decisione
     #     (a) del PM): vive a livello modulo e sopravvive FRA i test, quindi la
     #     scansione finta del test precedente diventerebbe la "misura" del
     #     successivo (stessa chiave: il libro finto e' identico). Si pulisce
@@ -305,6 +421,53 @@ def mai_la_produzione(monkeypatch, tmp_path):
         _mod = sys.modules.get(_nome)
         if _mod is not None and hasattr(_mod, "connect_sqlite"):
             monkeypatch.setattr(_mod, "connect_sqlite", _guardia)
+
+
+@pytest.fixture(autouse=True)
+def mai_la_produzione_store_watch(monkeypatch, tmp_path):
+    """(b-bis) 04/10, rilievo RV-P-A 5: TradeIdeaWatchStore usa `sqlite3.connect` RAW
+    (come TradeIdeaStore), quindi la guardia (b) non lo vede. Dopo la migrazione vera
+    il worker aperto sul DB del PM scriverebbe in `decisions` e manderebbe email vere.
+    TRIPWIRE sul path, stessa regola `_e_il_db_di_produzione` di (b): si guarda
+    `_connect`, l'unico punto da cui lo store apre il DB (anche il costruttore).
+    Import anticipato di proposito: un test che importa lo store DENTRO il corpo
+    resta coperto. RAGGIO DICHIARATO: solo questo store."""
+    from bellomberg.storage import trade_idea_watch_store as _ws
+
+    tmp_radice = str(tmp_path)
+    _vero_connect = _ws.TradeIdeaWatchStore._connect
+
+    def _guardia_watch(self, **kwargs):
+        if _e_il_db_di_produzione(self.db_path, tmp_radice):
+            raise ProduzioneToccata(
+                "un test ha aperto TradeIdeaWatchStore sul DB DI PRODUZIONE (%s): "
+                "usa un DB in tmp_path." % self.db_path)
+        return _vero_connect(self, **kwargs)
+
+    monkeypatch.setattr(_ws.TradeIdeaWatchStore, "_connect", _guardia_watch)
+
+
+@pytest.fixture(autouse=True)
+def valuta_dal_book_finta(monkeypatch):
+    """(b-ter) 04/10 (W1, Opus 5.5, assegnata da main): i wrapper dei tool solo-USA leggono la
+    valuta della posizione con `copertura.valuta_dal_book`, che apre il DB del book. Nei test
+    il book NON si legge mai: la funzione e' sostituita da un finto che risponde «fuori book»
+    con una nota che lo dice. Chi vuole provare la lettura vera ripristina l'originale
+    (`copertura.valuta_dal_book_vera`) e la punta su un DB in tmp_path, oppure passa
+    `db_path` esplicito (il finto allora legge davvero quel DB)."""
+    from bellomberg.market_data import copertura as _cop
+    if not hasattr(_cop, "valuta_dal_book_vera"):
+        monkeypatch.setattr(_cop, "valuta_dal_book_vera", _cop.valuta_dal_book, raising=False)
+    _vera = _cop.valuta_dal_book_vera if hasattr(_cop, "valuta_dal_book_vera") else _cop.valuta_dal_book
+
+    def _finta(ticker, db_path=None):
+        # db_path ESPLICITO (un DB del test in tmp_path, come fanno i test dell'API): lettura
+        # vera, sempre dietro il tripwire di connect_sqlite; senza db_path = il book di
+        # produzione -> mai letto
+        if db_path is not None:
+            return _vera(ticker, db_path=db_path)
+        return {"valuta": None, "origine": "fuori_book", "nota": "test: book non letto"}
+    monkeypatch.setattr(_cop, "valuta_dal_book", _finta)
 
 
 @pytest.fixture(scope="session")
@@ -423,6 +586,24 @@ def preferenze_di_prova(monkeypatch, tmp_path):
     monkeypatch.setattr(preferences, "PREFERENCES_PATH", tmp_path / "preferences.json")
 
 
+@pytest.fixture(autouse=True)
+def ritmo_sec_di_prova(monkeypatch, tmp_path):
+    """Fase D: attendi_sec() tiene il ritmo in DATA_DIR/.sec_ritmo (lock tra processi).
+    Nella suite il file vive nel tmp del test, mai in data/ (tripwire (c)). Chi prova il
+    percorso reale passa `percorso=` o ripunta `_ritmo_path` con una sua setattr."""
+    from bellomberg.market_data import sec_edgar
+    monkeypatch.setattr(sec_edgar, "_ritmo_path", lambda: tmp_path / ".sec_ritmo")
+
+
+@pytest.fixture(autouse=True)
+def ritmo_e_indice_esef_di_prova(monkeypatch, tmp_path):
+    """Fase B: ritmo filings.xbrl.org (DATA_DIR/.esef_ritmo) e cache dell'indice depositi
+    (DATA_DIR/esef_cache) nel tmp del test, mai in data/."""
+    from bellomberg.market_data import esef
+    monkeypatch.setattr(esef, "_ritmo_path", lambda: tmp_path / ".esef_ritmo")
+    monkeypatch.setattr(esef, "_cache_indice_dir", lambda: tmp_path / "esef_cache")
+
+
 # ============================================================================
 # (c) SPIA DELLE SCRITTURE SU FILE — TRIPWIRE (22/08 sera-2, voce (1b) del
 #     MASTER). Due fasi, entrambe con l'ok del PM:
@@ -486,3 +667,22 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
             "REGISTRA (solo misura: BELLOMBERG_SPIA_SCRITTURE=registra)"))
     for riga in _SPIA.rapporto().splitlines():
         terminalreporter.write_line(riga)
+
+
+@pytest.fixture(autouse=True)
+def cache_fonti_vuote():
+    """Le cache di processo delle fonti (trimestrali Finnhub 6 h, yfinance 12 h) non
+    passano da un test all'altro: ognuno vede solo il proprio trasporto finto."""
+    from bellomberg.market_data import earnings_yf, finnhub_news
+    finnhub_news.svuota_cache_earnings()
+    earnings_yf.svuota_cache()
+    yield
+    finnhub_news.svuota_cache_earnings()
+    earnings_yf.svuota_cache()
+
+
+@pytest.fixture(autouse=True)
+def cache_proposte_ai_di_prova(monkeypatch, tmp_path):
+    """Fase C: le proposte AI dei profili IR (DATA_DIR/filing_ai) nel tmp del test, mai in data/."""
+    from bellomberg.market_data import filing_proposta_ai
+    monkeypatch.setattr(filing_proposta_ai, "_cache_dir", lambda: tmp_path / "filing_ai")

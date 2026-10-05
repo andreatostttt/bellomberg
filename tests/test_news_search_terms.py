@@ -12,7 +12,7 @@ Regole misurate qui (regola PM 14/07, mai un ripiego muto):
   - negozio assente/illeggibile -> `origine` e `motivo` scritti, mappa VUOTA;
   - una sola voce malformata -> negozio illeggibile INTERO (mezzo negozio caricato
     e' un ripiego muto), col nome della voce nel motivo;
-  - voce assente -> si cerca il ticker nudo E lo si dichiara nel log;
+  - voce assente -> si cerca il nome Yahoo e, se manca, il ticker nudo; entrambi dichiarati;
   - voce `null` -> nessun provider interrogato, esclusione dichiarata nel log;
   - il prompt del sentiment e' una COSTANTE di modulo che la chiamata compone:
     e' cio' che il decimo controllo del cancello misura (canale «news/sentiment»).
@@ -130,12 +130,30 @@ def provider_finti(monkeypatch):
     monkeypatch.setattr(na, "_fetch_gnews", _finto("gnews"))
     monkeypatch.setattr(na, "_fetch_yfinance_news", lambda t, n: [])
     monkeypatch.setattr(na, "_all_rss_cached", lambda: [])
+    # La risoluzione identita' e' rete esterna quanto i provider: ogni test che vuole
+    # esercitarla monta esplicitamente una risposta, gli altri restano davvero offline.
+    monkeypatch.setattr(na, "_nome_emittente_yahoo", lambda t: "")
+    # G3 (04/10): anche la scoperta del simbolo USA (_ticker_us_yahoo_univoco, ticker col
+    # punto) e' rete: risposta Yahoo vuota finta; chi la esercita monta la sua dopo.
+    monkeypatch.setattr(na.requests, "get", lambda *a, **k: types.SimpleNamespace(
+        raise_for_status=lambda: None, json=lambda: {"quotes": []}))
+    # 04/10 (B2): Tiingo e Finnhub passano dai wrapper stubbabili — zero rete anche con la
+    # chiave Finnhub vera del .env (il test «KRYPTO» e' un simbolo senza punto)
+    # Integrazione (04/10): _fetch_tiingo e _fetch_finnhub_news restano VERI qui: i test G3 sotto
+    # montano i loro tiingo_news/finnhub_news finti in sys.modules e contano le chiamate (zero
+    # rete: gli stub dei moduli ci sono sempre, piu' in basso, anche con le chiavi vere del .env).
     tiingo = types.ModuleType("tiingo_news")
     tiingo.tiingo_available = lambda: False
     tiingo.fetch_tiingo_news = lambda *a, **k: []
+    tiingo.last_status = lambda: None
+    tiingo.reset_status = lambda: None
     monkeypatch.setitem(sys.modules, 'bellomberg.market_data.tiingo_news', tiingo)
+    finnhub = types.ModuleType("finnhub_news")
+    finnhub.fetch_company_news = lambda *a, **k: []
+    monkeypatch.setitem(sys.modules, "bellomberg.market_data.finnhub_news", finnhub)
     na.invalidate_cache()
-    return chiamate
+    yield chiamate
+    na.invalidate_cache()
 
 
 @pytest.fixture
@@ -161,6 +179,269 @@ def test_voce_assente_cerca_il_ticker_nudo_e_lo_DICHIARA(tmp_path, monkeypatch, 
     dichiarazioni = [r for r in log_catturato if "BETA.DE" in r and "ticker nudo" in r]
     assert dichiarazioni, log_catturato
     assert "assente" in dichiarazioni[0]
+
+
+def test_nuovo_ticker_xetra_senza_termini_cerca_il_nome_yahoo(
+        tmp_path, monkeypatch, provider_finti, log_catturato):
+    """Rottura catturata: ripristinare il fallback al ticker `.DE` invece del nome.
+
+    Il ticker di una quotazione secondaria Xetra non e' una parola chiave news affidabile.
+    Se il negozio non ha ancora una voce, il resolver legge l'identita' dell'emittente e le
+    fonti testuali ricevono il nome; il ticker del portafoglio resta invariato.
+    """
+    _negozio(tmp_path, monkeypatch, {})
+
+    monkeypatch.setattr(na, "_nome_emittente_yahoo",
+                        lambda ticker: "Beta Robotics, Inc.")
+
+    class _RispostaYahoo:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            # Nessun ticker US univoco: il comportamento utile qui e' comunque la
+            # ricerca per nome, non il pericoloso strip automatico del suffisso.
+            return {"quotes": []}
+
+    monkeypatch.setattr(na.requests, "get", lambda *a, **k: _RispostaYahoo())
+
+    na.search_news_for_ticker("BETA.DE", days=1, max_per_source=1)
+
+    query_testuali = [query for provider, query in provider_finti
+                      if provider in {"newsapi", "thenewsapi", "gnews"}]
+    assert query_testuali == ['"Beta Robotics, Inc."'] * 3
+    assert any("Beta Robotics" in r and "BETA.DE" in r for r in log_catturato)
+
+
+def test_xetra_con_match_yahoo_us_univoco_usa_il_simbolo_us_ma_tagga_quello_reale(
+        tmp_path, monkeypatch, provider_finti):
+    """Rottura catturata: provider symbol-based richiamati con `BETA.DE` o non richiamati.
+
+    La scoperta e' accettata solo per un candidato equity US univoco con lo stesso nome;
+    l'identita' di portafoglio non cambia e resta il ticker Xetra.
+    """
+    _negozio(tmp_path, monkeypatch, {})
+    from bellomberg.storage import negozi_privati
+    alias = tmp_path / "alias_fonti.json"
+    alias.write_text('{"finnhub": {}, "sec": {}, "yfinance": {}, "correlazione": {}}',
+                     encoding="utf-8")
+    monkeypatch.setattr(negozi_privati, "PERCORSO_ALIAS", str(alias))
+
+    monkeypatch.setattr(na, "_nome_emittente_yahoo",
+                        lambda ticker: "Beta Robotics, Inc.")
+
+    class _RispostaYahoo:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"quotes": [
+                {"symbol": "BETA.DE", "longname": "Beta Robotics, Inc.",
+                 "quoteType": "EQUITY", "exchange": "GER"},
+                {"symbol": "BTA", "longname": "Beta Robotics, Inc.",
+                 "quoteType": "EQUITY", "exchange": "NMS"},
+            ]}
+
+    monkeypatch.setattr(na.requests, "get", lambda *a, **k: _RispostaYahoo())
+
+    chiamate_yahoo = []
+    monkeypatch.setattr(
+        na, "_fetch_yfinance_news",
+        lambda ticker, max_results: chiamate_yahoo.append(ticker) or [{
+            "title": "Beta wins a contract", "snippet": "", "url": "https://example.invalid/y",
+            "published_at": "2026-09-10T09:00:00", "provider": "yfinance",
+        }])
+    chiamate_tiingo = []
+    tiingo = types.ModuleType("tiingo_news")
+    tiingo.tiingo_available = lambda: True
+    tiingo.fetch_tiingo_news = lambda tickers, **k: chiamate_tiingo.append(list(tickers)) or []
+    monkeypatch.setitem(sys.modules, "bellomberg.market_data.tiingo_news", tiingo)
+
+    chiamate_finnhub = []
+    finnhub = types.ModuleType("finnhub_news")
+    finnhub.fetch_company_news = lambda ticker, **k: chiamate_finnhub.append(ticker) or [{
+        "title": "Chipmaker raises guidance", "snippet": "", "url": "https://example.invalid/f",
+        "published_at": "2026-09-10T10:00:00", "provider": "Finnhub",
+    }]
+    monkeypatch.setitem(sys.modules, "bellomberg.market_data.finnhub_news", finnhub)
+
+    items = na.search_news_for_ticker("BETA.DE", days=1, max_per_source=1)
+
+    assert chiamate_yahoo == ["BTA"]
+    assert chiamate_tiingo == [["BTA"]]
+    assert chiamate_finnhub == ["BTA"]
+    assert items and {it["ticker_mentioned"] for it in items} == {"BETA.DE"}
+    assert {it["provider"].lower() for it in items} == {"yfinance", "finnhub"}
+
+
+def test_xetra_con_due_match_us_non_sceglie_un_ticker_arbitrario(
+        tmp_path, monkeypatch, provider_finti):
+    """Rottura catturata: scegliere il primo di due ticker USA dello stesso emittente."""
+    _negozio(tmp_path, monkeypatch, {})
+    from bellomberg.storage import negozi_privati
+    alias = tmp_path / "alias_fonti.json"
+    alias.write_text('{"finnhub": {}, "sec": {}, "yfinance": {}, "correlazione": {}}',
+                     encoding="utf-8")
+    monkeypatch.setattr(negozi_privati, "PERCORSO_ALIAS", str(alias))
+    monkeypatch.setattr(na, "_nome_emittente_yahoo",
+                        lambda ticker: "Beta Robotics, Inc.")
+
+    class _RispostaYahoo:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"quotes": [
+                {"symbol": "BTA", "longname": "Beta Robotics, Inc.",
+                 "quoteType": "EQUITY", "exchange": "NMS"},
+                {"symbol": "BTB", "longname": "Beta Robotics, Inc.",
+                 "quoteType": "EQUITY", "exchange": "NYQ"},
+            ]}
+
+    monkeypatch.setattr(na.requests, "get", lambda *a, **k: _RispostaYahoo())
+    chiamate_yahoo = []
+    monkeypatch.setattr(na, "_fetch_yfinance_news",
+                        lambda ticker, n: chiamate_yahoo.append(ticker) or [])
+    chiamate_tiingo = []
+    tiingo = types.ModuleType("tiingo_news")
+    tiingo.tiingo_available = lambda: True
+    tiingo.fetch_tiingo_news = lambda tickers, **k: chiamate_tiingo.append(tickers) or []
+    monkeypatch.setitem(sys.modules, "bellomberg.market_data.tiingo_news", tiingo)
+    chiamate_finnhub = []
+    finnhub = types.ModuleType("finnhub_news")
+    finnhub.fetch_company_news = lambda ticker, **k: chiamate_finnhub.append(ticker) or []
+    monkeypatch.setitem(sys.modules, "bellomberg.market_data.finnhub_news", finnhub)
+
+    na.search_news_for_ticker("BETA.DE", days=1, max_per_source=1)
+
+    assert chiamate_yahoo == ["BETA.DE"]
+    assert chiamate_tiingo == []
+    assert chiamate_finnhub == []
+
+
+def test_scoperta_automatica_rifiuta_un_simbolo_plain_non_us(monkeypatch):
+    """Rottura catturata: assumere che ogni simbolo Yahoo senza suffisso sia USA."""
+    class _RispostaYahoo:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"quotes": [{
+                "symbol": "ACM", "longname": "Acme Industries AG",
+                "quoteType": "EQUITY", "exchange": "GER",
+            }]}
+
+    monkeypatch.setattr(na, "REQ_OK", True)
+    monkeypatch.setattr(na.requests, "get", lambda *a, **k: _RispostaYahoo())
+
+    assert na._ticker_us_yahoo_univoco("ACME.DE", "Acme Industries AG") is None
+
+
+def test_alias_finnhub_esplicito_precede_la_scoperta_automatica(
+        tmp_path, monkeypatch, provider_finti):
+    """Rottura catturata: ignorare l'alias verificato e riscoprire il simbolo a ogni giro."""
+    _negozio(tmp_path, monkeypatch, {"ACME.DE": ["Acme Semiconductors"]})
+    from bellomberg.storage import negozi_privati
+    alias = tmp_path / "alias_fonti.json"
+    alias.write_text('{"finnhub": {"ACME.DE": "ACM"}, "sec": {}, '
+                     '"yfinance": {}, "correlazione": {}}', encoding="utf-8")
+    monkeypatch.setattr(negozi_privati, "PERCORSO_ALIAS", str(alias))
+    monkeypatch.setattr(
+        na.requests, "get",
+        lambda *a, **k: pytest.fail("Yahoo search non deve partire con alias esplicito"))
+
+    chiamate_yahoo = []
+    monkeypatch.setattr(na, "_fetch_yfinance_news",
+                        lambda ticker, n: chiamate_yahoo.append(ticker) or [])
+    chiamate_tiingo = []
+    tiingo = types.ModuleType("tiingo_news")
+    tiingo.tiingo_available = lambda: True
+    tiingo.fetch_tiingo_news = lambda tickers, **k: chiamate_tiingo.append(list(tickers)) or []
+    monkeypatch.setitem(sys.modules, "bellomberg.market_data.tiingo_news", tiingo)
+    chiamate_finnhub = []
+    finnhub = types.ModuleType("finnhub_news")
+    finnhub.fetch_company_news = lambda ticker, **k: chiamate_finnhub.append(ticker) or []
+    monkeypatch.setitem(sys.modules, "bellomberg.market_data.finnhub_news", finnhub)
+
+    na.search_news_for_ticker("ACME.DE", days=1, max_per_source=1)
+
+    assert chiamate_yahoo == ["ACM"]
+    assert chiamate_tiingo == [["ACM"]]
+    assert chiamate_finnhub == ["ACM"]
+
+
+def test_negozio_alias_assente_e_dichiarato_prima_della_scoperta_yahoo(
+        tmp_path, monkeypatch, log_catturato):
+    from bellomberg.storage import negozi_privati
+
+    monkeypatch.setattr(negozi_privati, "PERCORSO_ALIAS", str(tmp_path / "manca.json"))
+    monkeypatch.setattr(na, "_ticker_us_yahoo_univoco", lambda ticker, nome: "ACM")
+
+    assert na._simbolo_news("ACME.DE", "Acme Industries AG") == (
+        "ACM", "yahoo:nome_univoco")
+    assert any("alias_fonti assente" in r for r in log_catturato)
+
+
+def test_errore_finnhub_company_news_compare_nelle_fonti_mute(
+        tmp_path, monkeypatch, provider_finti):
+    _negozio(tmp_path, monkeypatch, {
+        "ACME.DE": ["Acme Industries"], "BETA.DE": ["Beta Robotics"],
+    })
+    from bellomberg.storage import negozi_privati
+    alias = tmp_path / "alias_fonti.json"
+    alias.write_text('{"finnhub": {"ACME.DE": "ACM", "BETA.DE": "BTA"}, "sec": {}, '
+                     '"yfinance": {}, "correlazione": {}}', encoding="utf-8")
+    monkeypatch.setattr(negozi_privati, "PERCORSO_ALIAS", str(alias))
+    monkeypatch.setattr(na, "_RUNTIME_PROVIDER_FAILURES", {}, raising=False)
+
+    finnhub = types.ModuleType("finnhub_news")
+
+    def _fallisce(ticker, motivo=None, **kwargs):
+        if ticker == "ACM":
+            motivo.append("429 rate limited (60 req/min free tier)")
+        return []
+
+    finnhub.fetch_company_news = _fallisce
+    monkeypatch.setitem(sys.modules, "bellomberg.market_data.finnhub_news", finnhub)
+
+    na.search_news_for_ticker("ACME.DE", days=1, max_per_source=1)
+    # Un successo successivo non deve cancellare il guasto gia' misurato su ACME.
+    na.search_news_for_ticker("BETA.DE", days=1, max_per_source=1)
+
+    assert "429" in na.providers_blocked()["finnhub"]
+
+
+def test_errore_runtime_finnhub_scade_con_la_cache(
+        tmp_path, monkeypatch, provider_finti):
+    _negozio(tmp_path, monkeypatch, {"ACME.DE": ["Acme Industries"]})
+    from bellomberg.storage import negozi_privati
+    alias = tmp_path / "alias_fonti.json"
+    alias.write_text('{"finnhub": {"ACME.DE": "ACM"}, "sec": {}, '
+                     '"yfinance": {}, "correlazione": {}}', encoding="utf-8")
+    monkeypatch.setattr(negozi_privati, "PERCORSO_ALIAS", str(alias))
+    monkeypatch.setattr(na, "_RUNTIME_PROVIDER_FAILURES", {}, raising=False)
+    adesso = [1000.0]
+    monkeypatch.setattr(na.time, "time", lambda: adesso[0])
+
+    finnhub = types.ModuleType("finnhub_news")
+
+    def _fallisce(ticker, motivo=None, **kwargs):
+        motivo.append("rete non disponibile")
+        return []
+
+    finnhub.fetch_company_news = _fallisce
+    monkeypatch.setitem(sys.modules, "bellomberg.market_data.finnhub_news", finnhub)
+
+    na.search_news_for_ticker("ACME.DE", days=1, max_per_source=1)
+    assert "finnhub" in na.providers_blocked()
+
+    adesso[0] += na.CACHE_TTL_SEC + 1
+    # Integrazione con l'altra sessione (04/10): l'ultimo esito Finnhub vive anche in
+    # esiti_fonti (TTL_ESITO_FONTE_S, orologio monotonico); qui si invecchia anche quello.
+    assert "finnhub" not in na._runtime_failures_correnti()
+    with na._ESITI_LOCK:
+        na._ESITI_FONTI["finnhub"]["mono"] -= na.TTL_ESITO_FONTE_S + 1
+    assert "finnhub" not in na.providers_blocked()
 
 
 def test_negozio_assente_la_ricerca_lo_dichiara_col_motivo(tmp_path, monkeypatch, provider_finti, log_catturato):
@@ -259,6 +540,31 @@ def test_fetch_corporate_events_non_manda_gli_esclusi_alla_sec(tmp_path, monkeyp
     assert ricevuti == [["GAMMA"]]
 
 
+def test_fetch_corporate_events_manda_alla_sec_un_xetra_con_alias_verificato(
+        tmp_path, monkeypatch, provider_finti):
+    """Rottura catturata: il filtro ``'.' not in ticker`` scarta anche alias SEC validi."""
+    _negozio(tmp_path, monkeypatch, {})
+    from bellomberg.storage import negozi_privati
+    alias = tmp_path / "alias_fonti.json"
+    alias.write_text('{"finnhub": {}, "sec": {"ACME": "ACM"}, '
+                     '"yfinance": {}, "correlazione": {}}', encoding="utf-8")
+    monkeypatch.setattr(negozi_privati, "PERCORSO_ALIAS", str(alias))
+
+    ricevuti = []
+    from bellomberg.market_data import sec_edgar
+    monkeypatch.setattr(sec_edgar, "get_corporate_events_for_portfolio",
+                        lambda tk, days=14: ricevuti.append(list(tk)) or [])
+    monkeypatch.setattr(na, "MemoryDB", lambda: _DBFinto([{"ticker": "ACME.DE"}]))
+    topics = types.ModuleType("news_topics")
+    topics.get_category_topics = lambda cat: []
+    monkeypatch.setitem(sys.modules, "bellomberg.market_data.news_topics", topics)
+
+    na.invalidate_cache()
+    na.fetch_corporate_events(days=1, max_items=5)
+
+    assert ricevuti == [["ACME.DE"]]
+
+
 def test_negozio_illeggibile_le_esclusioni_NON_si_applicano_e_il_giro_lo_dichiara(tmp_path, monkeypatch, provider_finti, log_catturato):
     """Il difetto confermato da tre lenti della review 04/09: con un negozio rotto (una
     virgola in piu' dopo un edit a mano) `termini_correnti` tornava {} buttando origine e
@@ -315,6 +621,9 @@ def test_auto_pull_feed_e_cablato_sul_giro_news(tmp_path, monkeypatch, provider_
                          "headline_it": "", "why_matters": ""})
     monkeypatch.setattr(na, "_drop_junk", lambda items: items)
     monkeypatch.setattr(na, "_dedupe", lambda items: items)
+    # Un guasto ancora entro il TTL puo' appartenere agli item serviti dalla cache: il
+    # nuovo giro non deve cancellarlo prima di sapere se il provider verra' rieseguito.
+    na._runtime_failure_record("finnhub", "ACM", "429 rate limited")
     # un item finto per far passare il classificatore (cosi' il contesto e' misurabile)
     monkeypatch.setattr(na, "search_news_global",
                         lambda q, **k: [{"title": "Notizia finta", "url": "https://example.invalid/1",
@@ -323,6 +632,7 @@ def test_auto_pull_feed_e_cablato_sul_giro_news(tmp_path, monkeypatch, provider_
     assert cercati == ["ACME.MI", "BETA.DE"]
     assert contesti and contesti[0] == ["ACME.MI (4.3%)"]
     assert out["saved"] >= 1
+    assert "429" in na._runtime_failures_correnti()["finnhub"]
 
 
 # ------------------------------------------------------------------ il prompt del sentiment

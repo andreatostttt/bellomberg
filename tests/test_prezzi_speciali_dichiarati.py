@@ -437,6 +437,11 @@ def test_la_riga_del_log_esce_col_task_in_QUIET(negozio, monkeypatch, capsys):
     finto = types.ModuleType("iv_history")
     finto.save_daily_snapshot = lambda: {}
     monkeypatch.setitem(_sys.modules, "bellomberg.market_data.iv_history", finto)
+    # idem per il worker dei trigger Trade Idea (TI-RESEARCH-PIPELINE): userebbe DB e data/ veri
+    finto_w = types.ModuleType("trade_idea_watch_worker")
+    finto_w.run_from_updater = lambda: {"status": "ok"}
+    finto_w.summary_lines = lambda output: []
+    monkeypatch.setitem(_sys.modules, "bellomberg.market_data.trade_idea_watch_worker", finto_w)
     monkeypatch.setattr(_sys, "argv", ["price_updater.py", "--quiet", "--no-ibkr"])
     pu.main()
     uscita = capsys.readouterr().out
@@ -459,6 +464,11 @@ def test_col_negozio_a_posto_il_log_non_dichiara_niente(negozio, monkeypatch, ca
     finto = types.ModuleType("iv_history")
     finto.save_daily_snapshot = lambda: {}
     monkeypatch.setitem(_sys.modules, "bellomberg.market_data.iv_history", finto)
+    # idem per il worker dei trigger Trade Idea (TI-RESEARCH-PIPELINE): userebbe DB e data/ veri
+    finto_w = types.ModuleType("trade_idea_watch_worker")
+    finto_w.run_from_updater = lambda: {"status": "ok"}
+    finto_w.summary_lines = lambda output: []
+    monkeypatch.setitem(_sys.modules, "bellomberg.market_data.trade_idea_watch_worker", finto_w)
     monkeypatch.setattr(_sys, "argv", ["price_updater.py", "--quiet", "--no-ibkr"])
     pu.main()
     assert "[PREZZI] KO dichiarato" not in capsys.readouterr().out

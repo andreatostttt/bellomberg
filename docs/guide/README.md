@@ -4,7 +4,8 @@ This handbook explains the source distribution and its current interface. The
 app lets you choose English or Italian at first login and in Settings. Historical
 research keeps its original text. This guide is in English; the glossary also
 explains Italian labels. Function numbers follow the shared navigation registry.
-**F19 opens the settings panel; it is not a separate research page.**
+**F19 opens the settings panel; it is not a separate research page.** Filing
+sits after Fundamentals in the menu but keeps the fixed key F20.
 
 The chapters show the actual English interface using one invented **DEMO**
 account. Analytics, histories and research text are authored synthetic snapshots;
@@ -38,6 +39,7 @@ for their source, fixed clock and capture process.
 | F4 | [Global Markets](pages/04-global-markets.md) | Search securities, inspect charts and company data |
 | F5 | [News Desk](pages/05-news-desk.md) | Read news, briefings and event calendars |
 | F6 | [Fundamentals](pages/06-fundamentals.md) | Inspect generated valuation models and assumptions |
+| F20 | [Filing](pages/20-filing.md) | See what changed between two reports and what the committee receives |
 | F7 | [Factor Lab](pages/07-factor-lab.md) | Examine shared portfolio exposures and model quality |
 | F8 | [Monte Carlo](pages/08-monte-carlo.md) | Compare a portfolio scenario with the current book |
 | F9 | [Vol Deck](pages/09-vol-deck.md) | Inspect expirations, Greeks and option strategies |
@@ -56,7 +58,7 @@ for their source, fixed clock and capture process.
 
 Press **Ctrl+K** (or **⌘K** where available), type a page name or an exact function
 label such as `F18`, use ↑/↓, then press Enter. Escape closes the palette. All
-destinations are listed, including F16–F19; a keyboard with only twelve function
+destinations are listed, including F16–F20; a keyboard with only twelve function
 keys can still reach every destination through the palette or menu.
 
 Type a ticker from your current book to find its Market, News and Trade Entry

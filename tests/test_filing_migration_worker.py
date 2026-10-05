@@ -100,3 +100,51 @@ def test_worker_missing_schema_logs_error_without_creation(tmp_path, capsys):
     assert filing_worker.main(['--db', str(db), '--log', str(log)]) == 1
     assert not db.exists()
     assert json.loads(log.read_text(encoding='utf-8'))['status'] == 'errore'
+
+
+def test_worker_ticker_never_calls_the_paid_judge(archive, tmp_path, monkeypatch, capsys):
+    from bellomberg.market_data import filing_service
+    from bellomberg.storage.filing_store import FilingStore
+    profile = {"ticker": "NOVA", "emittente_id": "CIK:0009990001", "lingua": "en", "tipo": "annuale",
+               "perimetro": "consolidato", "verifica": {"lingua": "English", "tipo": "annual", "perimetro": "consolidated"},
+               "sezioni": {"risk": {"inizio": "Risk", "fine": "End"}}, "fonti": []}
+    monkeypatch.setattr(migration, 'backend_alive', lambda: False)
+    migration.migra(archive, apply=True)
+    FilingStore(archive).set_profile("NOVA", profile, qualitative_enabled=True)
+    chiamate = []
+
+    def pipeline(*a, **k):
+        return {"stato": "ok", "motivi": [], "coppia": {"prima": {"sha256": "a" * 64}, "dopo": {"sha256": "b" * 64}},
+                "confronto_corrente": {"stato": "ok", "cambiamenti": [{"tipo": "modificato",
+                    "dopo": {"url": "https://example.org/b", "sha256": "b" * 64, "inizio": 1, "fine": 15,
+                             "testo": "Risk increased", "sezione": "risk"}}]}}
+
+    def sentinella(*a, **k):
+        chiamate.append(1)
+        raise AssertionError("giudice a pagamento chiamato dal worker CLI")
+
+    class Servizio(filing_service.FilingService):
+        def __init__(self, store, archive_root):
+            super().__init__(store, archive_root, pipeline=pipeline, judge=sentinella,
+                             indexer=lambda *_: {"status": "ok", "reason": None})
+
+    monkeypatch.setattr(filing_service, 'FilingService', Servizio)
+    args = ['--db', str(archive), '--archive', str(tmp_path / 'documents'), '--log', str(tmp_path / 'w.jsonl')]
+    assert filing_worker.main(args + ['--ticker', 'NOVA']) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["trigger"] == "scheduled" and out["judgment"]["status"] == "skipped"
+    assert chiamate == []
+
+
+def test_worker_ticker_con_controllo_programmato_disattivato_e_skipped(archive, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(migration, 'backend_alive', lambda: False)
+    migration.migra(archive, apply=True)
+    profile = {"ticker": "NOVA", "emittente_id": "CIK:0009990001", "lingua": "en", "tipo": "annuale",
+               "perimetro": "consolidato", "verifica": {"lingua": "English", "tipo": "annual", "perimetro": "consolidated"},
+               "sezioni": {"risk": {"inizio": "Risk", "fine": "End"}}, "fonti": []}
+    FilingStore(archive).set_profile("NOVA", profile, enabled=False)
+    args = ['--db', str(archive), '--archive', str(tmp_path / 'documents'), '--log', str(tmp_path / 'w.jsonl')]
+    assert filing_worker.main(args + ['--ticker', 'NOVA']) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"ticker": "NOVA", "status": "skipped", "reason": "controllo programmato disattivato per il profilo"}
+    assert filing_worker.main(args + ['--ticker', 'ASSENTE']) == 1

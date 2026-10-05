@@ -50,10 +50,18 @@ ERRORI E RETRY
 MODELLI DAL .ENV (precedenza scritta dal PM)
     chat:        CHAT_<AGENTE>_MODEL se presente, altrimenti CHAT_MODEL
     consigliere: round 0 = CONSIGLIERE_R0_MODEL; R1/R2 = CONSIGLIERE_<DESK>_MODEL o CONSIGLIERE_MODEL
-    capo / red_team / reflection / action_extractor / briefing / news_classifier: una variabile
+    capo / red_team / reflection / action_extractor / briefing / news_classifier / news_summary
+    (opzionale, fuori da VARIABILI_BASE): una variabile
     Variabile BASE assente o vuota = ConfigurazioneLLMMancante col NOME della variabile, al
     momento della chiamata: nessun default nel codice (regola 14/07; le MODEL STRINGS del
     CLAUDE.md vivono nel .env dal 05/09 su ordine del PM).
+
+EFFORT DAL .ENV (04/10, decisione maintainer)
+    CONSIGLIERE_R0/R1/R2_EFFORT, CONSIGLIERE_<DESK>_EFFORT (override R1/R2), CAPO_EFFORT,
+    RED_TEAM_EFFORT, REFLECTION_EFFORT, VALUATION_PREPARER_EFFORT: assente = default
+    documentato in DEFAULT_EFFORT; vuota o non valida = ConfigurazioneLLMMancante col nome.
+    Validate TUTTE all'avvio della run del comitato (valida_effort_env), prima di ogni
+    chiamata pagata. Tutto passa da _reasoning_openai.
 """
 from bellomberg.core.paths import PROJECT_ROOT
 import json
@@ -61,10 +69,12 @@ import os
 import time
 import math
 import asyncio
+from contextvars import ContextVar
 from email.utils import parsedate_to_datetime
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from bellomberg.core.request_journal import current_request_scope, request_scope, RequestBlocked
+from bellomberg.core.unbilled import provably_unbilled, unbilled_reason
 
 import httpx
 from dotenv import load_dotenv
@@ -119,6 +129,9 @@ _FUNZIONI_SINGOLE = {
     "action_extractor": "ACTION_EXTRACTOR_MODEL",
     "briefing": "BRIEFING_MODEL",
     "news_classifier": "NEWS_CLASSIFIER_MODEL",
+    # 02/10: sintesi di UN articolo su richiesta esplicita (market_data/article_summary.py).
+    # Funzione OPZIONALE: fuori da VARIABILI_BASE, vuota = «non configurata» solo li'.
+    "news_summary": "NEWS_SUMMARY_MODEL",
 }
 # Gli id degli agenti chat (chat_engine.SYSTEM_PROMPTS_BASE) e dei desk (specialists/*.name):
 # servono solo all'endpoint `engines` per elencare i modelli risolti, non alla risoluzione.
@@ -194,6 +207,7 @@ def _letture():
         "ACTION_EXTRACTOR_MODEL": os.getenv("ACTION_EXTRACTOR_MODEL"),
         "BRIEFING_MODEL": os.getenv("BRIEFING_MODEL"),
         "NEWS_CLASSIFIER_MODEL": os.getenv("NEWS_CLASSIFIER_MODEL"),
+        "NEWS_SUMMARY_MODEL": os.getenv("NEWS_SUMMARY_MODEL"),
     }
 
 
@@ -536,11 +550,166 @@ def _tool_choice_openai(tc):
     raise ValueError("tool_choice non riconosciuto: " + repr(tc))
 
 
-def thinking_consigliere(model):
-    """Scelta PM 20/09: Max solo per i desk Muse; gli altri ruoli restano invariati."""
-    if model == MUSE_STANDARD:
-        return {"type": "effort", "effort": "max"}
-    return {"type": "adaptive"}
+# ============================================================================ effort per fase
+# Decisione maintainer (integrazione 04/10): l'effort di ragionamento per fase vive nel .env
+# come i modelli, una variabile per fase. Variabile ASSENTE = il default qui sotto (la tabella
+# di Andrea del 02/10); presente ma VUOTA o con un valore fuori da VALORI_EFFORT =
+# ConfigurazioneLLMMancante col NOME della variabile, mai un default silenzioso.
+# Consigliere, stessa precedenza dei modelli:
+#   R0     = CONSIGLIERE_R0_EFFORT, per tutti i desk;
+#   R1/R2  = CONSIGLIERE_<DESK>_EFFORT (override del desk, vale per R1 e R2) se presente o se ha
+#            un default, altrimenti CONSIGLIERE_R1_EFFORT / CONSIGLIERE_R2_EFFORT.
+# Tabella di Andrea espressa cosi': R0 low; R1/R2 high (default di round, quindi fundamentals,
+# quant, options, macro); crypto ed eventdesk restano adaptive (default del loro override).
+# Ogni valore passa da _reasoning_openai: su z-ai/ (GLM) nessun effort esplicito parte mai.
+VALORI_EFFORT = ("adaptive", "disabled", "minimal", "low", "medium", "high", "xhigh", "max")
+DEFAULT_EFFORT = {
+    "CONSIGLIERE_R0_EFFORT": "low",
+    "CONSIGLIERE_R1_EFFORT": "high",
+    "CONSIGLIERE_R2_EFFORT": "high",
+    # override per desk (R1 e R2): None = segue CONSIGLIERE_R1_EFFORT / CONSIGLIERE_R2_EFFORT
+    "CONSIGLIERE_MACRO_EFFORT": None,
+    "CONSIGLIERE_QUANT_EFFORT": None,
+    "CONSIGLIERE_OPTIONS_EFFORT": None,
+    "CONSIGLIERE_FUNDAMENTALS_EFFORT": None,
+    "CONSIGLIERE_CRYPTO_EFFORT": "adaptive",
+    "CONSIGLIERE_EVENTDESK_EFFORT": "adaptive",
+    "CAPO_EFFORT": "high",
+    "RED_TEAM_EFFORT": "high",
+    "REFLECTION_EFFORT": "low",
+    # G7/C2 (04/10): il preparer delle valutazioni ha la SUA variabile. Prima seguiva di
+    # nascosto CONSIGLIERE_FUNDAMENTALS_EFFORT / CONSIGLIERE_R1_EFFORT: chi toccava l'effort
+    # dei desk cambiava anche lui. Default = il valore di Andrea (fundamentals R1 = high).
+    "VALUATION_PREPARER_EFFORT": "high",
+}
+_FASI_EFFORT = {"capo": "CAPO_EFFORT", "red_team": "RED_TEAM_EFFORT",
+                "reflection": "REFLECTION_EFFORT",
+                "valuation_preparer": "VALUATION_PREPARER_EFFORT"}
+
+
+def _letture_effort():
+    """Come _letture: ogni nome per esteso in una `os.getenv("...")` (test_env_example).
+    Valori GREZZI: qui «vuota» e «assente» sono due casi diversi."""
+    return {
+        "CONSIGLIERE_R0_EFFORT": os.getenv("CONSIGLIERE_R0_EFFORT"),
+        "CONSIGLIERE_R1_EFFORT": os.getenv("CONSIGLIERE_R1_EFFORT"),
+        "CONSIGLIERE_R2_EFFORT": os.getenv("CONSIGLIERE_R2_EFFORT"),
+        "CONSIGLIERE_MACRO_EFFORT": os.getenv("CONSIGLIERE_MACRO_EFFORT"),
+        "CONSIGLIERE_QUANT_EFFORT": os.getenv("CONSIGLIERE_QUANT_EFFORT"),
+        "CONSIGLIERE_OPTIONS_EFFORT": os.getenv("CONSIGLIERE_OPTIONS_EFFORT"),
+        "CONSIGLIERE_FUNDAMENTALS_EFFORT": os.getenv("CONSIGLIERE_FUNDAMENTALS_EFFORT"),
+        "CONSIGLIERE_CRYPTO_EFFORT": os.getenv("CONSIGLIERE_CRYPTO_EFFORT"),
+        "CONSIGLIERE_EVENTDESK_EFFORT": os.getenv("CONSIGLIERE_EVENTDESK_EFFORT"),
+        "CAPO_EFFORT": os.getenv("CAPO_EFFORT"),
+        "RED_TEAM_EFFORT": os.getenv("RED_TEAM_EFFORT"),
+        "REFLECTION_EFFORT": os.getenv("REFLECTION_EFFORT"),
+        "VALUATION_PREPARER_EFFORT": os.getenv("VALUATION_PREPARER_EFFORT"),
+    }
+
+
+def effort_env(nome):
+    """Il valore effort della variabile: dal .env, oppure il default se ASSENTE (None per un
+    override di desk senza default). Vuota o fuori da VALORI_EFFORT = errore col nome."""
+    letture = _letture_effort()
+    if nome not in letture:
+        raise ValueError("variabile effort sconosciuta: " + repr(nome))
+    grezzo = letture[nome]
+    if grezzo is None:
+        return DEFAULT_EFFORT[nome]
+    valore = grezzo.strip()
+    attesi = " / ".join(VALORI_EFFORT)
+    if not valore:
+        raise ConfigurazioneLLMMancante(
+            nome, "presente ma vuota nel .env: vuota NON vale default. Cancella la riga (default "
+            + repr(DEFAULT_EFFORT[nome]) + ") o scrivi uno fra " + attesi)
+    if valore not in VALORI_EFFORT:
+        raise ConfigurazioneLLMMancante(
+            nome, repr(valore) + " non e' un effort valido (attesi: " + attesi + ")")
+    return valore
+
+
+def valida_effort_env():
+    """G7/M1 (04/10): TUTTE le variabili *_EFFORT lette e validate in un colpo, all'avvio
+    della run del comitato, PRIMA di qualunque chiamata pagata. Prima un CAPO_EFFORT
+    sbagliato emergeva solo al Capo, a desk e red team gia' pagati. Ritorna {nome: valore};
+    la prima variabile vuota o non valida = ConfigurazioneLLMMancante col SUO nome (le altre
+    sbagliate sono elencate nello stesso messaggio)."""
+    valori, errori = {}, []
+    for nome in DEFAULT_EFFORT:
+        try:
+            valori[nome] = effort_env(nome)
+        except ConfigurazioneLLMMancante as exc:
+            errori.append(exc)
+    if errori:
+        primo = errori[0]
+        altri = [e.variabile for e in errori[1:]]
+        raise ConfigurazioneLLMMancante(
+            primo.variabile, str(primo).split(": ", 1)[-1]
+            + ((" (non valide anche: " + ", ".join(altri) + ")") if altri else ""))
+    return valori
+
+
+def _thinking_da_effort(valore):
+    if valore == "adaptive":
+        return {"type": "adaptive"}
+    if valore == "disabled":
+        return {"type": "disabled"}
+    return {"type": "effort", "effort": valore}
+
+
+# Ogni thinking che una variabile *_EFFORT puo' produrre (piu' la policy storica: adaptive e
+# max Muse sono gia' dentro). Serve SOLO a riconoscere richieste gia' pagate con un effort
+# diverso da quello di oggi (G7/C2, preparer): mai a sceglierne uno.
+THINKING_DA_EFFORT = tuple(_thinking_da_effort(v) for v in VALORI_EFFORT)
+
+
+def thinking_fase(fase):
+    """thinking per capo / red_team / reflection / valuation_preparer, da CAPO_EFFORT /
+    RED_TEAM_EFFORT / REFLECTION_EFFORT / VALUATION_PREPARER_EFFORT (default high / high /
+    low / high)."""
+    if fase not in _FASI_EFFORT:
+        raise ValueError("fase effort sconosciuta: " + repr(fase)
+                         + " (attese: " + ", ".join(_FASI_EFFORT) + ")")
+    return _thinking_da_effort(effort_env(_FASI_EFFORT[fase]))
+
+
+def thinking_consigliere(model, agente=None, round_n=None):
+    """Effort per fase dal .env (tabella sopra DEFAULT_EFFORT).
+
+    Le chiamate senza contesto mantengono la policy storica per compatibilita'
+    con strumenti esterni; i call site del Consigliere passano agente e round.
+    """
+    if agente is None or round_n is None:
+        if model == MUSE_STANDARD:
+            return {"type": "effort", "effort": "max"}
+        return {"type": "adaptive"}
+    if round_n == 0:
+        return _thinking_da_effort(effort_env("CONSIGLIERE_R0_EFFORT"))
+    if round_n not in (1, 2):
+        raise ValueError("round del Consigliere senza effort configurabile: " + repr(round_n)
+                         + " (attesi 0, 1, 2)")
+    valore = None
+    if str(agente).lower() in DESK:
+        valore = effort_env("CONSIGLIERE_" + str(agente).upper() + "_EFFORT")
+    if valore is None:
+        valore = effort_env("CONSIGLIERE_R" + str(round_n) + "_EFFORT")
+    return _thinking_da_effort(valore)
+
+
+_EFFORT_OMESSI_DICHIARATI = set()   # (slug, effort) gia' dichiarati a log in questo processo
+
+
+def _dichiara_effort_omesso(model, effort):
+    chiave = (str(model), effort)
+    if chiave in _EFFORT_OMESSI_DICHIARATI:
+        return
+    _EFFORT_OMESSI_DICHIARATI.add(chiave)
+    try:
+        print("[llm_client] " + str(model) + ": effort " + repr(effort) + " NON inviato "
+              "(su z-ai/ ogni effort esplicito azzera il ragionamento, misurato 05/09): "
+              "ragionamento nativo acceso, tetto = max_tokens")
+    except OSError:
+        pass
 
 
 def _reasoning_openai(thinking, model=""):
@@ -551,6 +720,11 @@ def _reasoning_openai(thinking, model=""):
         effort = thinking.get("effort")
         if effort not in ("minimal", "low", "medium", "high", "xhigh", "max"):
             raise ValueError("reasoning effort non riconosciuto: " + repr(effort))
+        if str(model).startswith(PREFISSI_RAGIONAMENTO_NATIVO):
+            # Misurato 05/09: su GLM QUALUNQUE effort esplicito azzera il ragionamento;
+            # omesso = acceso (il tetto resta max_tokens). Vale anche per gli effort dal .env.
+            _dichiara_effort_omesso(model, effort)
+            return None
         return {"effort": effort}
     if tipo == "adaptive":
         if str(model).startswith(PREFISSI_RAGIONAMENTO_NATIVO):
@@ -558,8 +732,20 @@ def _reasoning_openai(thinking, model=""):
         return dict(REASONING_ADAPTIVE)
     if tipo == "disabled":
         if model in RAGIONAMENTO_OBBLIGATORIO:
-            return dict(REASONING_MINIMO)   # gia' rifiutato una volta: minimal (0 token misurati)
+            # Gia' rifiutato una volta: minimal (0 token misurati). AMMESSO anche su z-ai/
+            # (decisione coordinatore 04/10, REV G7/R1): la regola «a z-ai/ non parte mai un
+            # effort» vale per le chiamate che vogliono la deliberazione ACCESA (adaptive /
+            # effort), dove un effort esplicito la azzererebbe. Qui la si vuole SPENTA e il
+            # modello rifiuta {"enabled": false}: minimal e' il modo misurato (05/09) per
+            # ottenere 0 token, cioe' proprio «disabled». Omettere il campo la accenderebbe.
+            return dict(REASONING_MINIMO)
         return dict(REASONING_DISABLED)
+    if tipo == "minimal":
+        # Percorsi di recupero che devono contenere il reasoning senza pagare
+        # prima il 400 "Reasoning is mandatory" dei modelli che non accettano
+        # {"enabled": false}. G7/M4 (04/10): stessa guardia del tipo «effort» — su z-ai/
+        # (GLM) nessun effort esplicito parte mai, nemmeno «minimal» (misurato 05/09).
+        return _reasoning_openai({"type": "effort", "effort": "minimal"}, model)
     if tipo == "enabled":
         b = thinking.get("budget_tokens")
         return {"max_tokens": int(b)} if b else {"enabled": True}
@@ -630,7 +816,11 @@ def _e_ragionamento_obbligatorio(errore, corpo):
 
 
 def _forza_minimal(corpo):
-    """Segna il modello e riscrive la richiesta con effort minimal, dichiarandolo nel log."""
+    """Segna il modello e riscrive la richiesta con effort minimal, dichiarandolo nel log.
+
+    Solo dopo un 400 «Reasoning is mandatory» su una richiesta partita SPENTA: e' la via
+    misurata per spegnere la deliberazione, ammessa anche su z-ai/ (REV G7/R1, vedi il ramo
+    «disabled» di _reasoning_openai). Chi la vuole accesa non passa mai di qui."""
     RAGIONAMENTO_OBBLIGATORIO.add(corpo.get("model"))
     corpo["reasoning"] = dict(REASONING_MINIMO)
     print("[llm_client] " + str(corpo.get("model")) + ": il ragionamento non si puo' spegnere "
@@ -985,6 +1175,20 @@ def _decodifica(resp):
         return None
 
 
+# G7/M2 (04/10): i chunk SSE si scrivono nel request journal a GRUPPI (una transazione ogni
+# CHECKPOINT_GRUPPO_CHUNK chunk o ogni CHECKPOINT_GRUPPO_S secondi), non uno per chunk: 4 desk
+# in streaming parallelo sullo stesso journal rischiavano un lock oltre il timeout SQLite.
+# Il gruppo pendente si scrive SEMPRE prima della ricevuta o del guasto (prova parziale
+# intera); la ripresa non dipende da questi chunk ma dalla prenotazione scritta prima del POST.
+CHECKPOINT_GRUPPO_CHUNK = 64
+CHECKPOINT_GRUPPO_S = 2.0
+# B5 (04/10): i commenti keepalive SSE («: OPENROUTER PROCESSING») azzerano il read-timeout,
+# quindi uno stream poteva durare senza limite. Tetto DICHIARATO alla durata totale di una
+# chiamata in streaming (dal POST all'ultimo byte): oltre, APITimeoutError col motivo; sotto
+# un journal la richiesta resta incerta (prenotazione intera), mai ripagata in automatico.
+DURATA_MAX_STREAM_S = 7200.0
+
+
 class _RequestAttempt:
     """Bind the existing SDK surface to its durable accounting owner."""
     def __init__(self, body):
@@ -992,12 +1196,27 @@ class _RequestAttempt:
         self.journal = scope.get("journal") if scope else None
         self.request_id, self.body, self.saved = None, body, None
         self.finished = False
+        self.released = None  # KA: secondi d'attesa se chiusa come certamente non fatturata
+        # RV-KA P3.2: True appena il provider ha risposto 2xx (stream aperto o corpo letto).
+        # Da li' in poi nessun guasto e' «certamente non fatturato», qualunque cosa porti.
+        self.response_started = False
+        self._checkpointed = False
+        self._pending = []
+        self._last_flush = time.monotonic()
         if self.journal is not None:
             self.request_id, self.body, self.saved = self.journal.prepare(body, scope)
             self.finished = self.saved is not None
 
+    def flush(self):
+        """Write the pending stream chunks (one transaction); a no-op when none."""
+        if self._pending and self.journal is not None and not self.finished:
+            pending, self._pending = self._pending, []
+            self.journal.checkpoint_many(self.request_id, pending)
+        self._last_flush = time.monotonic()
+
     def receive(self, data):
         if self.journal is not None and not self.finished:
+            self.flush()
             choices = data.get("choices") if isinstance(data, dict) else None
             complete = bool(isinstance(choices, list) and choices and isinstance(choices[0], dict)
                             and choices[0].get("finish_reason") is not None)
@@ -1017,12 +1236,33 @@ class _RequestAttempt:
         if self.request_id:
             error.request_id = self.request_id
         if self.journal is not None and not self.finished:
+            # KA (04/10, decisione PM «TI-RITENTATIVO-NON-FATTURATO»): un guasto che PROVA di
+            # non aver mai raggiunto un modello (connessione mai stabilita, 402 di ammissione)
+            # chiude la riga come 'released' (costo 0, con la prova) invece di 'unknown'.
+            # Ogni altro guasto resta incerto e blocca la run come prima.
+            wait = provably_unbilled(error)
+            if wait is not None and not (self.response_started or self._checkpointed or self._pending):
+                self._pending = []
+                if self.journal.release_unbilled(self.request_id, error, reason=unbilled_reason(error)):
+                    self.released = wait
+                self.finished = True
+                return
+            try:
+                self.flush()   # the partial evidence first, then the uncertain outcome
+            except Exception as flush_error:
+                self._pending = []
+                print("[llm_client] checkpoint del guasto non scritti: " + type(flush_error).__name__
+                      + ": " + str(flush_error)[:160])
             self.journal.fail(self.request_id, error, response=getattr(error, "partial_response", None))
             self.finished = True
 
     def checkpoint(self, chunk):
         if self.journal is not None and not self.finished:
-            self.journal.checkpoint(self.request_id, chunk)
+            self._checkpointed = True
+            self._pending.append(chunk)
+            if (len(self._pending) >= CHECKPOINT_GRUPPO_CHUNK
+                    or time.monotonic() - self._last_flush >= CHECKPOINT_GRUPPO_S):
+                self.flush()
 
     def message(self, message):
         message.request_id = self.request_id
@@ -1030,6 +1270,71 @@ class _RequestAttempt:
         if message.usage is not None:
             message.usage.request_id = self.request_id
         return message
+
+
+# RV-KA P3.4: acceso solo dentro sonda_modelli (ContextVar: vale per il thread/task corrente).
+_SENZA_NUOVO_TENTATIVO = ContextVar("bellomberg_senza_nuovo_tentativo", default=False)
+
+
+def _nuovo_tentativo_non_fatturato(attempt, error, rilasciati):
+    """KA (04/10): secondi d'attesa per l'UNICO nuovo tentativo, o None (si rilancia).
+
+    Solo una richiesta che il journal ha appena chiuso come 'released' si ritenta, e una
+    sola volta per chiamata: il secondo guasto non fatturato si rilancia DICHIARATO
+    (unbilled_retry_exhausted) con l'elenco delle richieste rilasciate.
+    Limite (RV-KA P3.3): il tetto e' PER SINGOLA CHIAMATA; un chiamante che ripete la
+    chiamata ottiene un altro giro (ogni riga 'released' porta comunque la sua prova).
+    La sonda modelli non ritenta mai (RV-KA P3.4): la riga resta 'released', l'esito KO."""
+    if attempt.released is not None:
+        rilasciati.append(attempt.request_id)
+    if rilasciati:
+        error.unbilled_released = list(rilasciati)
+    if attempt.released is None:
+        return None
+    if _SENZA_NUOVO_TENTATIVO.get():
+        error.unbilled_retry_skipped = "sonda modelli: misura, non insiste"
+        return None
+    if len(rilasciati) > 1:
+        error.unbilled_retry_exhausted = True
+        try:
+            print("[llm_client] secondo guasto non fatturato (" + type(error).__name__
+                  + "): nessun terzo tentativo; richieste rilasciate " + ", ".join(rilasciati))
+        except OSError:
+            pass
+        return None
+    try:
+        print("[llm_client] richiesta " + str(attempt.request_id) + " non fatturata ("
+              + str(unbilled_reason(error)) + "): un solo nuovo tentativo fra "
+              + format(attempt.released, "g") + " s")
+    except OSError:
+        pass
+    return attempt.released
+
+
+def _chunk_terminale(chunk):
+    """Il chunk che chiude la risposta: finish_reason o usage (anche con choices: [])."""
+    if not isinstance(chunk, dict):
+        return False
+    return chunk.get("usage") is not None or any(
+        isinstance(c, dict) and c.get("finish_reason") is not None for c in (chunk.get("choices") or []))
+
+
+def _oltre_la_durata_massima(scadenza, ric, chunk, resp):
+    """B5: anche i keepalive passano di qui, quindi il tetto vale pure per uno stream che
+    non manda mai contenuto. None = risposta salvata riletta offline (nessun tetto).
+    REV G7/R4 (04/10): il tetto NON scatta sul chunk terminale (finish/usage) ne' dopo:
+    una risposta completa e pagata arrivata a 7200,1 s resta una risposta, non un incerto.
+    L'id di generazione dell'header del 200 (se il provider lo manda) viaggia con l'errore,
+    cosi' anche uno stream di soli keepalive resta riconciliabile; senza id lo dice la
+    riconciliazione («no provider generation id was captured»)."""
+    if scadenza is None or ric.finish is not None or _chunk_terminale(chunk):
+        return
+    if time.monotonic() > scadenza:
+        error = APITimeoutError("durata totale dello stream oltre DURATA_MAX_STREAM_S ("
+                                + format(DURATA_MAX_STREAM_S, "g") + " s): chiamata interrotta, "
+                                "esito incerto dichiarato (nessun nuovo invio automatico)")
+        error.generation_id = getattr(resp, "headers", {}).get("x-generation-id")
+        raise error
 
 
 def _saved_stream_response(data):
@@ -1058,27 +1363,34 @@ class _Messages:
         self._c = client
 
     def create(self, **kw):
-        corpo = costruisci_corpo(stream=False, **kw)
-        attempt = _RequestAttempt(corpo)
-        corpo = attempt.body
-        forzato = _voleva_spento(kw) and corpo.get("reasoning") == REASONING_MINIMO
-        try:
+        corpo_base = costruisci_corpo(stream=False, **kw)
+        rilasciati = []
+        while True:  # KA: al piu' UN nuovo tentativo, solo dopo un guasto certamente non fatturato
+            attempt = _RequestAttempt(corpo_base)
+            corpo = attempt.body
+            forzato = _voleva_spento(kw) and corpo.get("reasoning") == REASONING_MINIMO
+            data = None
             try:
-                data = attempt.saved if attempt.saved is not None else self._c._post_json(corpo)
-            except APIStatusError as e:
-                if current_request_scope() is not None or not _e_ragionamento_obbligatorio(e, corpo):
+                try:
+                    data = attempt.saved if attempt.saved is not None else self._c._post_json(corpo)
+                except APIStatusError as e:
+                    if current_request_scope() is not None or not _e_ragionamento_obbligatorio(e, corpo):
+                        raise
+                    _forza_minimal(corpo)
+                    forzato = True
+                    data = self._c._post_json(corpo)
+                attempt.response_started = True
+                message = messaggio_da_json(data)
+                attempt.receive(data)
+                return attempt.message(_dichiara_forzato(message, forzato))
+            except Exception as exc:
+                if data is not None and not hasattr(exc, "partial_response"):
+                    exc.partial_response = data
+                attempt.fail(exc)
+                wait = _nuovo_tentativo_non_fatturato(attempt, exc, rilasciati)
+                if wait is None:
                     raise
-                _forza_minimal(corpo)
-                forzato = True
-                data = self._c._post_json(corpo)
-            message = messaggio_da_json(data)
-            attempt.receive(data)
-            return attempt.message(_dichiara_forzato(message, forzato))
-        except Exception as exc:
-            if "data" in locals() and not hasattr(exc, "partial_response"):
-                exc.partial_response = data
-            attempt.fail(exc)
-            raise
+            time.sleep(wait)
 
     def stream(self, **kw):
         corpo = costruisci_corpo(stream=True, **kw)
@@ -1125,6 +1437,7 @@ class OpenRouterClient:
                 headers = resp.headers
                 # The provider's generation id lets an uncertain outcome be reconciled later.
                 ultimo.generation_id = headers.get("x-generation-id")
+                ultimo.http_status = resp.status_code  # RV-KA: il code del corpo puo' differire
                 resp.close()
                 if not _ritentabile(resp.status_code):
                     raise ultimo
@@ -1146,6 +1459,7 @@ class _StreamSync:
     def __init__(self, client, corpo, forzato=False):
         self._c = client
         self._corpo = corpo
+        self._corpo_base = corpo  # KA: il nuovo tentativo riparte dalla richiesta originale
         self._forzato = forzato
         self._resp = None
         self._ric = _Ricomposizione()
@@ -1153,27 +1467,38 @@ class _StreamSync:
         self._retry = _RetryBudget(client.max_retries)
         self._attempt = None
         self._error = None
+        self._scadenza = None
 
     def __enter__(self):
-        if self._attempt is None:
-            self._attempt = _RequestAttempt(self._corpo)
-            self._corpo = self._attempt.body
-        if self._attempt.saved is not None:
-            self._resp = _saved_stream_response(self._attempt.saved)
-            return self
-        try:
+        rilasciati = []
+        while True:  # KA: al piu' UN nuovo tentativo, solo dopo un guasto certamente non fatturato
+            if self._attempt is None:
+                self._attempt = _RequestAttempt(self._corpo_base)
+                self._corpo = self._attempt.body
+            if self._attempt.saved is not None:
+                self._resp = _saved_stream_response(self._attempt.saved)
+                return self
+            if self._scadenza is None:
+                self._scadenza = time.monotonic() + DURATA_MAX_STREAM_S
             try:
-                self._resp = self._c._invia(self._corpo, stream=True, retry=self._retry)
-            except APIStatusError as e:
-                if current_request_scope() is not None or not _e_ragionamento_obbligatorio(e, self._corpo):
+                try:
+                    self._resp = self._c._invia(self._corpo, stream=True, retry=self._retry)
+                except APIStatusError as e:
+                    if current_request_scope() is not None or not _e_ragionamento_obbligatorio(e, self._corpo):
+                        raise
+                    _forza_minimal(self._corpo)
+                    self._forzato = True
+                    self._resp = self._c._invia(self._corpo, stream=True, retry=self._retry)
+            except Exception as exc:
+                self._attempt.fail(exc)
+                wait = _nuovo_tentativo_non_fatturato(self._attempt, exc, rilasciati)
+                if wait is None:
                     raise
-                _forza_minimal(self._corpo)
-                self._forzato = True
-                self._resp = self._c._invia(self._corpo, stream=True, retry=self._retry)
-        except Exception as exc:
-            self._attempt.fail(exc)
-            raise
-        return self
+                self._attempt = None
+                time.sleep(wait)
+                continue
+            self._attempt.response_started = True
+            return self
 
     def __exit__(self, *a):
         if self._resp is not None:
@@ -1194,6 +1519,7 @@ class _StreamSync:
                 try:
                     for riga in self._resp.iter_lines():
                         chunk = _payload_sse(riga)
+                        _oltre_la_durata_massima(self._scadenza, self._ric, chunk, self._resp)
                         if chunk is None:
                             continue
                         if chunk == "[DONE]":
@@ -1241,27 +1567,34 @@ class _MessagesAsync:
         self._c = client
 
     async def create(self, **kw):
-        corpo = costruisci_corpo(stream=False, **kw)
-        attempt = _RequestAttempt(corpo)
-        corpo = attempt.body
-        forzato = _voleva_spento(kw) and corpo.get("reasoning") == REASONING_MINIMO
-        try:
+        corpo_base = costruisci_corpo(stream=False, **kw)
+        rilasciati = []
+        while True:  # KA: al piu' UN nuovo tentativo, solo dopo un guasto certamente non fatturato
+            attempt = _RequestAttempt(corpo_base)
+            corpo = attempt.body
+            forzato = _voleva_spento(kw) and corpo.get("reasoning") == REASONING_MINIMO
+            data = None
             try:
-                data = attempt.saved if attempt.saved is not None else await self._c._post_json(corpo)
-            except APIStatusError as e:
-                if current_request_scope() is not None or not _e_ragionamento_obbligatorio(e, corpo):
+                try:
+                    data = attempt.saved if attempt.saved is not None else await self._c._post_json(corpo)
+                except APIStatusError as e:
+                    if current_request_scope() is not None or not _e_ragionamento_obbligatorio(e, corpo):
+                        raise
+                    _forza_minimal(corpo)
+                    forzato = True
+                    data = await self._c._post_json(corpo)
+                attempt.response_started = True
+                message = messaggio_da_json(data)
+                attempt.receive(data)
+                return attempt.message(_dichiara_forzato(message, forzato))
+            except Exception as exc:
+                if data is not None and not hasattr(exc, "partial_response"):
+                    exc.partial_response = data
+                attempt.fail(exc)
+                wait = _nuovo_tentativo_non_fatturato(attempt, exc, rilasciati)
+                if wait is None:
                     raise
-                _forza_minimal(corpo)
-                forzato = True
-                data = await self._c._post_json(corpo)
-            message = messaggio_da_json(data)
-            attempt.receive(data)
-            return attempt.message(_dichiara_forzato(message, forzato))
-        except Exception as exc:
-            if "data" in locals() and not hasattr(exc, "partial_response"):
-                exc.partial_response = data
-            attempt.fail(exc)
-            raise
+            await asyncio.sleep(wait)
 
     def stream(self, **kw):
         corpo = costruisci_corpo(stream=True, **kw)
@@ -1307,6 +1640,7 @@ class AsyncOpenRouterClient:
                 headers = resp.headers
                 # The provider's generation id lets an uncertain outcome be reconciled later.
                 ultimo.generation_id = headers.get("x-generation-id")
+                ultimo.http_status = resp.status_code  # RV-KA: il code del corpo puo' differire
                 await resp.aclose()
                 if not _ritentabile(resp.status_code):
                     raise ultimo
@@ -1328,6 +1662,7 @@ class _StreamAsync:
     def __init__(self, client, corpo, forzato=False):
         self._c = client
         self._corpo = corpo
+        self._corpo_base = corpo  # KA: il nuovo tentativo riparte dalla richiesta originale
         self._forzato = forzato
         self._resp = None
         self._ric = _Ricomposizione()
@@ -1335,27 +1670,38 @@ class _StreamAsync:
         self._retry = _RetryBudget(client.max_retries)
         self._attempt = None
         self._error = None
+        self._scadenza = None
 
     async def __aenter__(self):
-        if self._attempt is None:
-            self._attempt = _RequestAttempt(self._corpo)
-            self._corpo = self._attempt.body
-        if self._attempt.saved is not None:
-            self._resp = _saved_stream_response(self._attempt.saved)
-            return self
-        try:
+        rilasciati = []
+        while True:  # KA: al piu' UN nuovo tentativo, solo dopo un guasto certamente non fatturato
+            if self._attempt is None:
+                self._attempt = _RequestAttempt(self._corpo_base)
+                self._corpo = self._attempt.body
+            if self._attempt.saved is not None:
+                self._resp = _saved_stream_response(self._attempt.saved)
+                return self
+            if self._scadenza is None:
+                self._scadenza = time.monotonic() + DURATA_MAX_STREAM_S
             try:
-                self._resp = await self._c._invia(self._corpo, stream=True, retry=self._retry)
-            except APIStatusError as e:
-                if current_request_scope() is not None or not _e_ragionamento_obbligatorio(e, self._corpo):
+                try:
+                    self._resp = await self._c._invia(self._corpo, stream=True, retry=self._retry)
+                except APIStatusError as e:
+                    if current_request_scope() is not None or not _e_ragionamento_obbligatorio(e, self._corpo):
+                        raise
+                    _forza_minimal(self._corpo)
+                    self._forzato = True
+                    self._resp = await self._c._invia(self._corpo, stream=True, retry=self._retry)
+            except Exception as exc:
+                self._attempt.fail(exc)
+                wait = _nuovo_tentativo_non_fatturato(self._attempt, exc, rilasciati)
+                if wait is None:
                     raise
-                _forza_minimal(self._corpo)
-                self._forzato = True
-                self._resp = await self._c._invia(self._corpo, stream=True, retry=self._retry)
-        except Exception as exc:
-            self._attempt.fail(exc)
-            raise
-        return self
+                self._attempt = None
+                await asyncio.sleep(wait)
+                continue
+            self._attempt.response_started = True
+            return self
 
     async def __aexit__(self, *a):
         if self._resp is not None:
@@ -1376,6 +1722,7 @@ class _StreamAsync:
                 try:
                     async for riga in self._resp.aiter_lines():
                         chunk = _payload_sse(riga)
+                        _oltre_la_durata_massima(self._scadenza, self._ric, chunk, self._resp)
                         if chunk is None:
                             continue
                         if chunk == "[DONE]":
@@ -1429,7 +1776,16 @@ class _StreamAsync:
 def sonda_modelli(slugs, client=None, max_tokens=5, timeout_s=45.0):
     """{slug: {"ok": bool, "motivo": None|str, "durata_s": float}} per ogni slug distinto
     (ordine di prima apparizione). `client` finto nei test; in produzione OpenRouterClient
-    senza retry: la sonda misura, non insiste."""
+    senza retry: la sonda misura, non insiste. Anche il nuovo tentativo dopo un guasto
+    certamente non fatturato (KA) e' spento qui: la riga resta 'released', l'esito KO."""
+    token = _SENZA_NUOVO_TENTATIVO.set(True)
+    try:
+        return _sonda_modelli(slugs, client, max_tokens, timeout_s)
+    finally:
+        _SENZA_NUOVO_TENTATIVO.reset(token)
+
+
+def _sonda_modelli(slugs, client, max_tokens, timeout_s):
     esiti = {}
     distinti = []
     for s in slugs or []:

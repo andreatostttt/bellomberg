@@ -3,7 +3,7 @@
 # ==================================================================
 # Registra in Windows Task Scheduler:
 #   1. Bellomberg-PriceUpdater  -> ogni 15 min (prezzi live + FX)
-#   2. Bellomberg-NewsFeed      -> ogni 15 min Lun-Ven 07:00-23:00
+#   2. Bellomberg-NewsFeed      -> ogni 15 min Lun-Ven, ogni 2 ore Sab-Dom, 07:00-23:00
 #   3. Bellomberg-Consigliere   -> Lun + Gio 07:30 AM (riunione settimanale)
 #   4. Bellomberg-Briefing      -> 4 slot Lun-Ven 07:30/11:30/15:30/19:30 (Haiku daily briefing)
 #   5. Bellomberg-AutoBackup    -> ogni giorno 23:00 (zip DB + retention ultimi 30)
@@ -81,10 +81,10 @@ Register-ScheduledTask -TaskName "Bellomberg-PriceUpdater" `
 Write-Host "  OK -> log: $ProjectPath\data\price_updater.log" -ForegroundColor Green
 
 # ==================================================================
-# 2) NEWS FEED - ogni 15 min, Lun-Ven 07:00-23:00
+# 2) NEWS FEED - ogni 15 min Lun-Ven, ogni 2 ore Sab-Dom, 07:00-23:00
 # ==================================================================
 Write-Host ""
-Write-Host "[2/5] Registro: Bellomberg-NewsFeed (Lun-Ven, ogni 15 min, 07-23)" -ForegroundColor Cyan
+Write-Host "[2/5] Registro: Bellomberg-NewsFeed (Lun-Ven ogni 15 min, Sab-Dom ogni 2 ore, 07-23)" -ForegroundColor Cyan
 Remove-IfExists "Bellomberg-NewsFeed"
 
 $action2 = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$NewsFeedBat`"" -WorkingDirectory $ProjectPath
@@ -96,6 +96,13 @@ $repTrigger = New-ScheduledTaskTrigger -Once -At $triggerStart `
     -RepetitionInterval (New-TimeSpan -Minutes 15) `
     -RepetitionDuration (New-TimeSpan -Hours 16)
 $baseTrigger.Repetition = $repTrigger.Repetition
+# Weekend (decisione PM 04/10/2026): Sab-Dom ogni 2 ore, 07:00-23:00.
+$weekendTrigger = New-ScheduledTaskTrigger -Weekly -At $triggerStart `
+    -DaysOfWeek Saturday,Sunday
+$weekendRep = New-ScheduledTaskTrigger -Once -At $triggerStart `
+    -RepetitionInterval (New-TimeSpan -Hours 2) `
+    -RepetitionDuration (New-TimeSpan -Hours 16)
+$weekendTrigger.Repetition = $weekendRep.Repetition
 
 $settings2 = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
@@ -107,7 +114,7 @@ $principal2 = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -Run
 
 Register-ScheduledTask -TaskName "Bellomberg-NewsFeed" `
     -Description "Bellomberg - news auto-feed (Marketaux + NewsAPI + RSS + Haiku classifier)." `
-    -Action $action2 -Trigger $baseTrigger -Settings $settings2 -Principal $principal2 | Out-Null
+    -Action $action2 -Trigger @($baseTrigger, $weekendTrigger) -Settings $settings2 -Principal $principal2 | Out-Null
 Write-Host "  OK -> log: $ProjectPath\data\news_feed.log" -ForegroundColor Green
 
 # ==================================================================

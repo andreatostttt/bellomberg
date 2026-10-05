@@ -49,6 +49,22 @@ test('manual no-decision differs from unknown; partial executions can link expli
   assert.throws(() => legameTrade('31', [], 'SYNTH', 'BUY'));
 });
 
+test('blocked proposal is not linkable; different execution ticker needs recorded identity proof', () => {
+  const { assessmentAllowsExecution, decisioneCompatibile, legameTrade } = helpers();
+  const blocked = { ...decision, assessment_status: 'BLOCKED' };
+  const unavailable = { ...decision, assessment_status: 'CHECK_UNAVAILABLE' };
+  const override = { ...decision, assessment_status: 'OVERRIDE_PENDING' };
+  assert.equal(decisioneCompatibile(blocked, 'SYNTH', 'BUY'), false);
+  assert.equal(decisioneCompatibile(unavailable, 'SYNTH', 'BUY'), false);
+  assert.equal(decisioneCompatibile(override, 'SYNTH', 'BUY'), false);
+  assert.equal(assessmentAllowsExecution(blocked), false);
+  assert.equal(assessmentAllowsExecution(unavailable), false);
+  assert.equal(assessmentAllowsExecution(override), false);
+  assert.throws(() => legameTrade('31', [decision], 'BROKER.DE', 'BUY'));
+  assert.equal(legameTrade('31', [decision], 'BROKER.DE', 'BUY', true).linked_decision_id, 31);
+  assert.throws(() => legameTrade('31', [blocked], 'BROKER.DE', 'BUY', true));
+});
+
 test('confirmation freezes the server historical FX and exact linked request', () => {
   const { congelaAnteprima } = helpers();
   const input = { ...body };
@@ -216,4 +232,120 @@ test('opening readback rejects impossible calendar dates and preview cannot chan
   assert.throws(() => leggiPosizioniIniziali({ openings: [{ ...record, as_of: '2026-02-30' }] }));
   const changed = openingPreview(); changed.opening.nome = 'Wrong name';
   assert.throws(() => congelaPosizioneIniziale(openingBody, changed));
+});
+
+// ── G9a: anteprima sola lettura, legame confermato insieme al trade ──────────
+const ISIN_SINT = 'XS0000000000';
+const identityBody = { isin: ISIN_SINT, source: 'prospetto sintetico', verified_at: '2026-09-01T08:00:00.000Z', reason: 'stessa azione' };
+const identityView = { ...identityBody, proposed_ticker: 'SYNTH', execution_ticker: 'BROKER.DE' };
+const aliasBody = { ...body, ticker: 'BROKER.DE', instrument_identity: identityBody };
+const divBody = { ...body, linked_decision_id: undefined, senza_decisione: true,
+  manual_divergence: { decision_id: 41, reason: 'eseguito comunque' } };
+const divView = { decision_id: 41, reason: 'eseguito comunque', ticker_proposto: 'SYNTH', ticker_eseguito: 'SYNTH' };
+
+test('a confirmation carries only the ISIN verification and divergence the backend validated', () => {
+  const { congelaAnteprima } = helpers();
+  assert.equal(congelaAnteprima(aliasBody, { ...response(), instrument_identity: identityView }).body.instrument_identity.isin, ISIN_SINT);
+  assert.throws(() => congelaAnteprima(aliasBody, response()), 'preview silent on the verification');
+  assert.throws(() => congelaAnteprima(aliasBody, { ...response(), instrument_identity: { ...identityView, isin: 'XS0000000018' } }));
+  assert.throws(() => congelaAnteprima(body, { ...response(), instrument_identity: identityView }), 'verification nobody asked for');
+  const div = { ...response(), link_origin: 'none', decisione: null };
+  assert.equal(congelaAnteprima(divBody, { ...div, manual_divergence: divView }).body.manual_divergence.decision_id, 41);
+  assert.throws(() => congelaAnteprima(divBody, div), 'preview silent on the divergence');
+  assert.throws(() => congelaAnteprima(divBody, { ...div, manual_divergence: { ...divView, reason: 'altro' } }));
+  assert.throws(() => congelaAnteprima(divBody, { ...div, manual_divergence: { ...divView, decision_id: 42 } }));
+});
+
+test('ISIN verification body: unreadable date is a declared error, not a RangeError', () => {
+  const { corpoIdentita, FrontendTradeError } = helpers();
+  const ok = corpoIdentita(' xs0000000000 ', ' fonte ', '2026-09-01T10:00', ' motivo ');
+  assert.equal(ok.isin, ISIN_SINT); assert.equal(ok.source, 'fonte'); assert.equal(ok.reason, 'motivo');
+  assert.match(ok.verified_at, /^2026-09-01T\d{2}:00:00\.000Z$/);
+  for (const args of [['', 'f', '2026-09-01T10:00', 'm'], [ISIN_SINT, 'f', 'non-una-data', 'm'], [ISIN_SINT, 'f', '2026-13-45T99:99', 'm']]) {
+    let err = null; try { corpoIdentita(...args); } catch (e) { err = e; }
+    assert.ok(err instanceof FrontendTradeError, String(err));
+  }
+});
+
+test('the confirm dialog shows the ticker alias and the manual divergence that will be written', () => {
+  const { righeLegame } = helpers();
+  const rows = righeLegame({ ...response(), instrument_identity: identityView, manual_divergence: { ...divView, ticker_eseguito: 'BROKER.DE' } });
+  const text = rows.map(r => r.k + ' ' + r.v).join('\n');
+  for (const piece of ['SYNTH', 'BROKER.DE', ISIN_SINT, 'prospetto sintetico', '#41', 'eseguito comunque']) assert.ok(text.includes(piece), piece);
+  assert.equal(righeLegame(response()).length, 0);
+});
+
+test('deposited/withdrawn totals: missing amount and unknown type are n/a with a reason, a full window is a minimum', () => {
+  const { totaliMovimenti } = helpers();
+  const ok = totaliMovimenti([{ type: 'DEPOSIT', amount_eur: 100 }, { type: 'WITHDRAWAL', amount_eur: 30 }, { type: 'DEPOSIT', amount_eur: 5 }], 200);
+  assert.deepEqual([ok.versati, ok.prelevati, ok.parziale, ok.motivoVersati, ok.motivoPrelevati], [105, 30, false, null, null]);
+  const missing = totaliMovimenti([{ type: 'DEPOSIT', amount_eur: null }, { type: 'WITHDRAWAL', amount_eur: 30 }], 200);
+  assert.equal(missing.versati, null); assert.ok(missing.motivoVersati); assert.equal(missing.prelevati, 30);
+  const unknown = totaliMovimenti([{ type: 'DEPOSIT', amount_eur: 10 }, { type: 'FEE', amount_eur: 3 }], 200);
+  assert.equal(unknown.versati, null); assert.equal(unknown.prelevati, null);
+  assert.ok(unknown.motivoPrelevati.includes('FEE'));
+  assert.equal(totaliMovimenti([{ type: 'DEPOSIT', amount_eur: 1 }, { type: 'DEPOSIT', amount_eur: 1 }], 2).parziale, true);
+});
+
+test('Trade Entry page: preview never writes, commit reads the frozen body, menu compares the typed ticker', () => {
+  const src = fs.readFileSync(path.resolve(__dirname, '../../src/pages/TradeEntryPage.tsx'), 'utf8');
+  for (const gone of ['verifyInstrumentIdentity', 'recordManualTradeDivergence', 'decisioneCompatibile(d, d.ticker',
+                      'Trade <b>#', '· BLOCKED', "'DIV'"]) {
+    assert.ok(!src.includes(gone), gone);
+  }
+  const commit = src.slice(src.indexOf('const commit = async'), src.indexOf('const pendingRows'));
+  assert.ok(commit.includes('p.body.manual_divergence') && !/\bmanualDivergence(Decision|Reason)\b/.test(commit), 'commit reads live form state');
+  assert.ok(src.slice(src.indexOf('const pendingRows'), src.indexOf('if (v.ricalcolo)')).includes('righeLegame(v)'));
+  assert.ok(src.includes('decisioneCompatibile(d, tickerUp, action)'));
+  const api = fs.readFileSync(path.resolve(__dirname, '../../src/lib/api.ts'), 'utf8');
+  assert.ok(!api.includes("'/instrument-identities/verify'"));
+});
+
+test('taglieStoriche: an order with unreadable quantity or price is excluded and counted, never a size of 0 (G9b review)', () => {
+  const { taglieStoriche } = load(path.resolve(__dirname, '../../src/lib/cassa.ts'));
+  const r = taglieStoriche([
+    { ticker: 'ZZTEST', action: 'BUY', data: '2026-09-01', quantita: 10, prezzo: 5, valuta: 'EUR' },
+    { ticker: 'ACME.MI', action: 'BUY', data: '2026-09-02', quantita: null, prezzo: 7, valuta: 'EUR' },
+    { ticker: 'ZZTEST', action: 'SELL', data: '2026-09-03', quantita: 2, prezzo: 30, valuta: 'EUR' },
+  ], null, []);
+  assert.deepEqual(r.misurate.map(t => t.eur), [50, 60]);
+  assert.equal(r.mediana, 55);
+  assert.equal(r.senzaImporto, 1);
+  assert.equal(r.senzaCambio, 0);
+});
+
+test('Trade Entry page declares the orders excluded from the sizes for a missing amount (G9a+G9b integration)', () => {
+  const src = fs.readFileSync(path.resolve(__dirname, '../../src/pages/TradeEntryPage.tsx'), 'utf8');
+  assert.ok(/taglie\.senzaImporto > 0 && <> \{tr\('trade\.orders_no_amount', \{ n: String\(taglie\.senzaImporto\) \}\)\}/.test(src), 'senzaImporto not shown');
+  assert.ok(src.includes('taglie.senzaCambio > 0 || taglie.senzaImporto > 0 || tradesErr'), 'note hidden when only senzaImporto > 0');
+  const cat = l => fs.readFileSync(path.resolve(__dirname, `../../src/i18n/${l}/trade.ts`), 'utf8');
+  assert.match(cat('it'), /"orders_no_amount": "\{n\} movimenti senza importo non conteggiati"/);
+  assert.match(cat('en'), /"orders_no_amount": "\{n\} movements without an amount not counted"/);
+});
+
+test('manual divergence is offered for every non-operative status the backend accepts, each named in it/en (G6 in Trade Entry)', () => {
+  const { creaCaricatore, ambienteBrowser } = require('../i18n/_carica.cjs');
+  ambienteBrowser(); const read = creaCaricatore();
+  const language = read('i18n/lingua.ts'), trade = read('lib/trade-entry.ts');
+  const stati = ['BLOCKED', 'OVERRIDE_PENDING', 'CHECK_UNAVAILABLE'];
+  for (const s of stati) assert.equal(trade.statoDivergenza({ assessment_status: s }), s, s);
+  for (const s of ['OPERATIVE', null, undefined, '']) assert.equal(trade.statoDivergenza({ assessment_status: s }), null, String(s));
+  const attesi = { it: ['BLOCCATA', 'DEROGA IN ATTESA', 'NON VERIFICABILE'], en: ['BLOCKED', 'OVERRIDE PENDING', 'NOT VERIFIABLE'] };
+  for (const lingua of ['it', 'en']) {
+    language.impostaLinguaCorrente(lingua);
+    assert.deepEqual(stati.map(s => trade.etichettaStatoDivergenza(s)), attesi[lingua]);
+    const spiegazioni = stati.map(s => trade.spiegazioneDivergenza(s, 'ZZTEST'));
+    assert.equal(new Set(spiegazioni).size, 3, 'each case explains itself');
+    for (const t of spiegazioni) assert.ok(t.includes('ZZTEST') && !/[⟦{]/.test(t), t);
+    const righe = trade.righeLegame({ ...response(), manual_divergence: { decision_id: 41, reason: 'r', ticker_proposto: 'ZZTEST',
+      ticker_eseguito: 'ZZTEST', assessment_status: 'CHECK_UNAVAILABLE' } });
+    assert.ok(righe.some(r => r.v.includes(attesi[lingua][2])), 'confirm dialog names the status');
+  }
+  language.impostaLinguaCorrente('it');
+  // la pagina e il pulsante della pagina Decisioni passano dall'helper, non dal letterale BLOCKED
+  for (const file of ['TradeEntryPage.tsx', 'Decisions.tsx']) {
+    const src = fs.readFileSync(path.resolve(__dirname, '../../src/pages', file), 'utf8');
+    assert.ok(!src.includes("=== 'BLOCKED'") && !src.includes("!== 'BLOCKED'"), file);
+    assert.ok(src.includes('statoDivergenza(d) !== null'), file);
+  }
 });

@@ -60,6 +60,8 @@ function fakeApi(rows, detail) {
   return { calls, fundamentalsResearch: async () => { calls.push('list'); return {status: 'available', count: rows.length, items: rows, notices: []}; },
     fundamentalsCompany: async ticker => { calls.push('detail:' + ticker); return detail || rows.find(row => row.ticker === ticker); },
     fundamentalsArchive: async () => { calls.push('archive'); return {items: [], notices: []}; },
+    // Filing summary panel under the selected company: kept loading, outside these checks.
+    filingList: () => new Promise(() => {}),
     valuationModels() { throw new Error('Fund must not open the old valuation workspace'); }};
 }
 

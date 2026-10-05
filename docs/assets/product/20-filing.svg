@@ -1,0 +1,151 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="900" viewBox="0 0 1280 900" role="img" aria-labelledby="title desc">
+<title id="title">F20 Filing — synthetic DEMO illustration</title>
+<desc id="desc">Original explanatory mockup, not a screenshot. All values, names, instruments and research text are invented. No user portfolio data.</desc>
+<style>text{font-family:Segoe UI,Arial,sans-serif} .mono{font-family:Consolas,monospace}</style>
+<rect x="0" y="0" width="1280" height="900" rx="0" fill="#10151d"/>
+<rect x="0" y="0" width="1280" height="64" rx="0" fill="#141c26"/>
+<text x="28" y="41" font-size="24" fill="#eef2f7" font-weight="650" text-anchor="start">Bellomberg</text>
+<text x="207" y="39" font-size="13" fill="#adbac9" font-weight="400" text-anchor="start">Research terminal</text>
+<rect x="490" y="18" width="390" height="31" rx="4" fill="#10151d" stroke="#344250"/>
+<text x="504" y="39" font-size="13" fill="#adbac9" font-weight="400" text-anchor="start">Cerca pagina o ticker</text>
+<text x="866" y="39" font-size="13" fill="#e2bf72" font-weight="600" text-anchor="end">Ctrl + K</text>
+<text x="1250" y="39" font-size="13" fill="#e2bf72" font-weight="650" text-anchor="end">DEMO • Dati interamente sintetici</text>
+<rect x="0" y="64" width="1280" height="67" rx="0" fill="#18212c"/>
+<g id="navigation" aria-label="Navigation F1 to F20">
+<text x="39.0" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F1</text>
+<text x="39.0" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">DASH</text>
+<text x="101.5" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F2</text>
+<text x="101.5" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">PERF</text>
+<text x="164.0" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F3</text>
+<text x="164.0" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">FAVS</text>
+<text x="226.5" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F4</text>
+<text x="226.5" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">MKT</text>
+<text x="289.0" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F5</text>
+<text x="289.0" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">NEWS</text>
+<text x="351.5" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F6</text>
+<text x="351.5" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">FUND</text>
+<rect x="384.0" y="68" width="60" height="59" rx="3" fill="#2c3541"/>
+<rect x="384.0" y="125" width="60" height="3" rx="0" fill="#e2bf72"/>
+<text x="414.0" y="87" font-size="12" fill="#e2bf72" font-weight="400" text-anchor="middle">F20</text>
+<text x="414.0" y="111" font-size="12" fill="#eef2f7" font-weight="600" text-anchor="middle">FILE</text>
+<text x="476.5" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F7</text>
+<text x="476.5" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">FCTR</text>
+<text x="539.0" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F8</text>
+<text x="539.0" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">MTC</text>
+<text x="601.5" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F9</text>
+<text x="601.5" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">VOLS</text>
+<text x="664.0" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F10</text>
+<text x="664.0" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">EDGE</text>
+<text x="726.5" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F11</text>
+<text x="726.5" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">CHAT</text>
+<text x="789.0" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F12</text>
+<text x="789.0" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">LIVE</text>
+<text x="851.5" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F13</text>
+<text x="851.5" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">SCORE</text>
+<text x="914.0" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F14</text>
+<text x="914.0" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">MEMO</text>
+<text x="976.5" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F15</text>
+<text x="976.5" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">DECN</text>
+<text x="1039.0" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F16</text>
+<text x="1039.0" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">TRADE</text>
+<text x="1101.5" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F17</text>
+<text x="1101.5" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">MOVES</text>
+<text x="1164.0" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F18</text>
+<text x="1164.0" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">MNDT</text>
+<text x="1226.5" y="87" font-size="12" fill="#adbac9" font-weight="400" text-anchor="middle">F19</text>
+<text x="1226.5" y="111" font-size="12" fill="#adbac9" font-weight="600" text-anchor="middle">CONFIG</text>
+</g>
+<line x1="0" y1="132" x2="1280" y2="132" stroke="#344250" stroke-width="1"/>
+<text x="28.0" y="172" font-size="30" fill="#eef2f7" font-weight="650" text-anchor="start">Filing</text>
+<text x="28.0" y="202" font-size="16" fill="#adbac9" font-weight="400" text-anchor="start">Cosa cambia nelle relazioni dei tuoi titoli</text>
+<text x="28.0" y="864" font-size="12" fill="#adbac9" font-weight="400" text-anchor="start">DEMO  /  Illustration only. Not a screenshot, recommendation or measured result.</text>
+<rect x="28.0" y="230" width="117.03585657370519" height="26" rx="4" fill="#242016" stroke="#7e6742"/>
+<text x="86.5179282868526" y="247.32" font-size="12" fill="#e2bf72" font-weight="600" text-anchor="middle">Portafoglio</text>
+<rect x="152.35059760956176" y="230" width="97.52988047808765" height="26" rx="4" fill="#151b24" stroke="#637088"/>
+<text x="201.11553784860558" y="247.32" font-size="12" fill="#eef2f7" font-weight="400" text-anchor="middle">Preferiti</text>
+<text x="269.3864541832669" y="248" font-size="13" fill="#adbac9" font-weight="400" text-anchor="start">6 titoli coperti · ultimo controllo: data DEMO</text>
+<rect x="715.5856573705179" y="233" width="41.45019920318725" height="18" rx="9" fill="#24303c" stroke="#e2bf72"/>
+<circle cx="747.3" cy="242.0" r="6" fill="#e2bf72"/>
+<text x="766.7888446215139" y="247" font-size="13" fill="#eef2f7" font-weight="400" text-anchor="start">Controllo giornaliero</text>
+<rect x="935.0278884462151" y="230" width="156.04780876494024" height="26" rx="4" fill="#15243a" stroke="#344250"/>
+<text x="1013.0517928286853" y="247.32" font-size="12" fill="#eef2f7" font-weight="500" text-anchor="middle">Rivedi collegamenti</text>
+<rect x="1100.8286852589642" y="230" width="151.17131474103587" height="26" rx="4" fill="#e2bf72" stroke="#e2bf72"/>
+<text x="1176.414342629482" y="247.32" font-size="12" fill="#15120d" font-weight="600" text-anchor="middle">Attiva i mancanti</text>
+<rect x="28.0" y="268" width="1224.0" height="40" rx="5" fill="#141b24" stroke="#344250"/>
+<text x="45.06772908366534" y="293" font-size="13" fill="#e2bf72" font-weight="600" text-anchor="start">Contesto per il Comitato</text>
+<text x="249.8804780876494" y="293" font-size="12" fill="#adbac9" font-weight="400" text-anchor="start">3 aggiornati · 1 da aggiornare · 1 da confermare · 1 senza fonte · 0 esclusi · 5 200 / 14 000 caratteri · 2 cambiamenti omessi</text>
+<rect x="28.0" y="320" width="319.41035856573706" height="508" rx="5" fill="#18212c" stroke="#344250"/>
+<text x="47.50597609561753" y="344" font-size="15" fill="#eef2f7" font-weight="600" text-anchor="start">Titoli</text>
+<text x="327.9043824701195" y="344" font-size="12" fill="#adbac9" font-weight="400" text-anchor="end">Novità · A-Z</text>
+<text x="47.50597609561753" y="370" font-size="12" fill="#adbac9" font-weight="600" text-anchor="start">Con novità (2)</text>
+<rect x="37.75298804780876" y="380" width="299.9043824701195" height="46" rx="3" fill="#2c3541"/>
+<rect x="37.75298804780876" y="380" width="3.657370517928287" height="46" rx="0" fill="#e2bf72"/>
+<text x="52.38247011952191" y="399" font-size="13" fill="#eef2f7" font-weight="600" text-anchor="start">SYN-A</text>
+<text x="127.96812749003983" y="399" font-size="13" fill="#adbac9" font-weight="400" text-anchor="start">Demo equity A</text>
+<text x="52.38247011952191" y="417" font-size="12" fill="#e2bf72" font-weight="400" text-anchor="start">3 cambiamenti</text>
+<text x="52.38247011952191" y="451" font-size="13" fill="#eef2f7" font-weight="600" text-anchor="start">SYN-D</text>
+<text x="127.96812749003983" y="451" font-size="13" fill="#adbac9" font-weight="400" text-anchor="start">Demo equity D</text>
+<text x="52.38247011952191" y="469" font-size="12" fill="#e2bf72" font-weight="400" text-anchor="start">1 cambiamento</text>
+<text x="47.50597609561753" y="506" font-size="12" fill="#adbac9" font-weight="600" text-anchor="start">Da sistemare (1)</text>
+<text x="52.38247011952191" y="535" font-size="13" fill="#eef2f7" font-weight="600" text-anchor="start">SYN-E</text>
+<text x="127.96812749003983" y="535" font-size="13" fill="#adbac9" font-weight="400" text-anchor="start">Demo equity E</text>
+<text x="52.38247011952191" y="553" font-size="12" fill="#e89999" font-weight="400" text-anchor="start">Collegamento da confermare</text>
+<text x="47.50597609561753" y="590" font-size="12" fill="#adbac9" font-weight="600" text-anchor="start">Aggiornati (2)</text>
+<text x="52.38247011952191" y="619" font-size="13" fill="#eef2f7" font-weight="600" text-anchor="start">SYN-B</text>
+<text x="127.96812749003983" y="619" font-size="13" fill="#adbac9" font-weight="400" text-anchor="start">Demo equity B</text>
+<text x="52.38247011952191" y="637" font-size="12" fill="#adbac9" font-weight="400" text-anchor="start">Invariato</text>
+<text x="52.38247011952191" y="671" font-size="13" fill="#eef2f7" font-weight="600" text-anchor="start">SYN-F</text>
+<text x="127.96812749003983" y="671" font-size="13" fill="#adbac9" font-weight="400" text-anchor="start">Demo fund F</text>
+<text x="52.38247011952191" y="689" font-size="12" fill="#63cddb" font-weight="400" text-anchor="start">Controllo in corso</text>
+<text x="47.50597609561753" y="726" font-size="12" fill="#adbac9" font-weight="600" text-anchor="start">Senza fonte (1)</text>
+<text x="52.38247011952191" y="755" font-size="13" fill="#eef2f7" font-weight="600" text-anchor="start">SYN-C</text>
+<text x="127.96812749003983" y="755" font-size="13" fill="#adbac9" font-weight="400" text-anchor="start">Demo equity C</text>
+<text x="52.38247011952191" y="773" font-size="12" fill="#adbac9" font-weight="400" text-anchor="start">Nessuna fonte gratuita</text>
+<rect x="366.9163346613546" y="320" width="885.0836653386455" height="70" rx="5" fill="#18212c" stroke="#344250"/>
+<text x="386.42231075697214" y="346" font-size="18" fill="#eef2f7" font-weight="650" text-anchor="start">Demo equity A · SYN-A</text>
+<text x="386.42231075697214" y="372" font-size="12" fill="#adbac9" font-weight="400" text-anchor="start">Fonte DEMO · semestre 1 anno 1 → semestre 1 anno 2 · controllo: data DEMO · sezioni 4/4</text>
+<rect x="1064.2549800796812" y="332" width="80.4621513944223" height="24" rx="4" fill="#151b24" stroke="#637088"/>
+<text x="1104.4860557768925" y="348.32" font-size="12" fill="#eef2f7" font-weight="400" text-anchor="middle">Profilo</text>
+<rect x="1152.03187250996" y="332" width="90.21513944223108" height="24" rx="4" fill="#15243a" stroke="#344250"/>
+<text x="1197.1394422310757" y="348.32" font-size="12" fill="#eef2f7" font-weight="500" text-anchor="middle">Verifica ora</text>
+<rect x="366.9163346613546" y="402" width="885.0836653386455" height="238" rx="5" fill="#18212c" stroke="#344250"/>
+<text x="388.8605577689243" y="432" font-size="17" fill="#eef2f7" font-weight="600" text-anchor="start">Cambiamenti</text>
+<text x="388.8605577689243" y="456" font-size="12" fill="#e2bf72" font-weight="600" text-anchor="start">In evidenza</text>
+<text x="486.39043824701196" y="456" font-size="12" fill="#adbac9" font-weight="400" text-anchor="start">Rischi</text>
+<text x="549.784860557769" y="456" font-size="12" fill="#adbac9" font-weight="400" text-anchor="start">Gestione</text>
+<text x="627.808764940239" y="456" font-size="12" fill="#adbac9" font-weight="400" text-anchor="start">Contenziosi</text>
+<text x="725.3386454183267" y="456" font-size="12" fill="#adbac9" font-weight="400" text-anchor="start">Tutti</text>
+<line x1="388.8605577689243" y1="464" x2="1230.0557768924302" y2="464" stroke="#344250" stroke-width="1"/>
+<text x="388.8605577689243" y="488" font-size="11" fill="#63cddb" font-weight="400" text-anchor="start">Modificato · Rischi · p. 14 · C1-prima/dopo</text>
+<text x="1230.0557768924302" y="488" font-size="11" fill="#adbac9" font-weight="400" text-anchor="end">Apri documento</text>
+<text x="388.8605577689243" y="508" font-size="13" fill="#eef2f7" font-weight="400" text-anchor="start">Esposizione a un fornitore inventato</text>
+<text x="700.9561752988047" y="508" font-size="13" fill="#e89999" font-weight="400" text-anchor="start">unico fornitore</text>
+<line x1="700.9561752988047" y1="503" x2="791.1713147410359" y2="503" stroke="#e89999" stroke-width="1"/>
+<text x="808.2390438247012" y="508" font-size="13" fill="#8ecfa8" font-weight="600" text-anchor="start">due fornitori</text>
+<text x="388.8605577689243" y="538" font-size="11" fill="#63cddb" font-weight="400" text-anchor="start">Aggiunto · Contenziosi · p. 31 · C2-dopo</text>
+<text x="1230.0557768924302" y="538" font-size="11" fill="#adbac9" font-weight="400" text-anchor="end">Apri documento</text>
+<text x="388.8605577689243" y="558" font-size="13" fill="#eef2f7" font-weight="400" text-anchor="start">Nuova controversia fittizia su un contratto DEMO</text>
+<text x="388.8605577689243" y="588" font-size="11" fill="#63cddb" font-weight="400" text-anchor="start">Tolto · Gestione · p. 8 · C3-prima</text>
+<text x="1230.0557768924302" y="588" font-size="11" fill="#adbac9" font-weight="400" text-anchor="end">Apri documento</text>
+<text x="388.8605577689243" y="608" font-size="13" fill="#eef2f7" font-weight="400" text-anchor="start">Obiettivo di margine rimosso dal testo sintetico</text>
+<rect x="366.9163346613546" y="652" width="365.7370517928287" height="176" rx="5" fill="#18212c" stroke="#344250"/>
+<text x="388.8605577689243" y="682" font-size="17" fill="#eef2f7" font-weight="600" text-anchor="start">Numeri chiave</text>
+<text x="388.8605577689243" y="710" font-size="13" fill="#adbac9" font-weight="400" text-anchor="start">Ricavi</text>
+<text x="710.7091633466135" y="710" font-size="13" fill="#8ecfa8" font-weight="600" text-anchor="end">+12,0%</text>
+<text x="388.8605577689243" y="738" font-size="13" fill="#adbac9" font-weight="400" text-anchor="start">Utile operativo</text>
+<text x="710.7091633466135" y="738" font-size="13" fill="#8ecfa8" font-weight="600" text-anchor="end">+4,5%</text>
+<text x="388.8605577689243" y="766" font-size="13" fill="#adbac9" font-weight="400" text-anchor="start">Utile netto</text>
+<text x="710.7091633466135" y="766" font-size="13" fill="#e89999" font-weight="600" text-anchor="end">−3,1%</text>
+<text x="388.8605577689243" y="794" font-size="13" fill="#adbac9" font-weight="400" text-anchor="start">Debito</text>
+<text x="710.7091633466135" y="794" font-size="13" fill="#e89999" font-weight="600" text-anchor="end">+6,0%</text>
+<rect x="752.1593625498008" y="652" width="499.8406374501992" height="176" rx="5" fill="#18212c" stroke="#344250"/>
+<text x="774.1035856573706" y="682" font-size="17" fill="#eef2f7" font-weight="600" text-anchor="start">Cosa vede il Consigliere</text>
+<rect x="774.1035856573706" y="692" width="455.9521912350598" height="76" rx="3" fill="#10151d" stroke="#344250"/>
+<text x="786.2948207171315" y="712" font-size="12" fill="#eef2f7" font-weight="400" text-anchor="start">SYN-A NOVITÀ sem.1 a1→a2 · 3 cambiamenti</text>
+<text x="786.2948207171315" y="732" font-size="12" fill="#eef2f7" font-weight="400" text-anchor="start">numeri ricavi +12,0% · utile netto −3,1%</text>
+<text x="786.2948207171315" y="752" font-size="12" fill="#eef2f7" font-weight="400" text-anchor="start">C1 Rischi: due fornitori invece di uno</text>
+<text x="774.1035856573706" y="794" font-size="12" fill="#adbac9" font-weight="400" text-anchor="start">212 caratteri · 3 citati · 0 omessi</text>
+<rect x="1159.3466135458168" y="778" width="70.70916334661355" height="24" rx="4" fill="#151b24" stroke="#637088"/>
+<text x="1194.7011952191235" y="794.32" font-size="12" fill="#eef2f7" font-weight="400" text-anchor="middle">Copia</text>
+<text x="1252.0" y="864" font-size="12" fill="#adbac9" font-weight="400" text-anchor="end">Proposta AI solo da pulsante, dopo una stima gratuita.</text>
+</svg>

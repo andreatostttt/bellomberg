@@ -137,8 +137,9 @@ empty states and what to inspect before progressing.
 
 ## The terminal, page by page
 
-Use the menu or **Ctrl+K** and type a page name or its function label. All nineteen
-destinations are available; settings are last. F13–F19 remain accessible even on
+Use the menu or **Ctrl+K** and type a page name or its function label. All twenty
+destinations are available; settings are last. Filing keeps F20 although it
+sits after Fundamentals. F13–F20 remain accessible even on
 a keyboard that has no physical keys with those names.
 
 | Key | Destination | What it is for |
@@ -149,6 +150,7 @@ a keyboard that has no physical keys with those names.
 | F4 | [Global Markets](docs/guide/pages/04-global-markets.md) | Security search, charts, financials and holders |
 | F5 | [News Desk](docs/guide/pages/05-news-desk.md) | News, briefings and event calendars |
 | F6 | [Fundamentals](docs/guide/pages/06-fundamentals.md) | Generated valuations and their assumptions |
+| F20 | [Filing](docs/guide/pages/20-filing.md) | What changed between two reports, with citations and key figures |
 | F7 | [Factor Lab](docs/guide/pages/07-factor-lab.md) | Economic exposures and model diagnostics |
 | F8 | [Monte Carlo](docs/guide/pages/08-monte-carlo.md) | Portfolio scenarios and distributions |
 | F9 | [Vol Deck](docs/guide/pages/09-vol-deck.md) | Expirations, surface, Greeks and strategy laboratory |

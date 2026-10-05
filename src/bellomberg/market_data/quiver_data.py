@@ -28,6 +28,22 @@ QUIVER_KEY = os.environ.get("QUIVER_API_KEY", "")
 BASE = "https://api.quiverquant.com/beta"
 
 
+def _non_coperto(ticker: Optional[str], fonte: str, source: str) -> Optional[Dict[str, Any]]:
+    """Quiver copre solo emittenti USA (P1, 04/10, Opus 5.5). Un `XXX.MI` andava
+    all'URL cosi' com'era e tornava `n: 0`, indistinguibile da «nessun dato»:
+    ora si risponde PRIMA della rete con l'astensione dichiarata
+    (v. `copertura.copertura_usa`). None = si interroga.
+    Si ferma solo `non_coperto` (listino estero del registro, crypto): un
+    `indeterminato` (suffisso fuori registro, es. classe di azioni `.B`) passa,
+    perche' il simbolo va all'URL INTATTO — nessun omonimo possibile — e chi
+    conosce la valuta (i wrapper) puo' fermarlo con `copertura_usa(..., valuta)`."""
+    from bellomberg.market_data.copertura import copertura_usa, risposta_non_coperta
+    esito = copertura_usa(ticker, fonte)
+    if esito["stato"] != "non_coperto":
+        return None
+    return risposta_non_coperta(esito, source)
+
+
 def quiver_available() -> bool:
     return bool(REQ_OK and QUIVER_KEY)
 
@@ -77,7 +93,8 @@ def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         return r.json()
     except Exception as e:
         _log_eccezione(e, path)
-        return {"error": str(e)}
+        from bellomberg.core.errori_sicuri import descrivi_eccezione   # G3
+        return {"error": descrivi_eccezione(e, QUIVER_KEY)}
 
 
 def get_congress_trades(ticker: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
@@ -87,6 +104,10 @@ def get_congress_trades(ticker: Optional[str] = None, limit: int = 50) -> Dict[s
     per-ticker vive su /historical/...; il feed generale resta su /live/.
     """
     path = f"/historical/congresstrading/{ticker.upper()}" if ticker else "/live/congresstrading"
+    if ticker:
+        fuori = _non_coperto(ticker, "quiver_congress", f"quiver {path}")
+        if fuori:
+            return fuori
     data = _get(path)
     if isinstance(data, dict) and data.get("error"):
         return {**data, "_source": f"quiver {path}"}
@@ -98,6 +119,9 @@ def get_congress_trades(ticker: Optional[str] = None, limit: int = 50) -> Dict[s
 
 def get_lobbying(ticker: str, limit: int = 30) -> Dict[str, Any]:
     """Spese di lobbying registrate per una societa'."""
+    fuori = _non_coperto(ticker, "quiver_lobbying", "quiver /historical/lobbying")
+    if fuori:
+        return fuori
     data = _get(f"/historical/lobbying/{ticker.upper()}")
     if isinstance(data, dict) and data.get("error"):
         return {**data, "_source": "quiver /historical/lobbying"}
@@ -108,6 +132,9 @@ def get_lobbying(ticker: str, limit: int = 30) -> Dict[str, Any]:
 
 def get_gov_contracts(ticker: str, limit: int = 30) -> Dict[str, Any]:
     """Contratti governativi USA assegnati a una societa'."""
+    fuori = _non_coperto(ticker, "quiver_gov_contracts", "quiver /historical/govcontractsall")
+    if fuori:
+        return fuori
     data = _get(f"/historical/govcontractsall/{ticker.upper()}")
     if isinstance(data, dict) and data.get("error"):
         return {**data, "_source": "quiver /historical/govcontractsall"}

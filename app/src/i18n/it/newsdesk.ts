@@ -203,5 +203,11 @@ export const newsdesk = {
   "originalBellomberg": "Testo Bellomberg originale · {language}",
   "originalBackendLabel": "Etichetta originale del backend: {label}",
   "ageUnknown": "età non disponibile",
-  "calendarLoading": "Caricamento calendario..."
+  "calendarLoading": "Caricamento calendario...",
+  "refreshJob_missing_id": "il servizio non ha restituito l’identificativo del job di aggiornamento",
+  "refreshJob_changed_id": "il job di aggiornamento è cambiato durante l’attesa: atteso {expected}, ricevuto {received}",
+  "refreshJob_unexpected_status": "stato del job di aggiornamento non previsto: {status}",
+  "refreshJob_already_started": "aggiornamento già avviato da questa pagina",
+  "refreshJob_stopped": "attesa dell’aggiornamento interrotta",
+  "refreshJob_failed": "il job di aggiornamento è fallito senza dettagli"
 };

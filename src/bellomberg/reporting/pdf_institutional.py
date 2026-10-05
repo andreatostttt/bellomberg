@@ -18,7 +18,8 @@ try:
     from reportlab.lib import colors as C
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.platypus import (BaseDocTemplate, PageTemplate, Frame, Paragraph,
-                                    Spacer, Table, TableStyle, Image, PageBreak, NextPageTemplate)
+                                    Preformatted, Spacer, Table, TableStyle, Image,
+                                    PageBreak, NextPageTemplate)
     from reportlab.lib.utils import ImageReader
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
@@ -74,6 +75,11 @@ def _register_fonts():
                 pdfmetrics.registerFont(TTFont("LS",reg))
                 pdfmetrics.registerFont(TTFont("LSB",bold if os.path.exists(bold) else reg))
                 pdfmetrics.registerFont(TTFont("LSI",ital if os.path.exists(ital) else reg))
+                # fix 04/10 (KC, Opus 5.5): senza la FAMIGLIA il tag <b>/<i> dei Paragraph
+                # su "LS" non trova la variante e resta in tondo (il **grassetto** del memo
+                # usciva invisibile). Il grassetto-corsivo non ha un TTF cercato: si usa
+                # il grassetto (resa tipografica, nessun dato coinvolto).
+                pdfmetrics.registerFontFamily("LS",normal="LS",bold="LSB",italic="LSI",boldItalic="LSB")
                 _FONT_DONE=True
                 return ("LS","LSB","LSI")
             except Exception:
@@ -215,7 +221,13 @@ def build_institutional_memo(memo_markdown, portfolio_data=None, risk_data=None,
         if buf.strip(): out.append(buf.strip())
         return out
 
-    _lines=[b.strip("-• ").strip() for b in re.split(r"\n",bluf) if b.strip()]
+    def _senza_enfasi(t):
+        """fix 04/10 (KC, Opus 5.5): la cover scrive con drawString, che non sa fare
+        grassetto/corsivo: i marcatori **...** e *...* uscivano come asterischi letterali.
+        Si tolgono SOLO i marcatori (stessa regola di inline()); le parole restano."""
+        t=re.sub(r"\*\*(.+?)\*\*",r"\1",t)
+        return re.sub(r"(?<![\w*])\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?![\w*])",r"\1",t)
+    _lines=[_senza_enfasi(b.strip("-• ").strip()) for b in re.split(r"\n",bluf) if b.strip()]
     # Il Capo scrive il BLUF in PROSA: un unico paragrafo (~1300 char) che diventava un
     # muro di 32 righe nella colonna nera della cover. Se e' un blocco solo, si spezza.
     if len(_lines)==1 and len(_lines[0])>240:
@@ -325,11 +337,24 @@ def build_institutional_memo(memo_markdown, portfolio_data=None, risk_data=None,
         t.setStyle(TableStyle([("LINEBELOW",(0,0),(-1,-1),thick,AMBER),
                                ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
                                ("TOPPADDING",(0,0),(-1,-1),0),("BOTTOMPADDING",(0,0),(-1,-1),3)]))
+        t.keepWithNext = 1
         return t
     body=ParagraphStyle("b",fontName=REG,fontSize=9,textColor=INK,leading=13,spaceAfter=5,alignment=4)
     bullet=ParagraphStyle("bul",fontName=REG,fontSize=9,textColor=INK,leading=12.5,leftIndent=12,spaceAfter=3)
     small=ParagraphStyle("sm",fontName=REG,fontSize=7.2,textColor=GREY,leading=9.5,spaceBefore=3,
                          spaceAfter=4,alignment=4)   # note di lettura sotto le tabelle
+
+    def esc(s):
+        s=str(s)
+        return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+    def inline(s):
+        s=esc(s)
+        s=re.sub(r"\*\*(.+?)\*\*",r"<b>\1</b>",s)
+        # fix 04/10 (KC, Opus 5.5): corsivo *...* (lo usa anche freshness.format_for_memo,
+        # "*(...)*"): prima uscivano gli asterischi. L'asterisco apre solo se attaccato al
+        # testo e non preceduto da lettera/cifra: "3 * 4", "nota*" e "* isolato" restano.
+        return re.sub(r"(?<![\w*])\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?![\w*])",r"<i>\1</i>",s)
 
     story=[NextPageTemplate("body"),PageBreak()]
     # header sezione + KPI strip
@@ -350,12 +375,16 @@ def build_institutional_memo(memo_markdown, portfolio_data=None, risk_data=None,
     # 203: ACTION TABLE renderizzata come pannello (il vecchio renderer la SCARTAVA)
     try:
         # fix verificatore: stessa tolleranza di memory_db (DOTALL: righe interposte ammesse)
-        at=re.search(r"##\s*ACTION TABLE.*?((?:\|[^\n]*\n)+)",memo_markdown,re.IGNORECASE|re.DOTALL)
+        # REV2 G6 N4: la tabella si cerca DENTRO la sezione ACTION TABLE; una sezione svuotata
+        # dal gate (intestazione illeggibile) non deve far pescare una tabella dell'analisi
+        at_sec=re.search(r"##\s*ACTION TABLE[^\n]*\n(.*?)(?=\n##\s|\Z)",memo_markdown,re.IGNORECASE|re.DOTALL)
+        at=re.search(r"((?:\|[^\n]*\n)+)",at_sec.group(1)+"\n") if at_sec else None
         arows=[]
         if at:
             for ln_ in at.group(1).strip().split("\n"):
                 cells=[c.strip() for c in ln_.strip().strip("|").split("|")]
-                if not cells or "---" in cells[0] or cells[0].lower() in ("action","azione",""):
+                # REV G6 R7: intestazione in grassetto (**Action**) = intestazione, non riga dati
+                if not cells or "---" in cells[0] or cells[0].strip("*_` ").lower() in ("action","azione",""):
                     continue
                 if len(cells)>=5:
                     cells=cells[:5]
@@ -370,20 +399,34 @@ def build_institutional_memo(memo_markdown, portfolio_data=None, risk_data=None,
                     arows.append(cells)
         if arows:
             story.append(sec(_t("Action table - decisioni della settimana"),h2))
-            adata=[[_t("Azione"),"Ticker","EUR",_t("Timing"),_t("Confidence")]]+arows
-            att=Table(adata,colWidths=[2.6*cm,3.2*cm,2.6*cm,(W-4*cm-11.0*cm),2.6*cm])
+            action_header=ParagraphStyle("action_header",fontName=BOLD,fontSize=7.2,
+                                         textColor=AMBER,leading=8.4,spaceBefore=0,spaceAfter=0)
+            action_body=ParagraphStyle("action_body",fontName=REG,fontSize=7.4,
+                                       textColor=INK,leading=8.8,spaceBefore=0,spaceAfter=0,
+                                       splitLongWords=1)
+            headers=[_t("Azione"),"Ticker","EUR",_t("Timing"),_t("Confidence")]
+            adata=[[Paragraph(inline(cell),action_header) for cell in headers]]
+            for r_ in arows:
+                act=(r_[0] or "").strip().upper()
+                col=GREEN if act in ("ADD","BUY") else (RED if act in ("TRIM","SELL") else (GOLD_TXT if act=="HEDGE" else GREY))
+                row=[]
+                for j,cell in enumerate(r_):
+                    style=ParagraphStyle("action_body_{}_{}".format(len(adata),j),
+                                         parent=action_body,fontName=BOLD if j in (0,1) else REG,
+                                         textColor=col if j==0 else INK)
+                    row.append(Paragraph(inline(cell),style))
+                adata.append(row)
+            # Keep a full-width timing column; long prose wraps instead of entering
+            # the confidence column or being clipped at the page edge.
+            action_widths=[2.1*cm,2.6*cm,1.5*cm,7.9*cm,2.9*cm]
+            att=Table(adata,colWidths=action_widths,repeatRows=1)
             asty=[("BACKGROUND",(0,0),(-1,0),OBSIDIAN),("TEXTCOLOR",(0,0),(-1,0),AMBER),
-                  ("FONT",(0,0),(-1,0),BOLD,8),("FONT",(0,1),(-1,-1),REG,8.3),
-                  ("FONT",(0,1),(0,-1),BOLD,8.3),("FONT",(1,1),(1,-1),BOLD,8.3),
                   ("ALIGN",(2,1),(2,-1),"RIGHT"),
+                  ("VALIGN",(0,0),(-1,-1),"TOP"),
                   ("ROWBACKGROUNDS",(0,1),(-1,-1),[C.white,LGREY]),
                   ("LINEBELOW",(0,0),(-1,-1),0.4,RULE),
-                  ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
-                  ("LEFTPADDING",(0,0),(-1,-1),6)]
-            for i,r_ in enumerate(arows,start=1):
-                act=(r_[0] or "").upper()
-                col=GREEN if act in ("ADD","BUY") else (RED if act in ("TRIM","SELL") else (GOLD_TXT if act=="HEDGE" else GREY))
-                asty.append(("TEXTCOLOR",(0,i),(0,i),col))
+                  ("TOPPADDING",(0,0),(-1,-1),3),("BOTTOMPADDING",(0,0),(-1,-1),3),
+                  ("LEFTPADDING",(0,0),(-1,-1),4),("RIGHTPADDING",(0,0),(-1,-1),4)]
             att.setStyle(TableStyle(asty)); story.append(att); story.append(Spacer(1,0.4*cm))
     except Exception:
         arows=[]
@@ -397,7 +440,23 @@ def build_institutional_memo(memo_markdown, portfolio_data=None, risk_data=None,
             if v is not None: mrows.append([k,v,r])
         add(_t("Volatilita' annualizzata"),f"{p.get('vol_annual_pct','')}%",_t("oscillazione tipica annua"))
         add(_t("Sharpe ratio"),f"{p.get('sharpe','')}",_t("rendimento per unita' di rischio"))
-        add(_t("Beta vs S&P 500"),f"{p.get('beta_vs_spy','')}",_t("sensibilita' al mercato USA"))
+        # fix 04/10 (A7, Opus 5.5): beta non misurato (SPY assente/serie corta) = None dal
+        # motore -> la cella dice n.d. e la lettura porta il motivo (beta_error), mai «None».
+        _beta=p.get("beta_vs_spy")
+        if _beta is None:
+            from xml.sax.saxutils import escape as _esc
+            _why=risk_data.get("beta_error") or p.get("beta_error") or _t("motivo n.d.")
+            add(_t("Beta vs S&P 500"),_t("quote.unavailable"),Paragraph(_esc(str(_why)),ParagraphStyle(
+                "beta_nd",fontName=REG,fontSize=8,textColor=GREY,leading=10)))
+        else:
+            # review RV-R 04/10: beta su pochi giorni = numero con la riserva in lettura
+            _nota=risk_data.get("beta_note") or p.get("beta_note")
+            if _nota:
+                from xml.sax.saxutils import escape as _esc
+                add(_t("Beta vs S&P 500"),f"{_beta}",Paragraph(_esc(str(_nota)),ParagraphStyle(
+                    "beta_nota",fontName=REG,fontSize=8,textColor=GREY,leading=10)))
+            else:
+                add(_t("Beta vs S&P 500"),f"{_beta}",_t("sensibilita' al mercato USA"))
         add(_t("VaR 95% (1 giorno)"),f"{p.get('var_95_1d_pct','')}%",_t("perdita 1 giorno su 20"))
         add(_t("Max Drawdown (1 anno)"),f"{p.get('max_dd_1y_pct','')}%",_t("massima caduta picco-minimo"))
         if len(mrows)>1:
@@ -490,71 +549,177 @@ def build_institutional_memo(memo_markdown, portfolio_data=None, risk_data=None,
         story.append(Spacer(1,0.4*cm))
 
     # corpo memo (markdown -> flowables)
-    def esc(s): return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-    def inline(s):
-        s=esc(s); s=re.sub(r"\*\*(.+?)\*\*",r"<b>\1</b>",s); return s
+    def is_pipe_table_rule(line):
+        cells=(line or "").strip().strip("|").split("|")
+        return len(cells)>1 and all(
+            re.fullmatch(r"\s*:?-{3,}:?\s*",cell) for cell in cells
+        )
+
+    def is_ascii_rule(line):
+        return bool(re.fullmatch(r"\s*[=_-]{5,}\s*",line or "")) or is_pipe_table_rule(line)
+
     def _flush_table(buf):
         # 203: le tabelle markdown del memo (es. Tabella Scenari) ora vengono RESE, non scartate
         rows=[]
-        for ln_ in buf:
+        first_cells=[c.strip().lower() for c in buf[0].strip().strip("|").split("|")] if buf else []
+        nonoperative=(first_cells[:6] == ["azione", "ticker", "eur", "stato", "motivo", "deroga dichiarata"])
+        _table_body=ParagraphStyle("pub_action_td",fontName=REG,
+                                   fontSize=7.2 if nonoperative else 7.8,
+                                   textColor=INK,leading=8.6 if nonoperative else 10)
+        _table_header=ParagraphStyle("pub_action_th",fontName=BOLD,
+                                     fontSize=7.2 if nonoperative else 7.8,
+                                     textColor=C.white,leading=8.6 if nonoperative else 10)
+        for _row_index, ln_ in enumerate(buf):
             cells=[c.strip() for c in ln_.strip().strip("|").split("|")]
             if cells and "---" in cells[0]:
                 continue
-            rows.append([Paragraph(inline(c),ParagraphStyle("tc",fontName=REG,fontSize=7.8,textColor=INK,leading=10)) for c in cells])
+            _style=_table_header if not rows else _table_body
+            rows.append([Paragraph(inline(c),_style) for c in cells])
         if not rows: return
         ncol=max(len(r) for r in rows)
         rows=[r+[Paragraph("",body)]*(ncol-len(r)) for r in rows]
-        tt=Table(rows,colWidths=[(W-4*cm)/ncol]*ncol,repeatRows=1)
+        col_widths=([1.5*cm,2.0*cm,1.3*cm,3.2*cm,6.5*cm,2.5*cm]
+                    if nonoperative else [(W-4*cm)/ncol]*ncol)
+        tt=Table(rows,colWidths=col_widths,repeatRows=1)
         tt.setStyle(TableStyle([
             ("BACKGROUND",(0,0),(-1,0),NAVY),
             ("ROWBACKGROUNDS",(0,1),(-1,-1),[C.white,LGREY]),
             ("LINEBELOW",(0,0),(-1,-1),0.4,RULE),
             ("TOPPADDING",(0,0),(-1,-1),3),("BOTTOMPADDING",(0,0),(-1,-1),3),
-            ("LEFTPADDING",(0,0),(-1,-1),4)]))
-        # header bianco in grassetto
-        for j in range(ncol):
-            try: rows[0][j]=Paragraph("<b><font color='#FFFFFF'>"+rows[0][j].text+"</font></b>",
-                                      ParagraphStyle("th",fontName=BOLD,fontSize=7.8,leading=10))
-            except Exception: pass
+            ("LEFTPADDING",(0,0),(-1,-1),4),("RIGHTPADDING",(0,0),(-1,-1),4),
+            ("VALIGN",(0,0),(-1,-1),"TOP")]))
         story.append(tt); story.append(Spacer(1,0.3*cm))
 
-    in_action=False
-    tbuf=[]
-    for ln in memo_markdown.split("\n"):
-        ls=ln.strip()
-        if ls.startswith("##") and not ls.startswith("###"):
-            in_action=bool(re.match(r"##\s*ACTION TABLE", ls, re.IGNORECASE))
-        if ls.startswith("|"):
-            if not (in_action and action_panel_rendered):  # fallback: se il pannello non c'e', rendi nel corpo
-                tbuf.append(ls)
-            continue
-        if tbuf:
-            # audit/11 §5: una tabella che reportlab non parsa non deve SPARIRE dal PDF
-            # (fallback stile _safe_para di pdf_report: testo plain escapato + log)
-            try: _flush_table(tbuf)
-            except Exception as _e:
-                from xml.sax.saxutils import escape as _xesc
-                print("[pdf_inst] tabella scartata (" + str(_e)[:80] + "): resa come testo")
-                for _tl in tbuf:
-                    try: story.append(Paragraph(_xesc(str(_tl)), body))
-                    except Exception: pass
-            tbuf=[]
-        if not ls: continue
-        if in_action and ls.upper().startswith("## ACTION TABLE"): continue
-        if ls.startswith("### "): story.append(sec(inline(ls[4:]),h2))
-        elif ls.startswith("## "): story.append(sec(inline(ls[3:]),h1))
-        elif ls.startswith("# "): story.append(sec(inline(ls[2:]),h1))
-        elif ls.startswith(("- ","* ")): story.append(Paragraph("• "+inline(ls[2:]),bullet))
-        else:
-            try: story.append(Paragraph(inline(ls),body))
-            except Exception:
-                # audit/11 §5: mai far sparire il testo del memo dal PDF in silenzio
-                from xml.sax.saxutils import escape as _xesc
-                try: story.append(Paragraph(_xesc(str(ls)), body))
-                except Exception: print("[pdf_inst] riga scartata: " + str(ls)[:60])
-    if tbuf:
-        try: _flush_table(tbuf)
-        except Exception: pass
+    def _append_fenced_block(lines):
+        # Il Capo a volte usa fenced tables: interpreta le righe Markdown vere come
+        # tabelle e conserva gli ASCII table in monospazio senza fence o separatori.
+        content=[line.rstrip() for line in lines]
+        if content and content[0].strip().lower() in ("markdown","md","text","plaintext","csv"):
+            content=content[1:]
+        if (any(line.strip().startswith("|") for line in content)
+                or any(is_pipe_table_rule(line) for line in content)):
+            pipe_table=[]
+            for line in content:
+                if "|" in line or is_pipe_table_rule(line):
+                    pipe_table.append(line.strip())
+                    continue
+                if pipe_table:
+                    _flush_table(pipe_table)
+                    pipe_table=[]
+                if not line.strip() or is_ascii_rule(line):
+                    continue
+                story.append(Paragraph(inline(line.strip()),small if line.strip().upper().startswith("TABELLA ") else body))
+            if pipe_table:
+                _flush_table(pipe_table)
+            return
+        # Ruler lines signal fixed-width tables; preserve their column spacing.
+        if any(is_ascii_rule(line) for line in content):
+            table_lines=[line for line in content if line.strip() and not is_ascii_rule(line)]
+            if table_lines:
+                available=W-4*cm
+                max_chars=min(max(len(line) for line in table_lines),125)
+                font_size=min(6.2,available/(max_chars*0.6))
+                font_size=max(font_size,5.2)
+                code_style=ParagraphStyle("fenced_table",fontName="Courier",fontSize=font_size,
+                                          leading=font_size*1.25,textColor=INK,spaceBefore=0,spaceAfter=0)
+                max_line_length=max(1,int(available/(font_size*0.6)))
+                story.append(Preformatted("\n".join(table_lines),code_style,
+                                          maxLineLength=max_line_length))
+            return
+        for line in content:
+            if line.strip():
+                story.append(Paragraph(inline(line.strip()),body))
+
+    def append_markdown(markdown):
+        in_action=False
+        in_fence=False
+        fence_lines=[]
+        tbuf=[]
+
+        def flush_table():
+            nonlocal tbuf
+            if tbuf:
+                try:
+                    _flush_table(tbuf)
+                except Exception as exc:
+                    from xml.sax.saxutils import escape as xml_escape
+                    print("[pdf_inst] tabella scartata ("+str(exc)[:80]+"): resa come testo")
+                    for table_line in tbuf:
+                        try:
+                            story.append(Paragraph(xml_escape(str(table_line)),body))
+                        except Exception:
+                            pass
+                tbuf=[]
+
+        for raw_line in markdown.splitlines():
+            line=raw_line.rstrip()
+            ls=line.strip()
+            if in_fence:
+                if ls.startswith("```"):
+                    _append_fenced_block(fence_lines)
+                    fence_lines=[]
+                    in_fence=False
+                else:
+                    fence_lines.append(line)
+                continue
+            if ls.startswith("```"):
+                flush_table()
+                in_fence=True
+                fence_lines=[]
+                fence_info=ls[3:].strip()
+                if fence_info:
+                    fence_lines.append(fence_info)
+                continue
+            if is_ascii_rule(ls):
+                continue
+            if ls.startswith("##") and not ls.startswith("###"):
+                in_action=bool(re.match(r"##\s*ACTION TABLE",ls,re.IGNORECASE))
+            if ls.startswith("|"):
+                if not (in_action and action_panel_rendered):
+                    tbuf.append(ls)
+                continue
+            flush_table()
+            if not ls:
+                continue
+            if in_action and ls.upper().startswith("## ACTION TABLE"):
+                continue
+            if ls.startswith("### "):
+                story.append(sec(inline(ls[4:]),h2))
+            elif ls.startswith("## "):
+                story.append(sec(inline(ls[3:]),h1))
+            elif ls.startswith("# "):
+                story.append(sec(inline(ls[2:]),h1))
+            elif ls.startswith(("- ","* ")):
+                story.append(Paragraph("• "+inline(ls[2:]),bullet))
+            else:
+                try:
+                    story.append(Paragraph(inline(ls),body))
+                except Exception:
+                    from xml.sax.saxutils import escape as xml_escape
+                    try:
+                        story.append(Paragraph(xml_escape(str(ls)),body))
+                    except Exception:
+                        print("[pdf_inst] riga scartata: "+str(ls)[:60])
+        if in_fence:
+            _append_fenced_block(fence_lines)
+        flush_table()
+
+    # I controlli automatici rimangono nel PDF, ma in un'appendice separata dalla nota.
+    checks_heading=re.compile(
+        r"(?im)^##\s*(?:MEMO\s+LINTER\b|ACTION\s+VALIDATOR\b|QUALIT(?:A'|À)\s+DATI\b|DATA\s+QUALITY\b)"
+    )
+    checks_match=checks_heading.search(memo_markdown)
+    if checks_match:
+        main_memo=memo_markdown[:checks_match.start()]
+        checks_memo=memo_markdown[checks_match.start():]
+    else:
+        main_memo=memo_markdown
+        checks_memo=""
+    append_markdown(main_memo)
+    if checks_memo.strip():
+        story.append(PageBreak())
+        story.append(sec(_t("Automated checks"),h1))
+        append_markdown(checks_memo)
     try:
         doc.build(story)
         return output_path

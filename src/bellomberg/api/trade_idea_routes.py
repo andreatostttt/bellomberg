@@ -39,6 +39,14 @@ class PreflightBody(BaseModel):
     view_source: str = "manual"
     budget_limit_usd: str | float | int | None = None
     document_sources: list[PMDocumentSource] = Field(default_factory=list, max_length=4)
+    # Lotto 3 (L1, Opus 5.5): peer scelti dal PM per il pacchetto di mercato; vuota = selettore
+    peers: list[str] = Field(default_factory=list, max_length=8)
+
+
+def _body_peers(body):
+    """Peer del PM normalizzati (maiuscoli, senza doppioni ne' candidato); ValueError se invalidi."""
+    from bellomberg.market_data.trade_idea_market_pack import normalize_request_peers
+    return normalize_request_peers(list(body.peers or []), ticker=normalize_ticker(body.ticker))
 
 
 class StartBody(PreflightBody):
@@ -152,6 +160,9 @@ def _preflight_binding(body, session, *, db_path, language):
         'view_origin': body.view_source, 'language': language,
         'budget': str(Decimal(normalize_budget(body.budget_limit_usd)).normalize()),
         'documents': normalize_sources(body.document_sources)}
+    peers = _body_peers(body)
+    if peers:  # solo se presenti: i binding senza peer restano quelli di prima
+        bound['peers'] = peers
     return sha256(json.dumps(bound, ensure_ascii=False, sort_keys=True,
         separators=(',', ':'), allow_nan=False).encode('utf-8')).hexdigest()
 
@@ -298,6 +309,7 @@ def _matching_retry(body, detail):
                 and normalize_sources(body.document_sources) == normalize_sources([
                     row["request"] for row in ((run.get("source_qualification") or {})
                         .get("document_receipt") or {}).get("documents", [])])
+                and (run.get("peers") or []) == _body_peers(body)
                 and body.cost_acknowledged is True)
     except (ValueError, KeyError):
         return False
@@ -541,6 +553,10 @@ def install_trade_idea_routes(app, require_session, *, db_path=SQLITE_PATH,
     def preflight(body: PreflightBody, session: str = Depends(require_session)):
         from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE
         root = archive_root()
+        try:
+            _body_peers(body)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         checked = preflight_trade_idea(body.ticker, body.pm_view, body.view_source,
                                       body.budget_limit_usd, active_checker=checker,
                                       analysis_mode=RESEARCH_ANALYSIS_MODE,
@@ -652,10 +668,14 @@ def install_trade_idea_routes(app, require_session, *, db_path=SQLITE_PATH,
                                               "reasoning_effort": item["reasoning_effort"]}
                               for item in checked["models"]},
                    "catalog_snapshot": checked["catalog_snapshot"]}
+        if _body_peers(body):
+            request["peers"] = _body_peers(body)
         try:
             accepted = current.create_run(request, idempotency_key=body.idempotency_key)
         except (IdempotencyConflict, RunConflict) as exc:
             raise HTTPException(409, str(exc)) from exc
+        except ValueError as exc:  # richiesta invalida (es. peer = ticker risolto): 422, non 500
+            raise HTTPException(422, str(exc)) from exc
         run_id = accepted["run"]["id"]
         if accepted.get("created", True):
             snapshots.consume(cache_key)

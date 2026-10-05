@@ -64,6 +64,16 @@ def test_promozione_r1_placeholder_resta_vietata(bb):
     assert bb.memory_db.salvati == [], bb.memory_db.salvati
 
 
+@pytest.mark.parametrize("report", [
+    "[quant] RIFIUTO DEL MODELLO: policy refusal",
+    "[COLLASSO ANNUNCIO-SENZA-TOOL R2 DOPO NUDGE] preparo ora il report",
+    "   \n\t",
+])
+def test_rifiuto_collasso_e_whitespace_non_diventano_finali(bb, report):
+    bb.write("quant", 2, report)
+    assert bb.memory_db.salvati == [], bb.memory_db.salvati
+
+
 def test_red_team_persiste_comunque(bb):
     """Fuori perimetro DICHIARATO: il red team persiste anche su errore
     (decisione P1 storica — regenerate_memo non rigenera senza red team).

@@ -370,6 +370,9 @@ def news_blocked_sources(monkeypatch, tmp_path):
     monkeypatch.setattr(tiingo_news, 'tiingo_available', lambda: True)
     monkeypatch.setattr(news, 'PERCORSO_TERMINI', str(EXAMPLES_DIR / 'news_search_terms.example.json'))
     monkeypatch.setattr(news, '_NEWS_RATE_PATH', str(tmp_path / 'news_rate_state.json'))
+    # 04/10 (B2): esiti Tiingo/Finnhub di altri test fuori dai dict esatti qui sotto
+    tiingo_news.reset_status()
+    news.reset_esiti_fonti()
     return news
 
 

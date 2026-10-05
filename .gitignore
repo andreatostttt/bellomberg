@@ -32,6 +32,7 @@ archive/private/workspace-20260909/
 # workspace della skill subagent-driven-development: briefs, report e diff di lavoro
 # (materiale di runtime, come data/ e report/ qui sopra: fuori dal tracciato)
 .superpowers/
+.worktrees/
 
 # Output compilato dei contratti frontend, riproducibile in CI.
 /app/tests/**/.tmp/
@@ -43,3 +44,19 @@ src/*.egg-info/
 
 # Downloaded private release scanner; source tools/release/ remains tracked.
 /tools/release/policy/bin/
+
+# macOS
+.DS_Store
+
+# Local exports (personal portfolio data)
+outputs/
+
+# Personal ticker logos (third-party marks that describe the portfolio)
+/app/src/assets/logos/*.svg
+/app/src/assets/logos/*.png
+
+# Internal planning notes and local agent config (never published)
+/.planning/
+# /docs/superpowers/ NON si ignora: nel repo privato e' una cartella tracciata
+# (piani e spec, 63 file al 04/10/2026): ignorarla nasconderebbe i file nuovi.
+/.claude/

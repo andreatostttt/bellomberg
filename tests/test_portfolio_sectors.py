@@ -74,6 +74,13 @@ def test_settori_tema_e_bucket_derivati_dal_negozio(tmp_path):
     assert ps.settori_tema_del_negozio(assente) == {} and ps.bucket_economici_del_negozio(assente) == {}
 
 
+def test_settore_tema_dat_legacy_usa_il_prefisso_del_prompt():
+    negozio = {"veicoli": {
+        "ZZDAT": {"tipo": "dat", "settore_tema": "Digital asset treasury ZZDAT"},
+    }}
+    assert ps.settori_tema_del_negozio(negozio) == {"ZZDAT": "Crypto treasury ZZDAT"}
+
+
 def test_le_viste_all_import_sono_derivate_dal_negozio_corrente():
     assert isinstance(ps.SECTOR_OVERRIDES, dict) and isinstance(ps.ECON_BUCKET_OF, dict)
     assert set(ps.NEGOZIO_ESITO) >= {"veicoli", "origine", "motivo"}

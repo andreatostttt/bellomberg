@@ -15,6 +15,41 @@ const NEUTRE_PER_CHIAVE = { 'trade.opening_ticker': 'Ticker', 'voldeck.chain': '
   'voldeck.spot': 'Spot', 'voldeck.expected_move': 'Expected move 1σ',
   'newsdesk.blipCountOne': '{a} BLIP', 'progress.callsCountOne': '{a} call',
   'movements.bothCounts': '{a} + {b}' };
+// Nuova pages: shared domain terms, tickers, metric names and pure layouts of placeholders.
+Object.assign(NEUTRE_PER_CHIAVE, {
+  'agentsPage.descDone_desk_one': '1 desk', 'agentsPage.descDone_round_one': '1 round', 'agentsPage.runSpan': '{giorno} · {da} → {a}',
+  'agentsPage.sTickers_one': '1 ticker', 'agentsPage.memo': 'Memo #{id}', 'agentsPage.stepRound': 'Round {r}', 'agentsPage.stepMemo': 'Memo',
+  'agentsPage.rounds_one': '1 round', 'agentsPage.capo': 'Capo', 'agentsPage.stageRedTeam': 'Red team',
+  'agentsPage.lookedCount': '{tools} · {tickers}', 'agentsPage.lookedCount_ticker_one': '1 ticker', 'agentsPage.allN': '{n}',
+  'agentsPage.fx': 'FX USD/EUR', 'agentsPage.filingCount': '{con}/{tot}',
+  'chatPage.you': 'PM',
+  'dashboardPage.title': 'Dashboard', 'dashboardPage.regime': 'Regime', 'dashboardPage.dayPnlWindow': 'P&L {finestra}',
+  'dashboardPage.spy': 'SPY', 'dashboardPage.colPlEur': 'P&L €', 'dashboardPage.colPlPct': 'P&L %', 'dashboardPage.heatmap': 'Heatmap',
+  'dashboardPage.inCurrency': '{pct} in {ccy}', 'dashboardPage.vsSpy': 'vs SPY', 'dashboardPage.metrics_sharpe': 'Sharpe ratio',
+  'filingPage.orderAz': 'A-Z', 'filingPage.trigger': 'Trigger', 'filingPage.consigliere': 'Consigliere', 'filingPage.alias': 'alias',
+  'filingPage.ticker': 'ticker', 'filingPage.offSec': 'SEC', 'filingPage.offEsef': 'ESEF', 'filingPage.offIrFound_one': '1 PDF',
+  'marketsPage.auto': 'Auto · 2 min', 'marketsPage.countryNames_US': 'USA', 'marketsPage.countryNames_IN': 'India',
+  'marketsPage.kindFuture': 'Future', 'marketsPage.target': 'target {v}', 'marketsPage.stats_pe': 'P/E', 'marketsPage.stats_eps': 'EPS',
+  'marketsPage.stats_beta': 'Beta', 'marketsPage.stats_vol': 'Volume', 'marketsPage.stats_ev': 'Enterprise value',
+  'marketsPage.stats_evEbitda': 'EV/EBITDA', 'marketsPage.stats_peg': 'PEG', 'marketsPage.stats_pb': 'P/B',
+  'marketsPage.stats_fcf': 'FCF yield',
+  'newsPage.viewAgenda': 'Agenda', 'newsPage.positive': 'Positive', 'newsPage.negative': 'Negative',
+  'newsPage.radarTonePct': '{p}% positive · {n}% negative', 'newsPage.via': 'via {p}', 'newsPage.colArea': 'Area',
+  'newsPage.ctxMacro': 'Macro',
+  'performancePage.title': 'Performance', 'performancePage.dayPnlWindow': 'P&L {f}', 'performancePage.periods_1M': '1M',
+  'performancePage.periods_3M': '3M', 'performancePage.spyPill': 'SPY {v}', 'performancePage.maxDd': 'Max drawdown',
+  'performancePage.sharpe': 'Sharpe', 'performancePage.sharpeSub': 'risk-free {rf}', 'performancePage.sinceStartSub': 'SPY {spy} · {d}',
+  'performancePage.nav': 'NAV', 'performancePage.spy': 'SPY', 'performancePage.mSortino': 'Sortino', 'performancePage.mCalmar': 'Calmar',
+  'performancePage.rowPortfolioSub': 'TWR', 'performancePage.rowSpy': 'SPY', 'performancePage.hhi': '{c} · HHI {v}',
+  'performancePage.regionNames_ASIA': 'Asia', 'performancePage.cBeta': 'Beta', 'performancePage.cSharpe': 'Sharpe',
+  'performancePage.drawdown': 'Drawdown', 'performancePage.ddRecovered': '{n} · {d}', 'performancePage.mBench': 'Benchmark',
+  'performancePage.mBase': 'Base 100',
+  'tradePage.verbs_BUY': 'Buy', 'tradePage.verbs_ADD': 'Add', 'tradePage.verbs_TRIM': 'Trim', 'tradePage.verbs_SELL': 'Sell',
+  'tradePage.live': 'Live {v}', 'tradePage.nav': 'NAV', 'tradePage.colPl': 'P&L',
+  'trade.trade_ref': 'Trade #{id}', 'trade.div_short': 'DIV',
+  'dashboardPage.period_1M': '1M', 'newsPage.theme_fed': 'Fed / FOMC', 'newsPage.theme_btc_etf': 'BTC / ETF',
+  'tradeidea.pdfSectionPage': 'p. {page}', 'tradeidea.pdfSection_business': 'Business', 'tradeidea.pdfSection_red_team': 'Red team',
+});
 
 const NEUTRE = /^(OK|ESC|CTRL\+K|F\d{1,2}|N\.D\.|n\.d\.|n\/a|API|PING|LIVE|DOWN|ONLINE|OFFLINE|RUN LIVE|CONFIG|BELLOMBERG.*|PRIVATE INTELLIGENCE TERMINAL|V0\.9 OBSIDIAN|PIN AUTHENTICATION|◈ ACCESS GRANTED|◌ AUTHENTICATING…|◌ AUTHORIZE ACCESS|SAT-07|BLM-1 ASCENT|MEMORIA SQLITE|FEED NEWS \/ FRED|QUANT GARCH \/ MC|ALT|VEL|ORBIT|LINK|KM 0|Engine|Agents|SESSION|Command Center|Performance|Watchlist|Global Markets|News Desk|Fundamentals|Factor Lab|Monte Carlo|Vol Deck|Edge Scanner|Agent Chat|Agents Live|Memo Archive|Trade Entry|MKT \{ticker\}|NEWS \{ticker\}|REFRESH NEWS FEED|BACKUP DATABASE|pull \+ classify \(~60s\)|polygon -> yfinance.*|force refresh performance|weekly research note|snapshot data\/consigliere\.db|blotter \+ trade entry|\{tasto\} · \{label\} · \{gruppo\}|\{key\} \/\/ \{label\}|\{dd\}\/\{mm\}\/\{aa\}.*|\{n\} \{unita\}|\{n\}|\{testo\}|1 \{valuta\}|FX 60s|FX STALE \{minuti\}M|IMPATTO 2026-OB · 4\.2 KT|T\+\{mm\}:\{ss\}  ALT \{alt\} KM)$/;
 

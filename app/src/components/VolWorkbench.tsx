@@ -1,7 +1,9 @@
 import { linguaCorrente, localeDi } from '@/i18n/lingua';
 import { t as tr } from '@/i18n/t';
 import { useLingua } from '@/i18n/provider';
+import type { ReactNode } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import NewInterfaceBoundary from '@/components/NewInterfaceBoundary';
 import { ArrowDownLeft, ArrowUpRight, Check, ChevronDown, Layers3, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import {
   blankLeg, contractLeg, legSource, daysToExpiry, expiriesThrough, horizonDate, numberInput, numericText, serializeLegs, volNumber, volRequest, watchDownload,
@@ -14,6 +16,8 @@ import type { VolWorkspace } from '@/lib/vol-atlas';
 type Mode = VolWorkspace;
 type Props = { ticker: string; mode: Mode; coverage?: Coverage; surfaceBusy: boolean;
   onSurface: (result: any, expiries: string[]) => void; onLaboratory: () => void; onAcquisition: () => void };
+
+function DeferredVolWorkbenchView({ render }: { render: () => ReactNode }) { return render(); }
 
 function Datum({ label, value, unit, tone }: { label: string; value: string; unit?: string; tone?: string }) {
   return <div className={'vd-datum ' + (tone || '')}><span>{label}</span><strong>{value}</strong>{unit && <small>{unit}</small>}</div>;
@@ -203,7 +207,8 @@ export default function VolWorkbench({ ticker, mode, coverage, surfaceBusy, onSu
     setLegs(prev => [...prev, contractLeg(row, side)]);
   };
 
-  return <div className="vol-workbench">
+  return <NewInterfaceBoundary language={language}>
+  <DeferredVolWorkbenchView render={() => (<div className="vol-workbench">
     <section className="vd-catalog" aria-labelledby="vd-calendar-title" hidden={mode !== 'acquisition'}>
       <div className="vd-section-head"><div><h2 id="vd-calendar-title">{tr('voldeck.ui_how_far_ahead_do_you_want_to_look_110')}</h2>
         <p>{ticker ? tr('voldeck.fmt__a_choose_the_final_expiry_all_available_earlier_4', {a: ticker}) : tr('voldeck.ui_enter_a_ticker_to_explore_expiries_the_laboratory_also_111')}</p></div>
@@ -296,7 +301,7 @@ export default function VolWorkbench({ ticker, mode, coverage, surfaceBusy, onSu
           <div className="vd-chain-tools"><div className="vd-segment">{[['all', tr('voldeck.ui_all_182')], ['call', 'Call'], ['put', 'Put']].map(([id, label]) => <button key={id} aria-pressed={filter === id} onClick={() => setFilter(id)}>{label}</button>)}</div>
             <label>{tr('voldeck.ui_find_strike_183')}{' '}<input value={strikeSearch} inputMode="decimal" aria-label={tr('voldeck.ui_find_strike_183')} onChange={e => setStrikeSearch(e.target.value)} /></label>
             <span>{chain.n_contracts} {' '}{tr('voldeck.ui_downloaded_contracts_184')}{' '}{chain.filtered_contracts ?? chain.n_contracts} {' '}{tr('voldeck.ui_matching_filters_185')}{' '}{chain.chain_complete ? tr('voldeck.ui_expiry_fully_downloaded_186') : tr('voldeck.ui_expiry_download_incomplete_187')}{chain.malformed_contracts ? tr('voldeck.fmt__a_unreadable_rows_8', {a: chain.malformed_contracts}) : ''}</span>
-            <span>Download {new Date(chain._timestamp).toLocaleTimeString(localeDi(linguaCorrente()))}{chain.cached ? tr('voldeck.ui_declared_cache_188') : ''}</span></div>
+            <span>{tr('voldeck.chainDownloadedAt', { time: new Date(chain._timestamp).toLocaleTimeString(localeDi(linguaCorrente())) })}{chain.cached ? tr('voldeck.ui_declared_cache_188') : ''}</span></div>
           <div className="vd-chain-scroll"><table><thead><tr><th>{tr('voldeck.ui_type_189')}</th><th>Strike</th><th>Bid</th><th>Ask</th><th>IV %</th><th>Delta</th><th>Gamma</th><th>Vega</th><th>Theta</th><th>OI</th><th>{tr('voldeck.ui_quality_190')}</th><th>{tr('voldeck.ui_strategy_191')}</th></tr></thead>
             <tbody>{visibleRows.map((row, i) => <tr key={row.contract || i} className={(row.strike && chain.spot && Math.abs(row.strike / chain.spot - 1) < .01 ? 'atm ' : '') + (inspect === row ? 'inspected' : '')}>
               <td><button className={'vd-contract-type ' + row.type} onClick={() => setInspect(row)} aria-label={tr('voldeck.fmt_inspect_a_strike_b__9', {a: row.type, b: row.strike ?? tr('voldeck.na')})}>{row.type}</button></td>
@@ -321,7 +326,8 @@ export default function VolWorkbench({ ticker, mode, coverage, surfaceBusy, onSu
       </section>
       <div hidden={mode !== 'laboratory'}><StrategyLab key={ticker} ticker={ticker} legs={legs} setLegs={setLegs} observedSpot={chain?.spot ?? null} /></div>
     </div>
-  </div>;
+  </div>)} />
+  </NewInterfaceBoundary>;
 }
 
 function StrategyLab({ ticker, legs, setLegs, observedSpot }: { ticker: string; legs: LegDraft[]; setLegs: (legs: LegDraft[] | ((p: LegDraft[]) => LegDraft[])) => void; observedSpot: number | null }) {
@@ -363,7 +369,8 @@ function StrategyLab({ ticker, legs, setLegs, observedSpot }: { ticker: string; 
     setLegs(prev => [...prev, second]);
   }
 
-  return <section className="vd-lab" aria-labelledby="vd-lab-title">
+  return <NewInterfaceBoundary language={language}>
+  <DeferredVolWorkbenchView render={() => (<section className="vd-lab" aria-labelledby="vd-lab-title">
     <div className="vd-section-head"><div><h2 id="vd-lab-title">{tr('voldeck.ui_design_the_strategy_214')}</h2><p>{ticker || tr('voldeck.underlying')} {' '}{tr('voldeck.ui_local_theoretical_laboratory_no_orders_are_sent_215')}</p></div>
       <span className="vd-model">{tr('voldeck.ui_black_scholes_merton_european_216')}</span></div>
     <div className="vd-lab-grid">
@@ -404,7 +411,8 @@ function StrategyLab({ ticker, legs, setLegs, observedSpot }: { ticker: string; 
         <details className="vd-model-notes"><summary>{tr('voldeck.ui_method_and_limitations_264')}</summary><ul>{(result?.limits || [tr('voldeck.ui_european_model_does_not_value_american_early_exercise__265'), tr('voldeck.ui_act_365_calendar_days_intraday_expiry_time_is_not_mode_266'), tr('voldeck.ui_constant_iv_per_leg_with_a_parallel_shock_entry_premiu_267'), tr('voldeck.ui_mixed_expiries_scenarios_stop_at_the_first_expiry_no_i_268'), tr('voldeck.ui_initial_fees_included_slippage_exit_costs_financing_an_269')]).map(note => <li key={note}>{note}</li>)}</ul></details>
       </div>
     </div>
-  </section>;
+  </section>)} />
+  </NewInterfaceBoundary>;
 }
 
 function PayoffChart({ result }: { result: StrategyResult }) {
@@ -428,14 +436,14 @@ function PayoffChart({ result }: { result: StrategyResult }) {
     onPointerMove={hoverAt} onPointerLeave={() => setHover(null)} onKeyDown={e => { if (['ArrowLeft', 'ArrowRight'].includes(e.key)) { e.preventDefault(); setHover(v => Math.max(0, Math.min(rows.length - 1, (v ?? Math.floor(rows.length / 2)) + (e.key === 'ArrowLeft' ? -1 : 1)))); } }}>
     <defs><linearGradient id="vd-profit-wash" x1="0" y1="0" x2="0" y2="1"><stop stopColor="#2cb8a2" stopOpacity=".10" /><stop offset="1" stopColor="#2cb8a2" stopOpacity="0" /></linearGradient></defs>
     <rect x={left} y={top} width={width-left-right} height={y(0)-top} fill="url(#vd-profit-wash)" />
-    {[0,1,2,3,4].map(i => { const val = minY + (maxY-minY)*i/4; return <g key={i}><line x1={left} x2={width-right} y1={y(val)} y2={y(val)} stroke="#26364f" strokeDasharray="2 5" /><text x={left-10} y={y(val)+4} textAnchor="end">{volNumber(val, 0)}</text></g>; })}
+    {[0,1,2,3,4].map(i => { const val = minY + (maxY-minY)*i/4; return <g key={i}><line className="vd-grid-line" x1={left} x2={width-right} y1={y(val)} y2={y(val)} stroke="#26364f" strokeDasharray="2 5" /><text x={left-10} y={y(val)+4} textAnchor="end">{volNumber(val, 0)}</text></g>; })}
     {[0,1,2,3,4,5,6].map(i => { const val = minX+(maxX-minX)*i/6; return <g key={i}><text x={x(val)} y={height-15} textAnchor="middle">{volNumber(val, 1)}</text></g>; })}
-    <line x1={left} x2={width-right} y1={y(0)} y2={y(0)} stroke="#7689a6" />
-    {result.breakevens.filter(v => v >= minX && v <= maxX).map(v => <g key={v}><line x1={x(v)} x2={x(v)} y1={top} y2={height-bottom} stroke="#9b804f" strokeDasharray="3 5" /><circle cx={x(v)} cy={y(0)} r="4" fill="#e9ba64" /></g>)}
-    <path d={path('today')} stroke="#91a2ba" strokeWidth="1.6" strokeDasharray="5 5" fill="none" />
-    {result.same_expiry && <path d={path('expiry')} stroke="#e9ba64" strokeWidth="3" fill="none" />}
-    <path d={path('scenario')} stroke="#55d6ef" strokeWidth="2.5" fill="none" />
-    {hoverRow && <g><line x1={x(hoverRow.price)} x2={x(hoverRow.price)} y1={top} y2={height-bottom} stroke="#c6d3e7" strokeDasharray="2 3" /><circle cx={x(hoverRow.price)} cy={y(hoverRow.scenario)} r="5" fill="#55d6ef" stroke="#08101e" strokeWidth="2" /></g>}
+    <line className="vd-zero-line" x1={left} x2={width-right} y1={y(0)} y2={y(0)} stroke="#7689a6" />
+    {result.breakevens.filter(v => v >= minX && v <= maxX).map(v => <g key={v}><line className="vd-breakeven-line" x1={x(v)} x2={x(v)} y1={top} y2={height-bottom} stroke="#9b804f" strokeDasharray="3 5" /><circle className="vd-breakeven-point" cx={x(v)} cy={y(0)} r="4" fill="#e9ba64" /></g>)}
+    <path className="vd-payoff-today" d={path('today')} stroke="#91a2ba" strokeWidth="1.6" strokeDasharray="5 5" fill="none" />
+    {result.same_expiry && <path className="vd-payoff-expiry" d={path('expiry')} stroke="#e9ba64" strokeWidth="3" fill="none" />}
+    <path className="vd-payoff-scenario" d={path('scenario')} stroke="#55d6ef" strokeWidth="2.5" fill="none" />
+    {hoverRow && <g><line className="vd-hover-line" x1={x(hoverRow.price)} x2={x(hoverRow.price)} y1={top} y2={height-bottom} stroke="#c6d3e7" strokeDasharray="2 3" /><circle className="vd-hover-point" cx={x(hoverRow.price)} cy={y(hoverRow.scenario)} r="5" fill="#55d6ef" stroke="#08101e" strokeWidth="2" /></g>}
   </svg><div className="vd-chart-legend"><span className="expiry">{result.same_expiry ? tr('voldeck.ui_at_expiry_271') : tr('voldeck.ui_single_payoff_not_defined_272')}</span><span className="scenario">{tr('voldeck.ui_theoretical_scenario_273')}</span><span className="today">{tr('voldeck.ui_theoretical_value_today_274')}</span><span>{tr('voldeck.ui_underlying_price_275')}{result.currency})</span></div>
   <div className="vd-chart-reading" aria-live="polite">{hoverRow ? <>{tr('voldeck.ui_price_276')}{' '}<b>{volNumber(hoverRow.price)}</b><span>{tr('voldeck.ui_scenario_p_l')}{' '}<b>{volNumber(hoverRow.scenario)}</b></span><span>{tr('voldeck.ui_p_l_at_expiry_277')}{' '}<b>{volNumber(hoverRow.expiry)}</b></span></> : tr('voldeck.ui_point_at_the_chart_or_use_arrow_keys_to_compare_result_278')}</div></div>;
 }

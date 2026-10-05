@@ -148,14 +148,22 @@ def _build_table(rows, styles_):
     """Build una reportlab Table da rows (list of list)."""
     if not rows:
         return None
+    nonoperative = ([str(c).strip().lower() for c in rows[0][:6]]
+                    == ["azione", "ticker", "eur", "stato", "motivo", "deroga dichiarata"])
     # Converti ogni cella in Paragraph per word wrap
-    body = ParagraphStyle("td", parent=styles_["body"], fontSize=9, leading=11, alignment=TA_LEFT)
+    body = ParagraphStyle("td", parent=styles_["body"],
+                          fontSize=7.4 if nonoperative else 9,
+                          leading=9 if nonoperative else 11, alignment=TA_LEFT)
     header = ParagraphStyle("th", parent=body, textColor=colors.white, fontName="Helvetica-Bold")
     data = []
     for r_idx, row in enumerate(rows):
         cells = [_safe_para(c, header if r_idx == 0 else body) for c in row]
         data.append(cells)
-    t = Table(data, repeatRows=1)
+    # La tabella delle proposte bloccate ha colonne asimmetriche: il motivo deve
+    # restare leggibile e avvolgersi, mentre ticker/stato/importo restano compatti.
+    col_widths = ([1.5 * cm, 2.0 * cm, 1.3 * cm, 3.2 * cm, 6.5 * cm, 2.5 * cm]
+                  if nonoperative else None)
+    t = Table(data, colWidths=col_widths, repeatRows=1)
     # #178: stile sell-side — solo righe orizzontali, niente gabbia
     t.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), NAVY),

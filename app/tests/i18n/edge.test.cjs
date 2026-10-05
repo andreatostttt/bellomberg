@@ -51,7 +51,7 @@ test('Edge updates authored variants and labels locally, preserving strength, so
   assert.match(en, /Strength threshold/); assert.match(it, /Soglia forza/);
   assert.match(en, /Declared reading/); assert.match(en, /Declared note/); assert.match(it, /Lettura dichiarata/);
   assert.match(en, /1,234\.567/); assert.match(it, /1\.234,567/);
-  for (const html of [it, en]) { assert.match(html, /Original unmarked context/); assert.match(html, /SYNTH.X/); assert.match(html, /#b07a1e/i); }
+  for (const html of [it, en]) { assert.match(html, /Original unmarked context/); assert.match(html, /SYNTH.X/); assert.match(html, /#7a4f00/i); }
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].options, { params: { min_strength: 45 }, timeout: 420000, headers: { 'X-BB-Language': 'en', 'X-Synthetic-Test': 'yes' } });
   assert.deepEqual(data, before);

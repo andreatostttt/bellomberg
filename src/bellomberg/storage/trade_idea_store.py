@@ -647,6 +647,13 @@ class TradeIdeaStore:
         budget = _decimal(request.get("budget_limit_usd"), "budget_limit_usd", positive=True)
         canonical_request = {**request, "ticker": ticker, "budget_limit_usd": budget,
                              "authorization": authorization}
+        if "peers" in request:
+            # Lotto 3 (L1, Opus 5.5): peer del PM facoltativi; assenti = selettore dichiarato
+            from bellomberg.market_data.trade_idea_market_pack import normalize_request_peers
+            peers = normalize_request_peers(request["peers"], ticker=ticker)
+            if not peers:
+                raise ValueError("peers vuota: omettere il campo per usare il selettore")
+            canonical_request["peers"] = peers
         encoded, digest = _json(canonical_request), _digest(canonical_request)
         now = self._at()
         with self._connect() as conn:
@@ -2731,6 +2738,7 @@ class TradeIdeaStore:
                 "execution_policy": json.loads(row['request_json']).get('execution_policy'),
                 "continuation": json.loads(row["request_json"]).get("continuation"),
                 "source_qualification": json.loads(row["request_json"]).get("source_qualification"),
+                "peers": json.loads(row["request_json"]).get("peers"),
                 "technical_status": row["technical_status"], "phase": row["phase"],
                 "reason": row["reason"], "stop_requested": bool(row["stop_requested"]),
                 "created_at": row["created_at"], "started_at": row["started_at"],

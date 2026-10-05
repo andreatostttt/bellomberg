@@ -24,6 +24,11 @@ Famiglie (negozio in data/ -> esempio tracciato -> chi lo legge):
                               escludono e lo dichiarano) e `coingecko` (SIMBOLO -> id CoinGecko,
                               ultima fonte di price_updater). Le due sezioni sono INDIPENDENTI
                               -> portfolio_analytics/factors/garch/montecarlo/risk, price_updater
+- gemelli_usa.json            SIMBOLO non-USA del book -> gemello USA (stesso indice / ADR) e/o
+                              principali partecipazioni, con stato proposto/confermato/rifiutato
+                              ed evidenza scritta da chi propone (04/10, Opus 5.5)
+                              -> market_data.lookthrough_usa (SOLO le voci confermate),
+                              tools/ops/proponi_gemelli_usa.py (l'unico che lo scrive)
 
 Stdlib e helper di presentazione bilingue; nessun import di DB o provider. La regola del percorso dati e' quella di memory_db.DB_DIR
 (BELLOMBERG_DATA_DIR relativo alla radice o assoluto), replicata come in classificazione.py.
@@ -53,6 +58,8 @@ PERCORSO_PREZZI = str(DATA_DIR / "prezzi_speciali.json")
 ESEMPIO_PREZZI = "prezzi_speciali.example.json"
 PERCORSO_TEMI_TITOLI = str(DATA_DIR / "news_topics_tickers.json")
 ESEMPIO_TEMI_TITOLI = "news_topics_tickers.example.json"
+PERCORSO_GEMELLI = str(DATA_DIR / "gemelli_usa.json")
+ESEMPIO_GEMELLI = "gemelli_usa.example.json"
 
 
 # ============================================================
@@ -136,8 +143,11 @@ def _sezioni_ammesse(grezzo: Dict[str, Any], ammesse: Tuple[str, ...]) -> None:
 # ============================================================
 # LE FAMIGLIE
 # ============================================================
+_ISIN = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")
+
+
 def _valida_alias(grezzo: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
-    _sezioni_ammesse(grezzo, ("finnhub", "sec", "yfinance", "correlazione"))
+    _sezioni_ammesse(grezzo, ("finnhub", "sec", "yfinance", "correlazione", "tradegate"))
     finnhub = mappa_canonica(grezzo.get("finnhub", {}), stringa_piena, "alias finnhub")
     sec = mappa_canonica(grezzo.get("sec", {}), stringa_piena, "alias sec")
 
@@ -153,17 +163,24 @@ def _valida_alias(grezzo: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
     riservati = sorted(set(yfinance) & {"BTC", "ETH", "SOL"})
     if riservati:
         raise ValueError(_message('alias yfinance {v0!r} ridefinisce una conversione canonica pubblica', 'yfinance alias {v0!r} redefines a public canonical conversion', v0=riservati[0]))
+    def _isin(chiave, valore):
+        isin = stringa_piena(chiave, valore)
+        if not _ISIN.match(isin):
+            raise ValueError(_message('alias tradegate {v0!r}: {v1!r} non ha la forma di un ISIN', 'tradegate alias {v0!r}: {v1!r} does not have ISIN format', v0=chiave, v1=isin))
+        return isin
+
+    tradegate = mappa_canonica(grezzo.get("tradegate", {}), _isin, "alias tradegate")
     for k in sec:
         if "." in k:
             raise ValueError(_message("alias sec {v0!r}: la chiave e' la BASE di listino (prima del punto), lookup_cik confronta la base e non la troverebbe mai", 'SEC alias {v0!r}: the key is the listing BASE (before the dot); lookup_cik compares the base and would never find it', v0=k))
-    return {"finnhub": finnhub, "sec": sec,
-            "yfinance": yfinance, "correlazione": correlazione}
+    return {"finnhub": finnhub, "sec": sec, "yfinance": yfinance,
+            "correlazione": correlazione, "tradegate": tradegate}
 
 
 def carica_alias(path: Optional[str] = None) -> Dict[str, Any]:
-    """Alias per quattro fonti; `yfinance` e `correlazione` sono sezioni opzionali."""
+    """Alias per cinque fonti; `yfinance`, `correlazione` e `tradegate` sono sezioni opzionali."""
     return carica(path or PERCORSO_ALIAS, ESEMPIO_ALIAS, _valida_alias, "alias",
-                  {"finnhub": {}, "sec": {}, "yfinance": {}, "correlazione": {}})
+                  {"finnhub": {}, "sec": {}, "yfinance": {}, "correlazione": {}, "tradegate": {}})
 
 
 def _valida_iv(grezzo: Dict[str, Any]) -> Tuple[str, ...]:
@@ -397,3 +414,191 @@ def carica_temi_titoli(path: Optional[str] = None) -> Dict[str, Any]:
     quali titoli legarle» non possono essere la stessa frase."""
     return carica(path or PERCORSO_TEMI_TITOLI, ESEMPIO_TEMI_TITOLI, _valida_temi_titoli,
                   "temi", {})
+
+
+# ============================================================
+# GEMELLI USA (look-through per i simboli europei, 04/10, Opus 5.5)
+# ============================================================
+# Una voce dice: «per QUESTO simbolo del book, QUESTO strumento USA e' un proxy dichiarato,
+# per QUESTI usi». Il simbolo USA omonimo NON e' una prova (BA.L -> BA = Boeing, TRN.MI ->
+# Trinity: memoria «un filtro rimosso eredita la sua ragione»): l'evidenza la scrive chi
+# propone (KID, factsheet, 20-F, 13F) e la conferma la da' il PM UNA volta. I consumatori
+# (market_data.lookthrough_usa) leggono SOLO le voci `confermato`; `proposto` e `rifiutato`
+# restano nel negozio come storia e come lista di cio' che e' gia' stato guardato.
+STATI_GEMELLO = ("proposto", "confermato", "rifiutato")
+# stesso_indice = ETF/fondo USA che replica lo stesso indice; adr = stesso emittente quotato
+# negli USA; partecipazioni = nessun gemello unico, si guardano le principali posizioni USA.
+RELAZIONI_GEMELLO = ("stesso_indice", "adr", "partecipazioni")
+# per cosa il proxy e' ammesso: un gemello buono per la vol implicita puo' non esserlo per gli
+# insider (un ETF non ne ha). Vocabolario chiuso: un uso scritto male non deve passare zitto.
+USI_GEMELLO = ("opzioni", "congress", "lobbying", "gov_contracts", "insider",
+               "fondamentali", "notizie")
+_CAMPI_GEMELLO = frozenset({"stato", "relazione", "gemello_usa", "partecipazioni", "usi_ammessi",
+                            "proposto_il", "confermato_il", "confermato_tramite", "rifiutato_il",
+                            "motivo_rifiuto",
+                            "note"})
+_DATA_ISO = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _data_iso(chiave: str, valore: Any) -> str:
+    v = stringa_piena(chiave, valore)
+    if not _DATA_ISO.match(v):
+        raise ValueError(_message('{v0}: data {v1!r} non ISO (AAAA-MM-GG)', '{v0}: date {v1!r} is not ISO (YYYY-MM-DD)', v0=chiave, v1=v))
+    import datetime as _dt
+    try:
+        _dt.date.fromisoformat(v)
+    except ValueError:
+        raise ValueError(_message('{v0}: data {v1!r} inesistente', '{v0}: date {v1!r} does not exist', v0=chiave, v1=v))
+    return v
+
+
+def _simbolo_usa(chiave: str, valore: Any) -> str:
+    """Un simbolo USA: MAIUSCOLO, senza spazi, e `coperto` per la guardia unica
+    `copertura.copertura_usa` (review RV-C P2-5: `mercato_di` chiamava USA anche ZZQ.MC,
+    ZZQ-EUR, ^ZZX, ZZ=X — tutto cio' che non e' nel registro). Nessuna logica propria qui:
+    LIMITE DICHIARATO, una classe di azioni USA col punto (BRK.B) e' `indeterminato` per la
+    guardia e quindi NON e' ammessa come gemello finche' la guardia non la riconosce."""
+    from bellomberg.market_data.copertura import copertura_usa
+    s = stringa_piena(chiave, valore)
+    if s != s.upper() or re.search(r"\s", s):
+        raise ValueError(_message('{v0}: simbolo {v1!r} malformato: MAIUSCOLO e senza spazi', '{v0}: malformed symbol {v1!r}: UPPERCASE without spaces', v0=chiave, v1=s))
+    if copertura_usa(s, "gemello")["stato"] != "coperto":
+        raise ValueError(_message("{v0}: {v1!r} non e' un simbolo USA (suffisso di un altro mercato o crypto)", '{v0}: {v1!r} is not a US symbol (another market suffix or crypto)', v0=chiave, v1=s))
+    return s
+
+
+def _valida_gemello_usa(ticker: str, g: Any) -> Dict[str, str]:
+    if not isinstance(g, dict):
+        raise ValueError(_message('{v0}.gemello_usa: serve un oggetto {{simbolo, evidenza, fonte}}', '{v0}.gemello_usa: an object {{simbolo, evidenza, fonte}} is required', v0=ticker))
+    fuori = sorted(set(g) - {"simbolo", "evidenza", "fonte"})
+    if fuori:
+        raise ValueError(_message('{v0}.gemello_usa: campo {v1!r} sconosciuto', '{v0}.gemello_usa: unknown field {v1!r}', v0=ticker, v1=fuori[0]))
+    simbolo = _simbolo_usa("%s.gemello_usa.simbolo" % ticker, g.get("simbolo"))
+    # l'evidenza e la fonte le scrive CHI PROPONE: nessun gemello senza una riga verificabile
+    evidenza = stringa_piena("%s.gemello_usa.evidenza" % ticker, g.get("evidenza"))
+    fonte = stringa_piena("%s.gemello_usa.fonte" % ticker, g.get("fonte"))
+    if simbolo == ticker:
+        raise ValueError(_message("{v0}: il gemello e' il simbolo stesso", '{v0}: the twin is the symbol itself', v0=ticker))
+    base = ticker.split(".")[0]
+    # L'OMONIMO: il simbolo USA uguale alla base senza suffisso e' la trappola BA.L -> Boeing.
+    # Si accetta solo se l'evidenza NOMINA quel simbolo USA (chi propone l'ha guardato
+    # davvero, es. «ADR XXX su NYSE, stesso emittente, 20-F»), mai per somiglianza.
+    # «parola intera» esclude anche il simbolo seguito da un suffisso: «ZZB.L» NON nomina ZZB
+    # (review RV-C P2-2: l'evidenza che citava solo il ticker del book passava)
+    if "." in ticker and simbolo == base and not re.search(r"(?<![A-Z0-9.])%s(?![A-Z0-9]|\.[A-Z])" % re.escape(simbolo), evidenza):
+        raise ValueError(_message("{v0}: il gemello {v1!r} e' l'OMONIMO senza suffisso (classe BA.L -> Boeing): l'evidenza deve nominare {v1} e dire perche' e' lo stesso strumento/emittente", '{v0}: twin {v1!r} is the HOMONYM without suffix (BA.L -> Boeing class): the evidence must name {v1} and say why it is the same instrument/issuer', v0=ticker, v1=simbolo))
+    return {"simbolo": simbolo, "evidenza": evidenza, "fonte": fonte}
+
+
+def _valida_partecipazioni(ticker: str, p: Any) -> Dict[str, Any]:
+    if not isinstance(p, dict):
+        raise ValueError(_message('{v0}.partecipazioni: serve un oggetto {{fonte, data_riferimento, voci}}', '{v0}.partecipazioni: an object {{fonte, data_riferimento, voci}} is required', v0=ticker))
+    fuori = sorted(set(p) - {"fonte", "data_riferimento", "voci"})
+    if fuori:
+        raise ValueError(_message('{v0}.partecipazioni: campo {v1!r} sconosciuto', '{v0}.partecipazioni: unknown field {v1!r}', v0=ticker, v1=fuori[0]))
+    fonte = stringa_piena("%s.partecipazioni.fonte" % ticker, p.get("fonte"))
+    data = _data_iso("%s.partecipazioni.data_riferimento" % ticker, p.get("data_riferimento"))
+    voci_grezze = p.get("voci")
+    if not isinstance(voci_grezze, list) or not voci_grezze:
+        raise ValueError(_message('{v0}.partecipazioni.voci: serve una lista NON vuota di {{simbolo_usa, peso_pct}}', '{v0}.partecipazioni.voci: a NONEMPTY list of {{simbolo_usa, peso_pct}} is required', v0=ticker))
+    voci, visti, somma = [], set(), 0.0
+    for i, x in enumerate(voci_grezze):
+        dove = "%s.partecipazioni.voci[%d]" % (ticker, i)
+        if not isinstance(x, dict) or set(x) != {"simbolo_usa", "peso_pct"}:
+            raise ValueError(_message('{v0}: serve esattamente {{simbolo_usa, peso_pct}}', '{v0}: exactly {{simbolo_usa, peso_pct}} is required', v0=dove))
+        s = _simbolo_usa(dove, x["simbolo_usa"])
+        peso = x["peso_pct"]
+        if isinstance(peso, bool) or not isinstance(peso, (int, float)) or not 0 < peso <= 100:
+            raise ValueError(_message('{v0}: peso_pct {v1!r} fuori da (0, 100]', '{v0}: peso_pct {v1!r} outside (0, 100]', v0=dove, v1=peso))
+        if s in visti:
+            raise ValueError(_message('{v0}: {v1!r} doppio', '{v0}: duplicate {v1!r}', v0=dove, v1=s))
+        visti.add(s)
+        somma += float(peso)
+        voci.append({"simbolo_usa": s, "peso_pct": float(peso)})
+    if somma > 100.0 + 1e-6:
+        raise ValueError(_message('{v0}.partecipazioni: i pesi sommano {v1}% (> 100)', '{v0}.partecipazioni: weights sum to {v1}% (> 100)', v0=ticker, v1="%.2f" % somma))
+    return {"fonte": fonte, "data_riferimento": data, "voci": voci}
+
+
+def valida_voce_gemello(ticker: str, v: Any) -> Dict[str, Any]:
+    """Una voce del negozio dei gemelli, validata. Esposta perche' lo script che propone e
+    conferma valida la voce NUOVA con la stessa regola del caricatore, prima di scrivere."""
+    from bellomberg.market_data.copertura import copertura_usa
+    from bellomberg.market_data.mercati import mercato_di
+    if not isinstance(v, dict):
+        raise ValueError(_message('gemello {v0!r}: serve un oggetto', 'twin {v0!r}: an object is required', v0=ticker))
+    fuori = sorted(set(v) - _CAMPI_GEMELLO)
+    if fuori:
+        raise ValueError(_message('gemello {v0!r}: campo {v1!r} sconosciuto', 'twin {v0!r}: unknown field {v1!r}', v0=ticker, v1=fuori[0]))
+    # la chiave si giudica con la STESSA guardia del gemello (review RV-C P2-5): `coperto` =
+    # gia' USA, non serve un gemello; crypto (BTC-USD) = nessun emittente da proiettare.
+    # Un listino non censito (indeterminato) resta ammesso: e' proprio il caso da coprire.
+    esito_chiave = copertura_usa(ticker, "gemello")
+    if esito_chiave["stato"] == "coperto":
+        raise ValueError(_message("gemello {v0!r}: e' gia' un simbolo USA, il gemello serve ai simboli di altri mercati", "twin {v0!r}: already a US symbol; twins are for symbols listed elsewhere", v0=ticker))
+    if esito_chiave["mercato"] == "crypto 24/7" or mercato_di(ticker) is None:
+        raise ValueError(_message("gemello {v0!r}: e' una crypto, non uno strumento quotato di cui cercare il gemello USA", "twin {v0!r}: a crypto asset, not a listed instrument with a US twin", v0=ticker))
+    stato = v.get("stato")
+    if stato not in STATI_GEMELLO:
+        raise ValueError(_message('gemello {v0!r}: stato {v1!r} sconosciuto: ammessi {v2}', 'twin {v0!r}: unknown state {v1!r}: allowed {v2}', v0=ticker, v1=stato, v2=", ".join(STATI_GEMELLO)))
+    out: Dict[str, Any] = {"stato": stato, "proposto_il": _data_iso("%s.proposto_il" % ticker, v.get("proposto_il"))}
+    relazione = v.get("relazione")
+    if relazione is None and stato == "rifiutato":
+        pass   # «nessun gemello» dichiarato dal PM: la voce rifiutata puo' non proporre nulla
+    elif relazione not in RELAZIONI_GEMELLO:
+        raise ValueError(_message('gemello {v0!r}: relazione {v1!r} sconosciuta: ammesse {v2}', 'twin {v0!r}: unknown relation {v1!r}: allowed {v2}', v0=ticker, v1=relazione, v2=", ".join(RELAZIONI_GEMELLO)))
+    else:
+        out["relazione"] = relazione
+        if relazione == "partecipazioni":
+            if "gemello_usa" in v:
+                raise ValueError(_message("gemello {v0!r}: relazione 'partecipazioni' senza gemello_usa (un gemello unico e' un'altra relazione)", "twin {v0!r}: 'partecipazioni' relation takes no gemello_usa (a single twin is another relation)", v0=ticker))
+            if "partecipazioni" not in v:
+                raise ValueError(_message("gemello {v0!r}: relazione 'partecipazioni' senza il blocco partecipazioni", "twin {v0!r}: 'partecipazioni' relation without the partecipazioni block", v0=ticker))
+        elif "gemello_usa" not in v:
+            raise ValueError(_message("gemello {v0!r}: relazione {v1!r} senza gemello_usa", 'twin {v0!r}: relation {v1!r} without gemello_usa', v0=ticker, v1=relazione))
+        if "gemello_usa" in v:
+            out["gemello_usa"] = _valida_gemello_usa(ticker, v["gemello_usa"])
+        if "partecipazioni" in v:
+            out["partecipazioni"] = _valida_partecipazioni(ticker, v["partecipazioni"])
+        usi = v.get("usi_ammessi")
+        if not isinstance(usi, list) or not usi:
+            raise ValueError(_message('gemello {v0!r}: usi_ammessi dev\'essere una lista NON vuota fra {v1}', 'twin {v0!r}: usi_ammessi must be a NONEMPTY list among {v1}', v0=ticker, v1=", ".join(USI_GEMELLO)))
+        for u in usi:
+            if u not in USI_GEMELLO:
+                raise ValueError(_message('gemello {v0!r}: uso {v1!r} sconosciuto: ammessi {v2}', 'twin {v0!r}: unknown use {v1!r}: allowed {v2}', v0=ticker, v1=u, v2=", ".join(USI_GEMELLO)))
+        if len(set(usi)) != len(usi):
+            raise ValueError(_message('gemello {v0!r}: usi_ammessi con doppioni', 'twin {v0!r}: duplicate usi_ammessi', v0=ticker))
+        out["usi_ammessi"] = list(usi)
+    if stato == "confermato":
+        out["confermato_il"] = _data_iso("%s.confermato_il" % ticker, v.get("confermato_il"))
+        if out["confermato_il"] < out["proposto_il"]:
+            raise ValueError(_message('gemello {v0!r}: confermato_il prima di proposto_il', 'twin {v0!r}: confermato_il precedes proposto_il', v0=ticker))
+        # COME e' arrivata la conferma (review RV-C P3(a), istruzione PM 04/10): l'etichetta dice
+        # «confermato dal PM» e deve poter dire anche in che modo, es. «istruzione PM in chat del
+        # 04/10, registrata da Claude». Senza, una conferma e' una frase non verificabile.
+        out["confermato_tramite"] = stringa_piena("%s.confermato_tramite" % ticker, v.get("confermato_tramite"))
+    elif stato == "proposto" and ("confermato_il" in v or "confermato_tramite" in v):
+        raise ValueError(_message("gemello {v0!r}: una proposta non ha confermato_il ne' confermato_tramite", 'twin {v0!r}: a proposal has neither confermato_il nor confermato_tramite', v0=ticker))
+    elif stato == "rifiutato" and "confermato_il" in v:
+        # la storia: confermato e poi rifiutato dal PM
+        out["confermato_il"] = _data_iso("%s.confermato_il" % ticker, v.get("confermato_il"))
+        if v.get("confermato_tramite") is not None:
+            out["confermato_tramite"] = stringa_piena("%s.confermato_tramite" % ticker, v.get("confermato_tramite"))
+    if stato == "rifiutato":
+        out["rifiutato_il"] = _data_iso("%s.rifiutato_il" % ticker, v.get("rifiutato_il"))
+        out["motivo_rifiuto"] = stringa_piena("%s.motivo_rifiuto" % ticker, v.get("motivo_rifiuto"))
+    elif "rifiutato_il" in v or "motivo_rifiuto" in v:
+        raise ValueError(_message('gemello {v0!r}: rifiutato_il/motivo_rifiuto solo con stato rifiutato', 'twin {v0!r}: rifiutato_il/motivo_rifiuto only with state rifiutato', v0=ticker))
+    if v.get("note") is not None:
+        out["note"] = stringa_piena("%s.note" % ticker, v.get("note"))
+    return out
+
+
+def _valida_gemelli(grezzo: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    return mappa_canonica(grezzo, valida_voce_gemello, _message('simbolo del book', 'book symbol'))
+
+
+def carica_gemelli(path: Optional[str] = None) -> Dict[str, Any]:
+    """{"gemelli": {SIMBOLO: voce validata}, origine, motivo} — TUTTE le voci, in ogni stato:
+    il filtro «solo confermate» e' di market_data.lookthrough_usa, che e' l'unico consumatore."""
+    return carica(path or PERCORSO_GEMELLI, ESEMPIO_GEMELLI, _valida_gemelli, "gemelli")

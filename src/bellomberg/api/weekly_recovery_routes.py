@@ -12,11 +12,15 @@ class WeeklyRunOptions(BaseModel):
     delivery_only: bool = False
     authorize_new_ai: bool = False
     send_email: bool = False
+    # PM 04/10: conferma esplicita del possibile duplicato per ripetere un invio INCERTO.
+    acknowledge_uncertain_email: bool = False
 
     @model_validator(mode='after')
     def exact_recovery(self):
         if self.delivery_only and self.resume_memo_id is None:
             raise ValueError('Selezionare un memo preciso per recuperare la consegna')
+        if self.acknowledge_uncertain_email and (self.resume_memo_id is None or not self.send_email):
+            raise ValueError("La conferma del re-invio incerto vale solo per un memo preciso e con l'invio email richiesto")
         if self.delivery_only and self.authorize_new_ai:
             raise ValueError('Il recupero dei file non autorizza richieste AI')
         return self

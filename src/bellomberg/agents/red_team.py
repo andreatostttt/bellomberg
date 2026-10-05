@@ -347,8 +347,15 @@ def run_red_team(blackboard, portfolio_data=None, memory_db=None, *, citation_co
     # R1/R2, PRIMA dei report; tre stati dichiarati (v. specialists.base).
     try:
         from bellomberg.agents.specialists.base import blocco_vincoli_pm as _blocco_vincoli_pm
-        _mdb = memory_db if memory_db is not None else getattr(blackboard, "memory_db", None)
-        _v = _blocco_vincoli_pm(_mdb)
+        if trade_idea:
+            # E7 (04/10/2026, Opus 5.5): la Trade Idea non consegna il DB (memory_db=None per
+            # disegno): il blocco arriva dalla fotografia in sola lettura della run, e un buco
+            # e' una frase NON DISPONIBILI, mai la stringa vuota.
+            from bellomberg.agents.trade_idea import pm_constraints_text
+            _v = pm_constraints_text(blackboard)[0]
+        else:
+            _mdb = memory_db if memory_db is not None else getattr(blackboard, "memory_db", None)
+            _v = _blocco_vincoli_pm(_mdb)
         if _v:
             parts.append(_v.rstrip("\n"))
             parts.append("")
@@ -403,7 +410,7 @@ def _run_red_team_loop(blackboard, trade_idea, MODEL_SYNTHESIZER, user_msg,
                       tools_schema, checkpoint_key, saved_checkpoint):
     """Resume exact paid messages; a completed or ambiguous tool is never repeated."""
     import time as _time
-    from bellomberg.core.llm_client import OpenRouterClient, somma_usage as _somma_usage
+    from bellomberg.core.llm_client import OpenRouterClient, somma_usage as _somma_usage, thinking_fase
     from bellomberg.core.llm_refusal import refusal_reason as _refusal_reason
     from bellomberg.core.research_analysis import is_research_mode
     from bellomberg.agents.specialists.base import (
@@ -426,6 +433,12 @@ def _run_red_team_loop(blackboard, trade_idea, MODEL_SYNTHESIZER, user_msg,
             from bellomberg.core.trade_idea_contract import TRADE_IDEA_RED_TEAM_INSTRUCTIONS, RESEARCH_RED_TEAM_INSTRUCTIONS
             selected_system = prompt_for_language(RESEARCH_RED_TEAM_INSTRUCTIONS
                 if is_research_mode(blackboard) else TRADE_IDEA_RED_TEAM_INSTRUCTIONS)
+            # E7: il mandato del PM, come nei desk. Viene dalla fotografia della run (stessa
+            # alla ripresa); entra nel contract: i checkpoint Red Team precedenti non si
+            # riprendono e lo dicono (sotto).
+            from bellomberg.agents.trade_idea import pm_constraints_text
+            base_system = selected_system  # pre-E7: serve a riconoscere i checkpoint gia' pagati
+            selected_system += "\n" + pm_constraints_text(blackboard)[1]
         else:
             selected_system = prompt_for_language(RED_TEAM_PROMPT)
             if is_research_mode(blackboard):
@@ -436,11 +449,15 @@ def _run_red_team_loop(blackboard, trade_idea, MODEL_SYNTHESIZER, user_msg,
                     'fair value is required; do not request compiler inputs or workbook repairs. '
                     'Mandate, prices, risk and sizing controls remain binding.')
         max_tokens = TRADE_IDEA_RED_MAX_TOKENS if trade_idea else WEEKLY_RED_MAX_TOKENS
-        def contract_for(output_limit):
+        # Weekly: effort dal .env (RED_TEAM_EFFORT, default high), via llm_client.
+        red_thinking = (role_thinking(blackboard, 'red_team') if trade_idea
+                        else thinking_fase("red_team"))
+        def contract_for(output_limit, thinking=None, system=None):
             return _checkpoint_digest({"version": 1, "model": MODEL_SYNTHESIZER,
-                "system": selected_system, "tools": tools_schema, "iterations": 4,
+                "system": selected_system if system is None else system,
+                "tools": tools_schema, "iterations": 4,
                 "max_tokens": output_limit,
-                "thinking": role_thinking(blackboard, 'red_team') if trade_idea else {"type": "adaptive"}})
+                "thinking": red_thinking if thinking is None else thinking})
         contract = contract_for(max_tokens)
         start_iteration = 0
         pending_tools = {}
@@ -449,10 +466,30 @@ def _run_red_team_loop(blackboard, trade_idea, MODEL_SYNTHESIZER, user_msg,
             if saved_checkpoint["contract"] != contract:
                 # Only the exact previous policy is compatible. Keep its whole
                 # loop at the original cap, including already journaled bodies.
+                # A weekly loop started before effort high keeps its adaptive
+                # reasoning too: the same paid bodies, never a mixed contract.
                 legacy_cap = 65536 if trade_idea else 4200
-                if saved_checkpoint["contract"] != contract_for(legacy_cap):
-                    raise ValueError("Red Team checkpoint contract changed")
-                max_tokens = legacy_cap
+                candidates = [(max_tokens, red_thinking), (legacy_cap, red_thinking)]
+                if not trade_idea:
+                    candidates += [(max_tokens, {"type": "adaptive"}), (legacy_cap, {"type": "adaptive"})]
+                # E7 + review RV-E7 (P1): un checkpoint Trade Idea scritto PRIMA che il mandato
+                # entrasse nel system resta riprendibile col suo system originale (body
+                # identico a quello pagato: una critica gia' pagata non si perde), e la
+                # ripresa si DICHIARA (data_gaps via trade_idea.pm_constraints_gaps).
+                systems = [None] + ([base_system] if trade_idea else [])
+                match = next(((system, cap, thinking) for system in systems for cap, thinking in candidates
+                              if saved_checkpoint["contract"] == contract_for(cap, thinking, system)), None)
+                if match is None:
+                    raise ValueError("Red Team checkpoint contract changed"
+                        + (" (system diverso da quello attuale e da quello precedente all'ingresso "
+                           "del mandato del PM: non riprendibile, serve una nuova critica)"
+                           if trade_idea else ""))
+                if match[0] is not None:
+                    selected_system = match[0]
+                    blackboard.data["_red_team_system_pre_vincoli"] = True
+                    print("[RED_TEAM] ripreso da checkpoint precedente alla cura E7: "
+                          "mandato del PM non nel suo system (dichiarato)")
+                max_tokens, red_thinking = match[1], match[2]
                 contract = saved_checkpoint["contract"]
             if ("max_tokens" in saved_checkpoint
                     and (type(saved_checkpoint["max_tokens"]) is not int
@@ -525,9 +562,13 @@ def _run_red_team_loop(blackboard, trade_idea, MODEL_SYNTHESIZER, user_msg,
                 model=MODEL_SYNTHESIZER,
                 # PM 02/10: 128k per nuovo lavoro; un loop verificato gia' iniziato
                 # conserva il suo limite storico e gli stessi body di richiesta.
+                # (Il 4200 -> 10000 del 02/10 per l'effort high e' assorbito dai 128k.)
                 max_tokens=max_tokens,
-                # Ragionamento invariato: concorre al limite e alla usage registrata.
-                thinking=role_thinking(blackboard, 'red_team') if trade_idea else {"type": "adaptive"},
+                # Effort high (weekly): critica avversariale su tesi, dati e sizing. I token
+                # di ragionamento contano nel tetto e in usage.reasoning_tokens — se la
+                # critica esce troncata, il WARN qui sotto lo dice e il tetto si alza.
+                # Trade Idea: effort della policy di esecuzione congelata.
+                thinking=red_thinking,
                 system=selected_system,
                 messages=messages,
                 **_kw,

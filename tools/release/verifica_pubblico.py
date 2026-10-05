@@ -1525,6 +1525,10 @@ COLONNE_TESTO_UTENTE = (
     ("pm_feedback", "feedback_text", None, "feedback del PM agli specialisti, reso da pm_verbatim"),
     ("favorite_companies", "note", None, "nota del PM su un preferito, resa da pm_verbatim"),
     ("decision_notes", "testo", ("autore", "PM"), "nota del PM su una decisione (quelle con autore AI sono dei modelli)"),
+    ("decision_events", "reason", None, "motivo libero: puo' contenere la motivazione del PM di una divergenza manuale"),
+    ("decision_events", "details_json", None, "dettagli audit immutabili: possono contenere modifiche a note e testo libero del PM"),
+    ("instrument_identity_verifications", "source", None, "fonte della verifica ISIN dichiarata dal PM"),
+    ("instrument_identity_verifications", "reason", None, "motivazione della verifica ISIN inserita dal PM"),
     ("trade_history", "pm_rationale", None, "motivazione del trade scritta dal PM"),
     ("trade_history", "note", None, "nota libera del trade (PM o importatore)"),
     ("cash_movements", "note", None, "causale libera del movimento: la scrive chi registra o importa la riga, non sempre il PM"),
@@ -1556,12 +1560,15 @@ COLONNE_TESTO_NON_UTENTE = (
         "company_guidance.source_date", "company_guidance.effective_date", "company_guidance.valid_until",
         "company_guidance.created_at", "decision_notes.timestamp", "decisions.timestamp", "decisions.closed_at",
         "decisions.veto_at", "decisions.veto_revoked_at", "favorite_companies.added_at",
+        "decision_events.created_at", "instrument_identity_verifications.verified_at",
+        "instrument_identity_verifications.created_at",
         "iv_history.snap_date", "iv_history.expiry", "iv_history.created_at",
         "journal_entries.created_at", "journal_entries.updated_at", "journal_entries.archived_at",
         "journal_revisions.created_at", "journal_revisions.saved_at", "journal_revisions.archived_at",
         "llm_usage.timestamp", "memos.timestamp", "nav_snapshots.date", "nav_snapshots.created_at",
         "news_feed.published_at", "news_feed.pulled_at", "pm_feedback.timestamp",
         "position_openings.as_of", "position_openings.created_at", "position_prices.timestamp",
+        "venue_closes.timestamp", "venue_closes.data_sessione",
         "positions.data_apertura", "positions.last_updated", "schema_version.applied_at",
         "specialist_reports.timestamp", "themes_tracked.first_mentioned", "themes_tracked.last_mentioned",
         "trade_history.data", "trade_history.created_at", "valuation_snapshot_links.created_at",
@@ -1573,7 +1580,10 @@ COLONNE_TESTO_NON_UTENTE = (
         "cash_movements.type", "chat_messages.role", "chat_messages.output_language", "chat_sessions.specialist",
         "chat_sessions.output_language", "company_guidance.metric", "company_guidance.period",
         "company_guidance.status", "decision_notes.autore", "decisions.action", "decisions.confidence",
-        "decisions.status", "journal_entries.kind", "journal_entries.origin", "journal_revisions.kind",
+        "decisions.status", "decisions.proposal_action", "decisions.assessment_status",
+        "decision_events.event_type", "decision_events.from_status", "decision_events.to_status",
+        "decision_events.actor", "instrument_identity_verifications.verified_by",
+        "journal_entries.kind", "journal_entries.origin", "journal_revisions.kind",
         "journal_revisions.origin", "journal_revisions.action", "llm_usage.agent", "llm_usage.cost_status",
         "llm_usage.cache_ttl", "llm_usage.output_language", "memos.output_language", "news_feed.sentiment",
         "pm_feedback.specialist", "pm_feedback.sentiment", "position_openings.valuta",
@@ -1588,6 +1598,11 @@ COLONNE_TESTO_NON_UTENTE = (
         "valuation_snapshots.generation_id", "valuation_snapshots.payload_sha256",
         "method_record_sets.method_id", "method_record_sets.method_version", "method_record_sets.records_sha256",
         "filing_profiles.profile_sha256", "filing_runs.profile_sha256", "filing_runs.evidence_key")),
+    ("ISIN di uno strumento verificato dal PM: identifica un titolo del portafoglio come il ticker, "
+     "dato PRIVATO e mai identificativo tecnico (revisione di 4519cd4). Fuori dal controllo 13 (le "
+     "cifre non sono parole) e oggi da ogni controllo che cerca nel tree: ticker_db legge solo "
+     "TABELLE_TICKER. Buco dichiarato", (
+        "instrument_identity_verifications.isin",)),
     ("chi prepara o rivede un set di record: etichetta d'identita', non testo libero", (
         "method_record_sets.prepared_by", "method_record_reviews.reviewer")),
     ("set di record documentati preparati dai modelli dai documenti ufficiali (D1A): record, motivazioni "
@@ -1596,11 +1611,13 @@ COLONNE_TESTO_NON_UTENTE = (
         "method_record_sets.provenance")),
     ("ticker, nome o anagrafica del titolo: li cercano lotti, ticker_soli e payload", (
         "company_guidance.ticker", "decisions.ticker", "favorite_companies.ticker", "favorite_companies.name",
+        "decisions.proposal_ticker", "decisions.proposal_ticker_cell",
+        "instrument_identity_verifications.proposed_ticker", "instrument_identity_verifications.execution_ticker",
         "favorite_companies.sector", "favorite_companies.industry", "iv_history.ticker", "journal_entries.ticker",
         "journal_revisions.ticker", "news_feed.ticker_mentioned", "position_openings.ticker",
         "position_prices.ticker", "positions.ticker", "positions.nome", "trade_history.ticker",
         "valuation_snapshots.ticker", "valuation_theses.ticker", "method_record_sets.ticker",
-        "filing_profiles.ticker", "filing_runs.ticker")),
+        "venue_closes.ticker", "filing_profiles.ticker", "filing_runs.ticker")),
     ("risultato documentale estratto da filing esterni: URL, citazioni e fatti vanno comunque "
      "passati per i controlli payload/ticker e la revisione dell'export", (
         "filing_runs.result_json",)),
@@ -1612,7 +1629,8 @@ COLONNE_TESTO_NON_UTENTE = (
         "filing_runs.index_json",)),
     ("testo generato dai modelli o dal codice che li orchestra: ripete i prompt del codice, "
      "inservibile come corpus", (
-        "decisions.timing", "decisions.rationale", "memos.title", "memos.full_markdown",
+        "decisions.timing", "decisions.rationale", "decisions.assessment_reason",
+        "decisions.assessment_override_rationale", "memos.title", "memos.full_markdown",
         "specialist_reports.content", "valuation_theses.variant_view", "valuation_theses.sanity_headline")),
     ("nota d'esito della decisione: la scrivono il codice (auto-archiviazione in memory_db, AUTO-ESCLUSA "
      "in action_validator) e tools/maintenance/archivia_run_duplicata.py, da template; PATCH /decisions/{id} "
@@ -1622,6 +1640,7 @@ COLONNE_TESTO_NON_UTENTE = (
     ("etichetta o nota scritta dal codice (fonte, provider, modello, motore, esito di un calcolo)", (
         "cash_state.source", "iv_history.spot_source", "iv_history.source", "llm_usage.model",
         "llm_usage.fx_source", "memos.notes", "nav_snapshots.source", "position_prices.source",
+        "venue_closes.source",
         "schema_version.description", "trade_history.link_origin", "trade_history.fx_fonte",
         "valuation_theses.growth_path", "valuation_theses.engine", "valuation_theses.subsector",
         "valuation_theses.profile_key")),
@@ -1675,11 +1694,29 @@ def parole_testo(testo):
     return _PAROLA.findall(_normalizza_testo(testo or ""))
 
 
+# 05/10/2026, decisione PM («via di mezzo»): i campi TECNICI del profilo filing li scrive il
+# codice (nomi e regex delle intestazioni standard dei documenti societari, URL delle fonti,
+# lingua, perimetro, ticker, emittente, verifica): non sono testo del PM e le loro frasi
+# standard («relazione finanziaria annuale», «Item 1A. Risk Factors») combaciavano col codice
+# pubblico. Restano controllati TUTTI gli altri campi, dove il PM puo' scrivere note: una chiave
+# sconosciuta e' testo del PM finche' qualcuno non la aggiunge qui deliberatamente.
+# Misurato il 05/10 in sola lettura: profili e run del DB hanno esattamente queste 8 chiavi.
+# 05/10 mattina (decisione PM): i profili AUTOMATICI (market_data/filing_profili_auto.py) portano
+# altre 8 chiavi scritte dal codice, aggiunte qui; «nome» (nome dell'emittente preso dal
+# portafoglio) resta controllato per prudenza.
+CHIAVI_TECNICHE_PROFILO_FILING = frozenset({
+    "tipo", "sezioni", "fonti", "lingua", "perimetro", "ticker", "emittente_id", "verifica",
+    "cik", "lei", "sec_ticker", "forme_sec", "esef_modo", "origine_collegamento",
+    "sezioni_salta_indice", "varianti"})
+
+
 def _stringhe_profilo_filing(raw):
-    """Chiavi e valori JSON sono frammenti distinti, mai prosa concatenata."""
+    """Chiavi e valori JSON sono frammenti distinti, mai prosa concatenata. Le chiavi di primo
+    livello in CHIAVI_TECNICHE_PROFILO_FILING (e tutto il loro contenuto) restano fuori."""
     parsed = json.loads(raw)  # JSON malformato: KO dichiarato dal chiamante, non skip.
     if not isinstance(parsed, dict):
         raise ValueError("profilo filing JSON: oggetto richiesto")
+    parsed = {k: v for k, v in parsed.items() if k not in CHIAVI_TECNICHE_PROFILO_FILING}
 
     def visita(value):
         if isinstance(value, dict):

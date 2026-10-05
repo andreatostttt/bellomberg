@@ -36,11 +36,23 @@ def current_book_identity(db):
                 "cash": [dict(row) for row in conn.execute("SELECT * FROM cash_state ORDER BY singleton_id")]}
 
 
+# Stati terminali con costo attestato. 'settled' = richiesta 'unknown' chiusa dalla
+# RICONCILIAZIONE-COSTI-INCERTI (04/10, RequestJournal.settle_unknown) con la bolletta
+# misurata del provider: il journal la valida (_verify_row: cost == settlement.cost_nano
+# e generation_id presente) e non la blocca piu' in prepare(). 'incomplete', 'overrun',
+# 'reserved' e 'unknown' restano incerti, come nel journal (Opus 5.5).
+# 'released' (KA 04/10, decisione PM «TI-RITENTATIVO-NON-FATTURATO» portata nel weekly) =
+# richiesta CERTAMENTE non fatturata (connessione mai stabilita o 402 di ammissione
+# OpenRouter), chiusa dal journal con costo 0 e la prova (RequestJournal.release_unbilled,
+# _verify_row): il journal non la blocca in prepare(), quindi non e' incerta neanche qui.
+_RESOLVED_STATES = ("received", "rejected", "settled", "released")
+
+
 def costs_unresolved(costs):
     """A reused uncertain preparer receipt also blocks, without charging it twice."""
     return bool(costs.get("unavailable") or costs.get("unknown_requests") or
                 costs.get("external_unresolved_requests") or
-                any(request.get("state") not in ("received", "rejected") or request.get("cost") is None
+                any(request.get("state") not in _RESOLVED_STATES or request.get("cost") is None
                     for request in costs.get("requests", []) + costs.get("external_requests", [])))
 
 
@@ -124,12 +136,17 @@ class WeeklyRunStore:
                          "error": "Registro richieste non verificabile: " + type(exc).__name__}
             result["request_costs"] = costs
         uncertain = costs_unresolved(costs)
+        below_quorum = (result.get("committee_gaps") or {}).get("status") == "below_quorum"
         snapshot = json.loads(row["snapshot_json"])
         payload = snapshot.get("payload", {})
         changed = bool(snapshot and snapshot.get("sha256") != digest(payload))
+        # Comitato a lacune (PM 04/10): la risposta incompleta di un desk (o del Red Team) gia'
+        # DICHIARATO in lacuna non chiede piu' una revisione: il desk e' fuori dalla run.
+        _data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        gap_owners = set(_data.get("_desk_gaps") or {}) | ({"red_team"} if _data.get("_red_team_gap") else set())
         incomplete_report = any(checkpoint.get("status") in ("failed", "truncated")
-                                for checkpoint in payload.get("specialist_checkpoints", {}).values()
-                                if isinstance(checkpoint, dict))
+                                for key, checkpoint in payload.get("specialist_checkpoints", {}).items()
+                                if isinstance(checkpoint, dict) and str(key).split(":", 1)[0] not in gap_owners)
         def unresolved_tool(tool):
             # Public research is independently journaled: resuming it replays
             # verified bytes or returns the explicit unresolved GET. The issuer
@@ -149,6 +166,11 @@ class WeeklyRunStore:
             book_compatible = False
         reason = ("Worker ancora attivo" if active else
                   "Richieste o costi incerti: riconciliazione necessaria" if uncertain else
+                  # Comitato sotto quorum (PM 04/10): run CHIUSA. I desk in lacuna restano fuori
+                  # anche in ripresa, quindi una ripresa ricadrebbe nello stesso stop.
+                  "Comitato sotto quorum: run chiusa senza memo di decisione, i desk in lacuna restano "
+                  "fuori anche in ripresa (" + str((result.get("first_error") or {}).get("message") or "n.d.")[:300]
+                  + ")" if below_quorum else
                   "Snapshot modificato: ripresa rifiutata" if changed else
                   "Esito tool incerto: riconciliazione necessaria senza ripetere il dispatch" if uncertain_tool else
                   "Book cambiato o non verificabile: disponibile soltanto la consegna storica" if not book_compatible else
@@ -177,8 +199,10 @@ class WeeklyRunStore:
         result["delivery_recovery_available"] = "memo_validated" in stages and not active and not changed
         expected = ["priming"]
         for round_n in (0, 1, 2):
+            # Un desk in lacuna dichiarata non e' «lavoro mancante»: e' fuori per il resto della run.
             expected += ["desk:" + name + ":" + str(round_n) for name in self.context["contract"]["roster"]
-                         if round_n != 2 or name in self.context["contract"]["r2_specialists"]]
+                         if (round_n != 2 or name in self.context["contract"]["r2_specialists"])
+                         and ("desk:" + name + ":" + str(round_n) in stages or name not in gap_owners)]
         expected += ["research_dossier" if research else "valuation_coverage", "red_team", "synthesis_context", "capo", "memo_validated",
                      "reflection", "render_context", "decisions_finalized"]
         result["remaining_work"] = [stage for stage in expected if stage not in stages]
@@ -188,6 +212,9 @@ class WeeklyRunStore:
             result["remaining_work"].append("email_reconciliation" if
                 (result.get("email_delivery") or {}).get("state") in ("sending", "uncertain")
                 else "requested_email_delivery" if result.get("delivery_requested") else "optional_email_delivery")
+        if below_quorum:
+            # run chiusa: nessun lavoro residuo da offrire (ne' fasi, ne' artefatti, ne' consegna)
+            result.update(remaining_work=[], terminal_reason="committee_below_quorum")
         return result
 
     def worker_active(self):

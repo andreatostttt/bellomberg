@@ -1,50 +1,50 @@
+import type { CSSProperties, ReactNode } from 'react';
 import { t as tr } from '@/i18n/t';
 import { linguaCorrente, localeDi } from '@/i18n/lingua';
 /* ============================================================
-   F4 AGENTS LIVE v3 — "LA PLANCIA ORBITALE" (Opus 5, 26/07)
+   F4 AGENTI IN DIRETTA — la run del consigliere (redesign Nuova, 02/10/2026)
 
-   Impianto scelto dal PM sui mockup (mockup_f4_agents/opzione_2.html,
-   collaudato con qa.py alle tre inquadrature del suo 49"). La run del
-   comitato diventa un quadrante: un giro = la durata vera, mezzogiorno =
-   lo start, un'orbita per desk in ordine di accensione.
+   Stesso impianto della Dashboard e della Chat agenti (palette --bbn-*):
+     · box della run in alto: stato, durata, costo (n.d. dichiarato, «~» se
+       parziale), chiamate, avvio/stop, e le tappe Avvio → R0 → R1 → R2 →
+       Sintesi → Memo con la frase del presente;
+     · una card per desk (icona della Chat con l'anello di stato) che dice cosa
+       fa adesso, e la card del Capo con red team, riflessione e tabella azioni;
+     · a destra un pannello a schede: chiamate, costi, strumenti, ticker.
+   Il quadrante orbitale e il cielo animato non ci sono piu': i dati che
+   portavano (finestre, fasi, tool_log, cache, durate) stanno nelle tappe,
+   nelle card e nel pannello.
 
-   COSA CAMBIA RISPETTO ALLA VERSIONE PRECEDENTE (686 righe, non-v3).
-   Il payload di /agents/live consegnava — e la pagina buttava via:
-     · `duration_s`      10 durate per agente, mai rese da nessuna parte
-     · `cache_read/write` 1,33 M token riletti = 5,5x l'input fresco, mai resi
-     · i tempi del `tool_log`  stampati come testo, mai usati come TEMPO
-     · la struttura R0/R1/R2   resa come "R0" e mai aggregata
-     · gli `input` delle chiamate  troncati in cella: i ticker non si leggevano
-   Ora sono tutti in pagina.
-
-   TRE DIFETTI DI RESA CHIUSI, verificati sul payload vero:
-   1. la griglia mostrava "ROUNDS 0/3" su una run che aveva fatto 3 round,
-      perche' `reports_by_specialist` NON e' nel payload di una run chiusa.
-      I round ora si ricavano dal `tool_log`, che li porta davvero.
-   2. la stessa card diceva "ok" in alto (specialist_status = ha consegnato)
-      e "KO" in basso (usage.status = api_error): ora il verdetto e' UNO,
-      e vince il peggiore.
-   3. il totale mostrava 9,25 EUR senza dire in vetrina che 3,79 EUR (41%)
-      li avevano spesi due desk andati in api_error.
-
-   La logica di comando della run (avvio + conferma Lotto D, stop, watchdog)
-   e' quella di prima: non si tocca cio' che funziona.
+   La logica della run non cambia: avvio con RunConfirmDialog, polling di
+   /agents/live ogni 1,5 s, stop con cancel + reset + rilettura, heartbeat
+   illeggibile tenuto distinto da «nessuna run» (N7), un solo verdetto per
+   agente dove vince il peggiore, n.d. mai mostrato come zero.
    ============================================================ */
-import { useEffect, useLayoutEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useT } from '@/i18n/provider';
+import ModernPage from '@/components/ModernPage';
 import { leggiDetail } from '@/lib/quota';
 import { useNavigate } from 'react-router-dom';
-import { Bellomberg, AgentInfo, AgentsLiveState, EnginesInfo, UsageBySpecialist, UsageTotal } from '@/lib/api';
+import { Bellomberg, AgentInfo, AgentsLiveState, EnginesInfo, FilingActivateMissing, FilingOverview, UsageBySpecialist, UsageTotal } from '@/lib/api';
 import RunConfirmDialog from '@/components/RunConfirmDialog';
 import WeeklyRecoveryPanel from '@/components/WeeklyRecoveryPanel';
-import Quadrante from '@/components/Quadrante';
-import SkyCanvas from '@/components/SkyCanvas';
-import { Sigil } from '@/lib/Sigil';
+import { useInterfaceTheme } from '@/components/InterfaceThemeProvider';
 import { useBox } from '@/lib/useBox';
-import { derivePlancia, engineShort, fmtDurShort, fmtClock, type Plancia, type Desk } from '@/lib/plancia-data';
+import { derivePlancia, engineShort, fmtDurShort, type Desk } from '@/lib/plancia-data';
 import { conservaDettaglioRun, dettaglioLeggibile, statusHttp } from '@/lib/mandato';
-import { Play, Square, Radio, AlertCircle, Lightbulb } from 'lucide-react';
-import './agents-plancia.css';
+import { frase } from '@/lib/frase';
+import { Segmenti } from '@/components/nuova/Card';
+import { ArrowUpRight, Check, CircleAlert, FileText, Lightbulb, Play, Square, TriangleAlert, WifiOff } from 'lucide-react';
+import IconaDesk, { coloreDesk } from './chat/IconaDesk';
+import { AnelloDesk, Barra, CardCapo, CardDesk, Kpi, Tappe, type StatoDesk, type StatoRound, type Tappa, type VistaCapo, type VistaDesk } from './agents/VistaAgenti';
+import { parole } from './agents/parole';
+import CoperturaFiling, { mancantiFiling, type ErroreFiling } from './agents/CoperturaFiling';
+import { aggiornamentoInCorso, pollFiling } from '@/lib/filing-poll';
+import './agents-nuova.css';
+
+type SchedaPannello = 'chiamate' | 'strumenti' | 'ticker' | 'filing';
+/** iniziale maiuscola per le voci di catalogo scritte in minuscolo (frase() tocca solo il MAIUSCOLO) */
+const maiuscola = (s: string) => s ? s.charAt(0).toLocaleUpperCase() + s.slice(1) : s;
 
 const ACTIVE_RUN_KEY = 'bellomberg_active_run';
 const POLL_INTERVAL_MS = 1500;
@@ -150,29 +150,6 @@ export default function AgentsLive() {
   const [cursor, setCursor] = useState<number | null>(null);
   const [pinned, setPinned] = useState(false);
   const [dialRef, dialBox] = useBox<HTMLDivElement>();
-  /* La piastra di lettura si MISURA: le fasce delle etichette del quadrante
-     partono sotto il suo fondo vero, non sotto un numero scritto a mano (v.
-     BAND_L in Quadrante.tsx). Nessuna retroazione col ResizeObserver: la
-     piastra e' `position:absolute` e la sua altezza dipende solo da quanti
-     desk lavoravano al minuto puntato, non da dove finiscono le etichette.
-
-     ⚠️ QUI `useBox` NON VA BENE, e il primo tentativo e' fallito proprio cosi':
-     quel hook aggancia l'osservatore in un `useLayoutEffect` con dipendenze
-     `[]`, cioe' UNA VOLTA SOLA al montaggio della pagina. Il quadrante (.inst)
-     c'e' sempre e infatti funziona; questa piastra invece esiste solo quando
-     `P.ok` e' vero, cioe' NASCE DOPO, quando arrivano i dati — e a quel punto
-     l'effetto non gira piu' e la misura resta 0 per sempre. Il ref di stato
-     rifa' l'effetto quando l'elemento compare davvero. */
-  const [readEl, setReadEl] = useState<HTMLDivElement | null>(null);
-  const [readH, setReadH] = useState(0);
-  useLayoutEffect(() => {
-    if (!readEl) return;
-    const misura = () => setReadH(readEl.clientHeight);
-    misura();
-    const ro = new ResizeObserver(misura);
-    ro.observe(readEl);
-    return () => ro.disconnect();
-  }, [readEl]);
 
   useEffect(() => {
     Bellomberg.agentsList()
@@ -228,7 +205,12 @@ export default function AgentsLive() {
     return () => clearInterval(i);
   }, [state?.start_time, isRunning]);
 
-  const P = useMemo(() => derivePlancia(state, agents, engines, now), [state, agents, engines, now, tr]);
+  const P0 = useMemo(() => derivePlancia(state, agents, engines, now), [state, agents, engines, now, tr]);
+  /* Il tema non cambia i dati: i colori dei desk li normalizza IconaDesk
+     (coloreDesk), uguali in Chiaro e in Scuro. Il memo resta per non spostare
+     l'ordine degli hook. */
+  const dark = useInterfaceTheme().effective === 'dark';
+  const P = useMemo(() => P0, [P0, dark]);
 
   /* Il cursore: su una run VIVA insegue il presente; su una run chiusa parte
      dal minuto di massima attivita', che e' l'istante piu' informativo da
@@ -330,830 +312,492 @@ export default function AgentsLive() {
     }
   }, [state?.running, activeTaskId, stopNotice]);
 
+
+  /* ── presentazione (redesign 02/10/2026): quello che c'era sul quadrante sta
+     ora nelle tappe, nelle card dei desk e nel pannello a schede. Hook nuovi in
+     coda: i test i18n impostano lo stato per indice di useState. */
+  const [scheda, setScheda] = useState<SchedaPannello>('chiamate');
+  const [finitaQui, setFinitaQui] = useState(false);
+  const eraViva = useRef<boolean | null>(null);
+  useEffect(() => {
+    if (state?.running == null) return;
+    /* «completata» solo se la fine e' avvenuta sotto gli occhi del PM; aprire la
+       pagina su una run gia' chiusa la mostra a riposo, con l'ultima run */
+    if (eraViva.current === true && state.running === false) setFinitaQui(true);
+    if (state.running === true) setFinitaQui(false);
+    eraViva.current = state.running;
+  }, [state?.running]);
+
+  /* ── copertura filing (fase D, 03/10/2026): letta all'apertura e a fine run, quando
+     cambiano le novita'; l'attivazione in blocco rilegge subito e dopo 15 s, il tempo
+     dei primi confronti. Stato in coda: i test SSR seminano per indice. */
+  const [filing, setFiling] = useState<FilingOverview | null>(null);
+  const [filingErr, setFilingErr] = useState<ErroreFiling | null>(null);
+  const [filingBusy, setFilingBusy] = useState(false);
+  const [filingEsito, setFilingEsito] = useState<FilingActivateMissing | null>(null);
+  const montata = useRef(true);
+  useEffect(() => { montata.current = true; return () => { montata.current = false; }; }, []);
+  const caricaFiling = async () => {
+    try { const r = await Bellomberg.filingOverview(); if (montata.current) { setFiling(r); setFilingErr(null); } }
+    catch (e: any) { if (montata.current) setFilingErr({ stato: statusHttp(e), msg: dettaglioLeggibile(e) }); }
+  };
+  useEffect(() => { caricaFiling(); }, [isRunning]);
+  /* aggiornamento in corso (attivazione, controllo orario): rilettura ogni 10 s finche' dura */
+  const filingCorre = aggiornamentoInCorso(filing);
+  useEffect(() => pollFiling(filingCorre, () => { if (montata.current) caricaFiling(); }), [filingCorre]);
+  const attivaFiling = async () => {
+    setFilingBusy(true); setFilingEsito(null);
+    try {
+      const r = await Bellomberg.filingActivateMissing();
+      if (!montata.current) return;
+      setFilingEsito(r);
+      await caricaFiling();
+      if (r.attivati.length) setTimeout(() => { if (montata.current) caricaFiling(); }, 15000);
+    } catch (e: any) { if (montata.current) setFilingErr({ stato: statusHttp(e), msg: dettaglioLeggibile(e) }); }
+    finally { if (montata.current) setFilingBusy(false); }
+  };
+
   /* ── costi e buchi ──────────────────────────────────────────────────── */
   const total = state?.usage_total;
   const notes = costNotes(total, state?.usage_by_specialist);
   const hasTotal = total?.cost_eur != null;
   const partial = hasTotal && isPartial(total);
   const koIds = total?.error_agents || [];
-  const koCost = koIds.reduce((s, id) => s + (state?.usage_by_specialist?.[id]?.cost_eur || 0), 0);
-  const sumAgents = Object.values(state?.usage_by_specialist || {}).reduce((s, u) => s + (u.cost_eur || 0), 0);
-  const nDesk = P.desks.length || agents.filter(a => a.id !== 'capo').length;
+  // costo non dichiarato = n.d., mai 0 nella somma (08b S13, revisione G9b)
+  const costoNoto = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+  const koCostiNoti = koIds.map(id => state?.usage_by_specialist?.[id]?.cost_eur);
+  const koCost = koCostiNoti.every(costoNoto) ? koCostiNoti.reduce((s, v) => s + (v as number), 0) : null;
+  const costiAgenti = Object.values(state?.usage_by_specialist || {}).map(u => u.cost_eur);
+  const agentiSenzaCosto = costiAgenti.filter(v => !costoNoto(v)).length;
+  const sumAgents = costiAgenti.filter(costoNoto).reduce((s, v) => s + v, 0);
+  const koVisibile = koCost == null ? koIds.length > 0 : koCost > 0;
   const tutti = [...P.desks, ...P.pending, ...P.stages];
   const lavoro = tutti.reduce((s, d) => s + (d.dur || 0), 0);
   /* il numero esiste SOLO quando e' calcolabile (N2): a run viva la somma delle
      durate e' un minimo che cala con l'orologio, non un parallelismo */
   const par = P.parStato === 'calcolato' && P.runSec > 0 && lavoro > 0 ? lavoro / P.runSec : null;
 
-  const cur = cursor ?? 0;
-  const attivi = P.windows.filter(w => cur >= w.t0 && cur <= w.t1);
-  const fatte = P.calls.filter(c => c.t <= cur).length;
-  const fase = P.phases.find(p => cur >= p.t0 && cur <= p.t1);
-
-  /* ── chi lavora al minuto puntato (F45, blocco A) ─────────────────────────
-     Tre fonti, tutte dichiarate: le finestre (chiamate misurate, allungate al
-     presente se il desk e' `running`), i desk `running` senza finestra in
-     questo round, e il Capo (specialist_status.capo). Prima c'erano solo le
-     finestre: «nessun desk al lavoro» per la maggior parte della run (N1) e il
-     Capo che scriveva il memo invisibile (N10). */
-  /* la lancetta e' sul presente (a run viva il cursore ha un tetto: runSec) */
-  const alPresente = P.live && Math.abs(cur - P.runSec) <= 1.5;
-  const byId = (id: string) => tutti.find(x => x.id === id);
-  const righeDesk = attivi.map(w => {
-    const past = P.calls.filter(c => c.a === w.a && c.t <= cur);
-    const last = past[past.length - 1];
-    const ragiona = !!w.open && w.tCall != null && cur > w.tCall;
-    return { w, d: byId(w.a) as Desk, last, ragiona, da: ragiona ? cur - (w.tCall as number) : 0 };
-  }).filter(r => r.d);
-  /* i desk dichiarati in corsa SENZA finestra in questo round sono un fatto del
-     PRESENTE (specialist_status) e restano scritti anche a cursore inchiodato
-     nel passato — la riga dice «ora», cosi' non si confonde col minuto puntato
-     (review F45: inchiodare faceva sparire il desk e scrivere «attesa») */
-  const senzaFinestra: Desk[] = P.live
-    ? P.running.filter(id => !attivi.some(w => w.a === id)).map(byId).filter((d): d is Desk => !!d)
-    : [];
-  /* il Capo: dichiarato `running` -> si vede; se manca l'orario di partenza
-     (capoT) la durata e' n.d. dichiarato, non un Capo invisibile */
-  const capoScrive = P.live && P.capo === 'running' && (P.capoT == null || cur >= P.capoT);
-  const capoDesk = byId('capo');
-  const capoCol = capoDesk?.color ?? '#5A6685';     // lo stesso ripiego di derivePlancia (fuori roster)
-  const nDeskAlLavoro = righeDesk.length + senzaFinestra.length;
-  const nRighe = nDeskAlLavoro + (capoScrive ? 1 : 0);
-  const statoLettura = !P.live ? 'idle'
-    : capoScrive ? 'capo'
-    : (righeDesk.some(r => r.ragiona) || senzaFinestra.length) ? 'ragionano'
-    : nRighe ? 'chiamate' : 'attesa';
-  const faseLabel = capoScrive ? tr('activity.synthesisHead')
-    : fase ? phaseText(fase.k) + (fase.open ? tr('activity.progressSuffix') : '')
-    : (P.live && P.round != null ? `R${P.round}` : tr('activity.waiting'));
-  /* la piastra vuota dice cosa c'e', non una causa inventata: nella coda di una
-     run chiusa e' la catena di sintesi; prima della prima chiamata e' l'avvio;
-     fra due fasi misurate e' il buco fra le due; altrimenti solo il fatto */
-  const primaChiamata = P.calls.length ? P.calls[0].t : 0;
-  const faseprima = [...P.phases].reverse().find(p => p.t1 < cur);
-  const fasedopo = P.phases.find(p => p.t0 > cur);
-  const fraseVuota = fase?.k === 'SINTESI'
-    ? tr('activity.synthesisNoTools')
-    : cur < primaChiamata ? tr('activity.startingNoTools')
-    : faseprima && fasedopo ? tr('activity.betweenPhases', {a: phaseText(faseprima.k), b: phaseText(fasedopo.k)})
-    : P.live && alPresente ? tr('activity.noneRunning')
-    : tr('activity.noToolAtMinute');
-  /* heartbeat fermo (>600 s, stale_warning del backend): «ragiona da X» e «scrive
-     da X» sarebbero inferenze da uno stato che nessuno conferma piu' — si scrive
-     il fatto: dichiarato, e fermo da quanto.
-     review 31/08: a heartbeat ILLEGGIBILE persistente il backend non puo' piu'
-     consegnare stale_warning (risponde la forma read-error, che la guardia N7
-     scarta): oltre la STESSA soglia (600 s, bellomberg_api) il fermo lo misura
-     il client, con la stessa grandezza (now - updated_at) — altrimenti «ragiona
-     da X» crescerebbe per sempre su uno stato che nessuno conferma. */
+  /* heartbeat fermo (>600 s, stale_warning del backend) o illeggibile oltre la
+     stessa soglia: «ragiona da X» sarebbe un'inferenza da uno stato che nessuno
+     conferma piu' — si scrive il fatto: dichiarato, e fermo da quanto. */
   const hbIllDur = hbIll ? Math.max(0, (hbIll.al - hbIll.da) / 1000) : null;
   const hbIllLungo = hbIllDur != null && hbIllDur > 600;
-  const fermoDa = (P.stale || hbIllLungo) && state?.updated_at
+  const fermoDa = isRunning && (P.stale || hbIllLungo) && state?.updated_at
     ? Math.max(0, (now - new Date(state.updated_at).getTime()) / 1000) : null;
   const hhmm = (iso?: string) => iso ? new Date(iso).toLocaleTimeString(localeDi(linguaCorrente()),
     { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : tr('activity.unavailable');
+  const ora = (iso?: string) => iso ? new Date(iso).toLocaleTimeString(localeDi(linguaCorrente()),
+    { hour: '2-digit', minute: '2-digit' }) : tr('activity.unavailable');
+  const giorno = (iso?: string) => iso ? new Date(iso).toLocaleDateString(localeDi(linguaCorrente()),
+    { day: 'numeric', month: 'short' }) : tr('activity.unavailable');
 
-  /* le griglie dense ricevono il conteggio righe: con grid-auto-flow:column
-     una riga in meno significa una COLONNA in piu' fuori dal box, cioe' un
-     troncamento zitto (agents-plancia.css §10 e §12) */
-  const vars = {
-    ['--f4attr2' as any]: Math.max(1, Math.ceil(P.tools.length / 2)),
-    ['--f4attr1' as any]: Math.max(1, P.tools.length),
-    ['--f4logr' as any]: Math.max(1, Math.ceil(P.calls.length / 3)),
-    /* quante righe ha la ripartizione per agente di ECONOMIA: agli schermi
-       larghi-e-bassi il pannello vive in fascia bassa e la riga della griglia
-       deve conoscere IL SUO appetito, non solo quello degli strumenti — a run
-       viva con pochi tool la riga si accorciava e amputava il pannello
-       (misurato dal cancello: 4px visibili su 66) */
-    ['--f4peco' as any]: Math.max(1, tutti.length),
-  } as React.CSSProperties;
-
-  return (
-    /* `obsx` porta il vestito comune (.p3 .p3h .tick .chip .ld .tb): senza,
-       i pannelli non hanno ne' cornice ne' testata e le due meta' dell'header
-       finiscono una sull'altra. Stessa firma di F5 (.obsx .f5p) e F3 (.obsx .f3d). */
-    <div className="obsx f4p animate-fadeIn" style={vars}>
-
-      {/* ══ BARRA DI ASSETTO ══════════════════════════════════════════ */}
-      <div className="asst">
-        <span className="tick tl" /><span className="tick tr" />
-        <span className="tick bl" /><span className="tick br" />
-
-        <div className="id">
-          <Radio size={12} className={isRunning ? 'okc' : 'dim'} />
-          <span className="t">{tr('activity.pageTitle')}</span>
-          <span className={'chip ' + (isRunning ? 'g' : 'n')}>
-            {/* a state null con heartbeat illeggibile, «IDLE — NESSUNA RUN IN
-               CORSO» sarebbe un'affermazione senza alcun payload fidato: una
-               run puo' essere viva dietro il file illeggibile (review 31/08) */}
-            {!state ? tr(hbIll ? 'activity.stateUnreadable' : 'activity.stateMissing')
-              : isRunning ? tr('activity.runInProgress') : tr('activity.idle')}
-          </span>
-        </div>
-
-        {liveErr ? (
-          <div className="cell"><span className="k">heartbeat</span>
-            <span className="v sm ko">{tr('activity.heartbeatNoResponse')}</span>
-            <span className="s">{liveErr}</span></div>
-        ) : !state ? (
-          <div className="cell"><span className="k">heartbeat</span>
-            {hbIll
-              ? <><span className="v sm ko">{tr('activity.unreadableFromFirstPoll')}</span>
-                  <span className="s">{tr('activity.endpointRespondsFileUnreadable')}</span></>
-              : <span className="v sm nd">{tr('activity.querying')}</span>}</div>
-        ) : (
-          <>
-            <div className="cell">
-              <span className="k">{isRunning ? tr('activity.currentCommitteeRun') : tr('activity.lastCommitteeRun')}</span>
-              <span className="v sm">
-                {state.start_time
-                  ? new Date(state.start_time).toLocaleDateString(localeDi(linguaCorrente()),
-                      { day: '2-digit', month: 'short', year: 'numeric' }).toUpperCase()
-                  : <span className="nd">{tr('activity.unavailable')}</span>}
-                <span className="dim"> · </span>{hhmm(state.start_time)}
-                <span className="dim"> → </span>{isRunning ? tr('activity.inProgress') : hhmm(state.completed_at)}
-              </span>
-              <span className="s">{tr(state.language === 'it' ? 'activity.originalRunIt'
-                : state.language === 'en' ? 'activity.originalRunEn' : 'activity.originalRunUnknown')}</span>
-            </div>
-            <div className="cell">
-              <span className="k">{tr('activity.duration')}</span>
-              <span className="v num">{fmtDurShort(isRunning ? elapsed : P.runSec)}</span>
-              <span className="s">
-                {lavoro > 0
-                  ? tr('activity.workVsClock', {a: fmtDurShort(lavoro), b: fmtDurShort(isRunning ? elapsed : P.runSec)})
-                  : tr('activity.durationMissing')}
-              </span>
-            </div>
-            <div className="cell">
-              <span className="k">{tr('activity.tools')}</span>
-              {/* review 31/08: a tappato senza totale (o con un totale sotto le
-                 righe del log: contratto violato, P.nCallsTot lo scarta) il
-                 numero grande e' un n.d. dichiarato, non calls.length spacciato */}
-              <span className="v num">{P.logTappato && P.nCallsTot == null
-                ? <span className="nd">{tr('activity.unavailable')}</span>
-                : (P.nCallsTot ?? P.calls.length)}</span>
-              {/* a log tappato la riga si RISCRIVE corta invece di allungarsi:
-                  la versione lunga faceva collidere tre celle della testata
-                  (misurato dal cancello: 3 sovrapposizioni a terzo) */}
-              <span className="s">{P.logTappato
-                ? <>{P.nToolsDistinct} {tr('activity.toolsRecentPrefix')} {P.tickers.length} {tr('activity.tickersRecentPrefix')} {P.calls.length} {tr('activity.received')}</>
-                : <>{P.nToolsDistinct} {tr('activity.distinctToolsPrefix')} {P.tickers.length} {tr('activity.tickersTouchedShort')}</>}</span>
-            </div>
-            <div className="cell">
-              <span className="k">{tr('activity.tokensTouched')}</span>
-              <span className="v num">
-                {total ? fmtTok([total.in, total.out, total.cache_read, total.cache_write].every(v => v != null)
-                  ? total.in! + total.out! + total.cache_read! + total.cache_write! : null)
-                       : <span className="nd">{tr('activity.unavailable')}</span>}
-              </span>
-              <span className="s">
-                {total?.cache_read && total?.in
-                  ? tr('activity.cacheMultiple', {a: fmtTok(total.cache_read), b: fmtN(total.cache_read / total.in, 1)})
-                  : tr('activity.cacheMissing')}
-              </span>
-            </div>
-            <div className="cell">
-              <span className="k">{tr('activity.runCost')}</span>
-              <span className={'v num ' + (!hasTotal || partial || notes.length ? 'amc' : 'cyc')}>
-                {(partial ? '~' : '') + fmtEur(total?.cost_eur)}
-              </span>
-              <span className="s">
-                {/* campo assente e 'n.d.' dichiarato dal backend sono lo STESSO buco (v. costNotes) */}
-                FX USD/EUR <b className={total?.fx_source === 'live' ? 'okc' : 'amc'}>{total?.fx_source == null || total.fx_source === 'n.d.' ? tr('activity.unavailable') : total.fx_source}</b>
-                {' · '}{!hasTotal ? tr('activity.totalCostMissing') : partial ? tr('activity.partialTotalShort') : tr('activity.notPartialTotal')}
-              </span>
-            </div>
-            <div className="cell qcell">
-              <span className="k">{tr('activity.memoProduced')}</span>
-              <span className="v num">{state.memo_id != null ? '#' + state.memo_id : <span className="nd">{tr('activity.unavailable')}</span>}</span>
-              <span className="s">{state.memo_id != null ? tr('activity.savedDb') : tr('activity.noMemo')}</span>
-            </div>
-          </>
-        )}
-
-        <div className="grow" />
-        <button className="go" onClick={() => navigate('/agents/trade-idea')}><Lightbulb size={11} /> {tr('tradeidea.openTradeIdea')}</button>
-        {isRunning ? (
-          <button className="go stop" onClick={stopRun} disabled={stopping}
-            title={activeTaskId ? tr('activity.stopTask', {a: activeTaskId}) : tr('activity.noTrackedTask')}>
-            <Square size={10} fill="currentColor" />{stopping ? tr('activity.stopping') : tr('activity.stopRun')}
-          </button>
-        ) : (
-          <button className="go" onClick={() => setAskRun(true)}><Play size={11} /> {tr('activity.launchRun')}</button>
-        )}
-        <RunConfirmDialog open={askRun}
-          onConfirm={() => { setAskRun(false); triggerRun(); }}
-          onCancel={() => setAskRun(false)} />
-      </div>
-
-      {/* ══ I BUCHI IN VETRINA, non nei tooltip (regola PM 14/07) ═════ */}
-      <WeeklyRecoveryPanel disabled={isRunning} onStarted={tid => {
-        try { localStorage.setItem(ACTIVE_RUN_KEY, tid); } catch {}
-        setActiveTaskId(tid); setTriggerMsg({ kind: 'active', id: tid }); setStopNotice(null);
-        setState(prev => ({ ...(prev || {}), running: true, start_time: new Date().toISOString(),
-          message: tr('tradeidea.recoveryBusy') } as AgentsLiveState));
-      }} />
-      {triggerMsg && <div className="warn"><span>{triggerMsg.kind === 'starting' ? tr('activity.starting')
-        : tr('activity.runActiveEstimate', { a: triggerMsg.id ?? tr('activity.unavailable') })}</span></div>}
-      {stopNotice && <div className="warn" role="status">
-        <b>{tr(stopNotice.running === false ? 'activity.stopObservedIdle' : 'activity.stopUnconfirmed')}</b>
-        {stopNotice.issues.map((issue, i) => <span key={i}>{issue.source} — {issue.detail || tr('activity.errorNotDescribed')}</span>)}
-      </div>}
-      {isRunning && (state?.stale_warning || hbIllLungo) && (
-        <div className="warn ko"><AlertCircle size={11} />
-          <b>{tr('activity.possiblyStuck')}</b>
-          {/* review 31/08: a poll illeggibile `stale_seconds` resta CONGELATO
-             all'ultimo payload buono mentre l'orologio avanza — vince la misura
-             che cresce (now - updated_at), la stessa che il backend farebbe */}
-          <span>{tr('activity.heartbeatStaleFor')} {Math.max(1, Math.floor(Math.max(state?.stale_seconds || 0, fermoDa || 0) / 60))} {tr('activity.stuckAction')}</span>
-          {/* mentre il Capo genera il memo nessuno scrive l'heartbeat: il 26/08 e' stato
-              fermo 7'20" a run sana. Un consiglio di FERMARE senza dirlo costerebbe il memo. */}
-          {P.capo === 'running' && (
-            <span>{tr('activity.capoHeartbeatNote')}</span>
-          )}
-        </div>
-      )}
-      {hbIll && (
-        /* N7: il buco in vetrina, con la DURATA, e senza affermare uno «stato
-           buono» che a state null non e' mai esistito (review 31/08) */
-        <div className="warn"><AlertCircle size={11} />
-          <b>{tr('activity.heartbeatUnreadableUpper')}{hbIllDur != null && hbIllDur >= 3 ? tr('activity.unreadableSince', {a: fmtDurShort(hbIllDur)}) : tr('activity.unreadableNow')}</b>
-          <span>{tr('activity.unreadableMessagePrefix')}{hbIll.msg ?? tr('activity.unreadableHeartbeat')}{tr('activity.unreadableMessageSuffix')}{state
-            ? <>{tr('activity.lastGoodState')}{state.updated_at ? tr('activity.heartbeatTime', {a: hhmm(state.updated_at)}) : ''}</>
-            : <>{tr('activity.noneSinceOpen')}</>} {tr('activity.retryCadence')}</span>
-        </div>
-      )}
-      {koIds.length > 0 && (
-        <div className="warn">
-          <span className="ld r" />
-          <b>{tr(koIds.length === 1 ? 'activity.desksApiFailedOne' : 'activity.desksApiFailedMany', {a: koIds.length, b: nDesk})}</b>
-          <span className="dim">·</span>
-          <span>{koIds.join(tr('movements.and'))} {tr(koIds.length === 1 ? 'activity.declareOne' : 'activity.declare')} <b>status api_error</b> {tr(koIds.length === 1 ? 'activity.reportAnywayOne' : 'activity.reportAnyway')}</span>
-          <span className="dim">·</span>
-          <span>{tr('activity.withinTotalPrefix')} {fmtEur(total?.cost_eur)} {tr('activity.include')} <b>{fmtEur(koCost)}</b>
-            {total?.cost_eur ? ` (${fmtN(koCost / total.cost_eur * 100, 0)}%)` : ''} {tr(koIds.length === 1 ? 'activity.spentByThemOne' : 'activity.spentByThem')}</span>
-          <span className="dim">{tr('activity.errorAgentsField')}</span>
-        </div>
-      )}
-      {notes.length > 0 && <div className="warn"><AlertCircle size={11} /><span>{notes.join(' — ')}</span></div>}
-      {rosterErr && (
-        <div className="warn ko"><AlertCircle size={11} />
-          <b>{tr('activity.rosterMissing')}</b>
-          <span>{tr('activity.rosterErrorPrefix')}{rosterErr}{tr('activity.rosterErrorSuffix')}</span>
-        </div>
-      )}
-
-      {/* ══ LA PLANCIA ════════════════════════════════════════════════ */}
-      <div className="plancia">
-
-        {/* ── lo strumento ───────────────────────────────────────────── */}
-        <div className="p3 strum iw">
-            <span className="tick tl" /><span className="tick tr" />
-            <span className="tick bl" /><span className="tick br" />
-            <div className="p3h am">
-              <span>{tr('activity.orbitalDashboard')}</span>
-              <span className="side">
-                {P.ok ? tr('activity.dialNote', {a: P.scaleNote, b: P.desks.length, c: P.logTappato ? tr('activity.fromLog') : ''})
-                      : tr('activity.noDial')}
-              </span>
-              <div className="instbar">
-                <span className="k">{tr('activity.cursor')}</span>
-                <button className="tb" onClick={() => setPinned(v => !v)}>
-                  {pinned ? tr('activity.pinned') : tr('activity.followMouse')}
-                </button>
-                <span className="sep" />
-                <span className="k">{fmtClock(cur)}</span>
-              </div>
-            </div>
-            <div className="p3b">
-              <div className="skywrap"><SkyCanvas /></div>
-              <div className="scanline" />
-              <div className={'inst' + (isRunning ? ' live' : '')} ref={dialRef}>
-                {P.ok ? (
-                  <Quadrante p={P} w={dialBox.w} h={dialBox.h} cursor={cur} pinned={pinned}
-                    onCursor={setCursor} onPin={() => setPinned(v => !v)}
-                    koIds={koIds} fmtEur={fmtEur}
-                    costoRun={total?.cost_eur} koCost={koCost}
-                    /* `top:12px` della piastra (agents-plancia.css) + la sua
-                       altezza misurata, nella stessa origine su cui disegna
-                       l'SVG. ⚠️ `clientHeight` NON comprende i due bordi da 1px:
-                       il fondo vero e' 2px piu' in basso, e l'aria di 10px sotto
-                       li assorbe. 0 finche' non e' stata misurata. */
-                    readBottom={readH ? 12 + readH : 0}
-                    memoLabel={state?.memo_id != null ? `memo #${state.memo_id}` : tr('activity.noMemo')} />
-                ) : (
-                  <div className="buco ko">
-                    <span className="t">{tr('activity.undrawableDial')}</span>
-                    {/* review 31/08: con hbIll e state null, P.reason direbbe
-                       «/agents/live non risponde» — ma l'endpoint HA risposto */}
-                    <span className="s">{!state && hbIll
-                      ? tr('activity.noReadableState')
-                      : P.reason || tr('activity.insufficientData')}</span>
-                    <span className="s dim">
-                      {tr('activity.noFakeDial')}
-                    </span>
-                  </div>
-                )}
-              </div>
-              <div className="glassx" />
-              <div className="hudframe"><i className="tl" /><i className="tr" /><i className="bl" /><i className="br" /></div>
-
-              {P.ok && (
-                <>
-                  {/* lettura: chi lavorava all'istante puntato */}
-                  <div className="readout hudplate" ref={setReadEl}
-                    data-zona="lettura" data-stato={statoLettura} data-capo={P.capo ?? 'assente'}
-                    data-n={nRighe} data-heartbeat={P.stale ? 'fermo' : 'ok'}>
-                    <div className="rh">
-                      <span>{tr('activity.minute')} {fmtClock(cur)}</span>
-                      <span>{faseLabel}</span>
-                      {/* ALLE ALTEZZE CORTE il piede della piastra sparisce (v. la
-                          media query in agents-plancia.css), perche' altrimenti la
-                          piastra copre il box OPTIONS FLOW: misurato 198x54px, il
-                          100% di quel box. Ma il piede porta un dato che non sta
-                          in nessun altro punto della pagina — quante chiamate
-                          erano FATTE al minuto puntato — e un dato non si
-                          cancella per far passare un collaudo. Quindi risale qui,
-                          in forma compatta, e si vede SOLO quando il piede non
-                          c'e': il css lo tiene nascosto sopra i 1000px, dove il
-                          piede lo dice per esteso. Nessuna duplicazione a schermo. */}
-                      <span className="corta">{fatte}/{P.calls.length}{P.logTappato ? tr('activity.receivedAbbrev') : ''}</span>
-                      <span className="pin">{pinned ? tr('activity.pinned') : tr('activity.clickPin')}</span>
-                    </div>
-                    <div className="rb">
-                      {nRighe === 0 ? (
-                        <div className="rr nd">{fraseVuota}</div>
-                      ) : (
-                        <>
-                          {righeDesk.map(({ w, d, last, ragiona, da }) => (
-                            <div className={'rr' + (ragiona ? ' rag' : '')} key={w.a}>
-                              <svg width={11} height={11} viewBox="-7 -7 14 14"><Sigil id={d.id} color={d.color} size={11} /></svg>
-                              <span className="nm" style={{ color: d.color }}>{d.name.toUpperCase()}</span>
-                              <span className={'st ' + (ragiona ? (P.stale ? 'ko' : 'amc') : 'cyc')}
-                                title={ragiona ? tr('activity.thinkingAfterTool', {a: fmtDurShort(da), b: last ? last.tool : '—'}) : undefined}>
-                                {ragiona
-                                  ? (fermoDa != null
-                                      ? tr('activity.runningStale', {a: fmtDurShort(fermoDa)})
-                                      : tr('activity.thinkingLast', {a: fmtDurShort(da), b: last ? last.tool : '—'}))
-                                  : (last ? last.tool : '—')}
-                              </span>
-                            </div>
-                          ))}
-                          {senzaFinestra.map(d => (
-                            <div className="rr rag" key={d.id}>
-                              <svg width={11} height={11} viewBox="-7 -7 14 14"><Sigil id={d.id} color={d.color} size={11} /></svg>
-                              <span className="nm" style={{ color: d.color }}>{d.name.toUpperCase()}</span>
-                              {/* UN solo nodo di testo, corto: la cella `.st` e' a ellissi e un
-                                  secondo nodo finiva tagliato fuori vista (misurato: 1,6:1) */}
-                              {/* «nel log»: a run viva il log ricevuto sono le ultime 50 righe (N8),
-                                  quindi lo zero non e' una misura e non si scrive come tale */}
-                              <span className={'st ' + (P.stale ? 'ko' : 'amc')}
-                                title={tr('activity.runningNoLog', {a: P.round != null ? tr('activity.inRound', {a: P.round}) : ''})}>
-                                {fermoDa != null
-                                  ? tr('activity.runningStale', {a: fmtDurShort(fermoDa)})
-                                  : tr('activity.noCallsRound', {a: alPresente ? tr('activity.thinking') : tr('activity.runningNow'), b: P.round != null ? tr('activity.inRound', {a: P.round}) : ''})}
-                              </span>
-                            </div>
-                          ))}
-                          {capoScrive && (
-                            <div className="rr capo">
-                              <svg width={11} height={11} viewBox="-7 -7 14 14"><Sigil id="capo" color={capoCol} size={11} /></svg>
-                              <span className="nm" style={{ color: capoCol }}>CAPO</span>
-                              <span className={'st ' + (P.stale ? 'ko' : 'amc')}
-                                title={P.capoT != null
-                                  ? tr('activity.capoStart', {a: hhmm(state?.updated_at)})
-                                  : tr('activity.capoStartMissing')}>
-                                {fermoDa != null
-                                  ? tr('activity.writingStale', {a: fmtDurShort(fermoDa)})
-                                  : tr('activity.writingMemoSince', {a: state?.memo_id != null ? ` #${state.memo_id}` : '', b: P.capoT != null ? fmtDurShort(Math.max(0, Math.min(cur, P.runSec) - P.capoT)) : tr('activity.updatedAtMissing')})}
-                              </span>
-                            </div>
-                          )}
-                        </>
-                      )}
-                      <div className="ft">
-                        <b>{fatte}</b> {tr(fatte === 1 ? 'activity.callsDoneOutOfOne' : 'activity.callsDoneOutOf')} {P.calls.length}
-                        {/* il tappo lo DICE il backend (tool_log_tappato); la
-                            disuguaglianza copre un backend NUOVO col flag perso.
-                            Il backend VECCHIO non dichiara nulla (review 31/08):
-                            a run viva col log esattamente al tetto (50) il
-                            totale e' ignoto e si dichiara il dubbio, non «100%» */}
-                        {(P.logTappato || (P.nCallsTot != null && P.nCallsTot > P.calls.length))
-                          ? <> {tr('activity.receivedLatest')}{P.nCallsTot != null ? tr('activity.ofTotal', {a: P.nCallsTot}) : tr('activity.unknownTotal')})</>
-                          : P.live && P.nCallsTot == null && P.calls.length === 50
-                          ? <> {tr('activity.logCapUnknown')}</>
-                          : (P.calls.length > 0 ? ` (${fmtN(fatte / P.calls.length * 100, 0)}%)` : '')}
-                        {' · '}<b>{nDeskAlLavoro}</b> {tr(nDeskAlLavoro === 1 ? 'activity.desksWorkingOne' : 'activity.desksWorking')}
-                        {capoScrive && P.capoT != null && <> {tr('activity.capoSinceHeartbeat')} {hhmm(state?.updated_at)}</>}
-                        {fase && <> {tr('activity.phasePrefix')} <b>{phaseText(fase.k)}</b> {fmtClock(fase.t0)}→{fase.open ? tr('activity.inProgress') : fmtClock(fase.t1)}</>}
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* il fatto della run, in vetrina */}
-                  <div className="par hudplate" data-zona="parallelismo" data-par={P.parStato}>
-                    <div className="k">{tr('activity.parallelismFact')}</div>
-                    {P.parStato === 'parziale' ? (
-                      /* N2: a run viva la somma delle durate e' un minimo che cala con
-                         l'orologio (0,68x -> 0,44x col solo passare del tempo): non e'
-                         un parallelismo, e la piastra lo dice con i numeri */
-                      <div className="s nd">
-                        {tr('activity.notCalculable')} {P.durDeclared < P.agentsKnown
-                          ? <><b>{P.durDeclared} {tr('activity.agentsOutOf')} {P.agentsKnown}</b> {tr('activity.durationDeclared')}</>
-                          : <><b>{P.agentsKnown}</b> {tr('activity.agentsWithDuration')} {P.running.length + (P.capo === 'running' ? 1 : 0)} {tr('activity.stillRunningPartial')}</>}
-                        {P.live
-                          ? <>{' — '}{tr('activity.calculateWhenFinished')} {fmtDurShort(lavoro)} {tr('activity.workIn')} {fmtDurShort(P.runSec)} {tr('activity.elapsedTime')}</>
-                          : <>{' — '}{tr('activity.closedMissingDuration')}{fmtDurShort(lavoro)} {tr('activity.declaredWorkIn')} {fmtDurShort(P.runSec)})</>}
-                      </div>
-                    ) : par == null ? (
-                      <div className="s nd">{tr('activity.durationMissingParallelism')}</div>
-                    ) : (
-                      <>
-                        <div className="v"><b>{fmtN(par, 2)}×</b>
-                          <span>{fmtDurShort(lavoro)} {tr('activity.agentWorkWithin')} {fmtDurShort(P.runSec)} {tr('activity.elapsedTime')}</span></div>
-                        <div className="s">
-                          {/* #1 (28/07): la frase era scritta senza condizione, e a 0,44x
-                              diceva «supera l'orologio» — falso. Vera solo per par > 1. */}
-                          {par > 1
-                            ? <>{tr('activity.orbitsSubject')} <u>{tr('activity.overlap')}</u>{tr('activity.durationSumBy')}
-                                {' '}{P.agentsKnown} {tr('activity.exceedsClock')}</>
-                            : P.sovrapposte
-                            ? <>{tr('activity.someOverlap')}
-                                {' '}<u>{tr('activity.atTimes')}</u>{tr('activity.partlyTogether')}</>
-                            : <>{tr('activity.noOverlapPrefix')} <u>{tr('activity.not')}</u> {tr('activity.sequential')}</>}
-                        </div>
-                      </>
-                    )}
-                  </div>
-
-                  {/* ⚠️ LE DUE PIASTRE IN BASSO SONO STATE TOLTE — ordine PM 28/07:
-                      «leviamo i due box in basso, tra cui quello che copre crypto,
-                      ci sono scritte dentro cose inutili sul tempo e cosi' via».
-                      Erano `.legend` (basso-sx, 5 righe di spiegazione dei simboli)
-                      e `.scale` (basso-dx, cosa vale un giro/una tacca/il raggio).
-
-                      MISURATO PRIMA DI TOGLIERLE, perche' una piastra che porta un
-                      dato unico non si cancella: NESSUN numero e' andato perso.
-                        · «260 chiamate» -> intestazione STRUMENTI (riga 317), piu'
-                          le righe 464, 685, 777;
-                        · «1 giro = 50'01"» -> intestazione DURATA, righe 480 e 555;
-                        · «4 stadi di sintesi, durata si' orario no» -> righe 483,
-                          554 e la tabella agenti (675);
-                        · «coda SINTESI 40:19->50:01» -> riga 567 («dal minuto 40'
-                          nessuna chiamata: gira la catena di sintesi») E l'etichetta
-                          disegnata sul quadrante.
-                      Tutto il resto era spiegazione dei simboli, non dato.
-
-                      E il difetto che il PM ha visto e' MISURATO: a s150 (3413x960,
-                      il suo schermo con Windows al 150%) il cancello trovava 27
-                      scatole sovrapposte, con `div.scale.hudplate` sopra una piastra
-                      del quadrante. A schermo intero erano 0: il difetto viveva solo
-                      alla sua scala, ed e' la ragione per cui non era mai emerso. */}
-                </>
-              )}
-            </div>
-        </div>
-
-        {/* Ogni pannello e' una CELLA della griglia, non un figlio di una
-            colonna: cosi' ognuno puo' cambiare posto e misura a ogni
-            inquadratura senza toccare il DOM, e nessuno deve scorrere
-            dentro se stesso per far stare il contenuto (ordine PM). */}
-        <PannelloParallelismo P={P} par={par} lavoro={lavoro} />
-        <PannelloEconomia P={P} total={total} sumAgents={sumAgents} koCost={koCost} koIds={koIds} />
-        <PannelloCifre P={P} engines={engines} koIds={koIds} total={total} />
-        <PannelloStrumenti P={P} fatte={fatte} cur={cur} />
-        <PannelloTicker P={P} />
-        <PannelloNastro P={P} cur={cur} />
-      </div>
-    </div>
-  );
-}
-
-/* ══════════════════════════════════════════════════════════════════════
-   PANNELLI
-   ══════════════════════════════════════════════════════════════════════ */
-
-function PannelloParallelismo({ P, par, lavoro }: { P: Plancia; par: number | null; lavoro: number }) {
-  const tr = useT();
-  const bins = useMemo(() => {
-    const M = Math.max(1, Math.ceil(P.runSec / 60));
-    return Array.from({ length: M }, (_, m) => {
-      const t = m * 60 + 30;
-      return P.windows.filter(w => t >= w.t0 && t <= w.t1).length;
-    });
-  }, [P.runSec, P.windows]);
-  const mx = Math.max(1, ...bins);
-  const peak = bins.indexOf(mx);
+  /* ── i desk del comitato: in ordine di roster, cosi' le card non saltano ── */
+  const isStage = (id: string) => id === 'capo' || id.startsWith('_');
+  const byId = (id: string) => tutti.find(x => x.id === id);
+  const ordine = new Map(agents.map((a, i) => [a.id, i]));
+  const deskDellaRun = [...P.desks, ...P.pending].filter(d => !isStage(d.id));
+  const deskElenco: Desk[] = (deskDellaRun.length ? deskDellaRun : agents.filter(a => !isStage(a.id)).map(a => ({
+    id: a.id, name: a.name, role: a.role, color: a.color, onGrid: true, dur: null, apiCalls: 0, cost: null,
+    tin: null, tout: null, cacheR: null, cacheW: null, nCalls: 0, nTools: 0, rounds: [], obs0: null, obs1: null,
+  }))).slice().sort((a, b) => (ordine.get(a.id) ?? 999) - (ordine.get(b.id) ?? 999) || a.name.localeCompare(b.name));
+  const rosterDi = (id: string) => agents.find(a => a.id === id);
+  const nomeDi = (d: Pick<Desk, 'id' | 'name'>) => frase(rosterDi(d.id)?.name || d.name);
+  const coloreDi = (id: string) => rosterDi(id)?.color || byId(id)?.color || null;
+  const nDesk = deskElenco.length;
+  const r2 = state?.r2_specialists;
+  const pulisci = (input: string) => input === '{}' ? '' : input.replace(/[{}']/g, '').trim();
 
   return (
-    <div className="p3 ppar">
-      <span className="tick tl" /><span className="tick br" />
-      <div className="p3h"><span>{tr('activity.parallelism')}</span><span className="side">{tr('activity.desksPerMinute')}</span></div>
-      <div className="p3b parw">
-        {par == null ? (
-          <div className="buco"><span className="t">{tr('activity.unavailable')}</span>
-            <span className="s">
-              {P.parStato === 'parziale'
-                ? <>{P.durDeclared < P.agentsKnown
-                      ? <><b>{P.durDeclared} {tr('activity.agentsOutOf')} {P.agentsKnown}</b> {tr('activity.durationDeclared')}</>
-                      : <><b>{P.agentsKnown}</b> {tr('activity.agentsWithDuration')} {P.running.length + (P.capo === 'running' ? 1 : 0)} {tr('activity.stillRunningPartial')}</>}
-                    {P.live
-                      ? <>{tr('activity.parallelismWhenFinished')} <b>{fmtDurShort(lavoro)}</b> {tr('activity.workIn')} <b>{fmtDurShort(P.runSec)}</b> {tr('activity.elapsedTime')}</>
-                      : <>{tr('activity.closedMissingDurations')} <b>{fmtDurShort(lavoro)}</b> {tr('activity.declaredWorkIn')} <b>{fmtDurShort(P.runSec)}</b></>}</>
-                : <>{tr('activity.payloadMissing')} <b>duration_s</b> {tr('activity.durationPerAgentMissing')}</>}
-            </span></div>
-        ) : (
-          <>
-            <div className="bignum num">{fmtN(par, 2)}×</div>
-            <div className="bigsub">
-              <b>{fmtDurShort(lavoro)}</b> {tr('activity.workReportedBy')} {P.agentsKnown} {tr('activity.agentsWithin')} <b>{fmtDurShort(P.runSec)}</b> {tr('activity.elapsedTimeSentence')}
-              {par > 1
-                ? <> {tr('activity.overlapDial')}</>
-                : P.sovrapposte
-                ? <> {tr('activity.partialOverlapSentence')}</>
-                : <> {tr('activity.sequentialSentence')}</>}
-            </div>
-            <div className="simplot">
-              {bins.map((n, m) => (
-                <u key={m} title={tr('activity.minuteDesks', {a: m, b: n})}
-                  style={{ height: `${(n / mx * 100).toFixed(1)}%`, background: n === mx ? '#FFA51E' : undefined }} />
-              ))}
-            </div>
-            <div className="simax"><span>0'</span><span>{Math.round(P.runSec / 60)}'</span></div>
-            <div className="simfoot">
-              {tr('activity.peak')} <b>{mx} {tr('activity.desksTogether')}</b> {tr('activity.atMinute')} {peak}'.
-              {P.phases.some(p => p.k === 'SINTESI') && <> {tr('activity.fromMinute')} {Math.round(P.lastCallT / 60)}{tr('activity.synthesisFromMinute')} <b>{tr('activity.noTimestamps')}</b> {tr('activity.inPayload')}</>}
-            </div>
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
+    <>
+    <ModernPage page="agents" render={() => {
+      const w = parole();
+      const vivo = P.live;
+      const nonInR2 = (id: string) => !!r2 && !r2.includes(id) && (!vivo || (P.round ?? 0) >= 2);
 
-function PannelloEconomia({ P, total, sumAgents, koCost, koIds }: {
-  P: Plancia; total?: UsageTotal; sumAgents: number; koCost: number; koIds: string[];
-}) {
-  const tr = useT();
-  const rows: [string, number | null | undefined, string][] = [
-    [tr('activity.freshInput'), total?.in, '#29D3F2'],
-    [tr('activity.output'), total?.out, '#21E0A0'],
-    [tr('activity.cacheRead'), total?.cache_read, '#FFA51E'],
-    [tr('activity.cacheWrite'), total?.cache_write, '#9B7BFF'],
-  ];
-  const mx = Math.max(1, ...rows.map(r => r[1] || 0));
-  const agenti = [...P.desks, ...P.pending, ...P.stages];
-  const mxA = Math.max(1, ...agenti.map(a => (a.tin ?? 0) + (a.tout ?? 0) + (a.cacheR ?? 0) + (a.cacheW ?? 0)));
+      const desks: VistaDesk[] = deskElenco.map(d => {
+        const v = verdictOf(d);
+        const corre = vivo && (d.statusRun === 'running' || P.running.includes(d.id));
+        const mie = P.calls.filter(c => c.a === d.id);
+        const ultima = mie[mie.length - 1];
+        const fa = ultima ? Math.max(0, P.runSec - ultima.t) : null;
+        const stato: StatoDesk = v.cls === 'ko' ? 'ko'
+          : v.k === 'n.d.' ? 'nd'
+          : corre ? (fermoDa != null ? 'stale' : ultima && (P.round == null || ultima.r === P.round) && fa != null && fa <= 20 ? 'run' : 'think')
+          : d.statusRun === 'done' ? 'ok'
+          : 'wait';
+        const giri = [d.rounds.length ? w.rounds(d.rounds.length) : null, nonInR2(d.id) ? w.notInR2 : null,
+          ultima ? w.at(ultima.hhmm.slice(0, 5)) : null].filter(Boolean).join(' · ');
+        const fare: VistaDesk['fare'] =
+          stato === 'run' && ultima ? { icona: 'tool', codice: true, testo: ultima.tool, sotto: w.doingAgo(pulisci(ultima.input), fmtDurShort(fa)) }
+          : stato === 'think' ? (ultima && (P.round == null || ultima.r === P.round)
+              ? { icona: 'think', codice: false, testo: w.thinkingSince(fmtDurShort(fa)), sotto: w.lastTool(ultima.tool) + (pulisci(ultima.input) ? ' · ' + pulisci(ultima.input) : '') }
+              : { icona: 'think', codice: false, testo: w.noCallYet, sotto: w.noCallYetSub })
+          : stato === 'stale' ? { icona: 'pause', codice: false, testo: w.staleDoing(fmtDurShort(fermoDa)), sotto: ultima ? w.lastTool(ultima.tool) : '' }
+          : stato === 'ko' ? { icona: 'ko', codice: false, testo: w.koTitle, sotto: v.t }
+          : stato === 'nd' ? { icona: 'file', codice: false, testo: d.statusRun === 'done' ? w.delivered : frase(v.k), sotto: v.t }
+          : stato === 'ok' ? { icona: 'file', codice: false,
+              testo: vivo && P.round != null && !nonInR2(d.id) ? w.deliveredRound(P.round) : w.delivered, sotto: giri }
+          : { icona: 'wait', codice: false, testo: vivo ? w.waitingLive : w.waitingIdle, sotto: state ? (vivo ? '' : v.t) : '' };
+        const piuAlto = d.rounds.length ? Math.max(...d.rounds) : -1;
+        const round = [0, 1, 2].map((r): StatoRound => {
+          if (r === 2 && nonInR2(d.id)) return 'off';
+          if (stato === 'ko' && r === piuAlto) return 'ko';
+          if (corre && r === P.round) return 'on';
+          if (d.rounds.includes(r) || (vivo && P.round != null && r < P.round) || (!vivo && d.statusRun === 'done' && r <= piuAlto)) return 'ok';
+          return '';
+        });
+        return {
+          id: d.id, nome: nomeDi(d), ruolo: rosterDi(d.id)?.role || d.role, colore: coloreDi(d.id) || d.color, stato,
+          pastiglia: { run: w.stWorking, think: w.stThinking, ok: w.stDone, ko: w.stKo, nd: w.stNd, wait: w.stWaiting, stale: w.stStale }[stato],
+          titolo: v.t, fare, round, esito: v.k,
+          dur: fmtDurShort(d.dur), chiamate: w.calls(d.nCalls),
+          costo: d.cost == null ? tr('activity.unavailable') : (d.partial ? '~' : '') + fmtEur(d.cost), costoNd: d.cost == null,
+          dettaglio: w.deskDetail(d.nTools, d.apiCalls, engineShort(d.id, engines, d.rounds)),
+        };
+      });
+      const consegnati = deskElenco.filter(d => d.statusRun === 'done').length;
 
-  return (
-    <div className="p3 peco">
-      <span className="tick tr" />
-      <div className="p3h vi"><span>{tr('activity.economics')}</span><span className="side">token · cache · fx</span></div>
-      <div className="p3b tokwrap">
-        {!total ? (
-          <div className="buco"><span className="t">{tr('activity.unavailable')}</span>
-            <span className="s">{tr('activity.heartbeatMissing')} <b>usage_total</b>{tr('activity.runCostsMissing')}</span></div>
-        ) : (
-          <>
-            {rows.map(([k, v, c]) => (
-              <div className="tokrow" key={k}>
-                <span className="k">{k}</span>
-                <span className="bar"><u style={{ width: `${((v || 0) / mx * 100).toFixed(1)}%`, background: c }} /></span>
-                <span className="v num" style={{ color: c }} title={v != null ? tr(v === 1 ? 'activity.tokenCountOne' : 'communications.tokenCount', {a: fmtN(v)}) : tr('activity.notDeclared')}>
-                  {fmtTok(v)}</span>
-              </div>
-            ))}
-            {agenti.length > 0 && (
-              <div className="tkag">
-                <div className="h"><span>{tr('activity.tokensPerAgent')}</span><span>{tr('activity.totalTouched')}</span></div>
-                {agenti.map(a => {
-                  const completo = [a.tin, a.tout, a.cacheR, a.cacheW].every(v => v != null);
-                  const tot = completo ? a.tin! + a.tout! + a.cacheR! + a.cacheW! : null;
-                  const seg: [number | null, string][] = [[a.tin, '#29D3F2'], [a.tout, '#21E0A0'],
-                    [a.cacheR, '#FFA51E'], [a.cacheW, '#9B7BFF']];
-                  return (
-                    <div className="r" key={a.id} title={tr('activity.agentTokenBreakdown', {a: a.name, b: fmtTok(a.tin), c: fmtTok(a.tout), d: fmtTok(a.cacheR), e: fmtTok(a.cacheW), f: completo ? '' : tr('activity.partialTokens')})}>
-                      <span className="k" style={{ color: a.color }}>{a.name.toUpperCase()}</span>
-                      <span className="sb">
-                        {seg.map(([v, c], i) => <u key={i} style={{ width: `${((v ?? 0) / mxA * 100).toFixed(1)}%`, background: c }} />)}
-                      </span>
-                      <span className="v num">{fmtTok(tot)}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-            <div className="tokfoot">
-              {total.cache_read && total.in
-                ? <>{tr('activity.cacheReread')} <b>{fmtN(total.cache_read / total.in, 1)}×</b> {tr('activity.cacheBenefit')}</>
-                : <>{tr('activity.cacheMissingSentence')}</>}
-              <br />{tr('activity.agentSumTitle')} <b>{fmtEur(sumAgents)}</b>
-              {total.cost_eur != null && Math.abs(sumAgents - total.cost_eur) < 0.005
-                ? <>{tr('activity.sameAsTotal')}</>
-                : <>{tr('activity.againstTotal')} <b>{fmtEur(total.cost_eur)}</b>: <span className="amc">{tr('activity.unexplainedDelta')}</span>.</>}
-              {koIds.length > 0 && <><br /><span className="ko">{tr('activity.included')} {fmtEur(koCost)} {tr(koIds.length === 1 ? 'activity.spentByOne' : 'activity.spentBy')} {koIds.length} {tr(koIds.length === 1 ? 'activity.desksWithStatusOne' : 'activity.desksWithStatus')} <b>api_error</b>.</span></>}
-            </div>
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
+      /* ── il Capo ───────────────────────────────────────────────────── */
+      const capoD = byId('capo');
+      const capoV = capoD ? verdictOf(capoD) : null;
+      const memoId = state?.memo_id ?? null;
+      const chiusaConRun = !vivo && !!state?.start_time;
+      const capoStato: StatoDesk = capoV?.cls === 'ko' ? 'ko'
+        : vivo && P.capo === 'running' ? (fermoDa != null ? 'stale' : 'run')
+        : chiusaConRun && (memoId != null || P.capo === 'done') ? 'ok'
+        : 'wait';
+      const vaiDecisioni = () => navigate('/decisions');
+      /* la riga della run porta alla scheda Filing; sul 49" la card sta nella colonna delle chiamate */
+      const apriFiling = () => {
+        setScheda('filing');
+        requestAnimationFrame(() => {
+          const dove = [...document.querySelectorAll<HTMLElement>('.bbn-agents :is(.ag-panel, .ag-filing-wide)')].find(el => el.offsetParent !== null);
+          dove?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        });
+      };
+      const capo: VistaCapo = {
+        stato: capoStato, colore: coloreDi('capo'),
+        titolo: capoStato === 'ko' ? w.koTitle
+          : capoStato === 'run' || capoStato === 'stale' ? (P.capoT != null ? w.capoWriting(fmtDurShort(Math.max(0, P.runSec - P.capoT))) : w.capoWritingNoTime)
+          : capoStato === 'ok' ? (memoId != null ? w.capoSaved(memoId) : w.pillDone)
+          : chiusaConRun ? w.capoNoMemo
+          : vivo ? w.capoWaiting : w.capoIdle,
+        sotto: capoStato === 'ko' ? capoV!.t
+          : capoStato === 'stale' ? w.capoWritingStale(fmtDurShort(fermoDa))
+          : capoStato === 'run' ? (state?.updated_at ? w.capoWritingSub(ora(state.updated_at)) : tr('activity.capoStartMissing'))
+          : capoStato === 'ok' ? w.capoSavedSub(fmtDurShort(capoD?.dur), ora(state?.completed_at))
+          : chiusaConRun ? w.capoNoMemoSub
+          : vivo ? w.capoWaitingSub(consegnati, nDesk) : '',
+        pastiglia: capoStato === 'ko' ? w.stKo : capoStato === 'run' || capoStato === 'stale' ? w.capoPillWriting
+          : capoStato === 'ok' ? w.capoPillDone : w.capoPillWaiting,
+        stadi: ([['_red_team', w.stageRedTeam], ['_reflection', w.stageReflection], ['_action_table', w.stageActions]] as const).map(([id, nome]) => {
+          const s = byId(id);
+          return s?.dur != null ? { id, nome, stato: 'ok' as const, nota: fmtDurShort(s.dur) }
+            : { id, nome, stato: 'wait' as const, nota: chiusaConRun && s ? w.stageNoDuration : w.stageAfter };
+        }),
+        azioni: capoStato === 'ok' && memoId != null ? <>
+          <button type="button" className="bbn-btn is-primary is-sm" onClick={vaiDecisioni}><FileText size={15} />{w.openDecisions}</button>
+          <button type="button" className="bbn-btn is-sm" onClick={() => navigate('/memos')}>{w.memoArchive}</button>
+        </> : undefined,
+      };
 
-function PannelloCifre({ P, engines, koIds, total }: {
-  P: Plancia; engines?: EnginesInfo; koIds: string[]; total?: UsageTotal;
-}) {
-  const tr = useT();
-  const riga = (d: Desk) => {
-    const v = verdictOf(d);
-    return (
-      <div className="r" key={d.id} title={v.t} data-agente={d.id} data-esito={v.k}>
-        <span className="n">
-          <svg width={12} height={12} viewBox="-7 -7 14 14"><Sigil id={d.id} color={d.color} size={12} /></svg>
-          <span style={{ color: d.color }}>{d.name.toUpperCase()}</span>
-        </span>
-        <i>{fmtDurShort(d.dur)}</i>
-        <i>{d.nCalls || <span className="nd">—</span>}</i>
-        <i>{d.nTools || <span className="nd">—</span>}</i>
-        <i>{d.apiCalls || <span className="nd">—</span>}</i>
-        <i className={koIds.includes(d.id) ? 'amc' : 'c'}>{fmtEur(d.cost)}</i>
-        <span className={'v ' + v.cls}>{v.k === 'n.d.' ? tr('activity.unavailable') : v.k}</span>
-      </div>
-    );
-  };
-  const sommaTool = P.desks.reduce((s, d) => s + d.nTools, 0);
-  return (
-    <div className="p3 pcif">
-      <span className="tick bl" />
-      <div className="p3h"><span>{tr('activity.agentsFigures')}</span><span className="side">{tr('activity.singleVerdict')}</span></div>
-      <div className="p3b cif">
-        <div className="hd">
-          {/* colonne fisse (agents-plancia.css §9): ogni etichetta, in ogni lingua, sta nella
-              sua colonna piu' lo spazio che la segue — la prova e' in activity.test.cjs */}
-          <span>{tr('activity.deskOrbit')}</span><i>{tr('activity.durationAbbrev')}</i><i>{tr('activity.callsAbbrev')}</i><i>{tr('activity.toolsAbbrev')}</i><i>api</i><i>{tr('activity.cost')}</i><i className="ce">{tr('activity.outcome')}</i>
-        </div>
-        {P.desks.map(d => riga(d))}
-        {P.pending.length > 0 && (
-          <>
-            {/* un desk senza chiamate nel log NON e' uno stadio di sintesi (N8):
-                o non e' ancora partito in questo round, o le sue chiamate sono
-                uscite dalla finestra dell'heartbeat */}
-            <div className="sep">{tr('activity.desksNoLog')} <b>{tr('activity.notOnDial')}</b></div>
-            {P.pending.map(d => riga(d))}
-          </>
-        )}
-        {/* il Capo in corsa ha l'ORARIO (l'heartbeat di partenza, nella piastra di
-            lettura) ma non ancora la durata: non sta sotto «durata sì, orario no» */}
-        {P.live && P.capo === 'running' && P.stages.some(s => s.id === 'capo') && (
-          <>
-            <div className="sep">{tr('activity.capoSection')} <b>{tr('activity.running')}</b>{tr('activity.capoDurationEnd')}</div>
-            {P.stages.filter(s => s.id === 'capo').map(d => riga(d))}
-          </>
-        )}
-        {P.stages.some(s => !(P.live && P.capo === 'running' && s.id === 'capo')) && (
-          <>
-            <div className="sep">{tr('activity.synthesisStages')} <b>{tr('activity.durationNoTime')}</b>{tr('activity.notOnDialSuffix')}</div>
-            {P.stages.filter(s => !(P.live && P.capo === 'running' && s.id === 'capo')).map(d => riga(d))}
-          </>
-        )}
-        {total?.cost_eur != null && (
-          <div className="tot">
-            <span className="n">{tr('activity.agentSum')}</span>
-            <i>{fmtDurShort([...P.desks, ...P.pending, ...P.stages].reduce((s, d) => s + (d.dur || 0), 0))}</i>
-            <i>{P.calls.length}</i><i>{P.nToolsDistinct}*</i>
-            <i>{[...P.desks, ...P.pending, ...P.stages].reduce((s, d) => s + d.apiCalls, 0)}</i>
-            <i className="c">{fmtEur(total.cost_eur)}</i>
-            <span className={'v ' + (koIds.length ? 'ko' : 'okc')}>{koIds.length ? `${koIds.length} KO` : 'OK'}</span>
+      /* ── le tappe ──────────────────────────────────────────────────── */
+      const fase = (k: string) => P.phases.find(p => p.k === k);
+      const arco = (p: { t0: number; t1: number }) => `${fmtDurShort(p.t0)} – ${fmtDurShort(p.t1)}`;
+      const capoScrive = vivo && P.capo === 'running';
+      const tappe: Tappa[] = [{ id: 'avvio', nome: w.stepStart,
+        stato: state?.start_time ? 'done' : 'wait', sotto: state?.start_time ? ora(state.start_time) : w.stepWaiting }];
+      for (const r of [0, 1, 2]) {
+        const p = fase('R' + r);
+        let t: Tappa = { id: 'r' + r, nome: w.stepRound(r), stato: 'wait', sotto: w.stepWaiting };
+        if (vivo && capoScrive) t = p ? { ...t, stato: 'done', sotto: arco(p) } : { ...t, stato: P.round != null && r <= P.round ? 'done' : 'skip', sotto: P.round != null && r <= P.round ? w.stepDone : w.stepSkipped };
+        else if (vivo && P.round != null) {
+          if (r < P.round) t = { ...t, stato: 'done', sotto: p ? arco(p) : w.stepDone };
+          else if (r === P.round) t = { ...t, stato: 'now', sotto: fermoDa != null ? w.stepStale(fmtDurShort(fermoDa)) : p ? w.stepNow(fmtDurShort(Math.max(0, P.runSec - p.t0))) : w.stepNowShort };
+        } else if (vivo) {
+          if (p) t = { ...t, stato: p.open ? 'now' : 'done', sotto: p.open ? w.stepNow(fmtDurShort(Math.max(0, P.runSec - p.t0))) : arco(p) };
+        } else if (p) t = { ...t, stato: 'done', sotto: arco(p) };
+        else if (state?.start_time) t = { ...t, stato: 'skip', sotto: w.stepSkipped };
+        tappe.push(t);
+      }
+      const sintesi = fase('SINTESI');
+      tappe.push(capoScrive
+        ? { id: 'sintesi', nome: w.stepSynthesis, stato: 'now', sotto: fermoDa != null ? w.stepStale(fmtDurShort(fermoDa))
+            : P.capoT != null ? w.stepNow(fmtDurShort(Math.max(0, P.runSec - P.capoT))) : w.stepNowShort }
+        : !vivo && sintesi ? { id: 'sintesi', nome: w.stepSynthesis, stato: 'done', sotto: arco(sintesi) }
+        : chiusaConRun && (memoId != null || P.capo === 'done') ? { id: 'sintesi', nome: w.stepSynthesis, stato: 'done', sotto: w.stepDone }
+        : chiusaConRun ? { id: 'sintesi', nome: w.stepSynthesis, stato: 'skip', sotto: w.stepSkipped }
+        : { id: 'sintesi', nome: w.stepSynthesis, stato: 'wait', sotto: w.stepWaiting });
+      tappe.push(chiusaConRun && memoId != null
+        ? { id: 'memo', nome: w.stepMemo, stato: 'done', sotto: `#${memoId} · ${ora(state?.completed_at)}` }
+        : chiusaConRun ? { id: 'memo', nome: w.stepMemo, stato: 'skip', sotto: w.stepNoMemo }
+        : { id: 'memo', nome: w.stepMemo, stato: 'wait', sotto: w.stepWaiting });
+
+      /* ── la frase del presente (solo a run viva) ───────────────────── */
+      const fraRound = P.phases.find(p => p.k === 'FRA ROUND' && p.open);
+      const adesso: [string, string?] | null = !vivo ? null
+        : fermoDa != null ? [w.nowStale(fmtDurShort(fermoDa)), w.nowStaleSub(hhmm(state?.updated_at))]
+        : capoScrive ? [w.nowSynthesis, w.nowCapo]
+        : P.round != null && P.running.length ? [w.nowRound(P.round), w.nowWorking(P.running.length, nDesk, consegnati)]
+        : fraRound ? [w.nowBetween]
+        : !P.calls.length ? [w.nowStarting]
+        : P.round != null ? [w.nowRound(P.round), w.nowWorking(P.running.length, nDesk, consegnati)] : null;
+
+      /* ── cifre del box ─────────────────────────────────────────────── */
+      const chiamateTot = P.logTappato && P.nCallsTot == null ? null : (P.nCallsTot ?? P.calls.length);
+      const costoTesto = (partial ? '~' : '') + fmtEur(total?.cost_eur);
+      const costoTono = !hasTotal || partial || notes.length ? 'warn' as const : undefined;
+      const kDurata = <Kpi etichetta={w.kDuration} valore={fmtDurShort(isRunning ? (elapsed || P.runSec) : P.runSec)}
+        sotto={isRunning ? w.sClock : lavoro > 0 ? w.sWork(fmtDurShort(lavoro)) : tr('activity.durationMissing')} />;
+      const kCosto = <Kpi etichetta={isRunning ? w.kCostSoFar : w.kCost} valore={costoTesto} nd={!hasTotal}
+        sotto={!hasTotal ? w.sUnpriced : isRunning ? (partial ? w.sSoFarPartial : w.sSoFar)
+          : koVisibile ? w.sKoSpent(fmtEur(koCost)) : partial ? w.sPartial : w.sComplete}
+        tono={koVisibile && !isRunning ? 'warn' : costoTono} />;
+      const kChiamate = <Kpi etichetta={w.kCalls} valore={chiamateTot ?? tr('activity.unavailable')} nd={chiamateTot == null}
+        sotto={P.logTappato ? w.sLast50 : isRunning ? w.sDistinctTools(P.nToolsDistinct) : w.sTickers(P.tickers.length)} />;
+      const kQuarta = par != null
+        ? <Kpi etichetta={w.kParallelism} valore={fmtN(par, 2) + '×'} sotto={w.sTogether} />
+        : <Kpi etichetta={w.kTickers} valore={P.tickers.length} sotto={isRunning ? w.sTickersSoFar : w.sDistinctTools(P.nToolsDistinct)} />;
+      const kEsito = <Kpi etichetta={w.kOutcome} valore={koIds.length ? w.outcomeKo(koIds.length) : w.outcomeOk}
+        sotto={koIds.length ? koIds.map(id => nomeDi({ id, name: id })).join(', ') : undefined} tono={koIds.length ? 'bad' : undefined} />;
+
+      const cieco = !state || !!liveErr;
+      const pillola = !state && !liveErr && !hbIll ? <span className="bbn-pill is-piatto"><i className="ag-dot" />{w.pillQuerying}</span>
+        : cieco ? <span className="bbn-pill is-giu"><WifiOff size={13} />{w.pillUnreadable}</span>
+        : isRunning ? <span className={'bbn-pill ' + (fermoDa != null ? 'is-warn' : 'is-acc')}><i className={fermoDa != null ? 'ag-dot' : 'ag-pulse'} />{fermoDa != null ? w.pillStuck : w.pillRunning}</span>
+        : finitaQui ? <span className="bbn-pill is-su"><i className="ag-dot" />{memoId != null ? w.pillDone : w.pillEnded}</span>
+        : <span className="bbn-pill is-piatto"><i className="ag-dot" />{w.pillIdle}</span>;
+      const lingua = state?.language === 'it' ? tr('activity.originalRunIt') : state?.language === 'en' ? tr('activity.originalRunEn') : null;
+      const meta = isRunning && state?.start_time ? [w.startedAt(ora(state.start_time)), lingua].filter(Boolean).join(' · ')
+        : finitaQui && state?.start_time ? [w.runSpan(giorno(state.start_time), ora(state.start_time), ora(state.completed_at)), lingua].filter(Boolean).join(' · ')
+        : '';
+      const vista: 'cieco' | 'viva' | 'finita' | 'riposo' = cieco ? 'cieco' : isRunning ? 'viva' : finitaQui ? 'finita' : 'riposo';
+      const titolo = vista === 'cieco' ? (state || liveErr || hbIll ? w.titleUnreadable : w.titleIdle)
+        : vista === 'viva' ? (capoScrive ? w.titleSynthesis : w.titleLive)
+        : vista === 'finita' ? (memoId != null ? w.titleDone : w.titleDoneNoMemo)
+        : w.titleIdle;
+      const descrizione = vista === 'cieco' ? (state || liveErr || hbIll ? w.descUnreadable(state?.updated_at ? hhmm(state.updated_at) : null) : w.descIdle(nDesk))
+        : vista === 'viva' ? w.descLive
+        : vista === 'finita' ? (memoId != null ? w.descDone(nDesk, P.phases.filter(p => /^R\d/.test(p.k)).length) : w.descDoneNoMemo)
+        : w.descIdle(nDesk);
+      const bottone = isRunning
+        ? <button type="button" className="bbn-btn ag-stop" onClick={stopRun} disabled={stopping}
+            title={activeTaskId ? tr('activity.stopTask', { a: activeTaskId }) : tr('activity.noTrackedTask')}>
+            <Square size={15} />{stopping ? w.stopping : w.stop}</button>
+        : vista === 'finita' && memoId != null
+          ? <><button type="button" className="bbn-btn is-primary" onClick={vaiDecisioni}><FileText size={16} />{w.openDecisions}</button>
+              <button type="button" className="bbn-btn ag-launch" onClick={() => setAskRun(true)}><Play size={15} />{w.newRun}</button></>
+          : <button type="button" className="bbn-btn is-primary ag-launch" onClick={() => setAskRun(true)}><Play size={15} />{w.launch}</button>;
+      const ultimaRun = vista === 'riposo' && state?.start_time
+        ? <div className="ag-last">
+            <span className="t">{w.lastRun} <span>· {w.runSpan(giorno(state.start_time), ora(state.start_time), state.completed_at ? ora(state.completed_at) : tr('activity.unavailable'))}{lingua ? ' · ' + lingua : ''}</span></span>
+            <span className="bbn-grow" />
+            <div className="ag-kpis">{kDurata}{kCosto}{kChiamate}{kQuarta}{kEsito}</div>
+            {memoId != null && <button type="button" className="bbn-link ag-memo-link" onClick={vaiDecisioni}>{w.memo(memoId)} <ArrowUpRight size={14} /></button>}
           </div>
-        )}
-        <div className="note">
-          <b>{tr('activity.callsAbbrev')}</b> {tr('activity.callsDefinition')} <b>{tr('activity.toolsAbbrev')}</b> {tr('activity.toolsDefinition')} <b>{tr('activity.distinct')}</b> {tr('activity.ofDesk')}
-          {P.logTappato && <> {tr('activity.countsOnLatest')} <b>{tr('activity.latest')} {P.calls.length}</b> {tr('activity.callsReceived')}{P.nCallsTot != null && <> {tr('activity.runMadeCalls')} {P.nCallsTot})</>}{tr('activity.olderCallsUnderCount')}</>}
-          {P.nToolsDistinct > 0 && <> {tr(P.nToolsDistinct === 1 ? 'activity.toolsFootnoteOne' : 'activity.toolsFootnoteMany', {a: P.nToolsDistinct, b: sommaTool})}</>}
-          <br />{tr('activity.committeeEngineFrom')} <b>engines</b>{tr('activity.chatModelIsSeparate')}
-          {P.desks.length > 0 && <> desk <b>{engineShort(P.desks[0].id, engines, P.desks[0].rounds)}</b></>}
-          {P.stages.some(s => s.id === 'capo') && <> {tr('activity.capoInline')} <b>{engineShort('capo', engines)}</b></>}
-          {P.stages.some(s => s.id === '_reflection' || s.id === '_action_table') &&
-            <> {tr('activity.reflectionAction')} <b>{tr('activity.unavailable')}</b>{tr('activity.notExposed')}</>}
+        : null;
+
+      /* ── avvisi: i buchi in vetrina, non nei tooltip (regola PM 14/07) ── */
+      const avvisi: { k: string; tono: 'bad' | 'warn' | 'good' | 'info'; icona: ReactNode; testo: ReactNode; azione?: ReactNode }[] = [];
+      if (vista === 'finita') avvisi.push({ k: 'finita', tono: 'good', icona: <Check size={18} />,
+        testo: <b>{w.done(ora(state?.completed_at), memoId)}</b>,
+        azione: memoId != null ? <button type="button" className="bbn-link" onClick={vaiDecisioni}>{w.openDecisions} <ArrowUpRight size={14} /></button> : undefined });
+      if (triggerMsg) avvisi.push({ k: 'avvio', tono: 'info', icona: <Play size={18} />,
+        testo: frase(triggerMsg.kind === 'starting' ? tr('activity.starting') : tr('activity.runActiveEstimate', { a: triggerMsg.id ?? tr('activity.unavailable') })) });
+      if (stopNotice) avvisi.push({ k: 'stop', tono: stopNotice.running === false && !stopNotice.issues.length ? 'good' : 'bad', icona: <Square size={18} />,
+        testo: <><b>{tr(stopNotice.running === false ? 'activity.stopObservedIdle' : 'activity.stopUnconfirmed')}</b>
+          {stopNotice.issues.map((issue, i) => <span key={i} className="ag-ban-line">{issue.source} — {issue.detail || tr('activity.errorNotDescribed')}</span>)}</> });
+      if (liveErr) avvisi.push({ k: 'backend', tono: 'bad', icona: <WifiOff size={18} />,
+        testo: <><b>{w.backendDown}</b> {w.backendDownSub(liveErr.replace(/[.\s]+$/, ''), state?.updated_at ? hhmm(state.updated_at) : null)}</> });
+      if (isRunning && (state?.stale_warning || hbIllLungo)) avvisi.push({ k: 'fermo', tono: 'bad', icona: <TriangleAlert size={18} />,
+        /* review 31/08: a poll illeggibile `stale_seconds` resta CONGELATO all'ultimo
+           payload buono mentre l'orologio avanza — vince la misura che cresce */
+        testo: <><b>{w.stuck}</b> {w.stuckSub(Math.max(1, Math.floor(Math.max(state?.stale_seconds || 0, fermoDa || 0) / 60)))}
+          {/* mentre il Capo genera il memo nessuno scrive l'heartbeat: un consiglio di FERMARE senza dirlo costerebbe il memo */}
+          {P.capo === 'running' && <> {tr('activity.capoHeartbeatNote')}</>}</> });
+      if (hbIll) avvisi.push({ k: 'illeggibile', tono: 'warn', icona: <TriangleAlert size={18} />,
+        testo: <><b>{frase(tr('activity.heartbeatUnreadableUpper') + (hbIllDur != null && hbIllDur >= 3 ? tr('activity.unreadableSince', { a: fmtDurShort(hbIllDur) }) : tr('activity.unreadableNow')))}.</b>{' '}
+          {maiuscola(tr('activity.unreadableMessagePrefix'))}{hbIll.msg ?? tr('activity.unreadableHeartbeat')}{tr('activity.unreadableMessageSuffix')}{state
+            ? <>{tr('activity.lastGoodState')}{state.updated_at ? tr('activity.heartbeatTime', { a: hhmm(state.updated_at) }) : ''}</>
+            : <>{tr('activity.noneSinceOpen')}</>} {tr('activity.retryCadence')}</> });
+      if (koIds.length > 0) avvisi.push({ k: 'ko', tono: 'bad', icona: <CircleAlert size={18} />,
+        testo: <><b>{w.koBanner(koIds.length, nDesk || koIds.length)}</b>{' '}
+          <span>{koIds.map(id => nomeDi({ id, name: id })).join(tr('movements.and'))} {tr(koIds.length === 1 ? 'activity.declareOne' : 'activity.declare')} <b>status api_error</b> {tr(koIds.length === 1 ? 'activity.reportAnywayOne' : 'activity.reportAnyway')}</span>.{' '}
+          <span>{maiuscola(tr('activity.withinTotalPrefix'))} {fmtEur(total?.cost_eur)} {tr('activity.include')} <b>{fmtEur(koCost)}</b>
+            {total?.cost_eur && koCost != null ? ` (${fmtN(koCost / total.cost_eur * 100, 0)}%)` : ''} {tr(koIds.length === 1 ? 'activity.spentByThemOne' : 'activity.spentByThem')}</span>.</> });
+      /* «totale parziale» lo dice il titolo del banner: la nota del catalogo non si ripete */
+      const altreNote = partial ? notes.filter(n => n !== tr('activity.partialTotal')) : notes;
+      if (notes.length > 0) avvisi.push({ k: 'costi', tono: 'warn', icona: <TriangleAlert size={18} />,
+        testo: <>{partial && <><b>{w.partialBanner}</b> </>}{altreNote.map(maiuscola).join(' — ')}</> });
+      if (rosterErr) avvisi.push({ k: 'roster', tono: 'bad', icona: <CircleAlert size={18} />,
+        testo: <><b>{frase(tr('activity.rosterMissing'))}.</b> {tr('activity.rosterErrorPrefix')}{rosterErr}{tr('activity.rosterErrorSuffix')}</> });
+
+      /* ── pannello: chiamate, strumenti, ticker (i costi stanno sotto i desk) ── */
+      const conteggioChiamate = P.logTappato ? w.last50Of(P.calls.length, P.nCallsTot) : w.allN(P.calls.length);
+      const corpoChiamate = P.calls.length === 0 ? <p className="bbn-empty">{w.noCalls}</p> : (
+        <div className="bbn-scroll ag-tape">
+          <div className="ag-day">{isRunning ? w.callsNow : w.callsNewestFirst}</div>
+          {[...P.calls].reverse().map((c, i) => (
+            <div key={i} className={'ag-call' + (isRunning && P.runSec - c.t < 20 ? ' is-hot' : '')} title={tr('activity.wallClock', { a: c.hhmm, b: c.input })}>
+              <IconaDesk id={c.a} colore={coloreDi(c.a)} dimensione="xs" />
+              <span className="w"><code>{c.tool}</code><span>{nomeDi({ id: c.a, name: c.a })}{pulisci(c.input) ? ' · ' + pulisci(c.input) : ''}</span></span>
+              <span className="t num">{fmtDurShort(c.t)}<span className="rd">R{c.r}</span></span>
+            </div>
+          ))}
         </div>
-      </div>
-    </div>
-  );
-}
-
-function PannelloStrumenti({ P, fatte, cur }: { P: Plancia; fatte: number; cur: number }) {
-  const tr = useT();
-  const mx = P.tools[0]?.n || 1;
-  return (
-    <div className="p3 patt">
-      <span className="tick tl" />
-      <div className="p3h cy"><span>{tr('activity.committeeLooked')}</span>
-        {/* «tutti e N» solo quando il log e' INTERO: a run viva sono le ultime 50 (N8) */}
-        <span className="side">{P.logTappato
-          ? tr('activity.countInCalls', {a: P.nToolsDistinct, b: P.calls.length})
-          : tr('activity.allCount', {a: P.nToolsDistinct})}</span></div>
-      <div className="p3b attwrap">
-        {P.tools.length === 0 ? (
-          <div className="buco"><span className="t">{tr('activity.noCalls')}</span>
-            <span className="s">{tr('activity.theLog')} <b>tool_log</b> {tr('activity.heartbeatLogEmpty')}</span></div>
-        ) : (
-          <>
-            <div className="atl">
-              {P.desks.map(d => (
-                <b key={d.id} style={{ color: d.color }}>
-                  <svg width={10} height={10} viewBox="-7 -7 14 14"><Sigil id={d.id} color={d.color} size={10} /></svg>
-                  {d.name.toUpperCase()}
-                </b>
-              ))}
-              <span className="n">{tr('activity.toolBarExplanation')} <b>{tr('activity.shape')}</b>{tr('activity.notColour')}</span>
+      );
+      const righeToken: [string, number | null | undefined, string, string][] = [
+        [maiuscola(tr('activity.freshInput')), total?.in, 'var(--bbn-accent)', 'input'],
+        [maiuscola(tr('activity.output')), total?.out, 'var(--bbn-good)', 'output'],
+        [maiuscola(tr('activity.cacheRead')), total?.cache_read, 'var(--ag-cache-read)', 'cache-read'],
+        [maiuscola(tr('activity.cacheWrite')), total?.cache_write, 'var(--ag-cache-write)', 'cache-write'],
+      ];
+      const mxTok = Math.max(1, ...righeToken.map(r => r[1] || 0));
+      const agentiCosto = [...deskElenco, ...P.stages.filter(s => s.id === 'capo')];
+      const mxCosto = Math.max(0.0001, ...agentiCosto.map(a => a.cost || 0));
+      const fx = total?.fx_source == null || total.fx_source === 'n.d.' ? tr('activity.unavailable') : total.fx_source;
+      const corpoCosti = !total ? <p className="bbn-empty">{tr('activity.heartbeatMissing')} <b>usage_total</b>{tr('activity.runCostsMissing')}</p> : (
+        <div className="ag-costs">
+          <div className="ag-cost-tot"><div className="ag-big"><span className={'num' + (hasTotal ? '' : ' is-nd')}>{costoTesto}</span>
+            {hasTotal && <span className={'bbn-pill ' + (partial ? 'is-warn' : 'is-su')}>{partial ? w.pillPartial : w.pillComplete}</span>}
+            <span className="fx">{w.fx} <b className={total.fx_source === 'live' ? 'is-live' : 'is-warn'}>{fx}</b></span></div>
+          <p className="ag-foot">
+            {agentiSenzaCosto > 0 ? w.sumMissing(fmtEur(sumAgents), agentiSenzaCosto)
+              : total.cost_eur != null && Math.abs(sumAgents - total.cost_eur) < 0.005 ? w.sumEqual(fmtEur(sumAgents)) : w.sumDiff(fmtEur(sumAgents), fmtEur(total.cost_eur))}
+            {koIds.length > 0 && <> <span className="is-ko">{w.koInside(fmtEur(koCost), koIds.length)}</span></>}
+            <br />{w.engines(engineShort(deskElenco[0]?.id || 'macro', engines, deskElenco[0]?.rounds), engineShort('capo', engines))}
+          </p></div>
+          <div className="ag-cost-tok"><div className="ag-sub">{w.tokens}</div>
+            <div className="ag-bars">{righeToken.map(([k, v, c, kind]) => (
+              <div className="ag-barrow" key={kind} data-metric={kind}><span className="k">{k}</span><Barra quota={(v || 0) / mxTok} colore={c} />
+                <span className="v num" title={v != null ? tr(v === 1 ? 'activity.tokenCountOne' : 'communications.tokenCount', { a: fmtN(v) }) : tr('activity.notDeclared')}>{fmtTok(v)}</span></div>
+            ))}</div>
+            <p className="ag-foot">{total.cache_read && total.in ? w.cacheNote(fmtN(total.cache_read / total.in, 1)) : tr('activity.cacheMissingSentence')}</p></div>
+          {agentiCosto.length > 0 && <div className="ag-cost-agt"><div className="ag-sub">{w.costPerAgent}</div>
+            <div className="ag-bars" style={{ '--ag-righe': Math.ceil(agentiCosto.length / 2) } as CSSProperties}>{agentiCosto.map(a => {
+              const ko = koIds.includes(a.id);
+              const valore = a.cost != null ? (a.partial ? '~' : '') + fmtEur(a.cost) : a.id === 'capo' && P.capo === 'running' ? w.inProgressCost : tr('activity.unavailable');
+              return <div className="ag-agc" key={a.id} title={tr('activity.agentTokenBreakdown', { a: nomeDi(a), b: fmtTok(a.tin), c: fmtTok(a.tout), d: fmtTok(a.cacheR), e: fmtTok(a.cacheW), f: [a.tin, a.tout, a.cacheR, a.cacheW].every(v => v != null) ? '' : tr('activity.partialTokens') })}>
+                <IconaDesk id={a.id} colore={coloreDi(a.id) || a.color} dimensione="xs" /><span className="k">{nomeDi(a)}</span>
+                <Barra quota={(a.cost || 0) / mxCosto} colore={ko ? 'var(--bbn-bad)' : 'var(--bbn-accent)'} />
+                <span className={'v num' + (ko ? ' is-ko' : '') + (a.cost == null ? ' is-nd' : '')}>{valore}</span></div>;
+            })}</div></div>}
+        </div>
+      );
+      const deskDiStrumento = (id: string) => deskElenco.find(d => d.id === id);
+      const mxTool = P.tools[0]?.n || 1;
+      const corpoStrumenti = P.tools.length === 0 ? <p className="bbn-empty">{tr('activity.theLog')} <b>tool_log</b> {tr('activity.heartbeatLogEmpty')}</p> : (
+        <div className="bbn-scroll ag-tools">
+          <div className="ag-legend">{deskElenco.filter(d => d.nCalls > 0).map(d => <span key={d.id}><i style={{ background: coloreDesk(coloreDi(d.id) || d.color) }} />{nomeDi(d)}</span>)}</div>
+          {P.tools.map(t => (
+            <div className="ag-tool" key={t.tool} title={Object.entries(t.by).map(([a, n]) => `${a} ${n}`).join(' · ')}>
+              <code>{t.tool}</code><span className="n num">{t.n}</span>
+              <span className="ag-bar">{Object.entries(t.by).sort((a, b) => b[1] - a[1]).map(([a, n]) =>
+                <u key={a} style={{ width: `${n / mxTool * 100}%`, background: coloreDesk(coloreDi(a) || deskDiStrumento(a)?.color) }} />)}</span>
             </div>
-            <div className="att">
-              {P.tools.map(t => {
-                const seg = Object.entries(t.by).sort((a, b) => b[1] - a[1]);
-                const top = P.desks.find(x => x.id === seg[0]?.[0]);
-                return (
-                  <div className="r" key={t.tool} title={seg.map(([a, n]) => `${a} ${n}`).join(' · ')}>
-                    <span className="t">{t.tool}</span>
-                    <span className="c num">{t.n}</span>
-                    <span className="m">
-                      {top && <svg width={9} height={9} viewBox="-7 -7 14 14"><Sigil id={top.id} color={top.color} size={9} /></svg>}
-                      {seg.map(([a, n]) => {
-                        const d = P.desks.find(x => x.id === a);
-                        return <u key={a} style={{ width: `${(n / mx * 70).toFixed(1)}px`, background: d?.color || '#5A6685' }} />;
-                      })}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
+          ))}
+          <p className="ag-foot">{P.logTappato ? w.toolsFootLive(P.calls.length, P.nCallsTot) : w.toolsFoot(P.nToolsDistinct, P.calls.length)}</p>
+        </div>
+      );
+      const corpoTicker = P.tickers.length === 0 ? <p className="bbn-empty">{w.noTickers}</p> : (
+        <div className="bbn-scroll ag-tickers">{P.tickers.map(x => <span key={x.k} className="ag-tk">{x.k}<b className="num">{x.n}</b></span>)}</div>
+      );
+      const filingVista = (conTitolo: boolean) => <CoperturaFiling dati={filing} errore={filingErr} occupato={filingBusy} bloccato={isRunning}
+        esito={filingEsito} onAttiva={attivaFiling} onRiprova={caricaFiling} fmt={n => fmtN(n)} conTitolo={conTitolo}
+        onApri={t => navigate(t ? `/filing?t=${encodeURIComponent(t)}` : '/filing')} />;
+      const corpoFiling = <div className="bbn-scroll ag-filing-tab">{filingVista(true)}</div>;
+      const corpi: Record<SchedaPannello, ReactNode> = { chiamate: corpoChiamate, strumenti: corpoStrumenti, ticker: corpoTicker, filing: corpoFiling };
+      const conteggi: Record<SchedaPannello, string> = {
+        chiamate: conteggioChiamate, strumenti: P.logTappato ? w.last50Of(P.calls.length, P.nCallsTot) : w.allN(P.nToolsDistinct),
+        ticker: w.allN(P.tickers.length),
+        filing: filing ? w.filingCount(filing.copertura.con_confronto, filing.copertura.totale) : '',
+      };
 
-function PannelloTicker({ P }: { P: Plancia }) {
-  const tr = useT();
-  return (
-    <div className="p3 ptk">
-      <span className="tick br" />
-      <div className="p3h"><span>{tr('activity.tickersTouched')}</span>
-        <span className="side">{P.logTappato
-          ? tr('activity.countInCalls', {a: P.tickers.length, b: P.calls.length})
-          : tr('activity.allCount', {a: P.tickers.length})}</span></div>
-      <div className="p3b tkl">
-        {P.tickers.length === 0 ? (
-          <div className="buco"><span className="t">{tr('activity.noTicker')}</span>
-            <span className="s">{tr('activity.theInputs')} <b>input</b> {tr('activity.inputsNoTickers')}</span></div>
-        ) : P.tickers.map(x => <span key={x.k}>{x.k}<b>{x.n}</b></span>)}
-      </div>
-    </div>
-  );
-}
-
-function PannelloNastro({ P, cur }: { P: Plancia; cur: number }) {
-  const tr = useT();
-  return (
-    <div className="p3 plog">
-      <span className="tick tr" />
-      <div className="p3h cy"><span>{tr('activity.callsTape')}</span>
-        <span className="side">{P.logTappato
-          ? tr('activity.lastReceived', {a: P.calls.length, b: P.nCallsTot != null ? tr('activity.ofTotal', {a: P.nCallsTot}) : ''})
-          : tr('activity.allCalls', {a: P.calls.length})}{tr('activity.chronological')}</span></div>
-      <div className="p3b logwrap">
-        {P.calls.length === 0 ? (
-          <div className="buco"><span className="t">{tr('activity.emptyTape')}</span>
-            <span className="s">{tr('activity.heartbeatNoCalls')}</span></div>
-        ) : (
-          <>
-            <div className="lhd">
-              {[0, 1, 2].map(i => (
-                <div className="lr" key={i}>
-                  <span>T+</span><span>desk</span><span>{tr('activity.roundAbbrev')}</span><span>{tr('activity.tool')}</span><span>input</span>
+      return (
+        <div className="bbn-agents bbn-font" data-vista={vista} data-heartbeat={P.stale ? 'fermo' : 'ok'}>
+          {/* ── box della run ── */}
+          <section className="bbn-card ag-run" aria-live="polite">
+            <div className="ag-run-top">
+              <div className="ag-run-id">
+                <AnelloDesk id="capo" colore={coloreDi('capo')} grande
+                  stato={vista === 'viva' ? (fermoDa != null ? 'stale' : 'run') : vista === 'finita' && memoId != null ? 'ok' : 'wait'} />
+                <div className="ag-run-copy">
+                  <span className="k">{pillola}{meta && <span className="meta">{meta}</span>}</span>
+                  <h1>{titolo}</h1>
+                  <p>{descrizione}</p>
+                  <p className="ag-filing-line" data-filing-line={filingErr ? 'errore' : filing ? (mancantiFiling(filing) ? 'mancanti' : 'completa') : 'caricamento'}>
+                    <FileText size={14} />
+                    <span>{filingErr ? w.filingLineDown : filing ? w.filingLine(filing.copertura.con_confronto, filing.copertura.totale, mancantiFiling(filing)) : w.filingLineLoading}</span>
+                    <button type="button" className="bbn-link" data-filing-open="1" onClick={apriFiling}>{w.filingOpen} <ArrowUpRight size={14} /></button>
+                  </p>
                 </div>
-              ))}
+              </div>
+              {vista !== 'riposo' && <div className="ag-kpis">
+                {vista === 'cieco' && !state ? null : <>{kDurata}{kCosto}{kChiamate}{kQuarta}</>}
+              </div>}
+              <div className="ag-run-act">
+                <button type="button" className="bbn-btn" onClick={() => navigate('/agents/trade-idea')}><Lightbulb size={15} />{tr('tradeidea.openTradeIdea')}</button>
+                {bottone}
+              </div>
             </div>
-            <div className="logw">
-              {P.calls.map((c, i) => {
-                const d = P.desks.find(x => x.id === c.a);
-                return (
-                  <div className={'lr' + (Math.abs(c.t - cur) < 20 ? ' hot' : '')} key={i}
-                    title={tr('activity.wallClock', {a: c.hhmm, b: c.input})}>
-                    <span className="tm num">{fmtClock(c.t)}</span>
-                    <span className="ag" style={{ color: d?.color }}>{c.a.toUpperCase()}</span>
-                    {/* la classe CSS non viene mai da un catalogo: .rd e' la regola di agents-plancia.css §12 */}
-                    <span className="rd">R{c.r}</span>
-                    <span className="tl">{c.tool}</span>
-                    <span className="in" title={tr('activity.originalSource')}>{c.input === '{}' ? '—' : c.input.replace(/[{}']/g, '')}</span>
-                  </div>
-                );
-              })}
+            {ultimaRun}
+            <Tappe tappe={tappe} etichetta={w.steps} />
+            {adesso && <div className="ag-now"><span><b>{adesso[0]}</b>{adesso[1] ? ' · ' + adesso[1] : ''}</span>
+              {capoScrive && fermoDa == null && <span className="muted">· {w.nowCapoNote}</span>}</div>}
+            {/* ── recupero delle run settimanali (Trade Idea): stesso stato della run qui sopra ── */}
+            <WeeklyRecoveryPanel disabled={isRunning} onStarted={tid => {
+              try { localStorage.setItem(ACTIVE_RUN_KEY, tid); } catch {}
+              setActiveTaskId(tid); setTriggerMsg({ kind: 'active', id: tid }); setStopNotice(null);
+              setState(prev => ({ ...(prev || {}), running: true, start_time: new Date().toISOString(),
+                message: tr('tradeidea.recoveryBusy') } as AgentsLiveState));
+            }} />
+          </section>
+
+          {avvisi.length > 0 && <div className="ag-bans">
+            {avvisi.map(a => <div key={a.k} className={'ag-ban is-' + a.tono} data-avviso={a.k} role={a.tono === 'bad' ? 'alert' : 'status'}>
+              {a.icona}<span>{a.testo}</span>{a.azione && <span className="act">{a.azione}</span>}</div>)}
+          </div>}
+
+          {/* ── desk, Capo, costi (e sul 49" dove ha guardato) ── */}
+          <div className="ag-desks" ref={dialRef} aria-label={w.desks}>
+            <div className="ag-dgrid">{desks.map(d => <CardDesk key={d.id} d={d} />)}</div>
+            <CardCapo c={capo} nome={w.capo} />
+            <div className="ag-wide">
+              <section className="bbn-card ag-panel-card ag-cost-card"><header className="bbn-card-head"><h2>{w.costsTitle}</h2></header>{corpoCosti}</section>
+              <section className="bbn-card ag-panel-card ag-looked-card"><header className="bbn-card-head"><h2>{w.lookedTitle}</h2>
+                <span className="bbn-card-count">{w.lookedCount(P.nToolsDistinct, P.tickers.length)}</span></header>
+                <div className="ag-looked">{corpoStrumenti}{corpoTicker}</div></section>
             </div>
-          </>
-        )}
-      </div>
-    </div>
+          </div>
+
+          {/* ── pannello a schede (a destra); sul 49" solo Chiamate ── */}
+          <section className="bbn-card ag-panel" aria-label={w.panel}>
+            <header className="bbn-card-head">
+              <Segmenti<SchedaPannello> valore={scheda} etichetta={w.panel} onChange={setScheda} opzioni={[
+                { id: 'chiamate', testo: w.tabCalls },
+                { id: 'strumenti', testo: w.tabTools }, { id: 'ticker', testo: w.tabTickers },
+                { id: 'filing', testo: w.tabFiling },
+              ]} />
+              <span className="bbn-grow" />
+              {conteggi[scheda] && <span className="bbn-card-note">{conteggi[scheda]}</span>}
+            </header>
+            {corpi[scheda]}
+          </section>
+          <section className="bbn-card ag-calls-wide" aria-label={w.callsTitle}>
+            <header className="bbn-card-head"><h2>{w.callsTitle}</h2><span className="bbn-card-count">{conteggioChiamate}</span></header>
+            {corpoChiamate}
+          </section>
+          <section className="bbn-card ag-filing-wide" aria-label={w.filingTitle}>
+            <header className="bbn-card-head"><h2>{w.filingTitle}</h2>
+              {filing && <span className="bbn-card-count">{w.filingCount(filing.copertura.con_confronto, filing.copertura.totale)}</span>}</header>
+            {filingVista(false)}
+          </section>
+        </div>
+      );
+    }} />
+    <RunConfirmDialog open={askRun} pagePresentation
+      onConfirm={() => { setAskRun(false); triggerRun(); }}
+      onCancel={() => setAskRun(false)} />
+    </>
   );
 }

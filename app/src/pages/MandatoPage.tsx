@@ -3,18 +3,33 @@ import { useLingua, useT } from '@/i18n/provider';
 import { eLingua, linguaCorrente, localeDi, type Lingua } from '@/i18n/lingua';
 import { t as tr } from '@/i18n/t';
 import { localizePayload } from '@/lib/api-presentation';
+import type { ReactNode } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Bellomberg } from '@/lib/api';
+import ModernPage from '@/components/ModernPage';
+import NewInterfaceBoundary from '@/components/NewInterfaceBoundary';
 import {
   BLOCCHI_MANDATO, eliminaBozza, salvaBozza, leggiBozza, coperturaCampo, consumaDettaglioRun, RIFIUTO_RUN_EVENT,
   dettaglioLeggibile, leggiNumeroMandato, rispostaDellaRevisione,
   type AnteprimaMandato, type CampoMandato, type StatoMandato, type ValoriMandato,
 } from '@/lib/mandato';
 import './mandato.css';
+import './operations-modern.css';
 import JournalPage from './JournalPage';
 
 const ETICHETTA = fieldLabel;
 type Form = Record<string, any>;
+
+function DeferredMandatoView({ render }: { render: () => ReactNode }) {
+  return render();
+}
+
+function MandatoViewBoundary({ render }: { render: () => ReactNode }) {
+  const language = useLingua();
+  return <NewInterfaceBoundary language={language}>
+    <DeferredMandatoView render={render} />
+  </NewInterfaceBoundary>;
+}
 
 export function formaDaValori(schema: Record<string, CampoMandato>, valori: ValoriMandato | null, language: Lingua = linguaCorrente()): Form {
   const out: Form = {};
@@ -99,20 +114,22 @@ export default function MandatoPage() {
     window.addEventListener(RIFIUTO_RUN_EVENT, showMandato);
     return () => window.removeEventListener(RIFIUTO_RUN_EVENT, showMandato);
   }, []);
-  return <div className="mandato-workspace" data-layout="worktable">
-    <header className="mandato-workspace-head"><h1>{tr(tab === 'mandato' ? 'mandate.workspace' : 'journal.title')}</h1><p>{tr(tab === 'mandato' ? 'mandate.intro' : 'journal.privacy')}</p></header>
-    <nav className="mandato-tabs" role="tablist" aria-label={tr('mandate.workspace')} onKeyDown={event => {
-      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
-      event.preventDefault();
-      const next = event.key === 'Home' ? 'mandato' : event.key === 'End' ? 'diario' : tab === 'mandato' ? 'diario' : 'mandato';
-      selectTab(next); document.getElementById('tab-' + next)?.focus();
-    }}>
-      <button id="tab-mandato" role="tab" aria-selected={tab === 'mandato'} aria-controls="panel-mandato" tabIndex={tab === 'mandato' ? 0 : -1} onClick={() => selectTab('mandato')}>{tr('mandate.mandate')}</button>
-      <button id="tab-diario" role="tab" aria-selected={tab === 'diario'} aria-controls="panel-diario" tabIndex={tab === 'diario' ? 0 : -1} onClick={() => selectTab('diario')}>{tr('mandate.journal')}</button>
-    </nav>
+  return <ModernPage page="mandato" presentationBoundary={false} render={() => <div className="mandato-workspace" data-layout="worktable">
+    <MandatoViewBoundary render={() => <>
+      <header className="mandato-workspace-head"><h1>{tr(tab === 'mandato' ? 'mandate.workspace' : 'journal.title')}</h1><p>{tr(tab === 'mandato' ? 'mandate.intro' : 'journal.privacy')}</p></header>
+      <nav className="mandato-tabs" role="tablist" aria-label={tr('mandate.workspace')} onKeyDown={event => {
+        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        const next = event.key === 'Home' ? 'mandato' : event.key === 'End' ? 'diario' : tab === 'mandato' ? 'diario' : 'mandato';
+        selectTab(next); document.getElementById('tab-' + next)?.focus();
+      }}>
+        <button id="tab-mandato" role="tab" aria-selected={tab === 'mandato'} aria-controls="panel-mandato" tabIndex={tab === 'mandato' ? 0 : -1} onClick={() => selectTab('mandato')}>{tr('mandate.mandate')}</button>
+        <button id="tab-diario" role="tab" aria-selected={tab === 'diario'} aria-controls="panel-diario" tabIndex={tab === 'diario' ? 0 : -1} onClick={() => selectTab('diario')}>{tr('mandate.journal')}</button>
+      </nav>
+    </>} />
     <div id="panel-mandato" role="tabpanel" aria-labelledby="tab-mandato" hidden={tab !== 'mandato'}><MandatoForm /></div>
     <div id="panel-diario" role="tabpanel" aria-labelledby="tab-diario" hidden={tab !== 'diario'}>{journalOpened && <JournalPage />}</div>
-  </div>;
+  </div>} />;
 }
 
 export function MandatoForm() {
@@ -190,6 +207,7 @@ export function MandatoForm() {
     finally { setBusy(false); setSaving(false); }
   };
 
+  return <MandatoViewBoundary render={() => {
   if (!stato && !erroreCarica) return <div className="mandato-loading" role="status" aria-busy="true">{tr('mandate.loading')}</div>;
   if (!stato) return <div className="mandato-fault" role="alert"><b>{tr('mandate.unreadable')}</b><pre>{erroreCarica ? errorForLanguage(erroreCarica,language) : tr('mandate.loading')}</pre><button onClick={carica} disabled={busy}>{tr('mandate.retry')}</button></div>;
   const view = localizePayload(stato, language);
@@ -233,6 +251,7 @@ export function MandatoForm() {
         <div className="mandato-trace"><span>{tr('mandate.fingerprint')}</span><b>{stato.impronta?.slice(0,12) || tr('mandate.undeclared')}</b><small>{stato.dichiarato_il || tr('mandate.never_saved')} · {stato.origine === 'esempio' ? tr('mandate.example_origin') : stato.origine === 'personalizzato' ? tr('mandate.personalized') : tr('mandate.undeclared')}</small></div>
       </aside>
     </div>
-    <footer className="mandato-actions"><span>{dirty ? tr(changedSections === 1 ? 'mandate.local_draft_one' : 'mandate.local_draft',{a:changedSections}) : tr('mandate.unchanged')}</span><button onClick={()=>{ eliminaBozza();setBozza(null);sostituisci(formaDaValori(stato.campi,stato.valori,inputLanguage),metadatiDaValori(stato.valori),false); }} disabled={saving}>{tr('mandate.discard')}</button><button data-action="preview" onClick={prova} disabled={busy}>{tr('mandate.preview')}</button><button data-action="save" className="primary" onClick={salva} disabled={busy || !anteprima || !compilato.valori}>{tr('mandate.save')}</button></footer>
+    <footer className="mandato-actions"><span>{dirty ? tr(changedSections === 1 ? 'mandate.local_draft_one' : 'mandate.local_draft',{a:changedSections}) : tr('mandate.unchanged')}</span><button onClick={()=>{ eliminaBozza();setBozza(null);sostituisci(formaDaValori(stato.campi,stato.valori,inputLanguage),metadatiDaValori(stato.valori),false); }} disabled={saving}>{tr('mandate.discard')}</button><button data-action="preview" onClick={prova} disabled={busy}>{tr('mandate.preview')}</button><button data-action="save" className="primary" onClick={salva} disabled={busy || !anteprima || !compilato.valori}>{tr(saving ? 'ui.saving' : 'mandate.save')}</button></footer>
   </div>;
+  }} />;
 }

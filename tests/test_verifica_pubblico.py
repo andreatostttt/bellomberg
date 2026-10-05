@@ -2257,6 +2257,9 @@ UTENTE_ATTESO = {
     ("decisions", "pm_feedback", None), ("decisions", "veto_reason", None),
     ("pm_feedback", "feedback_text", None), ("favorite_companies", "note", None),
     ("decision_notes", "testo", ("autore", "PM")), ("trade_history", "pm_rationale", None),
+    ("decision_events", "reason", None), ("decision_events", "details_json", None),
+    ("instrument_identity_verifications", "source", None),
+    ("instrument_identity_verifications", "reason", None),
     ("trade_history", "note", None), ("cash_movements", "note", None), ("positions", "tesi", None),
     ("positions", "temi_monitoraggio", None), ("positions", "note", None),
     ("position_openings", "provenienza", None), ("position_openings", "nota", None),
@@ -2703,6 +2706,50 @@ def test_profilo_filing_privato_e_motivo_recovery_entrano_nel_controllo(tmp_path
     tree = _tree(**PULITO, **{"leak.py": f"# {nota}\n# {motivo}\n# {chiave}\n# {escaped}\n"})
     hits = _hit_testo(vp.controllo_testo_pm(tree, texts))
     assert {("leak.py", n) for n in (1, 2, 3, 4)} <= set(hits)
+
+
+def test_campi_tecnici_del_profilo_filing_non_sono_testo_pm_quelli_liberi_si(tmp_path, monkeypatch):
+    """05/10 (decisione PM): sezioni/fonti/... li scrive il codice e restano fuori; una chiave
+    sconosciuta, anche annidata, resta testo del PM."""
+    from bellomberg.storage.filing_store import FilingStore
+
+    db = _db_schema_nuovo(tmp_path, monkeypatch)
+    store = FilingStore(db)
+    standard = "relazione finanziaria annuale consolidata del gruppo sintetico"
+    nota = "la pianta grassa sul davanzale ricorda le idee del lunedi"
+    profile = {
+        "ticker": "SYNTH", "emittente_id": "CIK:123", "lingua": "it", "tipo": "annuale",
+        "perimetro": "consolidato", "verifica": {"lingua": "Italian", "tipo": "annual", "perimetro": "consolidated"},
+        "sezioni": {"rischi": {"inizio": standard, "fine": standard}}, "fonti": [],
+        "chiave_nuova": {"dentro": [nota]},
+    }
+    store.set_profile("SYNTH", profile)
+    store.start_run("SYNTH")
+    texts = vp.testi_utente_db(db)
+    for origin in ("filing_profiles.profile_json", "filing_runs.profile_json"):
+        assert (origin, nota) in texts and (origin, "chiave_nuova") in texts
+        assert not any(k == origin and standard in v for k, v in texts)
+        assert not any(k == origin and v in vp.CHIAVI_TECNICHE_PROFILO_FILING for k, v in texts)
+    hits = _hit_testo(vp.controllo_testo_pm(_tree(**PULITO, **{"code.py": "# " + standard + "\n# " + nota + "\n"}), texts))
+    assert ("code.py", 2) in set(hits) and ("code.py", 1) not in set(hits)
+
+
+def test_chiavi_dei_profili_filing_automatici_fuori_ma_nome_resta_controllato():
+    """05/10 mattina (decisione PM): le chiavi scritte da filing_profili_auto escono dal controllo,
+    «nome» (nome dell'emittente dal portafoglio) resta testo del PM."""
+    standard = "relazione finanziaria annuale consolidata del gruppo sintetico"
+    nome = "la societa sintetica delle idee viola e del lunedi"
+    raw = json.dumps({
+        "ticker": "SYNTH", "cik": "0000000001", "lei": "SYNTHLEI00000000000", "sec_ticker": "SYNTH",
+        "forme_sec": ["10-K"], "esef_modo": "sito", "origine_collegamento": "alias",
+        "sezioni_salta_indice": True, "varianti": [{"sezioni": {"rischi": {"inizio": standard}}}],
+        "nome": nome,
+    })
+    stringhe = list(vp._stringhe_profilo_filing(raw))
+    assert nome in stringhe and "nome" in stringhe
+    assert not any(standard in s for s in stringhe)
+    assert not set(stringhe) & {"varianti", "cik", "lei", "sec_ticker", "forme_sec", "esef_modo",
+                                "origine_collegamento", "sezioni_salta_indice"}
 
 
 def test_filing_reason_tecnico_non_diventa_prosa_pm_e_json_malformato_fa_ko(synthetic_policy, tmp_path, monkeypatch):

@@ -35,10 +35,15 @@ PAGES = [
     ("17-movements", "Movimenti", "Registro delle operazioni e della cassa"),
     ("18-mandate-journal", "Mandato e Diario", "Regole di investimento, con effetto e verifica in vista."),
     ("19-settings", "Impostazioni", "Stato del sistema e copie di sicurezza"),
+    ("20-filing", "Filing", "Cosa cambia nelle relazioni dei tuoi titoli"),
 ]
-NAV_SHORT = ["DASH", "PERF", "FAVS", "MKT", "NEWS", "FUND", "FCTR",
-             "MTC", "VOLS", "EDGE", "CHAT", "LIVE", "SCORE", "MEMO",
-             "DECN", "TRADE", "MOVES", "MNDT", "CONFIG"]
+# PAGES is indexed by function key (chapter number); the bar follows the menu order of
+# app/src/lib/navigation.ts, where Filing keeps its fixed F20 right after Fundamentals.
+NAV = [("F1", "DASH"), ("F2", "PERF"), ("F3", "FAVS"), ("F4", "MKT"), ("F5", "NEWS"),
+       ("F6", "FUND"), ("F20", "FILE"), ("F7", "FCTR"), ("F8", "MTC"), ("F9", "VOLS"),
+       ("F10", "EDGE"), ("F11", "CHAT"), ("F12", "LIVE"), ("F13", "SCORE"), ("F14", "MEMO"),
+       ("F15", "DECN"), ("F16", "TRADE"), ("F17", "MOVES"), ("F18", "MNDT"), ("F19", "CONFIG")]
+NAV_STEP = 62.5
 # Pages redrawn on the 12/09 layouts show the heading the app renders (h1 and intro of the Italian
 # catalogue, subtitle in PAGES); the destination name stays in <title>.
 APP_TITLES = {9: "Atlante della volatilità", 13: "Risultati con evidenza"}
@@ -75,14 +80,15 @@ class Canvas:
         self.text(866, 39, "Ctrl + K", 13, GOLD, 600, "end")
         self.text(1250, 39, "DEMO • Dati interamente sintetici", 13, GOLD, 650, "end")
         self.rect(0, 64, 1280, 67, PANEL)
-        self.items.append('<g id="navigation" aria-label="Navigation F1 to F19">')
-        for i, short in enumerate(NAV_SHORT, 1):
-            x = 12 + (i - 1) * 66
-            if i == index:
-                self.rect(x, 68, 64, 59, "#2c3541", 3)
-                self.rect(x, 125, 64, 3, GOLD)
-            self.text(x + 32, 87, f"F{i}", 12, GOLD if i == index else MUTED, anchor="middle")
-            self.text(x + 32, 111, short, 12, TEXT if i == index else MUTED, 600, "middle")
+        self.items.append(f'<g id="navigation" aria-label="Navigation F1 to F{len(NAV)}">')
+        for i, (key, short) in enumerate(NAV):
+            x = 9 + i * NAV_STEP
+            current = key == f"F{index}"
+            if current:
+                self.rect(x, 68, 60, 59, "#2c3541", 3)
+                self.rect(x, 125, 60, 3, GOLD)
+            self.text(x + 30, 87, key, 12, GOLD if current else MUTED, anchor="middle")
+            self.text(x + 30, 111, short, 12, TEXT if current else MUTED, 600, "middle")
         self.items.append('</g>')
         self.line(0, 132, 1280, 132)
         self.main = True
@@ -774,6 +780,81 @@ def draw(index: int) -> Canvas:
             ["Aggiornamento prezzi","Disabilitata","Nessuna esecuzione"],
         ],[275,175,270],45)
         c.text(380,707,"Le chiavi si configurano nel file .env privato.",15,GOLD)
+    elif index == 20:
+        # Filing page (FilingPage): header, context strip, grouped list, detail with three cards.
+        c.button(248, 160, "Portafoglio", 96, "pressed", 26, 12)
+        c.button(350, 160, "Preferiti", 80, "outline", 26, 12)
+        c.text(446, 178, "6 titoli coperti · ultimo controllo: data DEMO", 13, MUTED)
+        c.rect(812, 163, 34, 18, "#24303c", 9, GOLD)
+        c.dot(838, 172, 6, GOLD)
+        c.text(854, 177, "Controllo giornaliero", 13, TEXT)
+        c.button(992, 160, "Rivedi collegamenti", 128, "secondary", 26, 12)
+        c.button(1128, 160, "Attiva i mancanti", 124, "primary", 26, 12)
+        c.rect(248, 198, 1004, 40, "#141b24", 5, LINE)
+        c.text(262, 223, "Contesto per il Comitato", 13, GOLD, 600)
+        c.text(430, 223, "3 aggiornati · 1 da aggiornare · 1 da confermare · 1 senza fonte · 0 esclusi"
+               " · 5 200 / 14 000 caratteri · 2 cambiamenti omessi", 12, MUTED)
+        c.rect(248, 250, 262, 508, PANEL, 5, LINE)
+        c.text(264, 274, "Titoli", 15, TEXT, 600)
+        c.text(494, 274, "Novità · A-Z", 12, MUTED, anchor="end")
+        y = 300
+        for group, rows in [
+            ("Con novità", [("SYN-A", "Demo equity A", "3 cambiamenti", GOLD), ("SYN-D", "Demo equity D", "1 cambiamento", GOLD)]),
+            ("Da sistemare", [("SYN-E", "Demo equity E", "Collegamento da confermare", RED)]),
+            ("Aggiornati", [("SYN-B", "Demo equity B", "Invariato", MUTED), ("SYN-F", "Demo fund F", "Controllo in corso", CYAN)]),
+            ("Senza fonte", [("SYN-C", "Demo equity C", "Nessuna fonte gratuita", MUTED)]),
+        ]:
+            c.text(264, y, f"{group} ({len(rows)})", 12, MUTED, 600)
+            y += 10
+            for ticker, name, state, color in rows:
+                if ticker == "SYN-A":
+                    c.rect(256, y, 246, 46, "#2c3541", 3)
+                    c.rect(256, y, 3, 46, GOLD)
+                c.text(268, y + 19, ticker, 13, TEXT, 600)
+                c.text(330, y + 19, name, 13, MUTED)
+                c.text(268, y + 37, state, 12, color)
+                y += 52
+            y += 22
+        c.rect(526, 250, 726, 70, PANEL, 5, LINE)
+        c.text(542, 276, "Demo equity A · SYN-A", 18, TEXT, 650)
+        c.text(542, 302, "Fonte DEMO · semestre 1 anno 1 → semestre 1 anno 2 · controllo: data DEMO · sezioni 4/4", 12, MUTED)
+        c.button(1098, 262, "Profilo", 66, "outline", 24, 12)
+        c.button(1170, 262, "Verifica ora", 74, "secondary", 24, 12)
+        c.panel(526, 332, 726, 238, "Cambiamenti")
+        tabs = [("In evidenza", 80), ("Rischi", 52), ("Gestione", 64), ("Contenziosi", 80), ("Tutti", 44)]
+        x = 544
+        for k, (label, w) in enumerate(tabs):
+            c.text(x, 386, label, 12, GOLD if k == 0 else MUTED, 600 if k == 0 else 400)
+            x += w
+        c.line(544, 394, 1234, 394)
+        changes = [
+            ("Modificato · Rischi · p. 14 · C1-prima/dopo", "Esposizione a un fornitore inventato", "unico fornitore", "due fornitori"),
+            ("Aggiunto · Contenziosi · p. 31 · C2-dopo", "Nuova controversia fittizia su un contratto DEMO", None, None),
+            ("Tolto · Gestione · p. 8 · C3-prima", "Obiettivo di margine rimosso dal testo sintetico", None, None),
+        ]
+        for k, (meta, body, removed, added) in enumerate(changes):
+            yy = 418 + k * 50
+            c.text(544, yy, meta, 11, CYAN)
+            c.text(1234, yy, "Apri documento", 11, MUTED, anchor="end")
+            c.text(544, yy + 20, body, 13, TEXT)
+            if removed:
+                c.text(800, yy + 20, removed, 13, RED)
+                c.line(800, yy + 15, 874, yy + 15, RED, 1)
+                c.text(888, yy + 20, added, 13, GREEN, 600)
+        c.panel(526, 582, 300, 176, "Numeri chiave")
+        for k, (label, value, color) in enumerate([
+            ("Ricavi", "+12,0%", GREEN), ("Utile operativo", "+4,5%", GREEN),
+            ("Utile netto", "−3,1%", RED), ("Debito", "+6,0%", RED),
+        ]):
+            c.text(544, 640 + k * 28, label, 13, MUTED)
+            c.text(808, 640 + k * 28, value, 13, color, 600, "end")
+        c.panel(842, 582, 410, 176, "Cosa vede il Consigliere")
+        c.rect(860, 622, 374, 76, BG, 3, LINE)
+        c.lines(870, 642, ["SYN-A NOVITÀ sem.1 a1→a2 · 3 cambiamenti", "numeri ricavi +12,0% · utile netto −3,1%",
+                           "C1 Rischi: due fornitori invece di uno"], 12, TEXT, 20)
+        c.text(860, 724, "212 caratteri · 3 citati · 0 omessi", 12, MUTED)
+        c.button(1176, 708, "Copia", 58, "outline", 24, 12)
+        c.text(1252, 794, "Proposta AI solo da pulsante, dopo una stima gratuita.", 12, MUTED, anchor="end")
     return c
 
 

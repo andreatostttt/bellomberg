@@ -125,7 +125,7 @@ def test_verified_foreign_statement_reaches_existing_refresh_queue(setup, monkey
            'report_date': '2026-06-30', 'emittente_id': 'CIK:0000001234',
            'accession': '0000001234-26-000001', 'url': url}
     monkeypatch.setattr('bellomberg.market_data.sec_edgar.get_filing_catalog',
-                        lambda *_: {'stato': 'ok', 'motivi': [], 'documenti': [row]})
+                        lambda *_, **_k: {'stato': 'ok', 'motivi': [], 'documenti': [row]})
     def download(actual_url, archive, hosts):
         assert actual_url == url
         archive.mkdir(parents=True, exist_ok=True)

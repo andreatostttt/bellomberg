@@ -203,5 +203,11 @@ export const newsdesk = {
   "originalBellomberg": "Original Bellomberg text · {language}",
   "originalBackendLabel": "Original backend label: {label}",
   "ageUnknown": "age unavailable",
-  "calendarLoading": "Loading calendar..."
+  "calendarLoading": "Loading calendar...",
+  "refreshJob_missing_id": "the service returned no refresh job identifier",
+  "refreshJob_changed_id": "the refresh job changed while waiting: expected {expected}, received {received}",
+  "refreshJob_unexpected_status": "unexpected refresh job status: {status}",
+  "refreshJob_already_started": "refresh already started from this page",
+  "refreshJob_stopped": "waiting for the refresh was interrupted",
+  "refreshJob_failed": "the refresh job failed without details"
 };

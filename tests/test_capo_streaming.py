@@ -93,8 +93,7 @@ def test_capo_chiama_in_streaming_col_tetto_128k(monkeypatch):
     kw = chiamate[0]
     assert kw["max_tokens"] == 128000, kw["max_tokens"]
     assert kw["model"] == llm_client.modello("capo")
-    # il thinking del comitato resta ADAPTIVE (regola CLAUDE.md: com'era)
-    assert kw["thinking"] == {"type": "adaptive"}
+    assert kw["thinking"] == {"type": "effort", "effort": "high"}
     assert kw["system"], "system prompt del Capo perso nella conversione"
     assert "MEMO FINTO DEL CAPO" in final
     assert usage["output_tokens"] == 567
@@ -115,3 +114,50 @@ def test_etichetta_modello_non_stantia(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert llm_client.modello("capo") in out
     assert "Opus 4.8" not in out
+
+
+def test_r0_non_diventa_materiale_grezzo_se_r1_e_r2_mancano(monkeypatch):
+    """G7/M5 (04/10): con R1 e R2 del desk vuoti il Capo riceve [NO REPORT] con la causa,
+    come a e44e955: il testo R0 (ricognizione) NON gli arriva come «MATERIALE GREZZO».
+    Non concordato, e la stessa funzione serve anche Trade Idea."""
+    chiamate = _prepara(monkeypatch, _messaggio_finto())
+    errore = ("[ERROR fundamentals round 2]: max_tokens con zero testo anche "
+              "dopo il recupero senza tool e con reasoning minimo")
+    board = SimpleNamespace(data={
+        "macro": {2: "report macro finto"},
+        "fundamentals": {
+            0: "DATI GREZZI FUNDAMENTALS: guidance e consensus verificati.",
+            1: "[ERROR fundamentals round 1]: max_tokens con zero testo",
+            2: errore,
+        },
+    })
+
+    capo.run_capo(board)
+
+    user_msg = chiamate[0]["messages"][0]["content"]
+    assert "--- FUNDAMENTALS --- [NO REPORT] (a registro: [ERROR fundamentals round 2]" in user_msg
+    assert "MATERIALE GREZZO" not in user_msg
+    assert "DATI GREZZI FUNDAMENTALS" not in user_msg
+    scelti = capo.scegli_report_specialisti(board.data)["fundamentals"]
+    assert scelti["no_report"] is True and scelti["round"] == 2
+    assert set(scelti) == {"round", "report", "no_report"}
+
+
+def test_capo_non_recupera_rifiuti_o_collassi_come_materiale_grezzo(monkeypatch):
+    chiamate = _prepara(monkeypatch, _messaggio_finto())
+    errore = "[ERROR fundamentals round 2]: max_tokens con zero testo"
+    board = SimpleNamespace(data={
+        "fundamentals": {
+            0: "[COLLASSO ANNUNCIO-SENZA-TOOL R0 DOPO NUDGE] procedo con l'analisi",
+            1: "[fundamentals] RIFIUTO DEL MODELLO: impossibile rispondere",
+            2: errore,
+        },
+    })
+
+    capo.run_capo(board)
+
+    user_msg = chiamate[0]["messages"][0]["content"]
+    assert "--- FUNDAMENTALS --- [NO REPORT]" in user_msg
+    assert errore in user_msg
+    assert "MATERIALE GREZZO" not in user_msg
+    assert "procedo con l'analisi" not in user_msg

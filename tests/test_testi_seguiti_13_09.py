@@ -28,14 +28,20 @@ ROOT = Path(__file__).resolve().parents[1]
 def _pagina(ident, lingua):
     """(tasto F, etichetta) della destinazione `ident` come la mostra l'app."""
     registro = (ROOT / "app/src/lib/navigation.ts").read_text(encoding="utf-8")
-    ordine = re.findall(r"^\s*\['([^']+)',\s*'[^']+',", registro, re.MULTILINE)
-    assert ident in ordine, "destinazione %r assente da navigation.ts: %r" % (ident, ordine)
+    # Il tasto e' il sesto campo se fisso (Filing: F20), altrimenti progressivo come in navigation.ts.
+    voci = re.findall(r"^\s*\['([^']+)',(?:\s*'[^']*',){3}\s*'[^']*'(?:,\s*'([^']*)')?\s*\],", registro, re.MULTILINE)
+    tasti, progressivo = {}, 0
+    for nome, fisso in voci:
+        if not fisso:
+            progressivo += 1
+        tasti[nome] = fisso or "F%d" % progressivo
+    assert ident in tasti, "destinazione %r assente da navigation.ts: %r" % (ident, list(tasti))
     catalogo = (ROOT / f"app/src/i18n/{lingua}/shell.ts").read_text(encoding="utf-8")
     blocco = re.search(r"export const nav = \{(.*?)\};", catalogo, re.DOTALL)
     assert blocco, "blocco nav assente da %s/shell.ts" % lingua
     etichetta = re.search(rf"\b{ident}: '([^']+)'", blocco.group(1))
     assert etichetta, "etichetta %r assente da %s/shell.ts" % (ident, lingua)
-    return "F%d" % (ordine.index(ident) + 1), etichetta.group(1)
+    return tasti[ident], etichetta.group(1)
 
 
 # ------------------------------------------------------------------ 1. rotte news

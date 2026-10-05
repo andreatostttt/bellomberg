@@ -9,10 +9,11 @@ NUOVO IN FASE 1:
 """
 import json
 from datetime import datetime
-from bellomberg.core.llm_client import OpenRouterClient, modello as _modello_llm
+from bellomberg.core.llm_client import (OpenRouterClient, modello as _modello_llm, thinking_fase,
+                                        THINKING_DA_EFFORT)
 from bellomberg.core.config import PM_DESC
 from bellomberg.core.language import prompt_for_language, scoped_language
-from bellomberg.core.llm_refusal import refusal_reason as _refusal_reason
+from bellomberg.core.llm_refusal import REFUSAL_TAG, refusal_reason as _refusal_reason
 
 
 # 05/09 (ordine PM): il modello del Capo vive nel .env (CAPO_MODEL, slug OpenRouter) e si
@@ -188,6 +189,12 @@ Chiudi con un breve paragrafo: "Feedback del PM incorporato questa settimana: ..
 ## 12. Nota di Chiusura (100-150 parole)
 ```
 (Gli header restano in italiano come sopra. La ACTION TABLE in cima resta in formato tabella.)
+
+FORMATO TABELLE NEL MEMO (obbligatorio per la resa PDF):
+- Ogni tabella nelle sezioni 2, 5, 10 e 11 deve usare una tabella Markdown standard con intestazione, riga separatrice e righe dati, per esempio: | Colonna A | Colonna B | seguito da |---|---|.
+- Non usare blocchi ```...```, spaziature monospazio o righe di =====/----- per simulare colonne.
+- Mantieni al massimo 5 colonne per tabella; se i dati richiedono piu' colonne, dividili in tabelle contigue con ticker/identificativo ripetuto e senza perdere righe, valori, fonti o avvertenze.
+- Il renderer deve poter mandare a capo ogni cella; non comprimere frasi o rimuovere dati per far entrare una tabella.
 
 REGOLE ACTION TABLE (il parser la legge in automatico):
 - ESATTAMENTE 5 colonne: | Action | Ticker | EUR | Timing | Confidence |
@@ -437,7 +444,11 @@ def _blocco_red_team(rt, motivo_guasto=None):
 def _e_segnaposto(testo):
     """Stesso predicato di specialists.base (persistenza): un report che DICE di non esistere."""
     t = str(testo or "")
-    return (not t.strip()) or t.startswith("[ERROR") or ("No output produced in round" in t[:120])
+    testa = t.strip()[:200]
+    return (not testa) or testa.startswith("[ERROR") \
+        or ("No output produced in round" in testa) \
+        or testa.startswith("[COLLASSO ANNUNCIO-SENZA-TOOL") \
+        or REFUSAL_TAG in testa
 
 
 def _round_int(k):
@@ -509,6 +520,9 @@ def scegli_report_specialisti(data, orari=None):
         chiavi = sorted(rounds.keys(), key=_round_int)
         latest = chiavi[-1]
         scelto = latest
+        # G7/M5 (04/10): con R1 e R2 senza testo il desk resta SCOPERTO ([NO REPORT] qui
+        # sotto), come a e44e955. Il recupero del testo R0 come «MATERIALE GREZZO» per il
+        # Capo era un'aggiunta non concordata, e questa funzione serve anche Trade Idea.
         if _e_segnaposto(rounds[latest]):
             for k in reversed(chiavi[:-1]):
                 if _round_int(k) >= 1 and not _e_segnaposto(rounds[k]):
@@ -560,9 +574,20 @@ def run_capo(blackboard, portfolio_data=None, memory_db=None, sizing_context=Non
                 or type(_saved_request.get("max_tokens")) is not int
                 or _saved_request["max_tokens"] not in (64000, CAPO_MAX_TOKENS)):
             raise ValueError("Capo checkpoint contract changed; original request preserved")
+        # G7/C1 (04/10): la ripresa usa l'effort SALVATO con la richiesta originale, mai il
+        # CAPO_EFFORT di oggi: con un effort diverso la chiave del journal cambiava e il Capo
+        # (Opus, 128k) si pagava di nuovo. Formato vecchio (senza «thinking», scritto prima
+        # di questa cura): si chiede l'effort di oggi e il request journal riconosce la
+        # risposta gia' pagata con qualunque effort noto (request_journal.prepare, fase capo).
+        if "thinking" in _saved_request:
+            if _saved_request["thinking"] not in THINKING_DA_EFFORT:
+                raise ValueError("Capo checkpoint contract changed; original request preserved")
+            _thinking = _saved_request["thinking"]
+        else:
+            _thinking = _thinking_capo_o_errore()
         return _execute_capo_request(CAPO_MODEL, _system, _saved_request["user_message"],
                                      _mandato, _saved_request["research_date"],
-                                     max_tokens=_saved_request["max_tokens"])
+                                     max_tokens=_saved_request["max_tokens"], thinking=_thinking)
     print("\n" + "=" * 70)
     print("BELLOMBERG CAPO synthesis (" + CAPO_MODEL + ") - memory-aware v4")  # voce 5: etichetta derivata dal model string, non puo' piu' invecchiare
     print("=" * 70)
@@ -799,16 +824,30 @@ def run_capo(blackboard, portfolio_data=None, memory_db=None, sizing_context=Non
     user_msg = "\n".join(user_msg_parts)
     print("[CAPO] Context: " + str(len(user_msg)) + " chars")
     research_date = datetime.now().strftime("%d/%m/%Y")
+    # Effort dal .env (CAPO_EFFORT, default high), risolto UNA volta e congelato nel
+    # checkpoint con il resto della richiesta (G7/C1): vuota o non valida = errore col nome.
+    _thinking = _thinking_capo_o_errore()
     _persist = getattr(blackboard, "persist_run_checkpoint", None)
-    if callable(_persist):
+    if callable(_persist) and not isinstance(_thinking, Exception):
         blackboard.data["_capo_request"] = {"model": CAPO_MODEL, "system": _system,
-            "max_tokens": CAPO_MAX_TOKENS, "user_message": user_msg, "research_date": research_date}
+            "max_tokens": CAPO_MAX_TOKENS, "thinking": _thinking,
+            "user_message": user_msg, "research_date": research_date}
         _persist("capo_request", blackboard.data["_capo_request"])
     return _execute_capo_request(CAPO_MODEL, _system, user_msg, _mandato, research_date,
-                                 max_tokens=CAPO_MAX_TOKENS)
+                                 max_tokens=CAPO_MAX_TOKENS, thinking=_thinking)
 
 
-def _execute_capo_request(CAPO_MODEL, _system, user_msg, _mandato, research_date, *, max_tokens):
+def _thinking_capo_o_errore():
+    """CAPO_EFFORT risolto; vuota o non valida = l'eccezione col NOME, restituita e non
+    sollevata: _execute_capo_request la dichiara nel memo ([CAPO ERROR], 0 call) come prima."""
+    try:
+        return thinking_fase("capo")
+    except Exception as exc:
+        return exc
+
+
+def _execute_capo_request(CAPO_MODEL, _system, user_msg, _mandato, research_date, *, max_tokens,
+                          thinking):
     """Dispatch only the frozen prompt; a restart never reacquires Capo context."""
     import bellomberg.core.mandato_pm as _mandato_pm
     from bellomberg.agents.specialists.base import timeout_specialisti
@@ -829,11 +868,14 @@ def _execute_capo_request(CAPO_MODEL, _system, user_msg, _mandato, research_date
             try:
                 # Streaming conservato; il tetto e' quello del nuovo lavoro o
                 # della richiesta storica verificata, mai ricalcolato nel replay.
+                # Effort congelato con la richiesta (G7/C1): lo stesso anche per il nudge.
+                if isinstance(thinking, Exception):
+                    raise thinking   # CAPO_EFFORT non valida: dichiarata, nessuna call
                 api_calls += 1
                 with client.messages.stream(
                     model=CAPO_MODEL,
                     max_tokens=max_tokens,
-                    thinking={"type": "adaptive"},
+                    thinking=thinking,
                     system=_system,
                     messages=_messages,
                 ) as _stream:

@@ -42,6 +42,10 @@ except ImportError:
 # agli agenti per 3 run — perche' il commit lo aveva aggiunto QUI e basta.
 # Regola: tool nuovo = schema in chat_tools.TOOL_DEFINITIONS + ramo di dispatch +
 # nome nel subset dell'agente che lo deve usare. Tre posti, non uno.
+
+# W1 (04/10, Opus 5.5): opt-in ESPLICITO al gemello USA confermato dal PM. La proprieta'
+# vive nel registro VIVO (chat_tools, import leggero: non importa agent_tools).
+from bellomberg.agents.chat_tools import PROXY_USA_PROP  # noqa: E402
 TOOLS_SCHEMA = [
     {
         "name": "tavily_search",
@@ -135,14 +139,15 @@ TOOLS_SCHEMA = [
     },
     {
         "name": "get_options_data",
-        "description": "Get options market data for a US ticker: implied volatility (ATM), put/call open interest ratio, max pain strike, total OI, greeks ATM. Fonte primaria POLYGON (professionale, supporta il parametro expiry); fallback automatico IBKR TWS poi yfinance se Polygon non disponibile. Il campo 'data_source' dice quale fonte ha risposto. Solo ticker US.",
+        "description": "Get options market data for a US ticker: implied volatility (ATM), put/call open interest ratio, max pain strike, total OI, greeks ATM. Fonte primaria POLYGON (professionale, supporta il parametro expiry); fallback automatico IBKR TWS poi yfinance se Polygon non disponibile. Il campo 'data_source' dice quale fonte ha risposto. Solo ticker US: un ticker estero riceve 'non coperto' PRIMA di ogni fornitore (nessun tentativo IBKR) e il campo gemello_usa dice se esiste un gemello USA confermato (usalo SOLO con proxy_usa=true, citando l'etichetta PROXY).",
         "input_schema": {
             "type": "object",
             "properties": {
                 "ticker": {
                     "type": "string",
                     "description": "US ticker only (e.g. 'AAPL', 'TSLA', 'AMD')"
-                }
+                },
+                "proxy_usa": PROXY_USA_PROP
             },
             "required": ["ticker"]
         }
@@ -240,6 +245,10 @@ def tool_search_news(query, max_results=10):
                                   fetch_yfinance_news, reset_status, last_status)
     except ImportError as e:
         return {"error": "Modulo news non disponibile: " + str(e)}
+    try:
+        from bellomberg.market_data.news_sources import last_cache_eta
+    except ImportError:
+        last_cache_eta = None  # solo l'eta' della cache manca: gli stati restano dichiarati
 
     reset_status()
     risultati = []
@@ -271,21 +280,29 @@ def tool_search_news(query, max_results=10):
             break
 
     # --- Opus 4.8 15/07: dichiarazione per-fonte (regola PM 14/07) --------------------
-    # Vocabolario chiuso: live | SKIP_BUDGET | SKIP_COOLDOWN | SKIP_DISABLED | NO_KEY |
-    # HTTP_<code> | ERROR | DISABLED/NO_LIB | non_interrogata. Nessuno stato inventato:
+    # Vocabolario chiuso: live | cache | SKIP_BUDGET | SKIP_PACING | SKIP_COOLDOWN | SKIP_COOLDOWN_CACHE_KO |
+    # SKIP_DISABLED | NO_KEY | HTTP_<code> | ERROR | DISABLED/NO_LIB | non_interrogata. Nessuno stato inventato:
     # una fonte che non ha registrato nulla NON e' "ok", e' 'ignota' e va detto.
     _esiti = last_status()
     _fonti = {}
     for _f in ("marketaux", "thenewsapi", "gnews"):
         _fonti[_f] = _esiti.get(_f, "ignota")
     _fonti["yfinance"] = _esiti.get("yfinance", "non_interrogata" if not _yf_tentato else "ignota")
-    _mute = sorted([f for f, s in _fonti.items() if s not in ("live", "non_interrogata")])
-    _vive = sorted([f for f, s in _fonti.items() if s == "live"])
+    # Opus 5.5 04/10: "cache" = risultati GNews della STESSA query salvati < 2h fa dalla
+    # cache condivisa (gnews_cache), serviti durante il cooldown: la fonte VEDE, con un
+    # ritardo dichiarato in fonti_eta_cache_s. Prima il cooldown la rendeva muta.
+    _STATI_VIVI = ("live", "cache")
+    _mute = sorted([f for f, s in _fonti.items() if s not in _STATI_VIVI + ("non_interrogata",)])
+    _vive = sorted([f for f, s in _fonti.items() if s in _STATI_VIVI])
     # denominatore = le fonti CANDIDATE, non tutte: con una query non-ticker yfinance non
     # viene mai interrogata, e contarla direbbe "3 su 4" mentre copertura dice "NESSUNA".
     _candidate = [f for f, s in _fonti.items() if s != "non_interrogata"]
 
     out = {"query": query, "count": len(unici), "news": unici, "fonti": _fonti}
+    _eta_cache = {f: e for f, e in (last_cache_eta() if last_cache_eta else {}).items()
+                  if _fonti.get(f) == "cache"}
+    if _eta_cache:
+        out["fonti_eta_cache_s"] = _eta_cache
     if _mute:
         # NOMINARE chi e' degradato, come fa il pannello costi con gli agenti non prezzati.
         out["copertura"] = "PARZIALE" if _vive else "NESSUNA"
@@ -549,7 +566,8 @@ def tool_tavily_search(query, max_results=5):
                      "non presentarlo come quota corrente"),
         }
     except Exception as e:
-        return {"error": "Tavily error: " + str(e)}
+        from bellomberg.core.errori_sicuri import descrivi_eccezione   # G3
+        return {"error": "Tavily error: " + descrivi_eccezione(e, TAVILY_API_KEY)}
 
 
 
@@ -841,8 +859,157 @@ def _get_yfinance_oi_only(ticker, expiry=None):
         return None
 
 
-def tool_get_options_data(ticker, expiry=None):
-    """Implied vol, put/call OI ratio, max pain. Solo US tickers.
+# === W1 (04/10/2026, Opus 5.5): GUARDIA DI COPERTURA + GEMELLO USA nei wrapper dei tool ===
+# Le fonti SOLO-USA (opzioni Polygon/IBKR, Quiver, insider Finnhub/SEC) si interrogano DOPO
+# `copertura.copertura_usa/copertura_opzioni`: un ticker estero non parte verso nessun
+# fornitore (prima: errore Polygon scartato e tentativo IBKR col contratto SMART/USD;
+# Finnhub che toglie il suffisso e aggancia un omonimo). Il gemello USA confermato dal PM
+# (market_data.lookthrough_usa) si usa SOLO con `proxy_usa=true` esplicito e porta
+# l'etichetta PROXY in TESTA al payload. Mai un proxy scelto qui.
+
+def _esito_gemello_dichiarato(ticker, uso):
+    """esito_gemello senza eccezioni: un guasto del lettore e' uno STATO, non un silenzio."""
+    try:
+        from bellomberg.market_data.lookthrough_usa import esito_gemello
+        return esito_gemello(ticker, uso)
+    except Exception as e:
+        return {"stato": "errore_lettore", "ticker": ticker, "uso": uso, "voce": None,
+                "motivo": "lettura del negozio gemelli fallita (%s)" % type(e).__name__}
+
+
+def guardia_fonte_usa(ticker, fonte, uso, source, proxy_usa=False, opzioni=False, valuta=None,
+                      gemello=True):
+    """Decide PRIMA della rete se e cosa interrogare su una fonte solo-USA.
+
+    Ritorna {"simbolo": str|None, "etichetta": dict|None, "rifiuto": dict|None,
+    "avviso": dict|None}. `rifiuto` non None = restituiscilo al posto del dato (astensione
+    dichiarata, `error` col motivo, campo `gemello_usa`). `etichetta` non None = si interroga
+    il GEMELLO `simbolo` e il payload va marcato con `con_proxy`. `avviso` = copertura
+    indeterminata: si interroga col simbolo INTATTO (nessun omonimo possibile, regola C1),
+    e il payload lo dichiara."""
+    from bellomberg.market_data.copertura import (copertura_opzioni, copertura_usa,
+                                                  risposta_non_coperta, valuta_dal_book)
+    nota = None
+    t = str(ticker or "").strip().upper()
+    if valuta is None and t and "." not in t:
+        # solo un ticker SENZA suffisso dipende dalla valuta (dottrina classificazione.valuta):
+        # la si legge dalla posizione del book; fuori dal book la presunzione USA e' DICHIARATA
+        vb = valuta_dal_book(t)
+        valuta, nota = vb["valuta"], vb["nota"]
+    esito = copertura_opzioni(ticker, valuta) if opzioni else copertura_usa(ticker, fonte, valuta)
+    out = {"simbolo": esito["ticker"], "etichetta": None, "rifiuto": None, "avviso": None,
+           "nota_valuta": nota}
+    if esito["stato"] == "coperto":
+        return out
+    if esito["stato"] == "indeterminato":
+        if not esito["ticker"] or (valuta and str(valuta).strip().upper() != "USD"):
+            # senza suffisso ma quotato in non-USD: il simbolo nudo e' proprio l'omonimo
+            # USA da evitare -> nessuna chiamata
+            out["simbolo"] = None
+            out["rifiuto"] = risposta_non_coperta(esito, source)
+        else:
+            out["avviso"] = {"copertura": "indeterminato", "motivo": esito["motivo"]}
+        if out["rifiuto"] is not None and nota:
+            out["rifiuto"]["copertura_nota"] = nota
+        return out
+    # non_coperto
+    out["simbolo"] = None
+    rif = risposta_non_coperta(esito, source)
+    if nota:
+        rif["copertura_nota"] = nota
+    if esito.get("mercato") == "crypto 24/7":
+        rif["gemello_usa"] = {"stato": "non_applicabile",
+                              "motivo": "crypto: nessun emittente, nessun gemello USA"}
+        out["rifiuto"] = rif
+        return out
+    if not gemello:
+        rif["gemello_usa"] = {"stato": "non_applicabile",
+                              "motivo": "questo tool non usa gemelli USA (dato dell'emittente, non del mercato)"}
+        out["rifiuto"] = rif
+        return out
+    gem = _esito_gemello_dichiarato(esito["ticker"], uso)
+    if gem["stato"] == "confermato":
+        from bellomberg.market_data.lookthrough_usa import etichetta_proxy
+        try:
+            et = etichetta_proxy(gem["voce"], uso)
+        except Exception as e:
+            gem = {"stato": "errore_etichetta", "motivo": "etichetta PROXY rifiutata (%s)" % type(e).__name__}
+        else:
+            if proxy_usa:
+                if isinstance(et["ticker_dati"], list):
+                    rif["gemello_usa"] = {"stato": "confermato", "relazione": et["relazione"],
+                                          "motivo": "il gemello e' un PANIERE di partecipazioni (%s): "
+                                                    "questo tool interroga un solo sottostante, "
+                                                    "nessuna chiamata" % ", ".join(et["ticker_dati"])}
+                    rif["error"] = rif["error"] + " | proxy_usa: gemello a paniere non interrogabile qui"
+                    out["rifiuto"] = rif
+                    return out
+                out["simbolo"] = et["ticker_dati"]
+                out["etichetta"] = et
+                return out
+            rif["gemello_usa"] = {"stato": "confermato", "simbolo": et["ticker_dati"],
+                                  "relazione": et["relazione"],
+                                  "motivo": "gemello USA confermato dal PM disponibile per l'uso '%s': "
+                                            "richiama con proxy_usa=true (il dato arrivera' "
+                                            "etichettato PROXY)" % uso}
+            out["rifiuto"] = rif
+            return out
+    rif["gemello_usa"] = {"stato": gem["stato"], "motivo": gem.get("motivo")}
+    if proxy_usa:
+        rif["error"] = (rif["error"] + " | proxy_usa=true senza gemello confermato per '%s' (%s): "
+                        "nessun proxy usato" % (uso, gem["stato"]))
+    out["rifiuto"] = rif
+    return out
+
+
+def con_proxy(payload, guardia):
+    """Marca il payload: etichetta PROXY come PRIMA chiave, oppure l'avviso di copertura
+    indeterminata. Senza nessuno dei due il payload torna identico."""
+    if guardia.get("etichetta") is not None:
+        from bellomberg.market_data.lookthrough_usa import metti_in_testa
+        if not isinstance(payload, dict):
+            payload = {"data": payload}
+        return metti_in_testa(payload, guardia["etichetta"])
+    if guardia.get("avviso") is not None and isinstance(payload, dict) and "copertura" not in payload:
+        payload = dict(payload)
+        payload["copertura"] = guardia["avviso"]
+    if guardia.get("nota_valuta") and isinstance(payload, dict) and "copertura_nota" not in payload:
+        # presunzione USA (ticker fuori dal book) o valuta dalla posizione: sempre detta
+        payload = dict(payload)
+        payload["copertura_nota"] = guardia["nota_valuta"]
+    return payload
+
+
+def source_proxy(source, guardia):
+    """Il `_source` col PROXY dichiarato (lookthrough_usa.source_con_proxy) se c'e' un gemello."""
+    if guardia.get("etichetta") is None:
+        return source
+    from bellomberg.market_data.lookthrough_usa import source_con_proxy
+    return source_con_proxy(source, guardia["etichetta"])
+
+
+def tool_get_options_data(ticker, expiry=None, proxy_usa=False):
+    """Implied vol, put/call OI ratio, max pain. Solo opzioni USA.
+
+    W1 (04/10): la guardia `copertura_opzioni` sta PRIMA di Polygon, IBKR e yfinance: un
+    ticker estero non parte verso nessuno (dichiarato «non coperto», col gemello USA
+    confermato se esiste); con `proxy_usa=true` e gemello confermato si interroga il gemello
+    e il payload porta l'etichetta PROXY in testa. Un errore Polygon su un ticker USA non e'
+    piu' scartato in silenzio: resta in `polygon_non_usato`."""
+    g = guardia_fonte_usa(ticker, "opzioni_usa", "opzioni",
+                          "agent_tools.get_options_data(%s)" % ticker,
+                          proxy_usa=proxy_usa, opzioni=True)
+    if g["rifiuto"] is not None:
+        return g["rifiuto"]
+    note_polygon = []
+    r = _options_data_usa(g["simbolo"], expiry, note_polygon)
+    if isinstance(r, dict) and note_polygon and "polygon_non_usato" not in r:
+        r["polygon_non_usato"] = "; ".join(note_polygon)
+    return con_proxy(r, g)
+
+
+def _options_data_usa(ticker, expiry=None, note_polygon=None):
+    """Implied vol, put/call OI ratio, max pain. Solo US tickers (la guardia e' nel chiamante).
     expiry (YYYY-MM-DD) opzionale: tutti i provider devono usare la stessa scadenza.
     Strategia ibrida:
       - IBKR TWS (richiesta delayed-frozen) per spot + IV + Greeks
@@ -863,8 +1030,13 @@ def tool_get_options_data(ticker, expiry=None):
             poly = get_options_summary_polygon(ticker, expiry=expiry)
             if poly and not poly.get("error"):
                 return poly
-    except Exception:
-        pass
+            if note_polygon is not None:
+                note_polygon.append("Polygon: " + (str(poly.get("error")) if poly else "nessuna risposta"))
+        elif note_polygon is not None:
+            note_polygon.append("Polygon non disponibile (chiave o modulo assente)")
+    except Exception as e:
+        if note_polygon is not None:
+            note_polygon.append("Polygon: eccezione %s" % type(e).__name__)
 
     # 1. Tenta IBKR TWS (fallback se Polygon giu')
     ibkr_result = _get_ibkr_options(ticker, expiry=expiry) if expiry else _get_ibkr_options(ticker)
@@ -980,10 +1152,13 @@ def tool_get_13f_filing(institution):
                      + ", ".join(sorted(negozio["istituzioni"]["cik"])),
         }
     try:
-        # SEC EDGAR richiede User-Agent custom
-        headers = {"User-Agent": "Portfolio Monitor finance.research@example.com"}
+        # REV_G2a R-3: stesso ritmo comune (<= 8 req/s fra i processi) e stesso User-Agent con il
+        # contatto vero (SEC_CONTACT_EMAIL) degli altri percorsi SEC; prima un contatto finto e nessun ritmo.
+        from bellomberg.market_data import sec_edgar
+        headers = sec_edgar._headers()
         # 1. Cerca filing recenti
         url = "https://data.sec.gov/submissions/CIK" + cik + ".json"
+        sec_edgar.attendi_sec()
         r = _req.get(url, headers=headers, timeout=15)
         if r.status_code != 200:
             return {"error": "SEC EDGAR HTTP " + str(r.status_code)}
@@ -1715,6 +1890,17 @@ _NATIVE_TTL_S = 900.0  # come _FRED_TTL_S: la dashboard gira piu' volte a run
 _NATIVE_UA = {"User-Agent": "Bellomberg/1.0 (macro dashboard; personal use)"}
 
 
+# W1 (04/10, rilievo del verificatore news): l'errore di requests porta l'URL con la
+# querystring, e quindi la chiave (&api_key=...). Nessun testo d'errore che esce verso il
+# modello o i report deve contenerla: si maschera QUALUNQUE parametro-chiave noto.
+# Integrazione 04/10: UN solo ripulitore, quello comune di G3 (core/errori_sicuri.senza_segreti:
+# querystring, parametri-chiave, valori delle chiavi presenti nell'ambiente).
+def _senza_chiavi(testo):
+    """Il testo senza chiavi (querystring e parametri-chiave sostituiti da ***)."""
+    from bellomberg.core.errori_sicuri import senza_segreti
+    return senza_segreti(testo)
+
+
 def _native_cached(key, fn):
     import time as _t
     hit = _NATIVE_CACHE.get(key)
@@ -1724,7 +1910,8 @@ def _native_cached(key, fn):
         out = fn()
     except Exception as e:
         # niente cache degli errori: al giro dopo si ritenta
-        return {"error": key + ": " + str(e)[:160]}
+        from bellomberg.core.errori_sicuri import senza_segreti   # G3: mai la chiave all'agente
+        return {"error": key + ": " + senza_segreti(e)[:160]}
     _NATIVE_CACHE[key] = (_t.time(), out)
     return out
 
@@ -1846,7 +2033,10 @@ def _fred_fetch_series(series_id, last_n=24):
         _FRED_CACHE[_k] = (_t.time(), _out)
         return _out
     except Exception as e:
-        return {"error": "FRED fetch " + series_id + ": " + str(e)}
+        # G3 (ripulitore comune): tipo + stato HTTP + messaggio senza chiave; str(e) di
+        # requests contiene l'URL con &api_key=<chiave>
+        from bellomberg.core.errori_sicuri import descrivi_eccezione
+        return {"error": "FRED fetch " + str(series_id) + ": " + descrivi_eccezione(e, FRED_API_KEY)}
 
 
 def tool_get_macro_indicator(indicator, last_n=12):
@@ -1949,7 +2139,7 @@ def tool_get_macro_dashboard():
                 # silenzio (uk_cpi con ID inesistente e' sparito per mesi cosi')
                 dashboard["indicators"][key] = {"error": result["error"], "description": desc}
         except Exception as e:
-            dashboard["indicators"][key] = {"error": str(e), "description": desc}
+            dashboard["indicators"][key] = {"error": _senza_chiavi(str(e)), "description": desc}
 
     # Fonti native (P1 14/07, ok PM): serie morte su FRED riempite da ONS/
     # Eurostat/IMF/BCB, con src DICHIARATO. Errori dichiarati, mai saltati.
@@ -2024,7 +2214,7 @@ def tool_get_yield_curves():
         try:
             c = fn()
         except Exception as e:
-            out["curves"][k] = {"status": "error", "error": str(e)[:140]}
+            out["curves"][k] = {"status": "error", "error": _senza_chiavi(str(e))[:140]}
             continue
         entry = {"status": c.get("status"), "as_of": c.get("as_of"),
                  "label": label, "src": c.get("source")}
@@ -2067,7 +2257,7 @@ def tool_get_yield_curves():
         else:
             out["credit"]["eu_hy_oas"] = {"status": hy.get("status"), "error": hy.get("error")}
     except Exception as e:
-        out["credit"]["eu_hy_oas"] = {"status": "error", "error": str(e)[:140]}
+        out["credit"]["eu_hy_oas"] = {"status": "error", "error": _senza_chiavi(str(e))[:140]}
     # Review I-1 (26/07 sera-4): i due buchi avevano la STESSA motivazione e ne hanno due
     # diverse — e da oggi questo testo arriva al modello, che lo ripeterebbe al PM nel memo.
     out["unavailable"] = ("Italia BTP (curva e spread BTP-Bund): nessuna fonte gratuita "
@@ -2642,10 +2832,27 @@ def tool_check_decision_outcomes():
 
 
 # === #195: TOOL QUIVER (congress/lobbying/gov contracts) + INSIDER per gli agenti ===
-def tool_get_congress_trades(ticker=None, limit=50):
+def _quiver_con_guardia(nome, ticker, limit, uso, proxy_usa, chiama):
+    """Guardia di copertura PRIMA della chiave e della rete (W1): il «non coperto» e' vero
+    anche senza QUIVER_API_KEY. Il provider ha la sua guardia (C1); qui si aggiunge il
+    gemello USA (proxy_usa) e l'indeterminato dichiarato."""
+    g = guardia_fonte_usa(ticker, "quiver_" + uso, uso, "quiver %s(%s)" % (nome, ticker),
+                          proxy_usa=proxy_usa)
+    if g["rifiuto"] is not None:
+        return g["rifiuto"]
+    from bellomberg.market_data.quiver_data import quiver_available
+    if not quiver_available():
+        return {"error": "QUIVER_API_KEY non configurata"}
+    return con_proxy(chiama(g["simbolo"], limit), g)
+
+
+def tool_get_congress_trades(ticker=None, limit=50, proxy_usa=False):
     """Trade azionari del Congresso USA (Quiver). ticker opzionale (None = ultimi aggregati)."""
     try:
         from bellomberg.market_data.quiver_data import quiver_available, get_congress_trades
+        if ticker:
+            return _quiver_con_guardia("congress", ticker, limit, "congress", proxy_usa,
+                                       lambda t, n: get_congress_trades(ticker=t, limit=n))
         if not quiver_available():
             return {"error": "QUIVER_API_KEY non configurata"}
         return get_congress_trades(ticker=ticker, limit=limit)
@@ -2653,62 +2860,147 @@ def tool_get_congress_trades(ticker=None, limit=50):
         return {"error": "quiver congress: " + str(e)}
 
 
-def tool_get_lobbying(ticker, limit=30):
+def tool_get_lobbying(ticker, limit=30, proxy_usa=False):
     """Spesa di lobbying di una societa' (Quiver)."""
     try:
-        from bellomberg.market_data.quiver_data import quiver_available, get_lobbying
-        if not quiver_available():
-            return {"error": "QUIVER_API_KEY non configurata"}
-        return get_lobbying(ticker, limit=limit)
+        from bellomberg.market_data.quiver_data import get_lobbying
+        return _quiver_con_guardia("lobbying", ticker, limit, "lobbying", proxy_usa,
+                                   lambda t, n: get_lobbying(t, limit=n))
     except Exception as e:
         return {"error": "quiver lobbying: " + str(e)}
 
 
-def tool_get_gov_contracts(ticker, limit=30):
+def tool_get_gov_contracts(ticker, limit=30, proxy_usa=False):
     """Contratti governativi USA assegnati a una societa' (Quiver)."""
     try:
-        from bellomberg.market_data.quiver_data import quiver_available, get_gov_contracts
-        if not quiver_available():
-            return {"error": "QUIVER_API_KEY non configurata"}
-        return get_gov_contracts(ticker, limit=limit)
+        from bellomberg.market_data.quiver_data import get_gov_contracts
+        return _quiver_con_guardia("gov contracts", ticker, limit, "gov_contracts", proxy_usa,
+                                   lambda t, n: get_gov_contracts(t, limit=n))
     except Exception as e:
         return {"error": "quiver gov contracts: " + str(e)}
 
 
-def tool_get_insider_trades(ticker, days=90):
-    """Insider trades / Form 4 (Finnhub se disponibile, fallback SEC EDGAR)."""
+# Comunicazioni di internal dealing restituite al modello (il resto e' contato e dichiarato):
+# ognuna porta il dettaglio delle operazioni e il tool_result ha un tetto.
+INTERNAL_DEALING_MAX = 15
+
+
+def _internal_dealing_it(ticker, days, rifiuto_usa):
+    """Insider di un titolo italiano: eMarket SDIR (IT1). Gli stati KO / non_coperto / STALE
+    si DICHIARANO; nessun ripiego su Finnhub o SEC (togliendo .MI si aggancerebbe un omonimo)."""
+    from bellomberg.market_data.emarket_sdir import get_internal_dealing
     try:
-        try:
-            from bellomberg.market_data.finnhub_news import fetch_insider_trades as _fn
-            r = _fn(ticker, days=days)
-            if r:
-                return {"ticker": ticker, "source": "finnhub", "count": len(r), "trades": r[:30]}
-        except Exception:
-            pass
-        from bellomberg.market_data.sec_edgar import get_insider_trades as _sec
-        r = _sec(ticker, days=days)
-        return {"ticker": ticker, "source": "sec_edgar", "count": len(r) if r else 0, "trades": (r or [])[:30]}
+        giorni = int(days)
+    except (TypeError, ValueError):
+        giorni = days   # get_internal_dealing lo rifiuta con errore «parametro» dichiarato
+    r = get_internal_dealing(ticker, giorni=giorni)
+    comunicazioni = r.get("comunicazioni") or []
+    payload = {"ticker": r.get("ticker") or ticker, "source": "emarket_sdir (internal dealing)",
+               "stato": r.get("stato"), "errore": r.get("errore"), "motivo": r.get("motivo"),
+               "letto_il": r.get("letto_il"), "count": len(comunicazioni),
+               "comunicazioni": comunicazioni[:INTERNAL_DEALING_MAX]}
+    if len(comunicazioni) > INTERNAL_DEALING_MAX:
+        payload["comunicazioni_tagliate"] = ("mostrate %d su %d (le piu' recenti in testa come "
+                                             "le da' la fonte)" % (INTERNAL_DEALING_MAX, len(comunicazioni)))
+    for k in ("isin", "emarket_id", "url", "limiti", "troncato", "pdf_letti", "pdf_non_letti",
+              "pdf_falliti", "parse_falliti", "cache", "stato_originale", "voce_da"):
+        if k in r:
+            payload[k] = r[k]
+    if r.get("voce_da") == "automatico":
+        # IT1 04/10: l'ISIN viene dal negozio AUTOMATICO, non da quello confermato: si dice
+        payload["voce_da_nota"] = ("ISIN risolto AUTOMATICAMENTE su Borsa Italiana (negozio isin_it_auto, non confermato dal PM): verifica il titolo prima di usare il dato")
+    payload["fonti_usa"] = ("Finnhub/SEC Form 4 NON interrogate: " + str(rifiuto_usa.get("motivo") or ""))
+    if "gemello_usa" in rifiuto_usa:
+        payload["gemello_usa"] = rifiuto_usa["gemello_usa"]
+    stato = r.get("stato")
+    if stato in ("KO", "non_coperto"):
+        # zero comunicazioni con la fonte in KO NON e' «nessun insider»
+        payload["error"] = "internal dealing %s: %s" % (stato, r.get("motivo") or r.get("errore") or "n.d.")
+    elif stato == "STALE":
+        payload["avviso"] = ("STALE: fonte in guasto, servito il dato letto il %s (stato originale %s)"
+                             % (r.get("letto_il"), r.get("stato_originale")))
+    elif stato == "vuoto_misurato":
+        # misura della SOLA categoria eMarket (regola main 04/10, misura IT2): mai presentarla
+        # come assenza di operazioni degli insider
+        payload["esito"] = ("nessuna comunicazione nella categoria internal dealing di eMarket "
+                            "negli ultimi %s giorni (misura della sola categoria eMarket SDIR)" % giorni)
+    elif stato not in ("ok",):
+        payload["error"] = "internal dealing: stato inatteso %r" % (stato,)
+    return payload
+
+
+def insider_dichiarati(ticker, days=90, max_trades=30, proxy_usa=False):
+    """Insider trades con guardia di copertura (W1). Ritorna (payload, firma) per i due
+    consumatori (agent_tools e chat_tools).
+
+    - listino estero: nessuna chiamata a Finnhub/SEC; `.MI` -> internal dealing eMarket SDIR;
+      gli altri -> «non coperto» col gemello USA (usato SOLO con proxy_usa=true, etichettato);
+    - USA: Finnhub, poi SEC Form 4; i motivi delle fonti mute stanno in `fonti_mute` e una SEC
+      muta senza trade e' un `error` (mai «0 insider» muto)."""
+    t = str(ticker or "").strip().upper()
+    g = guardia_fonte_usa(t, "insider_form4", "insider", "insider(%s)" % t, proxy_usa=proxy_usa)
+    if g["rifiuto"] is not None:
+        if t.endswith(".MI"):
+            return (_internal_dealing_it(t, days, g["rifiuto"]),
+                    "eMarket SDIR internal dealing (%s)" % t)
+        return g["rifiuto"], "copertura insider (%s): nessuna fonte interrogata" % t
+    simbolo = g["simbolo"]
+    motivi_fh, motivi_sec = [], []
+    try:
+        from bellomberg.market_data.finnhub_news import fetch_insider_trades as _fn
+        r = _fn(simbolo, days=days, motivo=motivi_fh)
+        if r:
+            payload = {"ticker": t, "source": "finnhub", "count": len(r), "trades": r[:max_trades]}
+            return (con_proxy(payload, g),
+                    source_proxy("Finnhub insider transactions (Form 4 real-time)", g))
+    except Exception as e:
+        motivi_fh.append("eccezione %s" % type(e).__name__)
+    from bellomberg.market_data.sec_edgar import get_insider_trades as _sec
+    r = _sec(simbolo, days=days, motivo=motivi_sec) or []
+    payload = {"ticker": t, "source": "sec_edgar", "count": len(r), "trades": r[:max_trades]}
+    muti = {}
+    if motivi_fh:
+        muti["finnhub"] = "; ".join(str(m) for m in motivi_fh)
+    if motivi_sec:
+        muti["sec_edgar"] = "; ".join(str(m) for m in motivi_sec)
+    if muti:
+        payload["fonti_mute"] = muti
+    if not r and motivi_sec:
+        payload["error"] = "insider trades: SEC EDGAR non ha risposto (%s)" % muti["sec_edgar"]
+    return con_proxy(payload, g), source_proxy("SEC EDGAR Form 4 (fallback)", g)
+
+
+def tool_get_insider_trades(ticker, days=90, proxy_usa=False):
+    """Insider trades / Form 4 (Finnhub se disponibile, poi SEC EDGAR; .MI -> eMarket SDIR)."""
+    try:
+        payload, _firma = insider_dichiarati(ticker, days=days, max_trades=30, proxy_usa=proxy_usa)
+        return payload
     except Exception as e:
         return {"error": "insider trades: " + str(e)}
 
 
-TOOLS_SCHEMA.append({"name": "get_congress_trades", "description": "US CONGRESS stock trades (Quiver Quantitative, PAID). Which senators/representatives bought or sold a ticker and when - a strong political smart-money signal. Pass a ticker, or omit for the latest congressional trades across the market. Core tool for political/policy theses.", "input_schema": {"type": "object", "properties": {"ticker": {"type": "string", "description": "Ticker (optional; omit for latest market-wide)"}, "limit": {"type": "integer", "default": 50}}}})
-TOOLS_SCHEMA.append({"name": "get_lobbying", "description": "Corporate LOBBYING spend disclosures (Quiver, PAID). How much a company spends lobbying and on which issues - signals regulatory exposure and political positioning. Use for policy/regulation theses.", "input_schema": {"type": "object", "properties": {"ticker": {"type": "string"}, "limit": {"type": "integer", "default": 30}}, "required": ["ticker"]}})
-TOOLS_SCHEMA.append({"name": "get_gov_contracts", "description": "US GOVERNMENT CONTRACTS awarded to a company (Quiver, PAID). Federal awards are a hard revenue/visibility signal (defense, healthcare, infrastructure). Use for fundamentals + policy theses.", "input_schema": {"type": "object", "properties": {"ticker": {"type": "string"}, "limit": {"type": "integer", "default": 30}}, "required": ["ticker"]}})
-TOOLS_SCHEMA.append({"name": "get_insider_trades", "description": "INSIDER TRADES / Form 4 - officers and directors buying or selling (Finnhub PAID, fallback SEC EDGAR). Insider buying is bullish, clustered selling a caution. Use for fundamentals conviction.", "input_schema": {"type": "object", "properties": {"ticker": {"type": "string"}, "days": {"type": "integer", "default": 90}}, "required": ["ticker"]}})
+TOOLS_SCHEMA.append({"name": "get_congress_trades", "description": "US CONGRESS stock trades (Quiver Quantitative, PAID). Which senators/representatives bought or sold a ticker and when - a strong political smart-money signal. Pass a ticker, or omit for the latest congressional trades across the market. Core tool for political/policy theses.", "input_schema": {"type": "object", "properties": {"ticker": {"type": "string", "description": "Ticker (optional; omit for latest market-wide)"}, "limit": {"type": "integer", "default": 50}, "proxy_usa": PROXY_USA_PROP}}})
+TOOLS_SCHEMA.append({"name": "get_lobbying", "description": "Corporate LOBBYING spend disclosures (Quiver, PAID). How much a company spends lobbying and on which issues - signals regulatory exposure and political positioning. Use for policy/regulation theses. US issuers only: a foreign listing gets a DECLARED 'non coperto'.", "input_schema": {"type": "object", "properties": {"ticker": {"type": "string"}, "limit": {"type": "integer", "default": 30}, "proxy_usa": PROXY_USA_PROP}, "required": ["ticker"]}})
+TOOLS_SCHEMA.append({"name": "get_gov_contracts", "description": "US GOVERNMENT CONTRACTS awarded to a company (Quiver, PAID). Federal awards are a hard revenue/visibility signal (defense, healthcare, infrastructure). Use for fundamentals + policy theses. US issuers only: a foreign listing gets a DECLARED 'non coperto'.", "input_schema": {"type": "object", "properties": {"ticker": {"type": "string"}, "limit": {"type": "integer", "default": 30}, "proxy_usa": PROXY_USA_PROP}, "required": ["ticker"]}})
+TOOLS_SCHEMA.append({"name": "get_insider_trades", "description": "INSIDER TRADES / Form 4 - officers and directors buying or selling (Finnhub PAID, fallback SEC EDGAR). Insider buying is bullish, clustered selling a caution. Use for fundamentals conviction. Italian listings (.MI): internal dealing from eMarket SDIR (stato ok/vuoto_misurato/KO/non_coperto/STALE declared; KO is NOT zero insiders). Other foreign listings: DECLARED 'non coperto', no call to Finnhub/SEC (stripping the suffix would hit a US namesake).", "input_schema": {"type": "object", "properties": {"ticker": {"type": "string"}, "days": {"type": "integer", "default": 90}, "proxy_usa": PROXY_USA_PROP}, "required": ["ticker"]}})
 TOOL_DISPATCHER["get_congress_trades"] = tool_get_congress_trades
 TOOL_DISPATCHER["get_lobbying"] = tool_get_lobbying
 TOOL_DISPATCHER["get_gov_contracts"] = tool_get_gov_contracts
 TOOL_DISPATCHER["get_insider_trades"] = tool_get_insider_trades
 
 
-def tool_get_filing_changes(ticker):
-    from bellomberg.agents.filing_context import get_filing_changes
-    return get_filing_changes(ticker)
+from bellomberg.agents.filing_context import FILING_CHANGES_PROPERTIES
+
+
+def tool_get_filing_changes(ticker, da=None, max_changes=None, variante=None, ordine=None, run_id=None):
+    # Stessi parametri e stessa validazione del tool di chat (helper condiviso, mai eccezioni).
+    from bellomberg.agents.filing_context import get_filing_changes_da_input
+    return get_filing_changes_da_input({"ticker": ticker, "da": da, "max_changes": max_changes,
+                                        "variante": variante, "ordine": ordine, "run_id": run_id})
 
 
 TOOLS_SCHEMA.append({"name": "get_filing_changes",
                      "description": "Sola lettura archivio locale dei filing: confronto, citazioni, copertura, freschezza e giudizio; nessun nuovo fetch o fair value.",
-                     "input_schema": {"type": "object", "properties": {"ticker": {"type": "string"}},
+                     "input_schema": {"type": "object", "properties": dict(FILING_CHANGES_PROPERTIES),
                                       "required": ["ticker"]}})
 TOOL_DISPATCHER["get_filing_changes"] = tool_get_filing_changes

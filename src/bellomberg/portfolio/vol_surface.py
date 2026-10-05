@@ -58,6 +58,20 @@ def _expiry(value):
     return date.fromisoformat(value)
 
 
+def _opzioni_non_coperte(ticker, base):
+    """Le due funzioni sotto chiamano `polygon_data._get` DIRETTAMENTE, quindi la
+    guardia delle funzioni pubbliche del provider non le copre (P1, 04/10, Opus 5.5):
+    un `XXX.MI` interrogava OPRA a vuoto e tornava un errore generico. Ora
+    l'astensione dichiarata arriva PRIMA della rete, con `requests_used` 0.
+    Solo `non_coperto`: un suffisso fuori registro (classe di azioni col punto)
+    passa intatto, v. polygon_data._opzioni_non_coperte."""
+    from bellomberg.market_data.copertura import copertura_opzioni, risposta_non_coperta
+    esito = copertura_opzioni(ticker)
+    if esito["stato"] != "non_coperto":
+        return None
+    return {**base, **risposta_non_coperta(esito, base["_source"])}
+
+
 def get_expiry_catalog(ticker: str, after: Optional[str] = None,
                        request_budget: int = 8) -> Dict[str, Any]:
     """Discover distinct dates without downloading chains or sampling months.
@@ -76,6 +90,9 @@ def get_expiry_catalog(ticker: str, after: Optional[str] = None,
               "next_after": after, "requests_used": 0, "request_budget": request_budget,
               "error": None, "_source": "Polygon options contract reference",
               "_timestamp": datetime.now(timezone.utc).isoformat()}
+    fuori = _opzioni_non_coperte(ticker, result)
+    if fuori:
+        return fuori
     if not provider.polygon_available():
         return {**result, "error": _surface_text('POLYGON_API_KEY mancante o non attiva', 'POLYGON_API_KEY missing or inactive')}
     cursor = after
@@ -210,6 +227,9 @@ def _fetch_chain_detail(ticker, expiry, cursor):
             "next_cursor": None, "requests_used": 0, "page_limit": 250,
             "cached": False, "cache_ttl_seconds": CHAIN_CACHE_SECONDS,
             "_source": "Polygon option-chain snapshot", "_timestamp": datetime.now(timezone.utc).isoformat()}
+    fuori = _opzioni_non_coperte(ticker, base)
+    if fuori:
+        return fuori
     if not provider.polygon_available():
         return {**base, "error": _surface_text('POLYGON_API_KEY mancante o non attiva', 'POLYGON_API_KEY missing or inactive')}
     params = {"expiration_date": expiry, "limit": 250, "sort": "strike_price", "order": "asc"}
@@ -601,7 +621,11 @@ def build_vol_surface(ticker: str, max_expiries: int = 4,
             "_timestamp": datetime.now().isoformat(),
         }
     except Exception as e:
-        return {"error": error_text(e), "_source": src}
+        # 05/10 (Opus 5.5): i messaggi SCRITTI dalla casa (message()) passano;
+        # il testo di un'eccezione esterna no (requests porta l'URL con apiKey).
+        testo = error_text(e)
+        return {"error": testo if hasattr(testo, "_italian") else type(e).__name__,
+                "_source": src}
 
 
 def _interpret(ticker: str, slices: List[Dict[str, Any]],

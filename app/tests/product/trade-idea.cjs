@@ -339,11 +339,140 @@ test('research actions pin generation and retry identity; malformed reads fail v
     await TradeIdeaResearch.act('run/1', 'generation-exact', 'simulate', {changes: [{driver: 'wacc', value: 0.12}]}, 'request-exact');
     assert.equal(calls[0].url, 'http://synthetic.invalid/trade-ideas/runs/run%2F1/workspace/actions');
     assert.deepEqual(JSON.parse(calls[0].options.body), {kind:'simulate', generation_id:'generation-exact', request_id:'request-exact', data:{changes:[{driver:'wacc',value:0.12}]}});
-    await assert.rejects(TradeIdeaResearch.view('run/1'), /incomplete/);
+    // G9c (Opus 5.5): message now follows the UI language (it «incompleta», en «incomplete»)
+    await assert.rejects(TradeIdeaResearch.view('run/1'), /incomplet[ae]/);
   });
   await withFetch(() => new Response('exact workbook bytes'), async calls => {
     const blob = await researchArtifactBlob({artifact:{download_url:'/trade-ideas/runs/run-1/workspace/artifacts/7'}});
     assert.equal(await blob.text(), 'exact workbook bytes');
     assert.deepEqual(calls[0].options.headers, headers);
   });
+});
+
+test('cost reconciliation client previews without writing and records only with apply=true', async () => {
+  await withFetch({run_id: 'stopped/1', apply: false, outcomes: [], settled: 0, pending: 0}, async calls => {
+    await TradeIdeas.reconcileCosts('stopped/1', false);
+    await TradeIdeas.reconcileCosts('stopped/1', true);
+    assert.equal(calls[0].url, 'http://synthetic.invalid/trade-ideas/runs/stopped%2F1/costs/reconcile');
+    assert.equal(calls[0].options.method, 'POST');
+    assert.deepEqual(JSON.parse(calls[0].options.body), {apply: false});
+    assert.deepEqual(JSON.parse(calls[1].options.body), {apply: true});
+  });
+  await withFetch(() => new Response(JSON.stringify({detail: 'Run in corso: riconciliazione dei costi solo a run ferma'}),
+    {status: 409, headers: {'Content-Type': 'application/json'}}), async () => {
+    await assert.rejects(TradeIdeas.reconcileCosts('busy', false), error => error instanceof TradeIdeaApiError && error.status === 409
+      && /solo a run ferma/.test(error.message));
+  });
+});
+
+function reconcilePanel(api, detail) {
+  const JSX = require('react/jsx-runtime');
+  let index = 0, refIndex = 0;
+  const states = [], refs = [], nodes = [], changed = [];
+  const instrument = kind => (type, props, key) => { nodes.push({type, props}); return JSX[kind](type, props, key); };
+  const loader = creaCaricatore({stub: {
+    react: {...React, useRef(value) { return refs[refIndex++] ||= {current: value}; },
+      useState(value) { const at = index++; if (!(at in states)) states[at] = value; return [states[at], next => { states[at] = next; }]; }},
+    'react/jsx-runtime': {...JSX, jsx: instrument('jsx'), jsxs: instrument('jsxs')},
+    './api': { API_BASE: 'http://synthetic.invalid', requestHeaders: () => headers, clearSessionAndReload: () => {} },
+  }});
+  const language = loader('i18n/lingua.ts');
+  const lib = loader('lib/tradeIdeas.ts');
+  Object.assign(lib.TradeIdeas, api);
+  const Panel = loader('components/TradeIdeaCostReconcile.tsx').default;
+  const render = (lang = 'it') => { index = refIndex = 0; nodes.length = 0; language.impostaLinguaCorrente(lang);
+    return renderToStaticMarkup(React.createElement(Panel, {detail, onChanged: id => changed.push(id)})); };
+  return {render, nodes, changed, TradeIdeaApiError: lib.TradeIdeaApiError};
+}
+
+test('«Riconcilia costi» previews for free, always shows why a cost stays pending, and records only after confirmation', async () => {
+  const calls = [];
+  const outcomes = apply => [
+    {request_id: 'req-settle', status: apply ? 'settled' : 'settleable', charged_usd: '0.4123', role: 'quant', model: 'synthetic/model'},
+    {request_id: 'req-open', status: 'pending', reserved_usd: '0.9', reason: 'Original provider 404: generation not indexed yet'},
+  ];
+  const ui = reconcilePanel({reconcileCosts: async (id, apply) => { calls.push([id, apply]);
+    return {run_id: id, apply, outcomes: outcomes(apply), settled: apply ? 1 : 0, pending: 1}; }},
+    {run: {id: 'stopped-run', ticker: 'ZZTEST', technical_status: 'incomplete'}, cost: {unknown_requests: 2},
+      recovery: {blocked_reason: 'provider_cost_unresolved'}});
+  let html = ui.render('it');
+  assert.match(html, /Costi incerti/); assert.match(html, /Richieste dal costo incerto: 2/);
+  assert.doesNotMatch(html, /data-azione="registra"/, 'nothing to record before the preview');
+  ui.nodes.find(n => n.type === 'button' && n.props['data-azione'] === 'riconcilia').props.onClick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls, [['stopped-run', false]]);
+  html = ui.render('it');
+  assert.match(html, /Anteprima: nessun costo è stato ancora registrato/);
+  assert.match(html, /1 verificabili · 1 ancora incerte/);
+  assert.match(html, /Original provider 404: generation not indexed yet/);
+  assert.match(html, /Addebito misurato: 0.4123 USD/);
+  const en = ui.render('en');
+  assert.match(en, /Preview: no cost has been recorded yet/); assert.match(en, /Original provider 404/);
+  ui.render('it');
+  ui.nodes.find(n => n.type === 'button' && n.props['data-azione'] === 'registra').props.onClick();
+  assert.deepEqual(calls, [['stopped-run', false]], 'opening the confirmation writes nothing');
+  ui.render('it');
+  const dialog = ui.nodes.find(n => typeof n.type === 'function' && n.type.name === 'ConfirmDialog');
+  assert.equal(dialog.props.open, true);
+  assert.match(dialog.props.rows[1].v, /req-settle · 0.4123 USD/);
+  assert.doesNotMatch(dialog.props.rows[1].v, /req-open/);
+  dialog.props.onConfirm(); dialog.props.onConfirm();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls, [['stopped-run', false], ['stopped-run', true]]);
+  assert.deepEqual(ui.changed, ['stopped-run']);
+  html = ui.render('it');
+  assert.match(html, /1 registrate · 1 ancora incerte/); assert.match(html, /Original provider 404/);
+});
+
+test('cost reconciliation is hidden while running and a 409 is declared, never swallowed', async () => {
+  const hidden = reconcilePanel({reconcileCosts: async () => { throw new Error('must not be called'); }},
+    {run: {id: 'live', ticker: 'ZZTEST', technical_status: 'running'}, cost: {unknown_requests: 1}});
+  assert.equal(hidden.render('it'), '');
+  // 04/10 (G9b): nascosto in TUTTI gli stati non fermi, come inProgress della pagina
+  for (const technical_status of ['accepted', 'queued', 'pending', 'starting', 'running', 'stopping'])
+    assert.equal(reconcilePanel({reconcileCosts: async () => { throw new Error('must not be called'); }},
+      {run: {id: 'live', ticker: 'ZZTEST', technical_status}, cost: {unknown_requests: 1}}).render('it'), '', technical_status);
+  const none = reconcilePanel({reconcileCosts: async () => { throw new Error('must not be called'); }},
+    {run: {id: 'clean', ticker: 'ZZTEST', technical_status: 'completed'}, cost: {unknown_requests: 0}});
+  assert.equal(none.render('it'), '');
+  let ui;
+  ui = reconcilePanel({reconcileCosts: async () => { throw new ui.TradeIdeaApiError('Run in corso: riconciliazione dei costi solo a run ferma', 409); }},
+    {run: {id: 'raced', ticker: 'ZZTEST', technical_status: 'failed'}, cost: {unknown_requests: 1}});
+  ui.render('en');
+  ui.nodes.find(n => n.type === 'button' && n.props['data-azione'] === 'riconcilia').props.onClick();
+  await new Promise(resolve => setImmediate(resolve));
+  const html = ui.render('en');
+  assert.match(html, /role="alert"/); assert.match(html, /costs can be reconciled only once it has stopped/);
+  assert.match(html, /solo a run ferma/);
+});
+
+test('PDF manifest sections include recommendation, thesis, risks and data notes, ordered by page and tolerant when absent', () => {
+  const loader = creaCaricatore({stub: {'./api': { API_BASE: 'http://synthetic.invalid', requestHeaders: () => headers, clearSessionAndReload: () => {} }}});
+  const language = loader('i18n/lingua.ts');
+  const Sections = loader('components/TradeIdeaPdfSections.tsx').default;
+  const render = (lang, detail) => { language.impostaLinguaCorrente(lang); return renderToStaticMarkup(React.createElement(Sections, {detail})); };
+  const detail = {run: {id: 'r', ticker: 'ZZTEST'}, result: {dossier: [{key: 'valuation', title: 'Original valuation title', paragraphs: []}]},
+    progress: {report_quality: {section_pages: {annex: 9, data_notes: 7, risks: 5, thesis: 3, recommendation: 2, executive: 1,
+      valuation: 4, future_key: 8, broken: 'x'}}}};
+  const it = render('it', detail), en = render('en', detail);
+  assert.match(it, /Raccomandazione/); assert.match(it, /Tesi/); assert.match(it, /Rischi/); assert.match(it, /Note sui dati/);
+  assert.match(en, /Recommendation/); assert.match(en, /Thesis/); assert.match(en, /Risks/); assert.match(en, /Data notes/);
+  assert.match(en, /future_key/); assert.doesNotMatch(en, /broken/);
+  const order = [...en.matchAll(/data-sezione="([a-z_]+)"/g)].map(m => m[1]);
+  assert.deepEqual(order, ['executive', 'recommendation', 'thesis', 'valuation', 'risks', 'data_notes', 'future_key', 'annex']);
+  for (const missing of [{}, {progress: null}, {progress: {report_quality: null}}, {progress: {report_quality: {section_pages: {}}}}])
+    assert.equal(render('en', {run: {id: 'r', ticker: 'ZZTEST'}, ...missing}), '');
+});
+
+test('cost confirmation never shows «· USD» without an amount (G9b 04/10)', async () => {
+  const ui = reconcilePanel({reconcileCosts: async () => ({run_id: 'r1', apply: false, settled: 0, pending: 0,
+    outcomes: [{request_id: 'req-nocharge', status: 'settleable', charged_usd: null}]})},
+    {run: {id: 'r1', ticker: 'ZZTEST', technical_status: 'failed'}, cost: {unknown_requests: 1}});
+  ui.render('it');
+  ui.nodes.find(n => n.type === 'button' && n.props['data-azione'] === 'riconcilia').props.onClick();
+  await new Promise(resolve => setImmediate(resolve));
+  ui.render('it');
+  const dialog = ui.nodes.find(n => typeof n.type === 'function' && n.type.name === 'ConfirmDialog');
+  assert.doesNotMatch(dialog.props.rows[1].v, /· USD/);
+  assert.match(dialog.props.rows[1].v, /req-nocharge · importo non dichiarato dal backend/);
 });

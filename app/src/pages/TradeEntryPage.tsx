@@ -20,17 +20,20 @@ import { t as tr } from '@/i18n/t';
 //     «non disponibile».
 //   · «Il trade NON è stato scritto» veniva affermato anche su un timeout,
 //     cioe' proprio quando la scrittura poteva essere avvenuta.
+import type { ReactNode } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { Bellomberg } from '@/lib/api';
-import type { Decision, MovimentoCassa, PortfolioSnapshot, Position } from '@/lib/api';
+import type { Decision, MktSearchHit, MovimentoCassa, PortfolioSnapshot, Position } from '@/lib/api';
 import { portfolioValues } from '@/lib/portfolio-values';
-import { congelaAnteprima, dataTrade, decisioneCompatibile, legameTrade, FrontendTradeError } from '@/lib/trade-entry';
+import { congelaAnteprima, corpoIdentita, dataTrade, decisioneCompatibile, legameTrade, righeLegame, totaliMovimenti, FrontendTradeError, statoDivergenza, etichettaStatoDivergenza, spiegazioneDivergenza } from '@/lib/trade-entry';
 import type { TradeRequest, TradePreview, TradeResult } from '@/lib/trade-entry';
 import { preparaPosizioneIniziale, congelaPosizioneIniziale, leggiRicevutaPosizione, leggiPosizioniIniziali } from '@/lib/position-opening';
 import type { OpeningDraft, OpeningRecord, OpeningResult } from '@/lib/position-opening';
 import { useLingua, useT } from '@/i18n/provider';
+import ModernPage from '@/components/ModernPage';
+import NewInterfaceBoundary from '@/components/NewInterfaceBoundary';
 import { linguaCorrente, localeDi, type Lingua } from '@/i18n/lingua';
 import ConfirmDialog, { ConfirmRow } from '@/components/ConfirmDialog';
 import {
@@ -41,8 +44,25 @@ import {
 import type {
   Discordanza, Esito, EsitoMovimento, Ordine, RifiutoCassa, TradeRiga, Verbo,
 } from '@/lib/cassa';
-import { RefreshCw, Save, AlertOctagon, CheckCircle2, AlertTriangle, HelpCircle } from 'lucide-react';
-import './trade-cassa.css';
+import { RefreshCw, Check, AlertOctagon, CheckCircle2, AlertTriangle, HelpCircle, Info, ChevronRight, Link2, ArrowDownLeft, ArrowUpRight, FileText, XCircle } from 'lucide-react';
+import Card from '@/components/nuova/Card';
+import IconaTitolo from '@/components/nuova/IconaTitolo';
+import PastigliaVariazione from '@/components/nuova/PastigliaVariazione';
+import { parole } from './trade/parole';
+import './trade-nuova.css';
+
+/** Render the presentational tree below its boundary while keeping its
+ * controller hooks in the owning page component. */
+function DeferredTradeView({ render }: { render: () => ReactNode }) {
+  return render();
+}
+
+function TradeViewBoundary({ render }: { render: () => ReactNode }) {
+  const language = useLingua();
+  return <NewInterfaceBoundary language={language}>
+    <DeferredTradeView render={render} />
+  </NewInterfaceBoundary>;
+}
 
 const ACTIONS: { v: Verbo; label: string }[] = [
   { v: 'BUY', get label() { return tr('trade.buy_help'); } },
@@ -119,31 +139,54 @@ type CorpoMovimento = {
   data?: string; nota?: string; conferma?: boolean;
 };
 
+type Modo = 'trade' | 'cash' | 'opening';
+/** Cassa e ricarica stanno nel controller delle operazioni: la testata le legge da qui. */
+type Testata = { cassa: number | null; loading: boolean; letta: boolean };
+
 export default function TradeEntryPage() {
   const t = useT();
   const [params] = useSearchParams();
-  const initialOpening = params.get('mode') === 'opening';
-  const [mode, setMode] = useState<'trade' | 'opening'>(initialOpening ? 'opening' : 'trade');
-  const [visited, setVisited] = useState({ trade: !initialOpening, opening: initialOpening });
-  const selectedStyle = { background: 'rgba(41,211,242,.10)', color: 'var(--cy)', boxShadow: 'inset 0 -2px 0 0 var(--cy)' };
-  const choose = (value: 'trade' | 'opening') => {
-    setVisited(v => ({ ...v, [value]: true }));
+  const modoIniziale: Modo = params.get('mode') === 'opening' ? 'opening' : params.get('mode') === 'cash' ? 'cash' : 'trade';
+  const [mode, setMode] = useState<Modo>(modoIniziale);
+  // Operazione e Cassa condividono un solo controller (stesse letture, stessa cassa):
+  // resta montato finché una delle due schede è stata aperta, cosi' le bozze sopravvivono.
+  const [visited, setVisited] = useState({ trade: modoIniziale !== 'opening', opening: modoIniziale === 'opening' });
+  const [testata, setTestata] = useState<Testata>({ cassa: null, loading: false, letta: false });
+  const ricarica = useRef<(() => void) | null>(null);
+  const w = parole();
+  const choose = (value: Modo) => {
+    setVisited(v => ({ ...v, [value === 'opening' ? 'opening' : 'trade']: true }));
     setMode(value);
   };
-  return <div style={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column', gap: 9 }}>
-    <div className="f7c" style={{ height: 'auto' }}>
-      <div className="verbi" role="group" aria-label={t('trade.mode')} style={{ width: 320 }}>
-        <button type="button" id="f7-mode-trade" aria-pressed={mode === 'trade'} style={mode === 'trade' ? selectedStyle : undefined} onClick={() => choose('trade')}>{t('trade.operation')}</button>
-        <button type="button" id="f7-mode-opening" aria-pressed={mode === 'opening'} style={mode === 'opening' ? selectedStyle : undefined} onClick={() => choose('opening')}>{t('trade.opening')}</button>
+  const schede: { id: Modo; dom: string; testo: string }[] = [
+    { id: 'trade', dom: 'f7-mode-trade', testo: t('trade.operation') },
+    { id: 'cash', dom: 'f7-mode-cash', testo: t('trade.cash') },
+    { id: 'opening', dom: 'f7-mode-opening', testo: t('trade.opening') },
+  ];
+  return <ModernPage page="trades" presentationBoundary={false} render={() => <div className="te-page bbn-font">
+    <TradeViewBoundary render={() => <div className="te-top">
+      <h1>{w.title}</h1>
+      <div className="bbn-seg is-large" role="group" aria-label={t('trade.mode')}>
+        {schede.map(s => <button key={s.id} type="button" id={s.dom} aria-pressed={mode === s.id}
+          className={mode === s.id ? 'is-on' : undefined} onClick={() => choose(s.id)}>{s.testo}</button>)}
       </div>
+      <span className="bbn-grow" />
+      {visited.trade && <span className="te-today">
+        {w.cashAvailable} <b className="num">{!testata.letta ? '…' : testata.cassa != null ? eur(testata.cassa) : t('trade.na')}</b>
+        <button type="button" className="bbn-icon-btn" aria-label={w.refresh} title={w.refresh} aria-busy={testata.loading}
+          onClick={() => ricarica.current?.()}>
+          <RefreshCw size={14} className={testata.loading ? 'animate-spin' : ''} aria-hidden="true" />
+        </button>
+      </span>}
+    </div>} />
+    <div hidden={mode === 'opening'} aria-hidden={mode === 'opening'}>
+      {visited.trade && <TradeOperationEntry view={mode === 'cash' ? 'cash' : 'trade'}
+        onTestata={setTestata} ricarica={ricarica} />}
     </div>
-    <div style={{ flex: 1, minHeight: 0, display: mode === 'trade' ? 'block' : 'none' }} aria-hidden={mode !== 'trade'}>
-      {visited.trade && <TradeOperationEntry />}
-    </div>
-    <div style={{ flex: 1, minHeight: 0, display: mode === 'opening' ? 'block' : 'none' }} aria-hidden={mode !== 'opening'}>
+    <div hidden={mode !== 'opening'} aria-hidden={mode !== 'opening'}>
       {visited.opening && <PositionOpeningEntry />}
     </div>
-  </div>;
+  </div>} />;
 }
 
 /** A field retains its notation until cleared or explicitly filled by the book. */
@@ -157,14 +200,29 @@ function useNumericDraft() {
   return [raw, change, inputLanguage ?? linguaCorrente()] as const;
 }
 
-function TradeOperationEntry() {
+function TradeOperationEntry({ view, onTestata, ricarica }: {
+  view: 'trade' | 'cash';
+  onTestata: (value: Testata) => void;
+  ricarica: { current: (() => void) | null };
+}) {
   const tr = useT(), language = useLingua();
   const [searchParams] = useSearchParams();
   const decisionFromRoute = searchParams.get('decision');
+  const divergenceFromRoute = searchParams.get('divergence');
   const routeConsumed = useRef<string | null>(null);
+  const divergenceRouteConsumed = useRef<string | null>(null);
   const [decisions, setDecisions] = useState<Decision[]>([]);
   const [decisionsErr, setDecisionsErr] = useState<string | null>(null);
   const [selectedDecision, setSelectedDecision] = useState(decisionFromRoute || 'none');
+  const [manualDivergenceDecision, setManualDivergenceDecision] = useState(divergenceFromRoute || '');
+  const [manualDivergenceReason, setManualDivergenceReason] = useState('');
+  const [manualDivergenceMessage, setManualDivergenceMessage] = useState<{
+    text: string; error: boolean;
+  } | null>(null);
+  const [identityIsin, setIdentityIsin] = useState('');
+  const [identitySource, setIdentitySource] = useState('');
+  const [identityVerifiedAt, setIdentityVerifiedAt] = useState('');
+  const [identityReason, setIdentityReason] = useState('');
   const [tradeDay, setTradeDay] = useState('');
   const [tradeTime, setTradeTime] = useState('');
   const [preparing, setPreparing] = useState(false);
@@ -228,12 +286,8 @@ function TradeOperationEntry() {
     { rifiuto: RifiutoCassa; corpo: CorpoMovimento } | null>(null);
   const mvAnnullaRef = useRef<HTMLButtonElement>(null);
   const mvImportoRef = useRef<HTMLInputElement>(null);
-  const mvGemellaRef = useRef<HTMLDivElement>(null);
+  const mvGemellaRef = useRef<HTMLLIElement>(null);
 
-  const [taccaHover, setTaccaHover] = useState<number | null>(null);
-  const [taccaFuoco, setTaccaFuoco] = useState<number | null>(null);
-  const [taccaSel, setTaccaSel] = useState(0);
-  const tacchePista = useRef<HTMLDivElement>(null);
   const esitoRef = useRef<HTMLDivElement>(null);
 
   // ── i tre fetch, ognuno col SUO stato d'errore dichiarato ────────────────
@@ -300,6 +354,17 @@ function TradeOperationEntry() {
     if (['BUY', 'ADD', 'SELL', 'TRIM'].includes(d.action)) setAction(d.action as Verbo);
   }, [decisionFromRoute, decisions]);
 
+  useEffect(() => {
+    if (!divergenceFromRoute || divergenceRouteConsumed.current === divergenceFromRoute) return;
+    const d = decisions.find(item => String(item.id) === divergenceFromRoute);
+    if (!d) return;
+    divergenceRouteConsumed.current = divergenceFromRoute;
+    setManualDivergenceDecision(divergenceFromRoute);
+    setSelectedDecision('none');
+    setTicker(d.proposal_ticker || d.ticker);
+    if (['BUY', 'ADD', 'SELL', 'TRIM'].includes(d.action)) setAction(d.action as Verbo);
+  }, [divergenceFromRoute, decisions]);
+
   // ── il verbo: cambiarlo NON deve lasciarsi dietro il prezzo di prima ─────
   // Passando da un prezzo in pence a DIVIDEND, il campo diventa «EUR per azione»:
   // conservare il valore precedente gonfierebbe l'incasso. Si azzera quando
@@ -321,6 +386,21 @@ function TradeOperationEntry() {
   const positions: Position[] = useMemo(() => snap?.positions || [], [snap]);
   const bookAssente = posErr != null || snap == null;
   const tickerUp = ticker.toUpperCase().trim();
+  const selectedDecisionRow = decisions.find(d => String(d.id) === selectedDecision);
+  const manualDivergenceRow = decisions.find(d => String(d.id) === manualDivergenceDecision);
+  const identityTargetDecision = selectedDecisionRow || manualDivergenceRow;
+  const proposalTicker = selectedDecisionRow?.proposal_ticker || selectedDecisionRow?.ticker || '';
+  const identityProposalTicker = identityTargetDecision?.proposal_ticker || identityTargetDecision?.ticker || '';
+  const identityNeeded = !!identityTargetDecision && !!tickerUp
+    && identityProposalTicker.toUpperCase() !== tickerUp;
+  /** Decisione collegabile al trade che si sta scrivendo: stesso ticker inserito,
+   *  oppure la decisione GIA' scelta con un ticker broker diverso (alias che il
+   *  backend accetta solo con la verifica ISIN confermata insieme al trade). */
+  const compatibileQui = (d: Decision) => decisioneCompatibile(d, tickerUp, action)
+    || (String(d.id) === selectedDecision && decisioneCompatibile(d, tickerUp, action, true));
+  useEffect(() => {
+    setIdentityIsin(''); setIdentitySource(''); setIdentityVerifiedAt(''); setIdentityReason('');
+  }, [selectedDecision, manualDivergenceDecision, tickerUp]);
   const pos = useMemo(
     () => positions.find(p => (p.ticker || '').toUpperCase() === tickerUp),
     [positions, tickerUp],
@@ -360,21 +440,12 @@ function TradeOperationEntry() {
     return { da: Math.min(1, cassa / scala), largo: Math.min(1, delta / scala) };
   }, [scala, delta, cassa, sim.cassaDopo, entra]);
 
-  const fuoriScala = useMemo(
-    () => (scala == null ? 0 : taglie.misurate.filter(t => (t.eur as number) > scala).length),
-    [taglie, scala]);
   const ultimi = useMemo(
     () => taglie.taglie.slice()
       .sort((a, b) => (a.data < b.data ? 1 : a.data > b.data ? -1 : 0))
       .slice(0, ULTIMI_IN_LISTA),
     [taglie]);
 
-  // roving tabindex: l'indice deve restare dentro la lista, altrimenti nessuna
-  // tacca ha tabIndex=0 e il gruppo esce dall'ordine di tabulazione
-  useEffect(() => {
-    if (taccaSel > taglie.misurate.length - 1) setTaccaSel(Math.max(0, taglie.misurate.length - 1));
-  }, [taglie.misurate.length, taccaSel]);
-  const taccaMostrata = taccaHover ?? taccaFuoco;
 
   const selectPosition = (p: Position) => {
     setTicker(p.ticker);
@@ -391,6 +462,7 @@ function TradeOperationEntry() {
     if (previewInFlight.current || submitting) return;
     setAvviso(null); setEsito(null); setErroreScrittura(null); setEsitoIgnoto(null);
     setTradeResult(null);
+    setManualDivergenceMessage(null);
     if (letturaQty && !letturaQty.ok) { setAvviso({ render: tr => { const n = leggiNumero(qty, qtyLanguage, linguaCorrente()); return tr('trade.quantity_error', {a: n && !n.ok ? n.motivo : ''}); } }); return; }
     if (letturaPrice && !letturaPrice.ok) { setAvviso({ render: tr => { const n = leggiNumero(price, priceLanguage, linguaCorrente()); return tr('trade.price_error', {a: n && !n.ok ? n.motivo : ''}); } }); return; }
     if (!tickerUp || !qty || !price) { setAvviso({ render: tr => tr('trade.required_fields') }); return; }
@@ -417,11 +489,31 @@ function TradeOperationEntry() {
     previewInFlight.current = true;
     setPreparing(true);
     try {
+      if (manualDivergenceDecision) {
+        if (selectedDecision !== 'none' || !manualDivergenceRow
+            || !statoDivergenza(manualDivergenceRow)) {
+          throw new Error(tr('trade.manual_divergence_requires_blocked'));
+        }
+        if (!manualDivergenceReason.trim()) {
+          throw new Error(tr('trade.manual_divergence_reason_required'));
+        }
+      }
+      // ⚠ L'anteprima NON scrive nulla: prima qui partiva POST
+      // /instrument-identities/verify, un INSERT in una tabella append-only
+      // PRIMA del dialog — un «Annulla» lasciava la verifica per sempre e
+      // log_trade la riusava. Ora verifica e divergenza viaggiano nel corpo del
+      // trade: il backend le valida in anteprima e le scrive solo alla conferma,
+      // nella stessa transazione del trade.
+      const identita = identityNeeded && identityTargetDecision
+        ? corpoIdentita(identityIsin, identitySource, identityVerifiedAt, identityReason) : undefined;
       const body: TradeRequest = {
         ticker: tickerUp, action, quantita: qtyN, prezzo: priceN, valuta,
         note: note || undefined, pm_rationale: rationale || undefined,
         data: dataTrade(tradeDay, tradeTime, oggiISO()),
-        ...legameTrade(selectedDecision, decisions, tickerUp, action),
+        ...legameTrade(selectedDecision, decisions, tickerUp, action, !!identita),
+        ...(identita ? { instrument_identity: identita } : {}),
+        ...(manualDivergenceDecision ? { manual_divergence: {
+          decision_id: Number(manualDivergenceDecision), reason: manualDivergenceReason.trim() } } : {}),
       };
       const preview = await Bellomberg.previewTrade(body);
       setPending({ ...congelaAnteprima(body, preview), discorde });
@@ -441,6 +533,17 @@ function TradeOperationEntry() {
       setEsito(esitoScrittura(r));
       setTradeResult(r);
       setErroreScrittura(null); setEsitoIgnoto(null);
+      // La divergenza e' nel corpo CONGELATO all'anteprima (p.body), non nello
+      // stato vivo del modulo, ed e' scritta dal backend nella transazione del
+      // trade: qui si legge solo la ricevuta, nessuna seconda POST.
+      if (p.body.manual_divergence) {
+        const ev = r.manual_divergence;
+        setManualDivergenceMessage(ev && ev.decision_id === p.body.manual_divergence.decision_id
+          && Number.isSafeInteger(Number(ev.event_id)) && Number(ev.event_id) > 0
+          ? { text: tr('trade.manual_divergence_recorded'), error: false }
+          : { text: tr('trade.manual_divergence_response_missing'), error: true });
+        setManualDivergenceDecision(''); setManualDivergenceReason('');
+      }
       await carica();
       if (p.body.action === 'BUY' || p.body.action === 'SELL') setTicker('');
       setQty(''); setNote(''); setRationale('');
@@ -488,6 +591,9 @@ function TradeOperationEntry() {
     if (v.cassa_nota) rows.push({ k: tr('trade.cash_note'), v: v.cassa_nota });
     if (v.guardia_note) rows.push({ k: tr('trade.price_check'), v: v.guardia_note, tone: 'amber' });
     if (v.decisione?.nota) rows.push({ k: tr('trade.decision_status'), v: v.decisione.nota });
+    // alias del ticker e divergenza manuale: si scrivono con questo trade, quindi
+    // il PM li deve vedere qui, dall'anteprima validata e non dai campi vivi
+    rows.push(...righeLegame(v));
     if (v.ricalcolo) {
       const r = v.ricalcolo;
       rows.push(
@@ -726,951 +832,835 @@ function TradeOperationEntry() {
     (btns[n] as HTMLButtonElement | undefined)?.focus();
   };
 
-  const taccheKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
-    const n = taglie.misurate.length;
-    if (!n) return;
-    let next = taccaSel;
-    if (e.key === 'ArrowRight') next = Math.min(n - 1, taccaSel + 1);
-    else if (e.key === 'ArrowLeft') next = Math.max(0, taccaSel - 1);
-    else if (e.key === 'Home') next = 0;
-    else if (e.key === 'End') next = n - 1;
-    else return;
-    e.preventDefault();
-    setTaccaSel(next);
-    (tacchePista.current?.querySelectorAll('button.tc')[next] as HTMLButtonElement | undefined)
-      ?.focus();
+
+  // ══ TESTATA E RICERCA PER NOME ════════════════════════════════════════
+  // ⚠ Stato aggiunto IN CODA agli hook: il test i18n (trade-draft) indicizza
+  // useState/useEffect per posizione, e quelli di prima non devono spostarsi.
+  useEffect(() => {
+    ricarica.current = () => { void carica(); };
+    return () => { ricarica.current = null; };
+  }, [carica, ricarica]);
+  useEffect(() => { onTestata({ cassa, loading, letta: movLetto }); }, [cassa, loading, movLetto, onTestata]);
+
+  const [cercaAperta, setCercaAperta] = useState(false);
+  const [cercaAttiva, setCercaAttiva] = useState(0);
+  const [mercato, setMercato] = useState<{ q: string; stato: 'attesa' | 'ok' | 'errore'; righe: MktSearchHit[] } | null>(null);
+  const [valutaQuotata, setValutaQuotata] = useState<{ ticker: string; valuta: string; gestita: boolean } | null>(null);
+  const [dettagli, setDettagli] = useState(false);
+  const tickerScelto = useRef('');
+  const w = parole();
+
+  const domanda = ticker.trim();
+  const tenute = useMemo(() => {
+    if (!domanda) return [];
+    const q = domanda.toLowerCase();
+    return positions.filter(p => (p.ticker || '').toLowerCase().includes(q)
+      || (p.nome || '').toLowerCase().includes(q)).slice(0, 5);
+  }, [positions, domanda]);
+  // La ricerca di mercato parte dopo 300 ms di quiete e solo con il menu aperto.
+  // Un errore (rete, endpoint assente) non blocca nulla: si scrive il ticker a mano.
+  useEffect(() => {
+    if (!cercaAperta || domanda.length < 2) { setMercato(null); return; }
+    let vivo = true;
+    setMercato(m => (m && m.q === domanda ? m : { q: domanda, stato: 'attesa', righe: [] }));
+    const timer = setTimeout(() => {
+      Promise.resolve().then(() => Bellomberg.mktSearch(domanda))
+        .then(r => { if (vivo) setMercato({ q: domanda, stato: 'ok', righe: Array.isArray(r?.results) ? r.results : [] }); })
+        .catch(() => { if (vivo) setMercato({ q: domanda, stato: 'errore', righe: [] }); });
+    }, 300);
+    return () => { vivo = false; clearTimeout(timer); };
+  }, [cercaAperta, domanda]);
+  const inBook = useMemo(() => new Set(positions.map(p => (p.ticker || '').toUpperCase())), [positions]);
+  const altriMercati = useMemo(() => (mercato?.righe || [])
+    .filter(h => h.symbol && TIPI_CERCABILI.includes((h.type || '').toUpperCase()) && !inBook.has(h.symbol.toUpperCase()))
+    .slice(0, 8), [mercato, inBook]);
+  type Opzione = { tipo: 'book'; pos: Position } | { tipo: 'mercato'; hit: MktSearchHit };
+  const opzioni: Opzione[] = useMemo(() => [
+    ...tenute.map(pos => ({ tipo: 'book' as const, pos })),
+    ...altriMercati.map(hit => ({ tipo: 'mercato' as const, hit })),
+  ], [tenute, altriMercati]);
+  const menuVisibile = cercaAperta && domanda.length > 0
+    && (opzioni.length > 0 || (domanda.length >= 2 && mercato != null));
+  useEffect(() => { if (cercaAttiva > opzioni.length - 1) setCercaAttiva(0); }, [opzioni.length, cercaAttiva]);
+
+  // I Dettagli si aprono da soli quando contengono qualcosa che pesa sulla scrittura.
+  const dettagliForzati = selectedDecision !== 'none' || !!manualDivergenceDecision || !!tradeDay || !!tradeTime;
+  useEffect(() => { if (dettagliForzati) setDettagli(true); }, [dettagliForzati]);
+
+  const scegliMercato = (hit: MktSearchHit) => {
+    const simbolo = hit.symbol.toUpperCase();
+    tickerScelto.current = simbolo;
+    setTicker(simbolo); setCercaAperta(false); setValutaQuotata(null);
+    setAvviso(null); setEsito(null); setErroreScrittura(null); setEsitoIgnoto(null);
+    // la valuta viene dalla quotazione; il prezzo no: dev'essere quello eseguito
+    Promise.resolve().then(() => Bellomberg.mktQuote(simbolo)).then(q => {
+      if (tickerScelto.current !== simbolo) return;
+      const grezza = (q?.currency || '').trim();
+      if (!grezza) return;
+      const v = grezza === 'GBp' ? 'GBX' : grezza.toUpperCase();
+      const gestita = CURRENCIES.includes(v);
+      setValutaQuotata({ ticker: simbolo, valuta: v, gestita });
+      if (gestita) setValuta(cur => (action === 'DIVIDEND' ? cur : v));
+    }).catch(() => { /* senza quotazione la valuta resta da scegliere */ });
+  };
+  const scegli = (o: Opzione) => {
+    if (o.tipo === 'book') { tickerScelto.current = o.pos.ticker.toUpperCase(); setValutaQuotata(null); selectPosition(o.pos); setCercaAperta(false); }
+    else scegliMercato(o.hit);
+  };
+  const tickerKeyDown = (e: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Escape') { if (cercaAperta) { e.preventDefault(); setCercaAperta(false); } return; }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      if (!opzioni.length) return;
+      e.preventDefault();
+      if (!cercaAperta) { setCercaAperta(true); setCercaAttiva(0); return; }
+      const n = opzioni.length;
+      setCercaAttiva(i => (e.key === 'ArrowDown' ? (i + 1) % n : (i - 1 + n) % n));
+      return;
+    }
+    if (e.key === 'Enter' && menuVisibile && opzioni[cercaAttiva]) { e.preventDefault(); scegli(opzioni[cercaAttiva]); }
   };
 
-  return (
-    <div className="f7c">
+  const verboTesto = w.verbs[action];
+  const nomeTk = pos ? nomeTitolo(pos) : null;
+  const valutaNota = valutaQuotata && valutaQuotata.ticker === tickerUp ? valutaQuotata : null;
+  const vendita = !entra && action !== 'DIVIDEND';
+  const scalaOrdini = Math.max(delta ?? 0, ...ultimi.map(t => t.eur ?? 0), 1);
+  // ⚠ un importo mancante NON vale 0 e un tipo sconosciuto NON e' un prelievo:
+  // il totale diventa n.d. col motivo; a finestra piena e' un minimo («≥»).
+  const totaleMovimenti = useMemo(() => totaliMovimenti(movimenti, LIMITE_MOVIMENTI), [movimenti, language]);
+  const totaleReso = (v: number | null, segnoTesto: string, motivo: string | null) =>
+    v == null ? <span title={motivo || undefined}>{tr('trade.na')}</span>
+      : (totaleMovimenti.parziale ? '≥ ' : '') + (v ? segnoTesto : '') + eur(v, 0);
+  const flussoUltimo = movimenti.length ? flussi.get(movimenti[0].id) ?? null : null;
+  const flussoDopo = flussoUltimo != null && isFinite(importoN) && !finestraPiena
+    ? flussoUltimo + (mvTipo === 'DEPOSIT' ? importoN : -importoN) : null;
+  const dettagliNota = [
+    tradeDay ? w.detailsDated(tradeDay + (tradeTime ? ' ' + tradeTime : '')) : w.detailsNow,
+    manualDivergenceDecision ? w.detailsDivergence
+      : selectedDecision === 'none' ? w.detailsManual
+        : selectedDecision === 'unknown' ? w.detailsUnknown : w.detailsLinked(selectedDecision),
+  ].join(' · ');
 
-      {/* ══ COLONNA SINISTRA ══════════════════════════════════════════ */}
-      <div className="colonna sx">
+  return <TradeViewBoundary render={() => (
+    <div className="f7c te-views" aria-busy={loading}>
 
-        <div className="rq">
-          <span className="sq tl" /><span className="sq br" />
-          <div className="ph a">
-            <h1>{tr('trade.ticket_title')}</h1>
-            <span className="side">{tr('trade.ticket_subtitle')}</span>
-          </div>
-          <div className="pb" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-
-              <div className="verbi" role="radiogroup" aria-label={tr('trade.trade_type')}
-                   onKeyDown={verbiKeyDown}>
+      {/* ══════════════ OPERAZIONE ══════════════ */}
+      <div className="te-grid te-op" hidden={view !== 'trade'}>
+        <div className="te-col">
+          <Card titolo={w.newOrder} className="te-ticket" azioni={<span className="bbn-card-note">{w.writesOfficial}</span>}>
+            <form onSubmit={submit} className="te-body">
+              <div className="bbn-seg is-full" role="radiogroup" aria-label={tr('trade.trade_type')} onKeyDown={verbiKeyDown}>
                 {ACTIONS.map(a => (
                   <button key={a.v} type="button" role="radio" aria-checked={a.v === action}
-                          aria-label={a.label} title={a.label}
-                          tabIndex={a.v === action ? 0 : -1}
-                          onClick={() => cambiaVerbo(a.v)}>{a.v}</button>
+                          className={a.v === action ? 'is-on' : undefined}
+                          aria-label={a.label} title={a.label} tabIndex={a.v === action ? 0 : -1}
+                          onClick={() => cambiaVerbo(a.v)}>{w.verbs[a.v]}</button>
                 ))}
               </div>
+              <p className="te-gloss">{w.gloss[action]}</p>
 
-              <div className="campi">
-                <div className="campo largo">
-                  <label htmlFor="f7-tk">Ticker</label>
-                  <div className="box">
-                    <input id="f7-tk" value={ticker} placeholder={tr('trade.exact_ticker')}
-                           autoComplete="off"
-                           onChange={e => setTicker(e.target.value.toUpperCase())} />
-                    <span className="suf">
-                      {bookAssente ? '' : pos ? 'IN BOOK' : tickerUp ? tr('trade.new') : ''}
-                    </span>
-                  </div>
-                  <div className={'aiuto' + (bookAssente && tickerUp ? ' male' : '')}>
-                    {bookAssente
-                      ? (tickerUp ? tr('trade.book_not_loaded') : ' ')
-                      : pos
-                        ? tr('trade.holding_cost', {a: exact(pos.quantita), b: num(pos.prezzo_medio), c: pos.valuta})
-                        : tickerUp ? tr('trade.not_active') : ' '}
-                  </div>
+              <div className="te-field te-combo">
+                <label htmlFor="f7-tk">{w.instrument}</label>
+                <div className="te-input">
+                  {pos && <IconaTitolo ticker={pos.ticker} nome={pos.nome} dimensione="xs" />}
+                  <input id="f7-tk" value={ticker} placeholder={w.searchPlaceholder} autoComplete="off"
+                         role="combobox" aria-autocomplete="list" aria-expanded={menuVisibile} aria-controls="f7-tk-lista"
+                         aria-activedescendant={menuVisibile && opzioni[cercaAttiva] ? `f7-tk-o${cercaAttiva}` : undefined}
+                         onChange={e => { setTicker(e.target.value.toUpperCase()); setCercaAperta(true); setCercaAttiva(0); }}
+                         onFocus={() => { if (domanda) setCercaAperta(true); }}
+                         onBlur={() => setCercaAperta(false)}
+                         onKeyDown={tickerKeyDown} />
+                  {!bookAssente && tickerUp && <span className={'bbn-pill ' + (pos ? 'is-acc' : 'is-piatto')}>{pos ? w.inPortfolio : w.newName}</span>}
                 </div>
+                <div className={'te-help' + (bookAssente && tickerUp ? ' is-bad' : '')}>
+                  {bookAssente
+                    ? (tickerUp ? tr('trade.book_not_loaded') : ' ')
+                    : pos
+                      ? <>{nomeTk && nomeTk !== pos.ticker ? nomeTk + ' · ' : ''}{tr('trade.holding_cost', { a: exact(pos.quantita), b: num(pos.prezzo_medio), c: pos.valuta })}</>
+                      : valutaNota ? (valutaNota.gestita ? w.currencyFromQuote(valutaNota.valuta) : w.currencyUnsupported(valutaNota.valuta))
+                        : tickerUp ? tr('trade.not_active') : ' '}
+                </div>
+                {menuVisibile && (
+                  <div className="te-suggest" id="f7-tk-lista" role="listbox" aria-label={w.suggestLabel}
+                       onMouseDown={e => e.preventDefault()}>
+                    {tenute.length > 0 && <h4>{w.suggestHeld}</h4>}
+                    {opzioni.map((o, i) => {
+                      const attiva = i === cercaAttiva;
+                      const primaMercato = o.tipo === 'mercato' && (i === 0 || opzioni[i - 1].tipo === 'book');
+                      return <div key={o.tipo === 'book' ? 'b' + o.pos.ticker : 'm' + o.hit.symbol}>
+                        {primaMercato && <h4>{w.suggestMarket}</h4>}
+                        <div id={`f7-tk-o${i}`} role="option" aria-selected={attiva}
+                             className={'te-sg' + (attiva ? ' is-active' : '')}
+                             onMouseEnter={() => setCercaAttiva(i)} onClick={() => scegli(o)}>
+                          {o.tipo === 'book' ? <>
+                            <IconaTitolo ticker={o.pos.ticker} nome={o.pos.nome} dimensione="sm" />
+                            <span className="te-sg-name"><b>{o.pos.ticker}</b><span>{nomeTitolo(o.pos)} · {w.heldShares(exact(o.pos.quantita))}</span></span>
+                            <span className="te-sg-side num">{o.pos.valuta}{o.pos.prezzo_live != null ? ' · ' + num(o.pos.prezzo_live) : ''}</span>
+                          </> : <>
+                            <IconaTitolo ticker={o.hit.symbol} nome={o.hit.name} dimensione="sm" />
+                            <span className="te-sg-name"><b>{o.hit.symbol}</b><span>{[o.hit.name, o.hit.exchange].filter(Boolean).join(' · ')}</span></span>
+                            <span className="te-sg-side">{(o.hit.type || '').toLowerCase()}</span>
+                          </>}
+                        </div>
+                      </div>;
+                    })}
+                    {domanda.length >= 2 && mercato?.stato === 'attesa' && <p className="te-sg-state">{w.suggestSearching}</p>}
+                    {domanda.length >= 2 && mercato?.stato === 'ok' && altriMercati.length === 0 && <p className="te-sg-state">{w.suggestNone}</p>}
+                    {domanda.length >= 2 && mercato?.stato === 'errore' && <p className="te-sg-state">{w.suggestError}</p>}
+                    <p className="te-sg-foot">{w.suggestHint}</p>
+                  </div>
+                )}
+              </div>
 
-                {/* ⚠ type="text" e non "number": su type=number il browser CANCELLA
-                    il separatore decimale non della sua locale — `158,50` diventa
-                    `15850`, senza badInput. Misurato sull'app viva. */}
-                <div className="campo">
+              {/* ⚠ type="text" e non "number": su type=number il browser CANCELLA
+                  il separatore decimale non della sua locale — `158,50` diventa
+                  `15850`, senza badInput. Misurato sull'app viva. */}
+              <div className="te-row3">
+                <div className="te-field">
                   <label htmlFor="f7-qt">{action === 'DIVIDEND' ? tr('trade.shares') : tr('trade.quantity')}</label>
-                  <div className={'box' + (letturaQty && !letturaQty.ok ? ' rotto' : '')}>
+                  <div className={'te-input' + (letturaQty && !letturaQty.ok ? ' is-bad' : '')}>
                     <input id="f7-qt" className="num" type="text" inputMode="decimal"
                            title={tr('numeri.grafia_richiesta', { esempio: qtyLanguage === 'it' ? '1.234,56' : '1,234.56' })}
                            autoComplete="off" value={qty}
                            placeholder={action === 'DIVIDEND' ? tr('trade.example_shares') : tr('trade.example_qty')}
                            aria-invalid={!!(letturaQty && !letturaQty.ok)}
                            onChange={e => setQty(e.target.value)} />
-                    <span className="suf">{tr('trade.shares_upper')}</span>
+                    <span className="te-suf">{w.shares}</span>
                   </div>
-                  {letturaQty && !letturaQty.ok && (
-                    <div className="aiuto male">{letturaQty.motivo}</div>
-                  )}
+                  {letturaQty && !letturaQty.ok && <div className="te-help is-bad">{letturaQty.motivo}</div>}
                 </div>
-
-                <div className="campo">
-                  <label htmlFor="f7-pz">
-                    {action === 'DIVIDEND' ? tr('trade.euro_per_share') : tr('trade.price')}
-                  </label>
-                  <div className={'box' + (letturaPrice && !letturaPrice.ok ? ' rotto' : '')}>
+                <div className="te-field">
+                  <label htmlFor="f7-pz">{action === 'DIVIDEND' ? tr('trade.euro_per_share') : tr('trade.price')}</label>
+                  <div className={'te-input' + (letturaPrice && !letturaPrice.ok ? ' is-bad' : '')}>
                     <input id="f7-pz" className="num" type="text" inputMode="decimal"
                            title={tr('numeri.grafia_richiesta', { esempio: priceLanguage === 'it' ? '1.234,56' : '1,234.56' })}
                            autoComplete="off" value={price}
                            placeholder={action === 'DIVIDEND' ? tr('trade.example_dividend') : tr('trade.example_price')}
                            aria-invalid={!!(letturaPrice && !letturaPrice.ok)}
                            onChange={e => setPrice(e.target.value)} />
-                    <span className="suf">{action === 'DIVIDEND' ? 'EUR' : valuta}</span>
+                    <span className="te-suf">{action === 'DIVIDEND' ? 'EUR' : valuta}</span>
                   </div>
-                  {letturaPrice && !letturaPrice.ok ? (
-                    <div className="aiuto male">{letturaPrice.motivo}</div>
-                  ) : pos && pos.prezzo_live != null && action !== 'DIVIDEND' ? (
-                    <div className="aiuto">
-                      live {num(pos.prezzo_live)} {pos.valuta}
-                      {ordineValido && tr('trade.distance_live', {a: segno((priceN / pos.prezzo_live - 1) * 100)})}
-                    </div>
-                  ) : <div className="aiuto">&nbsp;</div>}
+                  {letturaPrice && !letturaPrice.ok ? <div className="te-help is-bad">{letturaPrice.motivo}</div>
+                    : pos && pos.prezzo_live != null && action !== 'DIVIDEND' ? (
+                      <div className="te-help">{w.live(`${num(pos.prezzo_live)} ${pos.valuta}`)}
+                        {ordineValido && tr('trade.distance_live', { a: segno((priceN / pos.prezzo_live - 1) * 100) })}</div>
+                    ) : null}
                 </div>
-
-                <div className="campo largo">
+                <div className="te-field">
                   <label htmlFor="f7-vl">{tr('trade.currency')}</label>
-                  <div className="box">
-                    <select id="f7-vl" value={valuta} disabled={action === 'DIVIDEND'}
-                            onChange={e => setValuta(e.target.value)}>
+                  <div className="te-input">
+                    <select id="f7-vl" value={valuta} disabled={action === 'DIVIDEND'} onChange={e => setValuta(e.target.value)}>
                       {CURRENCIES.map(c => <option key={c} value={c}>{c}</option>)}
                     </select>
-                    <span className="suf">
-                      {action === 'DIVIDEND' ? tr('trade.dividends_euro')
-                        : cambio.fonte === 'assente' ? tr('trade.fx_absent_upper')
-                          : `1 ${valuta} = ${num(cambio.tasso, 6)} EUR`}
-                    </span>
+                  </div>
+                  <div className="te-help num">
+                    {action === 'DIVIDEND' ? tr('trade.dividends_euro')
+                      : cambio.fonte === 'assente' ? tr('trade.fx_absent_upper')
+                        : `1 ${valuta} = ${num(cambio.tasso, 6)} EUR`}
                   </div>
                 </div>
               </div>
 
-              {/* ── LA CATENA DEL CAMBIO ── */}
-              <div className="campi">
-                <div className="campo">
-                  <label htmlFor="f7-data">{tr('trade.optional_date')}</label>
-                  <input id="f7-data" className="testo" type="date" min="2000-01-01" max={oggiISO()}
-                    value={tradeDay} onChange={e => setTradeDay(e.target.value)} />
-                  <div className="aiuto">{tr('trade.date_help')}</div>
+              <div className="te-row2 te-row-total">
+                <div className={'te-total' + (sim.valido ? '' : ' is-empty')}>
+                  <span className="te-total-k">{action === 'DIVIDEND' ? w.totalProceeds : w.total}</span>
+                  <span className="te-total-v num">{sim.valido && conv.eur != null ? eur(conv.eur) : sim.valido ? `${num(conv.locale)} ${valuta}` : '— €'}</span>
+                  <span className="te-total-chain num">
+                    {!sim.valido ? w.totalEmpty
+                      : conv.eur != null
+                        ? `${exact(qtyN)} × ${num(priceN)} ${valuta} = ${num(conv.locale)} ${valuta} · ${w.fxRate(num(cambio.tasso, 6))}`
+                        : <>{exact(qtyN)} × {num(priceN)} {valuta} · <b>{tr('trade.fx_word')} {valuta}{tr('trade.eur_unavailable')}</b>{tr('trade.eur_not_calculable_here')}</>}
+                  </span>
+                  {sim.valido && cambio.fonte === 'assente' && (
+                    <span className="te-total-chain">{tr('trade.no_fx_source')} {valuta}{tr('trade.no_fx_payload')}{ratesErr ? ` (${ratesErr})` : ''}. {tr('trade.no_invented_fx')}</span>
+                  )}
                 </div>
-                <div className="campo">
-                  <label htmlFor="f7-ora">{tr('trade.optional_time')}</label>
-                  <input id="f7-ora" className="testo" type="time" step="1"
-                    value={tradeTime} onChange={e => setTradeTime(e.target.value)} />
+                <div className="te-field">
+                  <label htmlFor="f7-rz">{w.rationale} <span className="te-muted">· {w.rationaleHint}</span></label>
+                  <textarea id="f7-rz" className="te-ta" rows={3} value={rationale}
+                            placeholder={tr('trade.rationale_example')}
+                            onChange={e => setRationale(e.target.value)} />
                 </div>
-              </div>
-              <div className="campo">
-                <label htmlFor="f7-decisione">{tr('trade.decision_link')}</label>
-                <div className="box">
-                  <select id="f7-decisione" value={selectedDecision}
-                    onChange={e => setSelectedDecision(e.target.value)}>
-                    <option value="none">{tr('trade.manual_no_decision')}</option>
-                    <option value="unknown">{tr('trade.unknown_link')}</option>
-                    {!['none', 'unknown'].includes(selectedDecision)
-                      && !decisions.some(d => String(d.id) === selectedDecision && decisioneCompatibile(d, tickerUp, action))
-                      && <option value={selectedDecision}>#{selectedDecision} {tr('trade.incompatible_option')}</option>}
-                    {decisions.filter(d => decisioneCompatibile(d, tickerUp, action)).map(d => (
-                      <option key={d.id} value={String(d.id)}>#{d.id} · {d.action} {d.ticker} · {d.timestamp.slice(0, 10)} · {d.status}
-                        {d.esecuzione ? tr('trade.executed_amount', {a: eur(d.esecuzione.eur), b: d.esecuzione.inferito ? tr('trade.inferred') : ''}) : ''}</option>
-                    ))}
-                  </select>
-                </div>
-                <div className={'aiuto' + (decisionsErr ? ' male' : '')}>
-                  {decisionsErr ? tr('trade.decisions_unavailable', {a: decisionsErr})
-                    : tr('trade.decision_help')}
-                </div>
-              </div>
-              {tradeDay && <div className="avv giallo"><span>{tr('trade.dated_trade_help')}</span></div>}
-              <div className="catena">
-                <div className="oggi">
-                  {sim.valido
-                    ? <>{tr('trade.estimate_current')}{' '}
-                        <b>{num(conv.locale)} {valuta}</b></>
-                    : tr('trade.write_to_estimate')}
-                </div>
-                {sim.valido && (
-                  <>
-                    <div className="anelli">
-                      <span className="an num">{exact(qtyN)}</span>
-                      <span className="op">×</span>
-                      <span className="an num">{num(priceN)} {valuta}</span>
-                      <span className="op">=</span>
-                      <span className="an num">{num(conv.locale)} {valuta}</span>
-                      {conv.eur != null ? (
-                        <>
-                          <span className="op">×</span>
-                          <span className="fx num">{num(cambio.tasso, 6)}</span>
-                          <span className="op">=</span>
-                          <span className="out num">{eur(conv.eur)}</span>
-                        </>
-                      ) : (
-                        <span className="rotta">
-                          × <b>{tr('trade.fx_word')} {valuta}{tr('trade.eur_unavailable')}</b>{tr('trade.eur_not_calculable_here')}
-                        </span>
-                      )}
-                    </div>
-                    <span className="src">
-                      {cambio.fonte === 'nativa' && tr('trade.order_in_euros')}
-                      {cambio.fonte === 'portafoglio' && <>{tr('trade.portfolio_fx_help')}</>}
-                      {cambio.fonte === 'fx' && <>{tr('trade.service_fx_help')}</>}
-                      {cambio.fonte === 'assente' && <>{tr('trade.no_fx_source')} {valuta}{tr('trade.no_fx_payload')}
-                        {ratesErr ? ` (${ratesErr})` : ''}. <b>{tr('trade.no_invented_fx')}</b></>}
-                    </span>
-                  </>
-                )}
               </div>
 
-              <div className="campo">
-                <label htmlFor="f7-rz">{tr('trade.why_trade')}</label>
-                <textarea id="f7-rz" rows={2} value={rationale}
-                          placeholder={tr('trade.rationale_example')}
-                          onChange={e => setRationale(e.target.value)} />
-              </div>
-              <div className="campo">
+              <div className="te-field">
                 <label htmlFor="f7-nt">{tr('trade.note')}</label>
-                <input id="f7-nt" className="testo" value={note} placeholder={tr('trade.free_text')}
-                       onChange={e => setNote(e.target.value)} />
+                <div className="te-input">
+                  <input id="f7-nt" value={note} placeholder={tr('trade.free_text')} onChange={e => setNote(e.target.value)} />
+                </div>
               </div>
 
-              {/* ── AVVISI ── */}
+              <details className="te-more" open={dettagli} onToggle={e => setDettagli((e.currentTarget as HTMLDetailsElement).open)}>
+                <summary><ChevronRight size={16} className="te-chev" aria-hidden="true" /> {w.details}<span className="te-more-note">{dettagliNota}</span></summary>
+                <div className="te-more-body">
+                  <div className="te-row2">
+                    <div className="te-field">
+                      <label htmlFor="f7-data">{w.execDate}</label>
+                      <div className="te-input"><input id="f7-data" type="date" min="2000-01-01" max={oggiISO()}
+                        value={tradeDay} onChange={e => setTradeDay(e.target.value)} /></div>
+                    </div>
+                    <div className="te-field">
+                      <label htmlFor="f7-ora">{w.execTime}</label>
+                      <div className="te-input"><input id="f7-ora" type="time" step="1"
+                        value={tradeTime} onChange={e => setTradeTime(e.target.value)} /></div>
+                    </div>
+                  </div>
+                  <div className="te-help">{tr('trade.date_help')}</div>
+                  {tradeDay && <Nota tono="warn">{tr('trade.dated_trade_help')}</Nota>}
+
+                  <div className="te-field">
+                    <label htmlFor="f7-decisione">{tr('trade.decision_link')}</label>
+                    <div className="te-input">
+                      <Link2 size={16} className="te-muted" aria-hidden="true" />
+                      <select id="f7-decisione" value={selectedDecision}
+                        onChange={e => {
+                          setSelectedDecision(e.target.value);
+                          if (e.target.value !== 'none') { setManualDivergenceDecision(''); setManualDivergenceReason(''); }
+                        }}>
+                        <option value="none">{tr('trade.manual_no_decision')}</option>
+                        <option value="unknown">{tr('trade.unknown_link')}</option>
+                        {/* ⚠ si confronta col ticker INSERITO: con `d.ticker` la decisione era
+                            confrontata con se stessa e il menu elencava decisioni di qualsiasi
+                            ticker. Un ticker broker diverso resta ammesso solo per la decisione
+                            gia' scelta, e chiede la verifica ISIN qui sotto. */}
+                        {!['none', 'unknown'].includes(selectedDecision)
+                          && !decisions.some(d => String(d.id) === selectedDecision && compatibileQui(d))
+                          && <option value={selectedDecision}>#{selectedDecision} {tr('trade.incompatible_option')}</option>}
+                        {decisions.filter(compatibileQui).map(d => (
+                          <option key={d.id} value={String(d.id)}>#{d.id} · {d.action} {d.ticker} · {d.timestamp.slice(0, 10)} · {d.status}
+                            {d.esecuzione ? tr('trade.executed_amount', { a: eur(d.esecuzione.eur), b: d.esecuzione.inferito ? tr('trade.inferred') : '' }) : ''}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className={'te-help' + (decisionsErr ? ' is-bad' : '')}>
+                      {decisionsErr ? tr('trade.decisions_unavailable', { a: decisionsErr }) : tr('trade.decision_help')}
+                    </div>
+                  </div>
+
+                  <div className="te-field">
+                    <label htmlFor="f7-divergence">{w.divergence}</label>
+                    <div className="te-input">
+                      <select id="f7-divergence" value={manualDivergenceDecision}
+                        onChange={e => {
+                          setManualDivergenceDecision(e.target.value);
+                          setManualDivergenceMessage(null);
+                          if (e.target.value) setSelectedDecision('none');
+                        }}>
+                        <option value="">{tr('trade.manual_divergence_none')}</option>
+                        {decisions.filter(d => statoDivergenza(d) !== null
+                          && ((['BUY', 'ADD'].includes(d.action) && ['BUY', 'ADD'].includes(action))
+                            || (['SELL', 'TRIM'].includes(d.action) && ['SELL', 'TRIM'].includes(action))))
+                          .map(d => <option key={d.id} value={String(d.id)}>#{d.id} · {d.action} {d.proposal_ticker || d.ticker} · {etichettaStatoDivergenza(d.assessment_status)}</option>)}
+                      </select>
+                    </div>
+                    <div className="te-help">{w.divergenceHelp}</div>
+                  </div>
+                  {manualDivergenceRow && <div className="te-subcard is-bad">
+                    <p>{statoDivergenza(manualDivergenceRow)
+                      ? spiegazioneDivergenza(statoDivergenza(manualDivergenceRow)!, manualDivergenceRow.proposal_ticker || manualDivergenceRow.ticker)
+                      : tr('trade.manual_divergence_requires_blocked')}</p>
+                    <div className="te-input">
+                      <input aria-label={tr('trade.manual_divergence_reason_required')}
+                        placeholder={tr('trade.manual_divergence_reason_required')}
+                        value={manualDivergenceReason} onChange={e => setManualDivergenceReason(e.target.value)} />
+                    </div>
+                  </div>}
+                  {identityTargetDecision && (identityNeeded
+                    ? <div className="te-subcard is-warn">
+                        <p><b>{w.identity}.</b> {tr('trade.identity_different_tickers', { proposal: identityProposalTicker, execution: tickerUp })}</p>
+                        <div className="te-row2">
+                          <div className="te-input"><input aria-label={tr('trade.identity_isin_label')} placeholder={tr('trade.identity_isin_label')}
+                            value={identityIsin} onChange={e => setIdentityIsin(e.target.value)} /></div>
+                          <div className="te-input"><input aria-label={tr('trade.identity_source_label')} placeholder={tr('trade.identity_source_label')}
+                            value={identitySource} onChange={e => setIdentitySource(e.target.value)} /></div>
+                          <div className="te-input"><input aria-label={tr('trade.identity_verified_at_label')} type="datetime-local"
+                            value={identityVerifiedAt} onChange={e => setIdentityVerifiedAt(e.target.value)} /></div>
+                          <div className="te-input"><input aria-label={tr('trade.identity_reason_label')} placeholder={tr('trade.identity_reason_label')}
+                            value={identityReason} onChange={e => setIdentityReason(e.target.value)} /></div>
+                        </div>
+                      </div>
+                    : <div className="te-help">{tr('trade.identity_same_ticker', { proposal: identityProposalTicker, execution: tickerUp || identityProposalTicker })}</div>)}
+                </div>
+              </details>
+              {identityTargetDecision && identityNeeded && !dettagli && <Nota tono="warn">{tr('trade.identity_check_required_short')}</Nota>}
+
+              {/* ── AVVISI: una riga, il resto nei dettagli ── */}
               {discorde && (
-                <div className="avv giallo"><span className="ic">▲</span>
-                  <span><b>{tr('trade.currency_differs')}</b> {tickerUp} {tr('trade.quoted_in')} {discorde.valutaBook}{tr('trade.you_chose')} {discorde.valutaScelta}
-                    {discorde.fattoreCento && <> — <b>{tr('trade.factor_hundred')}</b></>}{tr('trade.check_price')}</span></div>
+                <Nota tono="warn"><b>{tr('trade.currency_differs')}</b> {tickerUp} {tr('trade.quoted_in')} {discorde.valutaBook}{tr('trade.you_chose')} {discorde.valutaScelta}
+                  {discorde.fattoreCento && <> — <b>{tr('trade.factor_hundred')}</b></>}{tr('trade.check_price')}</Nota>
               )}
               {sim.caricoMuto && sim.caricoMuto !== 'ordine-incompleto' && (
-                <div className="avv viola"><span className="ic">⊘</span>
-                  <span><b>{tr('trade.cost_after_unknown')}</b>
-                    {' — '}{perche(sim.caricoMuto,
-                      discorde ? [discorde.valutaBook, discorde.valutaScelta] : undefined)}.
-                    {sim.caricoMuto === 'valuta-discorde' && <> {tr('trade.no_mixed_currency_average')}</>}</span></div>
+                <Nota tono="info" dettaglio={sim.caricoMuto === 'valuta-discorde' ? tr('trade.no_mixed_currency_average') : undefined}>
+                  <b>{tr('trade.cost_after_unknown')}</b>{' — '}{perche(sim.caricoMuto, discorde ? [discorde.valutaBook, discorde.valutaScelta] : undefined)}.
+                </Nota>
               )}
               {sfora && (
-                <div className="avv rosso"><span className="ic">▲</span>
-                  <span><b>{tr('trade.not_covered_shortfall')} {eur(sim.mancano)}.</b> {tr('trade.already_executed_intro')} <b>{tr('trade.already_executed')}</b> {tr('trade.at_broker')}</span></div>
+                <Nota tono="bad" dettaglio={<>{tr('trade.already_executed_intro')} {tr('trade.already_executed')} {tr('trade.at_broker')}</>}>
+                  <b>{tr('trade.not_covered_shortfall')} {eur(sim.mancano)}.</b>
+                </Nota>
               )}
-              {!sfora && sim.valido && sim.cassaDopo != null && (
-                <div className="avv calmo"><span className="ic">≡</span>
-                  <span>
-                    {entra ? <>{tr('trade.covered_remaining')} <b>{eur(sim.cassaDopo)}</b></>
-                      : <>{tr('trade.the_cash')} <b>{tr('trade.rises')}</b> {tr('trade.to')} <b>{eur(sim.cassaDopo)}</b></>}
-                    {volte != null && <> {tr('trade.order_multiple')} <b>{num(volte, 1)}×</b> {tr('trade.median_size')}</>}.</span></div>
-              )}
-              {sim.valido && entra && sim.copre === null && (
-                <div className="avv viola"><span className="ic">⊘</span>
-                  <span><b>{tr('trade.capacity_unknown')}</b> — {cassa == null
-                    ? tr('trade.cash_missing_payload')
-                    : tr('trade.euro_value_unknown')}.</span></div>
-              )}
-              {avviso && (
-                <div className="avv rosso"><span className="ic"><AlertOctagon size={12} /></span>
-                  <span>{noticeText(avviso, tr)}</span></div>
-              )}
+              {avviso && <Nota tono="bad" avviso>{noticeText(avviso, tr)}</Nota>}
 
               <button type="submit" disabled={submitting || preparing}
-                      className={'spara' + (sfora ? ' sfora' : '')}>
-                {submitting ? <RefreshCw size={11} className="animate-spin" /> : <Save size={11} />}
-                {submitting ? tr('trade.writing') : preparing ? tr('trade.checking')
-                  : tr('trade.check_confirm', {a: action})}
+                      className={'bbn-btn is-primary te-submit' + (sfora ? ' is-danger' : '')}>
+                {submitting ? <RefreshCw size={15} className="animate-spin" aria-hidden="true" /> : <Check size={15} aria-hidden="true" />}
+                {submitting ? w.writing : preparing ? w.checking : w.submit(verboTesto)}
               </button>
             </form>
 
             {/* ── L'ESITO: annunciato, e raggiungibile dal fuoco ── */}
-            <div ref={esitoRef} tabIndex={-1} role="status" aria-live="polite"
-                 style={{ outline: 'none' }}>
+            <div ref={esitoRef} tabIndex={-1} role="status" aria-live="polite" className="te-esito">
               {erroreScrittura && (
-                <div className="avv rosso"><span className="ic"><AlertOctagon size={12} /></span>
-                  <span><b>{tr('trade.trade_not_written')}</b> {tr('trade.backend_rejected')}<span className="verbatim">{erroreScrittura}</span></span></div>
+                <Nota tono="bad" verbatim={erroreScrittura}><b>{tr('trade.trade_not_written')}</b> {tr('trade.backend_rejected')}</Nota>
               )}
               {esitoIgnoto && (
-                <div className="avv viola"><span className="ic"><HelpCircle size={12} /></span>
-                  <span><b>{tr('trade.unknown_outcome')}</b> {tr('trade.request_sent_no_confirmation')} <b>{tr('trade.may_be_written')}</b>{tr('trade.check_movements')} <b>{tr('trade.before')}</b> {tr('trade.retry_duplicate_warning')}<span className="verbatim">{esitoIgnoto}</span></span></div>
+                <Nota tono="unknown" verbatim={esitoIgnoto}><b>{tr('trade.unknown_outcome')}</b> {tr('trade.request_sent_no_confirmation')} <b>{tr('trade.may_be_written')}</b>{tr('trade.check_movements')} <b>{tr('trade.before')}</b> {tr('trade.retry_duplicate_warning')}</Nota>
               )}
               {esito && !esito.riconosciuta && (
-                <div className="avv viola"><span className="ic"><HelpCircle size={12} /></span>
-                  <span><b>{tr('trade.unrecognized_response')}</b>{tr('trade.has_neither')} <code>ok</code> {tr('trade.nor')}
-                    <code> trade_id</code>{tr('trade.cannot_assert_trade')}</span></div>
+                <Nota tono="unknown"><b>{tr('trade.unrecognized_response')}</b>{tr('trade.has_neither')} <code>ok</code> {tr('trade.nor')}
+                  <code> trade_id</code>{tr('trade.cannot_assert_trade')}</Nota>
               )}
               {esito && esito.riconosciuta && esito.stato === 'aggiornata' && (
-                <div className="avv verde"><span className="ic"><CheckCircle2 size={12} /></span>
-                  <span>Trade <b>#{esito.tradeId}</b> {tr('trade.recorded_available_cash')} <b>{eur(esito.cassa)}</b>.</span></div>
+                <Nota tono="good"><b>{tr('trade.trade_ref', { id: esito.tradeId })}</b> {tr('trade.recorded_available_cash')} <b>{eur(esito.cassa)}</b>.</Nota>
               )}
               {esito && esito.riconosciuta && esito.stato === 'aggiornata-con-nota' && (
-                <div className="avv giallo"><span className="ic"><AlertTriangle size={12} /></span>
-                  <span>Trade <b>#{esito.tradeId}</b> {tr('trade.recorded_cash')}
-                    <b> {eur(esito.cassa)}</b>, <b>{tr('trade.backend_note_attached')}</b>:
-                    <span className="verbatim">« {esito.nota} »</span></span></div>
+                <Nota tono="warn" verbatim={`« ${esito.nota} »`}><b>{tr('trade.trade_ref', { id: esito.tradeId })}</b> {tr('trade.recorded_cash')} <b>{eur(esito.cassa)}</b>, <b>{tr('trade.backend_note_attached')}</b>:</Nota>
               )}
               {esito && esito.riconosciuta && esito.stato === 'non-aggiornata' && (
-                <div className="avv giallo"><span className="ic"><AlertTriangle size={12} /></span>
-                  <span>Trade <b>#{esito.tradeId}</b> {tr('trade.recorded_comma')} <b>{tr('trade.cash_not_updated')}</b>{tr('trade.backend_says_dot')}
-                    <span className="verbatim">« {esito.nota} »</span></span></div>
+                <Nota tono="warn" verbatim={`« ${esito.nota} »`}><b>{tr('trade.trade_ref', { id: esito.tradeId })}</b> {tr('trade.recorded_comma')} <b>{tr('trade.cash_not_updated')}</b>{tr('trade.backend_says_dot')}</Nota>
               )}
               {esito && esito.riconosciuta && esito.stato === 'muta' && (
-                <div className="avv giallo"><span className="ic"><AlertTriangle size={12} /></span>
-                  <span>Trade <b>#{esito.tradeId}</b> {tr('trade.recorded_comma')} <b>{tr('trade.cash_update_not_shown')}</b> {tr('trade.cash_missing_reason')}</span></div>
+                <Nota tono="warn"><b>{tr('trade.trade_ref', { id: esito.tradeId })}</b> {tr('trade.recorded_comma')} <b>{tr('trade.cash_update_not_shown')}</b> {tr('trade.cash_missing_reason')}</Nota>
               )}
               {/* GUARDIA PREZZI: ortogonale allo stato cassa — la scrittura è
-                  passata, ma il prezzo è lontano dall'ultimo riferimento (fra
-                  ±30% e ×3). Senza questo blocco il ramo avviso della specifica
-                  del PM era muto (ponte NUOVO 01/08, changelog (61)). */}
+                  passata, ma il prezzo è lontano dall'ultimo riferimento. */}
               {esito && esito.riconosciuta && esito.guardia && (
-                <div className="avv giallo"><span className="ic"><AlertTriangle size={12} /></span>
-                  <span><b>{tr('trade.price_guard')}</b> {tr('trade.price_guard_explanation')}
-                    <span className="verbatim">« {esito.guardia} »</span></span></div>
+                <Nota tono="warn" verbatim={`« ${esito.guardia} »`}><b>{tr('trade.price_guard')}</b> {tr('trade.price_guard_explanation')}</Nota>
               )}
-              {tradeResult?.data && <div className="avv calmo"><span>
+              {tradeResult?.data && <Nota tono="info">
                 {tr('trade.date_prefix')} <b>{tradeResult.data.replace('T', ' ')}</b>
                 {tradeResult.ora_convenzionale && tr('trade.conventional_time')}.
-                {' '}{tr('trade.link_prefix')} {tradeResult.link_origin === 'explicit' ? tr('trade.decision_id', {a: tradeResult.decisione?.id ?? tr('trade.na')})
+                {' '}{tr('trade.link_prefix')} {tradeResult.link_origin === 'explicit' ? tr('trade.decision_id', { a: tradeResult.decisione?.id ?? tr('trade.na') })
                   : tradeResult.link_origin === 'none' ? tr('trade.manual_link') : tr('trade.not_declared')}.
                 {tradeResult.fx && <> {tr('trade.fx_prefix')} {exact(tradeResult.fx.tasso)} · {tr(tradeResult.fx.fonte === 'identity' ? 'trade.already_euros' : tradeResult.fx.fonte === 'storico' ? 'trade.historical' : 'trade.current_not_historical')}.
                   {' '}{tradeResult.fx.nota}</>}
                 {tradeResult.ricalcolo && <> {tr('trade.successive_checked')} {tradeResult.ricalcolo.trade_successivi.length}.
                   {' '}{tradeResult.ricalcolo.note?.join(' ')}</>}
-              </span></div>}
-              {tradeResult?.performance_note && <div className="avv giallo"><span>
-                {tr('trade.trade_recorded')} {tradeResult.performance_note}
-              </span></div>}
+              </Nota>}
+              {tradeResult?.performance_note && <Nota tono="warn">{tr('trade.trade_recorded')} {tradeResult.performance_note}</Nota>}
+              {manualDivergenceMessage && <Nota tono={manualDivergenceMessage.error ? 'bad' : 'good'}>{manualDivergenceMessage.text}</Nota>}
             </div>
-          </div>
-        </div>
+          </Card>
 
-        {/* ── IL LIBRETTO DELLA CASSA (F37) ──────────────────────────────
-            Impianto C, scelto dal PM 20/08 sulla rosa IN SITU
-            (mockup_f7_cassa/F7cassa_C_dettaglio.png, contro A "il sesto
-            verbo" e B "il gesto sul binario"). La domanda a cui risponde:
-            versare è scrivere una riga di registro — e le righe già scritte
-            stanno SOTTO il modulo, così la terna duplicata si vede mentre la
-            si digita invece di scoprirla dal 422 a POST già partita. */}
-        <div className="rq lb-rq">
-          <span className="sq tl" /><span className="sq br" />
-          <div className="ph a">
-            <h2>{tr('trade.cashbook_title')}</h2>
-            {/* ⚠ «N movimenti a registro» era falso in due stati: prima della
-                prima lettura (N=0 su un registro mai letto) e quando N è il
-                TETTO chiesto, non il totale — che questa pagina non ha. */}
-            <span className="side">
-              {!movLetto ? tr('trade.register_loading')
-                : movErr ? tr('trade.register_unread')
-                  : finestraPiena
-                    ? tr('trade.at_least_movements', {a: movimenti.length, b: cassa != null ? eur(cassa) : tr('trade.na')})
-                    : `${movimenti.length} ${movimenti.length === 1 ? tr('trade.one_movement_shown') : tr('trade.many_movements_shown')}`
-                      + tr('trade.cash_fragment', {a: cassa != null ? eur(cassa) : tr('trade.na')})}
-            </span>
-          </div>
-          <div className="pb lb">
-            <form onSubmit={inviaMovimento}>
-              <div className="verbi cassa" role="radiogroup"
-                   aria-label={tr('trade.deposit_or_withdraw')} onKeyDown={mvKeyDown}>
-                {([['DEPOSIT', tr('trade.deposit_verb')], ['WITHDRAWAL', tr('trade.withdraw_verb')]] as const).map(([t, l]) => (
-                  <button key={t} type="button" role="radio" aria-checked={t === mvTipo}
-                          tabIndex={t === mvTipo ? 0 : -1}
-                          onClick={() => {
-                            setMvTipo(t);
-                            setMvRifiuto(null); setMvEsito(null); setMvAvviso(null);
-                          }}>{l}</button>
-                ))}
-              </div>
-
-              <div className="campi">
-                {/* ⚠ type="text" e non "number", come tutto il resto di F7:
-                    `12.345,67` in en-GB diventerebbe un altro numero. */}
-                {/* ⚠ ogni onChange BUTTA il rifiuto pendente: v. `scordaRifiuto` */}
-                <div className="campo largo">
-                  <label htmlFor="f7-mv-imp">{tr('trade.amount')}</label>
-                  <div className={'box' + (letturaImporto && !letturaImporto.ok ? ' rotto' : '')}>
-                    <input id="f7-mv-imp" ref={mvImportoRef} className="num" type="text"
-                           title={tr('numeri.grafia_richiesta', { esempio: cashLanguage === 'it' ? '1.234,56' : '1,234.56' })}
-                           inputMode="decimal"
-                           autoComplete="off" value={mvImporto} placeholder={tr('trade.amount_example')}
-                           aria-invalid={!!(letturaImporto && !letturaImporto.ok)}
-                           onChange={e => { setMvImporto(e.target.value); scordaRifiuto(); }} />
-                    <span className="suf">EUR</span>
-                  </div>
-                  <div className={'aiuto'
-                    + ((letturaImporto && !letturaImporto.ok) || prelievoScoperto ? ' male' : '')}>
-                    {letturaImporto && !letturaImporto.ok ? letturaImporto.motivo
-                      : prelievoScoperto
-                        ? tr('trade.withdrawal_refused', {a: eur(cassa)})
-                        : previsioneCredibile
-                          ? tr('trade.cash_prediction', {a: eur(cassa), b: eur(cassaDopoMovimento)})
-                          : cassa == null ? tr('trade.cash_capacity_unavailable')
-                            : ' '}
-                  </div>
-                </div>
-
-                <div className="campo">
-                  <label htmlFor="f7-mv-dt">{tr('trade.value_date')}</label>
-                  <div className={'box' + (letturaData && !letturaData.ok ? ' rotto' : '')}>
-                    <input id="f7-mv-dt" className="num" type="text" inputMode="numeric"
-                           autoComplete="off" value={mvData} placeholder={mvOggi}
-                           aria-invalid={!!(letturaData && !letturaData.ok)}
-                           onChange={e => {
-                             mvDataAuto.current = false;
-                             setMvData(e.target.value); scordaRifiuto();
-                           }} />
-                    <span className="suf">ISO</span>
-                  </div>
-                  <div className={'aiuto' + (letturaData && !letturaData.ok ? ' male' : '')}>
-                    {letturaData && !letturaData.ok ? letturaData.motivo
-                      : tr('trade.flow_date_help')}
-                  </div>
-                </div>
-
-                <div className="campo">
-                  <label htmlFor="f7-mv-nt">{tr('trade.description')}</label>
-                  <div className="box">
-                    <input id="f7-mv-nt" type="text" autoComplete="off" value={mvNota}
-                           placeholder={tr('trade.bank_transfer_example')}
-                           onChange={e => { setMvNota(e.target.value); scordaRifiuto(); }} />
-                  </div>
-                  {/* «verbatim» era falso: la causale passa da .trim() e una
-                      fatta di soli spazi non viene spedita affatto. */}
-                  <div className="aiuto">{tr('trade.stored_in')} <code>note</code>{tr('trade.trimmed_edges')}</div>
-                </div>
-              </div>
-
-              {mvAvviso && (
-                <div className="avv rosso"><span className="ic">✕</span>
-                  <span>{noticeText(mvAvviso, tr)}</span></div>
-              )}
-
-              {/* L'ANTICIPO DELLA GUARDIA: la riga gemella esiste già. Non
-                  blocca — la guardia vera è del backend — ma toglie la
-                  sorpresa, che è il motivo per cui questo impianto esiste. */}
-              {gemella && !mvRifiuto && (
-                <div className="avv giallo"><span className="ic">⚠</span>
-                  <span><b>{tr('trade.row_exists')}</b> (id={gemella.id}{tr('trade.duplicate_row_explanation')}</span></div>
-              )}
-
-              {/* `disabled` sul solo invio in volo: dal momento che ogni
-                  modifica ai campi butta il rifiuto, REGISTRA e CONFERMO non
-                  possono più essere entrambi vivi sullo stesso corpo. */}
-              <button type="submit" className="spara"
-                      disabled={mvInvio || !!mvRifiuto}>
-                <Save size={13} />
-                {mvInvio ? tr('trade.sending')
-                  : mvTipo === 'DEPOSIT' ? tr('trade.record_deposit') : tr('trade.record_withdrawal')}
-              </button>
-            </form>
-
-            {/* ── L'ESITO ────────────────────────────────────────────────
-                ⚠ La live region è l'annunciatore INVISIBILE qui sotto, non il
-                blocco visibile: un `aria-live` che entra nell'albero INSIEME
-                al testo non viene annunciato (e con `:empty{display:none}` non
-                ci entrava affatto). Così, in più, i BOTTONI non stanno dentro
-                una region che alcuni lettori rileggono a ogni mutazione. */}
-            <div className="lb-annuncio" role="status" aria-live="polite">
-              {mvRifiuto ? tr('trade.movement_rejected_reason', {a: mvRifiuto.rifiuto.motivo})
-                : mvIgnoto ? tr('trade.server_no_response')
-                  : mvEsito ? (mvEsito.riconosciuta
-                    ? tr('trade.movement_recorded_id', {a: mvEsito.movimentoId})
-                    : tr('trade.unrecognized_response_dot')) : ''}
-            </div>
-            <div className="lb-esito">
-              {mvRifiuto && (
-                <>
-                  <div className="avv giallo">
-                    <span className="ic"><AlertTriangle size={12} /></span>
-                    <span>
-                      <b>{mvRifiuto.rifiuto.quale === 'duplicato'
-                        ? tr('trade.duplicate_registered')
-                        : mvRifiuto.rifiuto.quale === 'soglia'
-                        /* la cifra NON si ricopia: `CASH_SOGLIA_CONFERMA_EUR`
-                           è policy modificabile (memory_db.py:906) e vive in un
-                           posto solo. Il numero vero lo porta il verbatim. */
-                          ? tr('trade.threshold_confirmation')
-                          : tr('trade.movement_rejected')}</b>{' '}
-                      {/* ⚠ «NON è stato scritto» solo dove il backend lo
-                          GARANTISCE (422/401). Su un 500 dopo l'INSERT o su un
-                          503 post-commit affermarlo manda il PM a riprovare,
-                          il secondo giro prende GUARDIA DUPLICATO, e il
-                          bottone qui sotto — che quella guardia la spegne — fa
-                          entrare il doppio movimento. */}
-                      {mvRifiuto.rifiuto.nonScritto
-                        ? <>{tr('trade.the_movement')} <b>{tr('trade.not_upper')}</b> {tr('trade.was_recorded')}</>
-                        : <>{tr('trade.backend_responded')} <b>HTTP {mvRifiuto.rifiuto.status}</b>:{' '}
-                          <b>{tr('trade.cannot_say')}</b> {tr('trade.check_register_before_retry')}</>}
-                      {' '}{tr('trade.backend_says')}
-                      <span className="verbatim">« {mvRifiuto.rifiuto.motivo} »</span>
-                    </span>
-                  </div>
-                  {mvRifiuto.rifiuto.rimediabile && (
-                    <>
-                      {/* ANNULLA prende il fuoco e ha la STESSA larghezza:
-                          l'INVIO accidentale non deve scavalcare due guardie. */}
-                      <div className="lb-conf">
-                        <button type="button" className="spara" onClick={confermaMovimento}
-                                disabled={mvInvio}>
-                          {mvInvio ? tr('trade.sending') : tr('trade.confirm_intentional')}
-                        </button>
-                        <button type="button" className="lb-ann" ref={mvAnnullaRef}
-                                onClick={() => {
-                                  setMvRifiuto(null);
-                                  mvImportoRef.current?.focus();
-                                }} disabled={mvInvio}>
-                          {tr('trade.cancel_caps')}
-                        </button>
-                      </div>
-                      {/* La chiave è UNA per DUE guardie (memory_db.py:958 e
-                          :964): chi conferma deve sapere che spegne anche
-                          l'altra. Dirlo è la resa decisa dal PM il 20/08. */}
-                      <div className="gate">
-                        {tr('trade.confirm_resends')} <b>{tr('trade.same')}</b> {tr('trade.movement_with')}{' '}
-                        <code>conferma=true</code>{tr('trade.disables')} <b>{tr('trade.both')}</b> {tr('trade.overridable_checks')} <b>{tr('trade.and')}</b> {tr('trade.amount_guard_too')}
-                      </div>
-                    </>
-                  )}
-                </>
-              )}
-
-              {mvIgnoto && (
-                <div className="avv viola"><span className="ic"><HelpCircle size={12} /></span>
-                  <span><b>{tr('trade.unknown_outcome_short')}</b>{tr('trade.server_no_reply_so')}{' '}
-                    <b>{tr('trade.do_not_know')}</b> {tr('trade.whether_movement_written')} <b>{tr('trade.reading_again')}</b>{' '}
-                    {tr('trade.register_check_row')}
-                    <span className="verbatim">{mvIgnoto}</span></span></div>
-              )}
-
-              {mvEsito && (
-                mvEsito.riconosciuta ? (
-                  <div className={'avv ' + (mvEsito.stato === 'aggiornata' ? 'verde'
-                    : mvEsito.stato === 'muta' ? 'viola' : 'giallo')}>
-                    <span className="ic">
-                      {mvEsito.stato === 'aggiornata' ? <CheckCircle2 size={12} />
-                        : mvEsito.stato === 'muta' ? <HelpCircle size={12} />
-                          : <AlertTriangle size={12} />}</span>
-                    <span>
-                      <b>{tr('trade.movement')} {mvEsito.movimentoId} {tr('trade.recorded_dot')}</b>{' '}
-                      {/* i quattro stati hanno quattro rami: prima
-                          `aggiornata-con-nota` cadeva in quello che afferma
-                          l'OPPOSTO («la cassa non è stata aggiornata») */}
-                      {mvEsito.stato === 'aggiornata'
-                        ? <>{tr('trade.cash_updated')} <b>{eur(mvEsito.cassa)}</b>.</>
-                        : mvEsito.stato === 'aggiornata-con-nota'
-                          ? <>{tr('trade.cash_updated_to')} <b>{eur(mvEsito.cassa)}</b>{tr('trade.with_backend_note')}</>
-                          : mvEsito.stato === 'muta'
-                            ? <>{tr('trade.the_response')} <b>{tr('trade.no_cash_in_response')}</b>{tr('trade.register_written_value_unknown')}</>
-                            : <>{tr('trade.the_cash')} <b>{tr('trade.not')}</b> {tr('trade.cash_register_diverge')} <b>{tr('trade.diverge')}</b>.</>}
-                      {mvEsito.nota && (
-                        <span className="verbatim">« {mvEsito.nota} »</span>
-                      )}
-                    </span>
-                  </div>
-                ) : (
-                  <div className="avv viola"><span className="ic"><HelpCircle size={12} /></span>
-                    <span><b>{tr('trade.unrecognized_response')}</b>{tr('trade.has_neither')} <code>ok</code> {tr('trade.nor')}{' '}
-                      <code>movement_id</code>{tr('trade.cannot_assert_movement')}</span></div>
-                )
-              )}
-            </div>
-
-            {/* ── LE RIGHE GIÀ SCRITTE ── */}
-            <div className="lbm">
-              {!movLetto ? (
-                <div className="vuoto">{tr('trade.reading_register')}</div>
-              ) : movErr ? (
-                <div className="vuoto">{tr('trade.register_unread_prefix')} <b>{movErr}</b>{tr('trade.unread_register_help')}</div>
-              ) : movimenti.length === 0 ? (
-                <div className="vuoto">{tr('trade.no_cash_movements')}</div>
-              ) : (
-                movimenti.map(m => {
-                  const dupe = gemella != null && m.id === gemella.id;
-                  const cum = flussi.get(m.id);
-                  const val = typeof m.amount_eur === 'number' && isFinite(m.amount_eur)
-                    ? m.amount_eur : null;
-                  const verso = m.type === 'DEPOSIT' ? '+' : '−';
-                  // ⚠ l'importo di riga è reso a 0 decimali per far stare la
-                  // colonna: 1.234,49 € si legge «+1.234 €». Il valore ESATTO
-                  // dev'essere raggiungibile da qualche parte, se no la pagina
-                  // rende un numero che non sta nel registro — e `gemella`
-                  // confronta i centesimi, quindi due righe diverse di un
-                  // centesimo si vedono identiche. Qui sta nel title e
-                  // nell'aria-label, insieme all'anno che `gg()` non rende.
-                  const esatto = val == null ? tr('trade.amount_na')
-                    : `${m.date} · ${m.type === 'DEPOSIT' ? tr('trade.deposit_lower') : tr('trade.withdrawal_lower')}`
-                      + ` ${verso}${num(Math.abs(val))} €`;
-                  return (
-                    <div className={'uo' + (dupe ? ' qui' : '')} key={m.id}
-                         ref={dupe ? mvGemellaRef : undefined}
-                         aria-label={esatto + (m.note ? ` — ${m.note}` : '')}
-                         title={esatto + (m.note ? `\n${m.note}` : '')}>
-                      <span className="dt num">{gg(m.date)}</span>
-                      <span className="tk">
-                        {m.type === 'DEPOSIT' ? tr('trade.deposit_upper') : tr('trade.withdrawal_upper')}</span>
-                      <span className="ba">
-                        {movimentoMax > 0 && val != null && (
-                          <i className={dupe ? 'q' : undefined}
-                             style={{ width: pct(Math.abs(val) / movimentoMax) }} />
-                        )}
-                      </span>
-                      <span className="ev num">
-                        {val == null ? <span className="nd">{tr('trade.amount_na')}</span>
-                          : <>{verso}{eur(Math.abs(val), 0)}</>}
-                      </span>
-                      <span className="ev num fl">
-                        {cum != null ? tr('trade.flows_value', {a: eur(cum, 0)}) : tr('trade.flows_na')}
-                      </span>
-                    </div>
-                  );
-                })
-              )}
-            </div>
-            {/* ⚠ Le due note stanno FUORI da `.lbm`. Quella della finestra ci
-                stava DENTRO: con 200 righe finiva a 6.211px di scroll dentro un
-                vano da 149px — una dichiarazione che nessuno avrebbe letto,
-                sopra numeri che senza di lei sono falsi. */}
-            {movLetto && !movErr && finestraPiena && (
-              <div className="gate">
-                {tr('trade.rows_shown')} <b>{movimenti.length}</b>{tr('trade.window_at_limit')} <b>{tr('trade.cannot_see_older')}</b>{tr('trade.flows_partial')}
-              </div>
-            )}
-            {/* La colonna dice «flussi» e non «saldo» perché il saldo cassa NON
-                è ricostruibile da qui: anche i trade la muovono. Sulla rosa
-                quella colonna dava una cifra incompatibile col versamento. */}
-            <div className="gate">
-              <b>{tr('trade.flows')}</b> {tr('trade.cumulative_deposit_withdrawal')} <b>{tr('trade.shown_below')}</b>{tr('trade.flows_not_cash')}
-            </div>
-          </div>
-        </div>
-
-        {/* ── PRIMA → DOPO ── */}
-        <div className="rq">
-          <div className="ph c">
-            <h2>{tr('trade.before_after')}</h2>
-            <span className="side">
-              {sim.valutazione === 'eseguito-proxy' ? tr('trade.valued_entered_price')
-                : tr('trade.live_book_simulation')}
-            </span>
-          </div>
-          <div className="pb">
-            {!sim.valido ? (
-              <div className="t-no" style={{ fontSize: 12 }}>
-                {tr('trade.simulation_needs_inputs')}
-              </div>
-            ) : (
-              <>
-                <div className="pd">
-                  <Riga k={tr('trade.cash')} a={eur(sim.cassaPrima)} b={eur(sim.cassaDopo)}
-                        muto={sim.cassaDopo == null}
-                        dl={sim.cassaDopo != null && sim.cassaPrima != null
-                          ? segno(sim.cassaDopo - sim.cassaPrima) + ' €' : tr('trade.na')}
-                        verso={entra ? 1 : -1} grosso sfora={sfora} />
-                  <Riga k={tr('trade.ticker_shares', {a: tickerUp})}
-                        a={sim.qtaPrima != null ? exact(sim.qtaPrima) : tr('trade.na')}
-                        b={sim.qtaMuta ? '—' : exact(sim.qtaDopo)}
-                        muto={!!sim.qtaMuta}
-                        dl={sim.qtaMuta ? perche(sim.qtaMuta)
-                          : (sim.qtaDopo != null && sim.qtaPrima != null
-                            ? (sim.qtaDopo - sim.qtaPrima > 0 ? '+' : '') + exact(sim.qtaDopo - sim.qtaPrima)
-                            : tr('trade.na'))}
-                        verso={0} />
-                  <Riga k={tr('trade.cost_basis')}
-                        a={sim.caricoPrima != null ? `${num(sim.caricoPrima)} ${pos?.valuta || ''}` : tr('trade.na')}
-                        b={sim.caricoMuto ? '—' : `${num(sim.caricoDopo)} ${pos?.valuta || valuta}`}
-                        muto={!!sim.caricoMuto}
-                        dl={sim.caricoMuto
-                          ? perche(sim.caricoMuto,
-                            discorde ? [discorde.valutaBook, discorde.valutaScelta] : undefined)
-                          : sim.caricoInvariato ? tr('trade.unchanged')
-                            : (sim.caricoDopo != null && sim.caricoPrima != null
-                              ? segno(sim.caricoDopo - sim.caricoPrima) : tr('trade.new_cost'))}
-                        verso={sim.caricoDopo != null && sim.caricoPrima != null
-                          ? Math.sign(sim.caricoDopo - sim.caricoPrima) : 0} />
-                  <Riga k={tr('trade.securities_weight')}
-                        a={sim.pesoPrima != null ? num(sim.pesoPrima) + '%' : tr('trade.na')}
-                        b={sim.pesoMuto ? '—' : num(sim.pesoDopo) + '%'}
-                        muto={!!sim.pesoMuto}
-                        dl={sim.pesoMuto ? perche(sim.pesoMuto)
-                          : (sim.pesoDopo != null && sim.pesoPrima != null
-                            ? segno(sim.pesoDopo - sim.pesoPrima) + ' pt' : tr('trade.na'))}
-                        verso={0} />
-                  <Riga k="NAV" a={eur(sim.navPrima, 0)}
-                        b={sim.navMuto ? '—' : eur(sim.navDopo, 0)}
-                        muto={!!sim.navMuto}
-                        dl={sim.navMuto ? perche(sim.navMuto)
-                          : (sim.navDelta != null
-                            ? (Math.abs(sim.navDelta) < 0.005 ? tr('trade.unchanged') : segno(sim.navDelta) + ' €')
-                            : tr('trade.na'))}
-                        verso={sim.navDelta != null ? -Math.sign(sim.navDelta) : 0} />
-                </div>
-                <div className="avv calmo" style={{ marginTop: 8 }}>
-                  <span className="ic">≡</span>
-                  <span>
-                    {tr('trade.this_is_a')} <b>{tr('trade.simulation')}</b>{tr('trade.cash_moves_entered')} <b>{tr('trade.entered')}</b>{tr('trade.securities_valued')}{' '}
-                    {sim.valutazione === 'mercato' ? <>{tr('trade.at')} <b>{tr('trade.market_price')}</b></>
-                      : sim.valutazione === 'eseguito-proxy'
-                        ? <>{tr('trade.at')} <b>{tr('trade.entered_price')}</b>{tr('trade.new_name_no_market_price')}</>
-                        : <>{tr('trade.no_price_valuation')}</>}.
-                    {' '}{tr('trade.nav_difference')} <b>{tr('trade.our_arithmetic')}</b>{tr('trade.backend_usually_matches')}
-                  </span>
-                </div>
-              </>
-            )}
-          </div>
-        </div>
-
-        {/* ── GLI ULTIMI ORDINI ── */}
-        <div className="rq cresce">
-          <div className="ph">
-            <h2>{tr('trade.recent_orders')}</h2>
-            <span className="side">{tr('trade.same_scale')}</span>
-          </div>
-          <div className="pb scorre nopad">
+          {/* ── GLI ULTIMI ORDINI ── */}
+          <Card titolo={w.recent} className="te-recent te-stretch" azioni={<span className="bbn-card-note">{w.recentNote}</span>}>
             {tradesErr ? (
-              <div className="vuoto">{tr('trade.history_unavailable_prefix')} <b>{tradesErr}</b>{tr('trade.history_comparison_missing')}</div>
-            ) : ultimi.length === 0 ? (
-              <div className="vuoto">{tr('trade.no_archived_movements')}</div>
+              <p className="bbn-empty">{tr('trade.history_unavailable_prefix')} <b>{tradesErr}</b>.</p>
+            ) : ultimi.length === 0 && !sim.valido ? (
+              <p className="bbn-empty">{tr('trade.no_archived_movements')}</p>
             ) : (
-              <>
+              <ul className="te-orders">
                 {sim.valido && (
-                  <div className="uo qui">
-                    <span className="dt">{tr('trade.now')}</span>
-                    <span className="tk">{tickerUp}</span>
-                    <span className="ba">
-                      {delta != null && scala != null && (
-                        <i className="q" style={{ width: pct(delta / scala) }} />
-                      )}
-                    </span>
-                    <span className="ev num">{eur(conv.eur, 0)}</span>
-                  </div>
+                  <li className="te-orow is-now">
+                    <span className="te-orow-d">{w.now}</span>
+                    <span className="te-orow-tk">{tickerUp}</span>
+                    <span className="te-bar" aria-hidden="true">{delta != null && <i style={{ width: pct(delta / scalaOrdini) }} />}</span>
+                    <span className="te-orow-v num"><span className={'te-verb ' + (entra ? 'is-in' : 'is-out')}>{action === 'DIVIDEND' ? tr('trade.div_short') : action}</span>{eur(conv.eur, 0)}</span>
+                  </li>
                 )}
                 {ultimi.map((t, i) => (
-                  <div className="uo" key={`${t.data}-${t.ticker}-${i}`}>
-                    <span className="dt num">{gg(t.data)}</span>
-                    <span className="tk">{t.ticker}</span>
-                    <span className="ba" title={`${num(t.locale)} ${t.valuta}`}>
-                      {t.eur != null && scala != null && (
-                        <i style={{ width: pct(t.eur / scala) }} />
-                      )}
+                  <li className="te-orow" key={`${t.data}-${t.ticker}-${i}`} title={`${num(t.locale)} ${t.valuta}`}>
+                    <span className="te-orow-d num">{gg(t.data)}</span>
+                    <span className="te-orow-tk">{t.ticker}</span>
+                    <span className="te-bar" aria-hidden="true">{t.eur != null && <i style={{ width: pct(t.eur / scalaOrdini) }} />}</span>
+                    <span className="te-orow-v num">
+                      <span className={'te-verb ' + (['BUY', 'ADD'].includes(t.action) ? 'is-in' : 'is-out')}>{t.action === 'DIVIDEND' ? tr('trade.div_short') : t.action}</span>
+                      {t.eur != null ? eur(t.eur, 0) : <span className="te-muted">{tr('trade.fx_word')} {t.valuta} {tr('trade.na')}</span>}
                     </span>
-                    <span className="ev num">
-                      {t.eur != null ? eur(t.eur, 0)
-                        : <span className="nd">{tr('trade.fx_word')} {t.valuta} {tr('trade.na')}</span>}
-                    </span>
-                  </div>
+                  </li>
                 ))}
-              </>
+              </ul>
             )}
-          </div>
+          </Card>
+        </div>
+
+        <div className="te-col">
+          {/* ── EFFETTO SUL PORTAFOGLIO ── */}
+          <Card titolo={w.preview} className="te-preview"
+                azioni={<><span className="bbn-chip">{tr('trade.live_book_simulation')}</span><span className="bbn-grow" />
+                  <span className="bbn-card-note">{sim.valutazione === 'eseguito-proxy' ? w.previewProxy : w.previewMarket}</span></>}>
+            <div className="te-body">
+              {posErr ? (
+                <Nota tono="bad"><b>{tr('trade.portfolio_unavailable')}</b> — {posErr}. {tr('trade.cashbar_missing_book')}</Nota>
+              ) : cassa == null ? (
+                <Nota tono="warn"><b>{tr('trade.cash_payload_absent')}</b> — {portfolioValues(snap).note}.{' '}
+                  {tr('trade.missing_nonnumeric_capacity')} <b>{tr('trade.cannot_verify')}</b>.</Nota>
+              ) : cassa <= 0 ? (
+                <Nota tono="warn"><b>{cassa === 0 ? tr('trade.zero_cash') : tr('trade.overdraft', { a: eur(-cassa) })}</b>
+                  {' '}{tr('trade.is_a_measurement')} <b>{tr('trade.measurement')}</b>.</Nota>
+              ) : (
+                <div className="te-cashwrap">
+                  <span className="te-k">{w.cash}</span>
+                  {pezzo && sim.cassaDopo != null ? (
+                    <div className="te-cashline">
+                      <span className="te-cash-from num">{eur(cassa)}</span><span className="te-muted" aria-hidden="true">→</span>
+                      <span className={'te-cash-to num' + (sfora ? ' is-bad' : '')}>{eur(sim.cassaDopo)}</span>
+                      <span className={'bbn-pill ' + (sfora ? 'is-giu' : entra ? 'is-piatto' : 'is-su')}>{entra ? '−' : '+'}{eur(delta)}</span>
+                    </div>
+                  ) : (
+                    <div className="te-cashline"><span className="te-cash-to num">{eur(cassa)}</span><span className="te-muted">{w.inCash}</span></div>
+                  )}
+                  <div className={'te-cashbar' + (sfora ? ' is-bad' : '')} role="img"
+                       aria-label={pezzo && sim.cassaDopo != null ? `${w.cash} ${eur(cassa)} → ${eur(sim.cassaDopo)}` : `${w.cash} ${eur(cassa)}`}>
+                    {!pezzo ? <i className="te-rest" style={{ width: '100%' }} />
+                      : entra ? <>
+                        <i className="te-rest" style={{ width: pct(sim.cassaDopo != null && sim.cassaDopo > 0 ? sim.cassaDopo / cassa : 0) }} />
+                        <i className="te-bite" style={{ left: pct(sim.cassaDopo != null && sim.cassaDopo > 0 ? sim.cassaDopo / cassa : 0), width: pct(Math.min(1, (delta ?? 0) / cassa)) }} />
+                      </> : <>
+                        <i className="te-rest" style={{ width: pct(pezzo.da) }} />
+                        <i className="te-bite is-in" style={{ left: pct(pezzo.da), width: pct(pezzo.largo) }} />
+                      </>}
+                  </div>
+                  <div className="te-legend">
+                    <span><i className="te-sw te-sw-rest" />{w.restInCash}</span>
+                    {pezzo && <span><i className={'te-sw ' + (sfora ? 'te-sw-bad' : entra ? 'te-sw-bite' : 'te-sw-in')} />
+                      {sfora ? w.beyondCash : entra ? w.usedByOrder : w.enteringCash}
+                      {entra && delta != null && <> · {w.ofCash(num((delta / cassa) * 100, 1))}</>}</span>}
+                  </div>
+                </div>
+              )}
+              {sim.valido && entra && sim.copre === null && cassa != null && (
+                <Nota tono="unknown"><b>{tr('trade.capacity_unknown')}</b> — {tr('trade.euro_value_unknown')}.</Nota>
+              )}
+
+              <div className="te-tiles">
+                <Tessera k={sim.valido && tickerUp ? w.position(tickerUp) : w.positionGeneric} vuota={!sim.valido} attesa={w.waiting}
+                  v={sim.qtaMuta ? '—' : sim.qtaDopo != null ? `${exact(sim.qtaDopo)}` : tr('trade.na')}
+                  sotto={sim.qtaMuta ? perche(sim.qtaMuta)
+                    : sim.nuovaPosizione ? w.newPosition
+                      : sim.qtaPrima != null && sim.qtaDopo != null
+                        ? <>{w.from(exact(sim.qtaPrima))} · <span className={sim.qtaDopo >= sim.qtaPrima ? 'te-up' : 'te-down'}>{(sim.qtaDopo - sim.qtaPrima > 0 ? '+' : '') + exact(sim.qtaDopo - sim.qtaPrima)}</span></>
+                        : tr('trade.na')} />
+                <Tessera k={w.cost} vuota={!sim.valido} attesa={w.waiting}
+                  v={sim.caricoMuto ? '—' : `${num(sim.caricoDopo)} ${pos?.valuta || valuta}`}
+                  sotto={sim.caricoMuto ? perche(sim.caricoMuto, discorde ? [discorde.valutaBook, discorde.valutaScelta] : undefined)
+                    : sim.caricoInvariato ? w.unchanged
+                      : sim.caricoPrima != null && sim.caricoDopo != null ? <>{w.from(num(sim.caricoPrima))} · {segno(sim.caricoDopo - sim.caricoPrima)}</>
+                        : tr('trade.new_cost')} />
+                <Tessera k={w.weight} vuota={!sim.valido} attesa={w.waiting}
+                  v={sim.pesoMuto ? '—' : num(sim.pesoDopo) + '%'}
+                  sotto={sim.pesoMuto ? perche(sim.pesoMuto)
+                    : sim.pesoPrima != null && sim.pesoDopo != null ? <>{w.from(num(sim.pesoPrima) + '%')} · {segno(sim.pesoDopo - sim.pesoPrima)} pt</> : tr('trade.na')} />
+                <Tessera k={w.nav} vuota={!sim.valido} attesa={w.waiting}
+                  v={sim.navMuto ? '—' : eur(sim.navDopo, 0)}
+                  sotto={sim.navMuto ? perche(sim.navMuto)
+                    : sim.navDelta != null ? (Math.abs(sim.navDelta) < 0.005 ? w.unchanged : <>{w.from(eur(sim.navPrima, 0))} · {segno(sim.navDelta)} €</>)
+                      : tr('trade.na')} />
+              </div>
+
+              <div className="te-size">
+                <div className="te-size-txt">
+                  {sim.valido && volte != null && taglie.mediana != null ? <>
+                    <b>{w.sizeTimes(num(volte, 1) + '×', eur(taglie.mediana, 0))}</b>
+                    {taglie.massimo != null && delta != null && <> · <span className={delta > taglie.massimo ? 'te-down' : undefined}>
+                      {delta > taglie.massimo ? w.sizeAboveMax(eur(taglie.massimo, 0)) : w.sizeBelowMax(eur(taglie.massimo, 0))}</span></>}.
+                    <br /><span className="te-small">{w.sizeBasis(taglie.misurate.length)}</span>
+                  </> : taglie.mediana != null ? w.sizeEmpty(eur(taglie.mediana, 0)) : w.sizeEmptyNoHistory}
+                  {(taglie.senzaCambio > 0 || taglie.senzaImporto > 0 || tradesErr) && <span className="te-small">
+                    {taglie.senzaCambio > 0 && <> {taglie.senzaCambio} {tr('trade.orders_no_marker')} {taglie.scoperte.join(', ')}.</>}
+                    {/* integrazione G9a+G9b: ordini con quantita'/prezzo illeggibile esclusi dalla mediana: si dichiarano */}
+                    {taglie.senzaImporto > 0 && <> {tr('trade.orders_no_amount', { n: String(taglie.senzaImporto) })}.</>}
+                    {tradesErr && <> {tr('trade.history_no_markers')}.</>}</span>}
+                </div>
+                <Istogramma valori={taglie.misurate.map(t => t.eur as number)} mio={sim.valido ? delta : null}
+                  mediana={taglie.mediana} etichetta={w.sizeChart} />
+              </div>
+
+              {sim.valido && (
+                <details className="te-how">
+                  <summary>{w.moreInfo}</summary>
+                  <p>{tr('trade.this_is_a')} {tr('trade.simulation')}{tr('trade.cash_moves_entered')} {tr('trade.entered')}{tr('trade.securities_valued')}{' '}
+                    {sim.valutazione === 'mercato' ? <>{tr('trade.at')} {tr('trade.market_price')}</>
+                      : sim.valutazione === 'eseguito-proxy' ? <>{tr('trade.at')} {tr('trade.entered_price')}{tr('trade.new_name_no_market_price')}</>
+                        : <>{tr('trade.no_price_valuation')}</>}.
+                    {' '}{tr('trade.nav_difference')} {tr('trade.our_arithmetic')}{tr('trade.backend_usually_matches')}</p>
+                </details>
+              )}
+            </div>
+          </Card>
+
+          {/* ── IL PORTAFOGLIO: clic = precompila il ticket ── */}
+          <Card titolo={w.portfolio} className="te-book te-stretch"
+                azioni={<span className="bbn-card-note">{bookAssente ? tr('trade.unavailable') : w.portfolioNote(book.righe.length)}</span>}>
+            {posErr ? (
+              <p className="bbn-empty">{tr('trade.positions_unavailable_upper')} {posErr}{tr('trade.book_error_refresh')}</p>
+            ) : loading && book.righe.length === 0 ? (
+              <p className="bbn-empty">{tr('trade.positions_loading')}</p>
+            ) : book.righe.length === 0 ? (
+              <p className="bbn-empty">{tr('trade.no_position_buy')}</p>
+            ) : <>
+              <div className="te-lhead" aria-hidden="true"><span /><span>{w.colTitle}</span><span>{w.colValue}</span><span>{w.colPl}</span></div>
+              <ul className="te-rows">{book.righe.map(r => {
+                const on = r.pos.ticker.toUpperCase() === tickerUp;
+                return <li key={r.pos.ticker}>
+                  {/* un comando VERO: uno spazio battuto per scorrere non deve
+                      sovrascrivere in silenzio il modulo che stavi compilando */}
+                  <button type="button" className={'te-row' + (on ? ' is-on' : '')} aria-pressed={on}
+                          aria-label={tr('trade.use_ticker', { a: r.pos.ticker })} onClick={() => selectPosition(r.pos)}>
+                    <IconaTitolo ticker={r.pos.ticker} nome={r.pos.nome} dimensione="sm" />
+                    <span className="te-row-name"><b>{r.pos.ticker}</b>
+                      <span>{nomeTitolo(r.pos) !== r.pos.ticker.split('.')[0] ? nomeTitolo(r.pos) + ' · ' : ''}{w.carry(exact(r.pos.quantita), num(r.pos.prezzo_medio), r.peso != null ? num(r.peso) + '%' : tr('trade.na'))}</span></span>
+                    <span className="te-row-value"><b className="num">{eur(r.pos.valore_mercato, 0)}</b>
+                      <span className="num">{r.pos.prezzo_live != null ? w.live(num(r.pos.prezzo_live)) : tr('trade.na')}</span></span>
+                    <span className="te-row-pl">
+                      {r.pos.pl_pct == null ? <span className="bbn-pill is-piatto">{tr('trade.na')}</span>
+                        : <PastigliaVariazione valore={r.pos.pl_pct}><span className="num">{segno(r.pos.pl_pct)}%</span></PastigliaVariazione>}
+                    </span>
+                  </button>
+                </li>;
+              })}</ul>
+              {book.senzaValore > 0 && <p className="te-foot">{tr('trade.missing_value_at_end', { a: book.senzaValore })}</p>}
+            </>}
+          </Card>
         </div>
       </div>
 
-      {/* ══ COLONNA DESTRA ════════════════════════════════════════════ */}
-      <div className="colonna dx">
+      {/* ══════════════ CASSA ══════════════ */}
+      <div className="te-grid te-cash" hidden={view !== 'cash'}>
+        <Card titolo={w.cashMovement} className="te-cashform" azioni={<span className="bbn-card-note">{w.cashTwr}</span>}>
+          <form onSubmit={inviaMovimento} className="te-body te-fill">
+            <div className="bbn-seg is-full" role="radiogroup" aria-label={tr('trade.deposit_or_withdraw')} onKeyDown={mvKeyDown}>
+              {([['DEPOSIT', w.deposit], ['WITHDRAWAL', w.withdraw]] as const).map(([t, l]) => (
+                <button key={t} type="button" role="radio" aria-checked={t === mvTipo} className={t === mvTipo ? 'is-on' : undefined}
+                        tabIndex={t === mvTipo ? 0 : -1}
+                        onClick={() => { setMvTipo(t); setMvRifiuto(null); setMvEsito(null); setMvAvviso(null); }}>{l}</button>
+              ))}
+            </div>
 
-        {/* ── IL BINARIO DELLA CASSA: l'oggetto-firma ── */}
-        <div className="rq" style={{ flex: '0 0 214px' }}>
-          <span className="sq tl" /><span className="sq br" />
-          <div className="ph a">
-            <h2>{tr('trade.cash_title')}</h2>
-            <span className="side">
-              {bookAssente ? tr('trade.portfolio_not_loaded')
-                : cassa != null ? tr('trade.cash_source_field', {a: eur(cassa)})
-                  : tr('trade.cash_field_absent')}
-            </span>
-            <button type="button" className="mini" onClick={carica} aria-busy={loading}>
-              <RefreshCw size={10} className={loading ? 'animate-spin' : ''} /> {tr('trade.refresh')}
+            {/* ⚠ type="text" e non "number", come tutto il resto di F7.
+                ⚠ ogni onChange BUTTA il rifiuto pendente: v. `scordaRifiuto` */}
+            <div className="te-field te-amount">
+              <label htmlFor="f7-mv-imp">{tr('trade.amount')}</label>
+              <div className={'te-input' + (letturaImporto && !letturaImporto.ok ? ' is-bad' : '')}>
+                <input id="f7-mv-imp" ref={mvImportoRef} className="num" type="text" inputMode="decimal"
+                       title={tr('numeri.grafia_richiesta', { esempio: cashLanguage === 'it' ? '1.234,56' : '1,234.56' })}
+                       autoComplete="off" value={mvImporto} placeholder={tr('trade.amount_example')}
+                       aria-invalid={!!(letturaImporto && !letturaImporto.ok)}
+                       onChange={e => { setMvImporto(e.target.value); scordaRifiuto(); }} />
+                <span className="te-suf">EUR</span>
+              </div>
+              <div className={'te-help' + ((letturaImporto && !letturaImporto.ok) || prelievoScoperto ? ' is-bad' : '')}>
+                {letturaImporto && !letturaImporto.ok ? letturaImporto.motivo
+                  : prelievoScoperto ? tr('trade.withdrawal_refused', { a: eur(cassa) })
+                    : cassa == null ? tr('trade.cash_capacity_unavailable') : w.amountHint}
+              </div>
+            </div>
+
+            <div className="te-row2">
+              <div className="te-field">
+                <label htmlFor="f7-mv-dt">{tr('trade.value_date')}</label>
+                <div className={'te-input' + (letturaData && !letturaData.ok ? ' is-bad' : '')}>
+                  <input id="f7-mv-dt" className="num" type="text" inputMode="numeric" autoComplete="off" value={mvData} placeholder={mvOggi}
+                         aria-invalid={!!(letturaData && !letturaData.ok)}
+                         onChange={e => { mvDataAuto.current = false; setMvData(e.target.value); scordaRifiuto(); }} />
+                  <span className="te-suf">ISO</span>
+                </div>
+                <div className={'te-help' + (letturaData && !letturaData.ok ? ' is-bad' : '')}>
+                  {letturaData && !letturaData.ok ? letturaData.motivo : tr('trade.flow_date_help')}
+                </div>
+              </div>
+              <div className="te-field">
+                <label htmlFor="f7-mv-nt">{tr('trade.description')}</label>
+                <div className="te-input">
+                  <input id="f7-mv-nt" type="text" autoComplete="off" value={mvNota} placeholder={tr('trade.bank_transfer_example')}
+                         onChange={e => { setMvNota(e.target.value); scordaRifiuto(); }} />
+                </div>
+                <div className="te-help">{tr('trade.stored_in')} <code>note</code>{tr('trade.trimmed_edges')}</div>
+              </div>
+            </div>
+
+            {/* «la cassa passa da X a Y» è una PREVISIONE: si tace dove si sa già
+                che non si avvererà (riga gemella, rifiuto a schermo, prelievo scoperto). */}
+            {previsioneCredibile && cassaDopoMovimento != null && cassa != null && (
+              <div className="te-effect" aria-label={w.effect}>
+                <span className="te-k">{w.effect}</span>
+                <div className="te-effect-row"><span>{w.cashAvailable}</span>
+                  <span className="num">{eur(cassa)} → <b>{eur(cassaDopoMovimento)}</b>{' '}
+                    <span className={'bbn-pill ' + (mvTipo === 'DEPOSIT' ? 'is-su' : 'is-giu')}>{mvTipo === 'DEPOSIT' ? '+' : '−'}{eur(importoN)}</span></span></div>
+                {cassa > 0 && cassaDopoMovimento > 0 && (() => {
+                  const scalaMv = Math.max(cassa, cassaDopoMovimento);
+                  const base = Math.min(cassa, cassaDopoMovimento) / scalaMv;
+                  return <div className="te-cashbar is-thin" aria-hidden="true">
+                    <i className="te-rest" style={{ width: pct(base) }} />
+                    <i className={'te-bite ' + (mvTipo === 'DEPOSIT' ? 'is-in' : 'is-out')} style={{ left: pct(base), width: pct(1 - base) }} />
+                  </div>;
+                })()}
+                {flussoUltimo != null && flussoDopo != null && <div className="te-effect-row"><span>{w.flowsTwr}</span>
+                  <span className="num">{eur(flussoUltimo, 0)} → <b>{eur(flussoDopo, 0)}</b></span></div>}
+                {dataISO && <div className="te-effect-row"><span>{w.valueDate}</span>
+                  <span className="num"><b>{gg(dataISO)}/{dataISO.slice(0, 4)}</b>{dataISO === mvOggi ? ' · ' + w.today : ''}</span></div>}
+              </div>
+            )}
+
+            {mvAvviso && <Nota tono="bad" avviso>{noticeText(mvAvviso, tr)}</Nota>}
+            {/* L'ANTICIPO DELLA GUARDIA: la riga gemella esiste già. Non blocca —
+                la guardia vera è del backend — ma toglie la sorpresa. */}
+            {gemella && !mvRifiuto && (
+              <Nota tono="warn"><b>{tr('trade.row_exists')}</b> (id={gemella.id}{tr('trade.duplicate_row_explanation')}</Nota>
+            )}
+
+            {/* `disabled` sul solo invio in volo: ogni modifica ai campi butta il
+                rifiuto, quindi REGISTRA e CONFERMO non sono mai vivi sullo stesso corpo. */}
+            <button type="submit" className="bbn-btn is-primary te-submit" disabled={mvInvio || !!mvRifiuto}>
+              <Check size={15} aria-hidden="true" />
+              {mvInvio ? w.sending : mvTipo === 'DEPOSIT' ? w.recordDeposit : w.recordWithdrawal}
             </button>
-          </div>
-          <div className="pb">
-            {posErr ? (
-              <div className="vuoto">
-                <span><b>{tr('trade.portfolio_unavailable')}</b> — {posErr}.<br />
-                  {tr('trade.cashbar_missing_book')}</span>
-              </div>
-            ) : cassa == null ? (
-              <div className="vuoto">
-                <span><b>{tr('trade.cash_payload_absent')}</b> — {portfolioValues(snap).note}.{' '}
-                  {tr('trade.missing_nonnumeric_capacity')} <b>{tr('trade.cannot_verify')}</b> {tr('trade.empty_bar_looks_zero')}</span>
-              </div>
-            ) : cassa <= 0 ? (
-              <div className="vuoto">
-                <span><b>{cassa === 0 ? tr('trade.zero_cash') : tr('trade.overdraft', {a: eur(-cassa)})}</b>
-                  {' '}{tr('trade.is_a_measurement')} <b>{tr('trade.measurement')}</b>{tr('trade.zero_bar_explanation')}</span>
-              </div>
-            ) : scala != null ? (
-              <>
-                <div className={'binario' + (sfora ? ' sfora' : '') + (pezzo && !entra ? ' entrata' : '')}>
-                  {pezzo && (
-                    <>
-                      <div className="morso"
-                           style={{ left: pct(pezzo.da), width: pct(pezzo.largo) }} />
-                      <div className="etm">
-                        {sfora ? tr('trade.not_covered') : entra ? tr('trade.order_outflow') : tr('trade.order_inflow')}
-                        <b className="num">{entra ? '−' : '+'}{eur(delta)}</b>
-                      </div>
-                    </>
-                  )}
-                  <div className="resto">
-                    <span className="num">
-                      {sfora && sim.mancano != null
-                        ? <>{tr('trade.shortfall')} {eur(sim.mancano)}</>
-                        : <>{eur(pezzo ? sim.cassaDopo : cassa)}{' '}
-                          <span className="t-no" style={{ fontSize: 10 }}>
-                            {pezzo ? (entra ? tr('trade.remaining_upper') : tr('trade.cash_after_upper')) : tr('trade.cash_upper')}</span></>}
-                    </span>
-                  </div>
-                </div>
 
-                <div className="tacche" ref={tacchePista} onKeyDown={taccheKeyDown}
-                     role="group" aria-label={tr('trade.order_sizes_label')}>
-                  {taglie.misurate.map((t, i) => (
-                    <button key={`${t.data}-${t.ticker}-${i}`} type="button" className="tc"
-                            tabIndex={i === taccaSel ? 0 : -1}
-                            style={{ left: pct((t.eur as number) / scala) }}
-                            aria-label={tr('trade.order_date_fragment', {a: t.ticker, b: t.action, c: gg(t.data)})
-                              + tr('trade.equivalent_eur_fragment', {a: num(t.locale), b: t.valuta, c: eur(t.eur)})}
-                            onMouseEnter={() => setTaccaHover(i)}
-                            onMouseLeave={() => setTaccaHover(null)}
-                            onFocus={() => { setTaccaFuoco(i); setTaccaSel(i); }}
-                            onBlur={() => setTaccaFuoco(null)} />
-                  ))}
-                  {taglie.mediana != null && (
-                    <>
-                      <span className="rif" style={{ left: pct(taglie.mediana / scala) }} />
-                      <span className="lb" style={{ left: pct(taglie.mediana / scala) }}>
-                        {tr('trade.median_upper')} {num(taglie.mediana, 0)} €
-                      </span>
-                    </>
-                  )}
-                  {taglie.massimo != null && taglie.massimo <= scala && (
-                    <>
-                      <span className="rif" style={{ left: pct(taglie.massimo / scala) }} />
-                      <span className="lb" style={{ left: pct(taglie.massimo / scala) }}>
-                        {tr('trade.your_maximum')} {num(taglie.massimo, 0)} €
-                      </span>
-                    </>
-                  )}
-                  {taccaMostrata != null && taglie.misurate[taccaMostrata] && (() => {
-                    const t = taglie.misurate[taccaMostrata];
-                    const f = (t.eur as number) / scala;
-                    const lato = f < 0.16 ? 'sx' : f > 0.84 ? 'dx' : 'cx';
-                    return (
-                      <div className={'tip ' + lato} role="tooltip"
-                           style={{ left: pct(f) }}>
-                        <b>{t.ticker} · {t.action}</b>
-                        <div className="kv"><span>{tr('trade.when')}</span>
-                          <span className="num">{t.data.slice(0, 10)}</span></div>
-                        <div className="kv"><span>{tr('trade.value_lower')}</span>
-                          <span className="num">{num(t.locale)} {t.valuta}</span></div>
-                        <div className="kv"><span>{tr('trade.in_euros')}</span>
-                          <span className="num">{eur(t.eur)}</span></div>
-                      </div>
-                    );
-                  })()}
+            {/* La live region è l'annunciatore INVISIBILE: un `aria-live` che entra
+                nell'albero INSIEME al testo non viene annunciato. */}
+            <div className="lb-annuncio te-sr" role="status" aria-live="polite">
+              {mvRifiuto ? tr('trade.movement_rejected_reason', { a: mvRifiuto.rifiuto.motivo })
+                : mvIgnoto ? tr('trade.server_no_response')
+                  : mvEsito ? (mvEsito.riconosciuta ? tr('trade.movement_recorded_id', { a: mvEsito.movimentoId }) : tr('trade.unrecognized_response_dot')) : ''}
+            </div>
+            {mvRifiuto && <>
+              <Nota tono="warn" verbatim={`« ${mvRifiuto.rifiuto.motivo} »`}>
+                <b>{mvRifiuto.rifiuto.quale === 'duplicato' ? tr('trade.duplicate_registered')
+                  : mvRifiuto.rifiuto.quale === 'soglia' ? tr('trade.threshold_confirmation') : tr('trade.movement_rejected')}</b>{' '}
+                {/* «NON è stato scritto» solo dove il backend lo GARANTISCE (422/401). */}
+                {mvRifiuto.rifiuto.nonScritto
+                  ? <>{tr('trade.the_movement')} <b>{tr('trade.not_upper')}</b> {tr('trade.was_recorded')}</>
+                  : <>{tr('trade.backend_responded')} <b>HTTP {mvRifiuto.rifiuto.status}</b>: <b>{tr('trade.cannot_say')}</b> {tr('trade.check_register_before_retry')}</>}
+                {' '}{tr('trade.backend_says')}
+              </Nota>
+              {mvRifiuto.rifiuto.rimediabile && <>
+                {/* ANNULLA prende il fuoco e ha la STESSA larghezza: l'INVIO
+                    accidentale non deve scavalcare due guardie. */}
+                <div className="te-cash-confirm">
+                  <button type="button" className="bbn-btn te-confirm-cancel" ref={mvAnnullaRef} disabled={mvInvio}
+                          onClick={() => { setMvRifiuto(null); mvImportoRef.current?.focus(); }}>{w.cancel}</button>
+                  <button type="button" className="bbn-btn is-primary te-confirm-go" onClick={confermaMovimento} disabled={mvInvio}>
+                    {mvInvio ? w.sending : w.confirmIntentional}
+                  </button>
                 </div>
+                {/* La chiave è UNA per DUE guardie: chi conferma deve sapere che spegne anche l'altra. */}
+                <p className="te-help">
+                  {tr('trade.confirm_resends')} <b>{tr('trade.same')}</b> {tr('trade.movement_with')}{' '}
+                  <code>conferma=true</code>{tr('trade.disables')} <b>{tr('trade.both')}</b> {tr('trade.overridable_checks')} <b>{tr('trade.and')}</b> {tr('trade.amount_guard_too')}
+                </p>
+              </>}
+            </>}
+            {mvIgnoto && (
+              <Nota tono="unknown" verbatim={mvIgnoto}><b>{tr('trade.unknown_outcome_short')}</b>{tr('trade.server_no_reply_so')}{' '}
+                <b>{tr('trade.do_not_know')}</b> {tr('trade.whether_movement_written')} <b>{tr('trade.reading_again')}</b> {tr('trade.register_check_row')}</Nota>
+            )}
+            {mvEsito && (mvEsito.riconosciuta ? (
+              <Nota tono={mvEsito.stato === 'aggiornata' ? 'good' : mvEsito.stato === 'muta' ? 'unknown' : 'warn'}
+                    verbatim={mvEsito.nota ? `« ${mvEsito.nota} »` : undefined}>
+                <b>{tr('trade.movement')} {mvEsito.movimentoId} {tr('trade.recorded_dot')}</b>{' '}
+                {/* i quattro stati hanno quattro rami */}
+                {mvEsito.stato === 'aggiornata' ? <>{tr('trade.cash_updated')} <b>{eur(mvEsito.cassa)}</b>.</>
+                  : mvEsito.stato === 'aggiornata-con-nota' ? <>{tr('trade.cash_updated_to')} <b>{eur(mvEsito.cassa)}</b>{tr('trade.with_backend_note')}</>
+                    : mvEsito.stato === 'muta' ? <>{tr('trade.the_response')} <b>{tr('trade.no_cash_in_response')}</b>{tr('trade.register_written_value_unknown')}</>
+                      : <>{tr('trade.the_cash')} <b>{tr('trade.not')}</b> {tr('trade.cash_register_diverge')} <b>{tr('trade.diverge')}</b>.</>}
+              </Nota>
+            ) : (
+              <Nota tono="unknown"><b>{tr('trade.unrecognized_response')}</b>{tr('trade.has_neither')} <code>ok</code> {tr('trade.nor')}{' '}
+                <code>movement_id</code>{tr('trade.cannot_assert_movement')}</Nota>
+            ))}
 
-                <div className="leg">
-                  <i><span className={'sw mo' + (pezzo && !entra ? ' in' : '')} />
-                    {entra ? tr('trade.outflow_size') : tr('trade.inflow_size')}
-                    {delta != null && <> — <b>{num((delta / scala) * 100, 1)}%</b> {tr('trade.of_scale')}</>}</i>
-                  <i><span className="sw tc" />{tr('trade.your')} <b>{taglie.misurate.length}</b> {tr('trade.historic_orders_current_fx')}</i>
-                  <i><span className="sw md" />{tr('trade.median_maximum')}</i>
-                  <i>{tr('trade.full_width')} {entra || !pezzo ? tr('trade.cash_now')
-                    : tr('trade.cash_after_order')}<span className="t-et">: {eur(scala)}</span></i>
-                  {fuoriScala > 0 && (
-                    <i className="gate"><b>{fuoriScala}</b> {tr('trade.orders_beyond_scale')}</i>
-                  )}
-                  {taglie.senzaCambio > 0 && (
-                    <i className="gate"><b>{taglie.senzaCambio}</b> {tr('trade.orders_no_marker')} {taglie.scoperte.join(', ')}</i>
-                  )}
-                  {tradesErr && <i className="gate">{tr('trade.history_no_markers')}</i>}
-                </div>
-              </>
-            ) : null}
-          </div>
-        </div>
+            <Nota tono="info" spinta>{w.confirmNote}</Nota>
+          </form>
+        </Card>
 
-        {/* ── IL BOOK ── */}
-        <div className="rq cresce">
-          <div className="ph">
-            <h2>{tr('trade.book_title')}</h2>
-            <span className="side">
-              {bookAssente ? tr('trade.unavailable')
-                : tr('trade.sorted_value', {a: book.fuoriPosto, b: book.righe.length})
-                  + tr('trade.different_order')}
-              {book.senzaValore > 0 && tr('trade.missing_value_at_end', {a: book.senzaValore})}
-            </span>
-          </div>
-          <div className="pb scorre nopad">
-            <table>
-              <thead>
-                <tr>
-                  <th>Ticker</th><th>{tr('trade.currency_short')}</th><th className="r">{tr('trade.quantity_short')}</th>
-                  <th className="r">{tr('trade.cost_short')}</th><th className="r">Live</th>
-                  <th className="r">{tr('trade.value')}</th><th className="r">{tr('trade.weight')}</th>
-                  <th className="r">P&amp;L</th><th className="r">{tr('trade.rank_change')}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {posErr ? (
-                  <tr><td colSpan={9} className="d" style={{ textAlign: 'center', padding: 22 }}>
-                    {tr('trade.positions_unavailable_upper')} {posErr}{tr('trade.book_error_refresh')}
-                  </td></tr>
-                ) : loading && book.righe.length === 0 ? (
-                  <tr><td colSpan={9} style={{ textAlign: 'center', padding: 22 }}>
-                    {tr('trade.positions_loading')}</td></tr>
-                ) : book.righe.length === 0 ? (
-                  <tr><td colSpan={9} style={{ textAlign: 'center', padding: 22 }}>
-                    {tr('trade.no_position_buy')}</td></tr>
-                ) : book.righe.map(r => (
-                  <tr key={r.pos.ticker}
-                      className={r.pos.ticker.toUpperCase() === tickerUp ? 'mira' : undefined}>
-                    <td className="d">
-                      {/* un comando VERO: prima era la riga a rispondere a INVIO e
-                          SPAZIO, e uno spazio battuto per scorrere sovrascriveva
-                          in silenzio il modulo che stavi compilando */}
-                      <button type="button" className="usa"
-                              aria-label={tr('trade.use_ticker', {a: r.pos.ticker})}
-                              onClick={() => selectPosition(r.pos)}>{r.pos.ticker}</button>
-                    </td>
-                    <td className="num">{r.pos.valuta}</td>
-                    <td className="r num">{exact(r.pos.quantita)}</td>
-                    <td className="r num">{num(r.pos.prezzo_medio)}</td>
-                    <td className="r num">{r.pos.prezzo_live != null ? num(r.pos.prezzo_live) : tr('trade.na')}</td>
-                    <td className="r num d">{eur(r.pos.valore_mercato, 0)}</td>
-                    <td className="r num">{r.peso != null ? num(r.peso) + '%' : tr('trade.na')}</td>
-                    <td className="r num">
-                      {r.pos.pl_pct == null ? tr('trade.na') : (
-                        <span className={r.pos.pl_pct > 0 ? 'pos' : r.pos.pl_pct < 0 ? 'neg' : 'pari'}>
-                          {segno(r.pos.pl_pct)}%
-                        </span>
-                      )}
-                    </td>
-                    <td className="r num">
-                      <span className={r.scarto === 0 ? 'zero' : r.scarto > 0 ? 'su' : 'giu'}>
-                        {r.scarto === 0 ? '·' : segno(r.scarto, 0)}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+        <div className="te-col">
+          <section className="bbn-card te-hero" aria-label={w.cashAvailable}>
+            <div><div className="te-k">{w.cashAvailable}</div>
+              <div className="te-hero-big num">{bookAssente ? tr('trade.na') : cassa != null ? eur(cassa) : tr('trade.na')}</div></div>
+            <div><div className="te-k">{w.deposited}</div><div className="te-hero-v num te-up">{movLetto && !movErr ? totaleReso(totaleMovimenti.versati, '+', totaleMovimenti.motivoVersati) : tr('trade.na')}</div></div>
+            <div><div className="te-k">{w.withdrawn}</div><div className="te-hero-v num">{movLetto && !movErr ? totaleReso(totaleMovimenti.prelevati, '−', totaleMovimenti.motivoPrelevati) : tr('trade.na')}</div></div>
+            <div><div className="te-k">{w.movements}</div><div className="te-hero-v num">{movLetto && !movErr ? (finestraPiena ? '≥ ' : '') + movimenti.length : tr('trade.na')}</div></div>
+          </section>
+          {movLetto && !movErr && (totaleMovimenti.motivoVersati || totaleMovimenti.motivoPrelevati || totaleMovimenti.parziale) && (
+            <p className="te-help is-bad">{[...new Set([totaleMovimenti.motivoVersati, totaleMovimenti.motivoPrelevati]
+              .filter(Boolean)), totaleMovimenti.parziale ? tr('trade.totals_partial') : null].filter(Boolean).join(' · ')}</p>
+          )}
+
+          {movLetto && !movErr && movimenti.length > 0 && (
+            <Card titolo={w.flowsChart} className="te-flows" azioni={<span className="bbn-card-note">{w.flowsChartNote}</span>}>
+              <div className="te-body"><GraficoFlussi movimenti={movimenti} flussi={flussi} etichetta={w.flowsChartLabel} oggi={w.today} /></div>
+            </Card>
+          )}
+
+          <Card titolo={w.register} className="te-register te-stretch"
+                azioni={<span className="bbn-card-note">
+                  {!movLetto ? tr('trade.register_loading') : movErr ? tr('trade.register_unread')
+                    : finestraPiena ? tr('trade.at_least_movements', { a: movimenti.length, b: cassa != null ? eur(cassa) : tr('trade.na') })
+                      : w.registerCount(movimenti.length)}</span>}>
+            {!movLetto ? <p className="bbn-empty">{tr('trade.reading_register')}</p>
+              : movErr ? <p className="bbn-empty">{tr('trade.register_unread_prefix')} <b>{movErr}</b>{tr('trade.unread_register_help')}</p>
+                : movimenti.length === 0 ? <p className="bbn-empty">{tr('trade.no_cash_movements')}</p>
+                  : <>
+                    <div className="te-mhead" aria-hidden="true"><span /><span>{w.colMove}</span><span>{w.colSize}</span><span>{w.colAmount}</span><span>{w.colFlows}</span></div>
+                    <ul className="te-moves">{movimenti.map(m => {
+                      const dupe = gemella != null && m.id === gemella.id;
+                      const cum = flussi.get(m.id);
+                      const val = typeof m.amount_eur === 'number' && isFinite(m.amount_eur) ? m.amount_eur : null;
+                      const dentro = m.type === 'DEPOSIT';
+                      const verso = dentro ? '+' : '−';
+                      // l'importo di riga è reso senza decimali: il valore ESATTO sta nel
+                      // title e nell'aria-label, insieme all'anno che `gg()` non rende.
+                      const esatto = val == null ? tr('trade.amount_na')
+                        : `${m.date} · ${dentro ? tr('trade.deposit_lower') : tr('trade.withdrawal_lower')} ${verso}${num(Math.abs(val))} €`;
+                      return <li key={m.id} ref={dupe ? mvGemellaRef : undefined}
+                                 className={'te-mrow' + (dupe ? ' is-twin' : '')}
+                                 aria-label={esatto + (m.note ? ` — ${m.note}` : '')} title={esatto + (m.note ? `\n${m.note}` : '')}>
+                        <span className={'te-dir' + (dentro ? '' : ' is-out')} aria-hidden="true">{dentro ? <ArrowDownLeft size={16} /> : <ArrowUpRight size={16} />}</span>
+                        <span className="te-mrow-name"><b>{dentro ? tr('trade.deposit_lower') : tr('trade.withdrawal_lower')}</b>
+                          <span className="num">{gg(m.date)}/{(m.date || '').slice(0, 4)}{m.note ? ' · ' + m.note : ''}</span></span>
+                        <span className="te-bar" aria-hidden="true">{movimentoMax > 0 && val != null && <i className={dentro ? 'is-in' : 'is-out'} style={{ width: pct(Math.abs(val) / movimentoMax) }} />}</span>
+                        <span className={'te-mrow-amt num' + (dentro ? ' te-up' : ' te-down')}>{val == null ? tr('trade.amount_na') : verso + eur(Math.abs(val))}</span>
+                        <span className="te-mrow-cum num">{cum != null ? eur(cum, 0) : tr('trade.na')}</span>
+                      </li>;
+                    })}</ul>
+                    {/* Le note stanno FUORI dalla lista: con 200 righe finirebbero in fondo allo scroll. */}
+                    {finestraPiena && <p className="te-foot">
+                      {tr('trade.rows_shown')} <b>{movimenti.length}</b>{tr('trade.window_at_limit')} <b>{tr('trade.cannot_see_older')}</b>{tr('trade.flows_partial')}
+                    </p>}
+                    <p className="te-foot">{w.flowsFoot}</p>
+                  </>}
+          </Card>
         </div>
       </div>
 
       {pending && (
         <ConfirmDialog
           open
+          pagePresentation={true}
+          variant="nuova"
           tone={pending.preview.cash_disponibile_eur < 0 || pending.discorde ? 'crimson' : 'amber'}
           title={tr('trade.confirm_trade_title')}
           intro={tr('trade.confirm_trade_intro')}
+          lead={<div className="bbn-confirm-lead">
+            <span className="bbn-confirm-verb">{pending.body.action === 'DIVIDEND' ? tr('trade.div_short') : pending.body.action}</span>
+            <span className="bbn-confirm-what"><span>{pending.body.ticker} · {exact(pending.body.quantita)} × {exact(pending.body.prezzo)} {pending.body.valuta}</span>
+              <b className="num">{eur(Math.abs(pending.preview.cash_delta_eur))}</b></span>
+            <span className={'bbn-pill ' + (pending.preview.cash_disponibile_eur < 0 ? 'is-giu' : 'is-piatto')}>{tr('trade.cash_after')} {eur(pending.preview.cash_disponibile_eur)}</span>
+          </div>}
           rows={pendingRows(pending)}
           warn={(pending.preview.cash_disponibile_eur < 0
-            ? tr('trade.confirm_shortfall', {a: eur(pending.preview.cash_disponibile_eur)}) : '')
-            + tr('trade.preview_expiry', {a: pending.preview.expires_in_seconds})
+            ? tr('trade.confirm_shortfall', { a: eur(pending.preview.cash_disponibile_eur) }) : '')
+            + tr('trade.preview_expiry', { a: pending.preview.expires_in_seconds })
             + tr('trade.confirm_register_change')
             + tr('trade.confirm_atomic_no_undo')}
-          confirmLabel={tr('trade.record_action', {a: pending.body.action})}
-          cancelLabel={tr('trade.cancel')}
+          confirmLabel={w.record(w.verbs[pending.body.action as Verbo] ?? pending.body.action)}
+          cancelLabel={w.cancel}
           onConfirm={() => { const p = pending; setPending(null); commit(p); }}
           onCancel={() => setPending(null)}
         />
       )}
     </div>
-  );
+  )} />;
 }
 
 const emptyOpening = (): OpeningDraft => ({ ticker: '', nome: '', quantita: '', prezzo_medio: '',
@@ -1768,115 +1758,228 @@ function PositionOpeningEntry() {
     ...(value.nota ? [{ k: t('trade.opening_note'), v: value.nota }] : []),
   ];
   const receiptRecord = viewed ?? receipt?.opening;
-  return <div className="f7c" data-opening-entry>
-    <div className="colonna sx">
-      <div className="rq">
-        <div className="ph a"><h1>{t('trade.opening_title')}</h1><span className="side">{t('trade.opening_side')}</span></div>
-        <div className="pb">
-          <p className="gate">{t('trade.opening_intro')}</p>
-          <form onSubmit={preview}>
-            <fieldset disabled={frozen} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
-              <div className="campi">
-                <div className="campo"><label htmlFor="f7-op-ticker">{t('trade.opening_ticker')}</label>
-                  <input id="f7-op-ticker" className="testo" autoComplete="off" value={draft.ticker} onChange={e => change('ticker', e.target.value)} /></div>
-                <div className="campo"><label htmlFor="f7-op-name">{t('trade.opening_name')}</label>
-                  <input id="f7-op-name" className="testo" value={draft.nome} onChange={e => change('nome', e.target.value)} /></div>
-                <div className="campo"><label htmlFor="f7-op-qty">{t('trade.opening_qty')}</label>
-                  <input id="f7-op-qty" className="testo num" type="text" inputMode="decimal" autoComplete="off" value={draft.quantita}
-                    title={t('numeri.grafia_richiesta', { esempio: (inputLanguages.quantita ?? language) === 'it' ? '1.234,56' : '1,234.56' })}
-                    onChange={e => change('quantita', e.target.value)} /></div>
-                <div className="campo"><label htmlFor="f7-op-cost">{t('trade.opening_cost')}</label>
-                  <input id="f7-op-cost" className="testo num" type="text" inputMode="decimal" autoComplete="off" value={draft.prezzo_medio}
-                    title={t('numeri.grafia_richiesta', { esempio: (inputLanguages.prezzo_medio ?? language) === 'it' ? '1.234,56' : '1,234.56' })}
-                    onChange={e => change('prezzo_medio', e.target.value)} /></div>
-                <div className="campo"><label htmlFor="f7-op-currency">{t('trade.opening_currency')}</label>
-                  <div className="box"><select id="f7-op-currency" value={draft.valuta} onChange={e => change('valuta', e.target.value)}>
-                    {CURRENCIES.map(currency => <option key={currency}>{currency}</option>)}
-                  </select></div></div>
-                <div className="campo"><label htmlFor="f7-op-day">{t('trade.opening_date')}</label>
-                  <input id="f7-op-day" className="testo" type="date" min="2000-01-01" max={oggiISO()} value={draft.giorno} onChange={e => change('giorno', e.target.value)} /></div>
-                <div className="campo"><label htmlFor="f7-op-precision">{t('trade.opening_precision')}</label>
-                  <div className="box"><select id="f7-op-precision" value={draft.precisione} onChange={e => change('precisione', e.target.value as OpeningDraft['precisione'])}>
-                    <option value="day">{t('trade.opening_day')}</option><option value="second">{t('trade.opening_second')}</option>
-                  </select></div></div>
-                {draft.precisione === 'second' && <div className="campo"><label htmlFor="f7-op-time">{t('trade.opening_time')}</label>
-                  <input id="f7-op-time" className="testo" type="time" step="1" value={draft.ora} onChange={e => change('ora', e.target.value)} /></div>}
+  const w = parole();
+  return <TradeViewBoundary render={() => <div className="te-grid te-open" data-opening-entry>
+    <Card titolo={w.openingTitle} className="te-openform" azioni={<span className="bbn-pill is-piatto">{w.openingPill}</span>}>
+      <div className="te-body">
+        <Nota tono="info">{w.openingIntro}</Nota>
+        <form onSubmit={preview} className="te-body te-flush">
+          <fieldset disabled={frozen} className="te-fieldset">
+            <div className="te-group">
+              <div className="te-group-title"><span className="te-n">1</span>{w.groupInstrument}</div>
+              <div className="te-row2">
+                <div className="te-field"><label htmlFor="f7-op-ticker">{t('trade.opening_ticker')}</label>
+                  <div className="te-input"><input id="f7-op-ticker" autoComplete="off" value={draft.ticker} placeholder={w.openingTickerPh}
+                    onChange={e => change('ticker', e.target.value)} /></div></div>
+                <div className="te-field"><label htmlFor="f7-op-name">{t('trade.opening_name')}</label>
+                  <div className="te-input"><input id="f7-op-name" value={draft.nome} placeholder={w.openingNamePh}
+                    onChange={e => change('nome', e.target.value)} /></div></div>
               </div>
-              <div className="campo"><label htmlFor="f7-op-source">{t('trade.opening_source')}</label>
-                <input id="f7-op-source" className="testo" value={draft.provenienza} placeholder={t('trade.opening_source_example')} onChange={e => change('provenienza', e.target.value)} /></div>
-              <div className="campo"><label htmlFor="f7-op-note">{t('trade.opening_note')}</label>
-                <textarea id="f7-op-note" rows={2} value={draft.nota} onChange={e => change('nota', e.target.value)} /></div>
-              <p className="aiuto">{t('trade.opening_zero')}</p>
-            </fieldset>
-            {validationAttempted && parsed.error && <div className="avv rosso" role="alert">{parsed.error}</div>}
-            <button type="submit" className="spara" disabled={frozen}><Save size={12} />
-              {t(busy === 'preview' ? 'trade.opening_checking' : busy === 'write' ? 'trade.opening_writing' : 'trade.opening_preview')}</button>
-          </form>
-          <div ref={statusRef} tabIndex={-1} role="status" aria-live="polite" style={{ outline: 'none' }}>
-            {failure && <div className={'avv ' + (failure.kind === 'uncertain' ? 'viola' : 'rosso')}>
-              <span>{failure.kind !== 'preview' && <b>{t(failure.kind === 'uncertain' ? 'trade.opening_uncertain' : 'trade.opening_rejected')}</b>}
-                <span className="verbatim">{noticeText(failure.detail, t)}</span></span></div>}
-            {receipt && <div className="avv verde"><span>{t('trade.opening_saved')} · #{receipt.opening.id} · {receipt.opening.ticker}</span></div>}
-            {receipt?.performance_note && <div className="avv giallo"><span>{receipt.performance_note}</span></div>}
-            {locked && <p className="gate">{t('trade.opening_locked')}</p>}
-          </div>
-          {sent && <button type="button" className="mini" onClick={() => void readTicker(sent.body.ticker)}>{t('trade.opening_readback')} · {sent.body.ticker}</button>}
-          {readback && <div className={'avv ' + (readback.ok ? 'verde' : 'rosso')} role="status">
-            {t(readback.ok ? 'trade.opening_readback_ok' : 'trade.opening_readback_error')}{readback.detail && ` · ${noticeText(readback.detail, t)}`}</div>}
-          {receipt && <button type="button" className="mini" onClick={() => {
+            </div>
+            <div className="te-divider" />
+            <div className="te-group">
+              <div className="te-group-title"><span className="te-n">2</span>{w.groupBalance}</div>
+              <div className="te-row2">
+                <div className="te-field"><label htmlFor="f7-op-qty">{t('trade.opening_qty')}</label>
+                  <div className="te-input"><input id="f7-op-qty" className="num" type="text" inputMode="decimal" autoComplete="off" value={draft.quantita}
+                    title={t('numeri.grafia_richiesta', { esempio: (inputLanguages.quantita ?? language) === 'it' ? '1.234,56' : '1,234.56' })}
+                    onChange={e => change('quantita', e.target.value)} /></div></div>
+                <div className="te-field"><label htmlFor="f7-op-cost">{t('trade.opening_cost')}</label>
+                  <div className="te-input"><input id="f7-op-cost" className="num" type="text" inputMode="decimal" autoComplete="off" value={draft.prezzo_medio}
+                    title={t('numeri.grafia_richiesta', { esempio: (inputLanguages.prezzo_medio ?? language) === 'it' ? '1.234,56' : '1,234.56' })}
+                    onChange={e => change('prezzo_medio', e.target.value)} /><span className="te-suf">{draft.valuta}</span></div></div>
+              </div>
+              <div className="te-field"><label htmlFor="f7-op-currency">{t('trade.opening_currency')}</label>
+                <div className="te-input"><select id="f7-op-currency" value={draft.valuta} onChange={e => change('valuta', e.target.value)}>
+                  {CURRENCIES.map(currency => <option key={currency}>{currency}</option>)}
+                </select></div>
+                <div className="te-help">{t('trade.opening_zero')}</div></div>
+            </div>
+            <div className="te-divider" />
+            <div className="te-group">
+              <div className="te-group-title"><span className="te-n">3</span>{w.groupDocs}</div>
+              <div className="te-row2">
+                <div className="te-field"><label htmlFor="f7-op-day">{t('trade.opening_date')}</label>
+                  <div className="te-input"><input id="f7-op-day" type="date" min="2000-01-01" max={oggiISO()} value={draft.giorno}
+                    onChange={e => change('giorno', e.target.value)} /></div></div>
+                <div className="te-field"><label htmlFor="f7-op-precision">{t('trade.opening_precision')}</label>
+                  <div className="te-input"><select id="f7-op-precision" value={draft.precisione}
+                    onChange={e => change('precisione', e.target.value as OpeningDraft['precisione'])}>
+                    <option value="day">{w.precisionDay}</option><option value="second">{w.precisionSecond}</option>
+                  </select></div></div>
+              </div>
+              {draft.precisione === 'second' && <div className="te-field"><label htmlFor="f7-op-time">{t('trade.opening_time')}</label>
+                <div className="te-input"><input id="f7-op-time" type="time" step="1" value={draft.ora}
+                  onChange={e => change('ora', e.target.value)} /></div></div>}
+              <div className="te-field"><label htmlFor="f7-op-source">{t('trade.opening_source')}</label>
+                <div className="te-input"><FileText size={16} className="te-muted" aria-hidden="true" />
+                  <input id="f7-op-source" value={draft.provenienza} placeholder={t('trade.opening_source_example')}
+                    onChange={e => change('provenienza', e.target.value)} /></div></div>
+              <div className="te-field"><label htmlFor="f7-op-note">{t('trade.opening_note')}</label>
+                <textarea id="f7-op-note" className="te-ta" rows={2} value={draft.nota} onChange={e => change('nota', e.target.value)} /></div>
+            </div>
+          </fieldset>
+          {validationAttempted && parsed.error && <Nota tono="bad" allerta>{parsed.error}</Nota>}
+          <button type="submit" className="bbn-btn is-primary te-submit" disabled={frozen}>
+            {busy ? <RefreshCw size={15} className="animate-spin" aria-hidden="true" /> : <Check size={15} aria-hidden="true" />}
+            {busy === 'preview' ? w.checking : busy === 'write' ? w.writing : w.verifyBalance}</button>
+        </form>
+        <div ref={statusRef} tabIndex={-1} role="status" aria-live="polite" className="te-esito">
+          {failure && <Nota tono={failure.kind === 'uncertain' ? 'unknown' : 'bad'} verbatim={noticeText(failure.detail, t)}>
+            {failure.kind !== 'preview' && <b>{t(failure.kind === 'uncertain' ? 'trade.opening_uncertain' : 'trade.opening_rejected')}</b>}</Nota>}
+          {receipt && <Nota tono="good">{t('trade.opening_saved')} · #{receipt.opening.id} · {receipt.opening.ticker}</Nota>}
+          {receipt?.performance_note && <Nota tono="warn">{receipt.performance_note}</Nota>}
+          {locked && <p className="te-help">{t('trade.opening_locked')}</p>}
+        </div>
+        {(sent || receipt) && <div className="te-actions">
+          {sent && <button type="button" className="bbn-btn" onClick={() => void readTicker(sent.body.ticker)}>{w.readBack(sent.body.ticker)}</button>}
+          {receipt && <button type="button" className="bbn-btn" onClick={() => {
             setDraft(emptyOpening()); setInputLanguages({}); setReceipt(null); setSent(null); setViewed(null); setReadback(null); setFailure(null); setValidationAttempted(false);
-          }}>{t('trade.opening_next')}</button>}
-          <div className="avv calmo"><span>{t('trade.opening_effects')}</span></div>
-          <div className="avv giallo"><span>{t('trade.opening_coverage')}</span></div>
+          }}>{w.nextBalance}</button>}
+        </div>}
+        {readback && <div role="status"><Nota tono={readback.ok ? 'good' : 'bad'}>
+          {t(readback.ok ? 'trade.opening_readback_ok' : 'trade.opening_readback_error')}{readback.detail && ` · ${noticeText(readback.detail, t)}`}</Nota></div>}
+      </div>
+    </Card>
+
+    <div className="te-col">
+      <section className="bbn-card te-facts" aria-label={w.registers}>
+        <div className="te-body">
+          <div className="te-row2">
+            <div className="te-fact is-yes"><h3><CheckCircle2 size={16} aria-hidden="true" /> {w.registers}</h3>
+              <ul>{w.registersList.map(x => <li key={x}>{x}</li>)}</ul></div>
+            <div className="te-fact is-no"><h3><XCircle size={16} aria-hidden="true" /> {w.notCreates}</h3>
+              <ul>{w.notCreatesList.map(x => <li key={x}>{x}</li>)}</ul></div>
+          </div>
+          <Nota tono="warn" dettaglio={t('trade.opening_coverage')} riassunto={w.coverageMore}><b>{w.coverage}</b> {w.coverageShort}</Nota>
         </div>
+      </section>
+      <div className="te-open-pair">
+        <Card titolo={w.openingRegister} className="te-stretch" conteggio={rows ? w.openingCount(rows.length) : undefined}
+              azioni={<button type="button" className="bbn-icon-btn" data-qa="opening-refresh" disabled={reading} onClick={() => void refresh()}
+                aria-label={t('trade.opening_refresh')} title={t('trade.opening_refresh')}>
+                <RefreshCw size={14} className={reading ? 'animate-spin' : ''} aria-hidden="true" /></button>}>
+          <div aria-busy={reading} className="te-reg">
+            {reading && !rows && <p className="bbn-empty">{t('trade.opening_loading')}</p>}
+            {listError && <div className="te-body"><Nota tono="bad">{t('trade.opening_read_error')}: {noticeText(listError, t)}</Nota></div>}
+            {rows?.length === 0 && <div className="te-empty"><span className="te-empty-ico" aria-hidden="true"><FileText size={22} /></span>
+              <b>{w.openingEmptyTitle}</b><span>{w.openingEmpty}</span><span className="te-sr">{t('trade.opening_empty')}</span></div>}
+            {rows && rows.length > 0 && <ul className="te-rows">{rows.map(row => <li key={row.id}>
+              <button type="button" className={'te-row is-compact' + (receiptRecord?.id === row.id ? ' is-on' : '')}
+                      aria-label={`${t('trade.opening_view')} #${row.id} · ${row.ticker}`} onClick={() => void readTicker(row.ticker)}>
+                <IconaTitolo ticker={row.ticker} nome={row.nome} dimensione="sm" />
+                <span className="te-row-name"><b>{row.ticker}</b>
+                  <span className="num">{format(row.quantita)} · {format(row.prezzo_medio)} {row.valuta} · {w.openingKnownAt(row.as_of.replace('T', ' '))}</span></span>
+                <span className="te-muted num">#{row.id}</span>
+              </button>
+            </li>)}</ul>}
+          </div>
+        </Card>
+        {receiptRecord && <Card titolo={w.receipt(receiptRecord.id)} className="te-receipt-card" data-opening-receipt
+              azioni={viewed && readback?.ok ? <span className="bbn-pill is-su"><CheckCircle2 size={12} aria-hidden="true" /> {w.readBackOk}</span> : undefined}>
+          <div className="te-body">
+            <dl className="te-receipt">
+              {[...balanceRows(receiptRecord), { k: t('trade.opening_created'), v: receiptRecord.created_at }].map(row =>
+                <div key={row.k}><dt>{row.k}</dt><dd className={row.tone === 'amber' ? 'te-warn-t' : undefined}>{row.v}</dd></div>)}
+            </dl>
+          </div>
+        </Card>}
       </div>
     </div>
-    <div className="colonna dx">
-      {receiptRecord && <div className="rq" data-opening-receipt>
-        <div className="ph c"><h2>{t('trade.opening_receipt')} #{receiptRecord.id}</h2></div>
-        <div className="pb"><table><tbody>
-          {[...balanceRows(receiptRecord), { k: t('trade.opening_created'), v: receiptRecord.created_at }].map(row =>
-            <tr key={row.k}><th>{row.k}</th><td style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{row.v}</td></tr>)}
-        </tbody></table><p className="gate">{t('trade.opening_coverage')}</p></div>
-      </div>}
-      <div className="rq cresce">
-        <div className="ph"><h2>{t('trade.opening_register')}</h2>
-          <button type="button" className="mini" disabled={reading} onClick={() => void refresh()}>{t('trade.opening_refresh')}</button></div>
-        <div className="pb scorre" aria-busy={reading}>
-          {reading && <p>{t('trade.opening_loading')}</p>}
-          {listError && <div className="avv rosso">{t('trade.opening_read_error')}: {noticeText(listError, t)}</div>}
-          {rows?.length === 0 && <p>{t('trade.opening_empty')}</p>}
-          {rows?.map(row => <div className="rq" key={row.id}>
-            <div className="ph"><span>{row.ticker} · {format(row.quantita)} {row.valuta}</span>
-              <button type="button" className="mini" onClick={() => void readTicker(row.ticker)}>{t('trade.opening_view')} #{row.id}</button></div>
-            <div className="pb">{t('trade.opening_date')}: {row.as_of.replace('T', ' ')}<br />{row.provenienza}</div>
-          </div>)}
-        </div>
-      </div>
-    </div>
-    {pending && <ConfirmDialog open title={t('trade.opening_confirm_title')} intro={t('trade.opening_effects')}
+    {pending && <ConfirmDialog open pagePresentation={true} variant="nuova" title={t('trade.opening_confirm_title')} intro={t('trade.opening_effects')}
       rows={[...balanceRows(pending.preview.opening),
         { k: t('trade.opening_cash_delta'), v: `${format(pending.preview.cash_delta_eur)} EUR` },
         { k: t('trade.opening_cash_after'), v: pending.preview.cash_disponibile_eur == null ? t('trade.opening_na') : `${format(pending.preview.cash_disponibile_eur)} EUR` }]}
       warn={t('trade.opening_frozen', { seconds: pending.preview.expires_in_seconds }) + ' ' + t('trade.opening_coverage')}
-      confirmLabel={t('trade.opening_confirm')} cancelLabel={t('trade.cancel')}
+      confirmLabel={w.recordBalance} cancelLabel={w.cancel}
       onCancel={() => setPending(null)} onConfirm={() => void commit(pending)} />}
+  </div>} />;
+}
+
+// ── pezzi di presentazione: senza hook, cosi' l'ordine degli hook del
+//    controller non dipende da cosa e' a schermo (test i18n trade-draft) ──────
+
+const TIPI_CERCABILI = ['EQUITY', 'ETF', 'CRYPTOCURRENCY', 'MUTUALFUND'];
+const nomeTitolo = (p: Position) =>
+  p.nome && p.nome !== p.ticker && p.nome.toLowerCase() !== 'none' ? p.nome : p.ticker.split('.')[0];
+
+type Tono = 'bad' | 'warn' | 'good' | 'info' | 'unknown';
+const ICONA_TONO = { bad: AlertOctagon, warn: AlertTriangle, good: CheckCircle2, info: Info, unknown: HelpCircle };
+
+/** Avviso breve: una riga con icona e colore; la spiegazione lunga e la risposta
+ *  letterale del backend restano raggiungibili, non tolte. */
+function Nota({ tono, children, dettaglio, riassunto, verbatim, avviso, allerta, spinta }: {
+  tono: Tono; children: ReactNode; dettaglio?: ReactNode; riassunto?: string; verbatim?: string;
+  avviso?: boolean; allerta?: boolean; spinta?: boolean;
+}) {
+  const Icona = ICONA_TONO[tono];
+  return <div className={`te-note is-${tono}` + (spinta ? ' te-push' : '')} role={allerta ? 'alert' : undefined}
+              data-avviso={avviso ? '' : undefined}>
+    <Icona size={16} aria-hidden="true" />
+    <span className="te-note-txt">{children}
+      {verbatim && <span className="te-verbatim">{verbatim}</span>}
+      {dettaglio && <details><summary>{riassunto ?? parole().moreInfo}</summary><p>{dettaglio}</p></details>}
+    </span>
   </div>;
 }
 
-// ── la riga di PRIMA → DOPO ─────────────────────────────────────────────────
-function Riga(props: {
-  k: string; a: string; b: string; dl: string; verso: number;
-  grosso?: boolean; sfora?: boolean; muto?: boolean;
+/** Riquadro prima → dopo dell'anteprima. */
+function Tessera({ k, v, sotto, vuota, attesa }: { k: string; v: ReactNode; sotto: ReactNode; vuota: boolean; attesa: string }) {
+  return <div className={'te-tile' + (vuota ? ' is-ghost' : '')}>
+    <span className="te-tile-k">{k}</span>
+    <span className="te-tile-v num">{vuota ? '—' : v}</span>
+    <span className="te-tile-s">{vuota ? attesa : sotto}</span>
+  </div>;
+}
+
+/** Le taglie degli ordini passati in ordine crescente, con l'ordine in corso in evidenza. */
+function Istogramma({ valori, mio, mediana, etichetta }: {
+  valori: number[]; mio: number | null; mediana: number | null; etichetta: string;
 }) {
-  const cls = props.muto || props.verso === 0 ? '' : props.verso > 0 ? 'su' : 'giu';
-  return (
-    <div className={'rg' + (props.grosso ? ' grosso' : '') + (props.sfora ? ' sfora' : '')}>
-      <span className="k">{props.k}</span>
-      <span className="a num">{props.a}</span>
-      <span className="fr">→</span>
-      <span className={'b num' + (props.muto ? ' muto' : '')}>{props.b}</span>
-      <span className={'dl num ' + cls}>{props.dl}</span>
-    </div>
-  );
+  const barre = valori.filter(v => isFinite(v) && v > 0).map(v => ({ v, mio: false }));
+  if (mio != null && isFinite(mio) && mio > 0) barre.push({ v: mio, mio: true });
+  if (!barre.length) return null;
+  barre.sort((a, b) => a.v - b.v);
+  const tetto = Math.max(...barre.map(b => b.v));
+  const vicinoMediana = mediana == null ? -1 : barre.reduce((best, b, i) =>
+    !b.mio && (best < 0 || Math.abs(b.v - mediana) < Math.abs(barre[best].v - mediana)) ? i : best, -1);
+  return <div className="te-hist" role="img" aria-label={etichetta}>
+    {barre.slice(-40).map((b, i) => <span key={i}
+      className={b.mio ? 'is-me' : i === vicinoMediana ? 'is-med' : undefined}
+      style={{ height: `${Math.max(8, (b.v / tetto) * 100)}%` }} />)}
+  </div>;
+}
+
+/** Flussi cumulati a gradini, per data valuta, dalla riga più vecchia visibile. */
+function GraficoFlussi({ movimenti, flussi, etichetta, oggi }: {
+  movimenti: MovimentoCassa[]; flussi: Map<number, number | null>;
+  etichetta: (n: number, last: string) => string; oggi: string;
+}) {
+  const punti = movimenti.slice().reverse()
+    .map(m => ({ d: m.date, v: flussi.get(m.id) }))
+    .filter((p): p is { d: string; v: number } => typeof p.v === 'number' && isFinite(p.v) && !!p.d);
+  if (!punti.length) return null;
+  const W = 800, H = 170, top = 14, bottom = 136;
+  const t0 = Date.parse(punti[0].d), t1 = Math.max(Date.now(), Date.parse(punti[punti.length - 1].d) + 86400000);
+  const span = Math.max(1, t1 - t0);
+  const vmin = Math.min(0, ...punti.map(p => p.v)), vmax = Math.max(1, ...punti.map(p => p.v));
+  const x = (d: string) => ((Date.parse(d) - t0) / span) * W;
+  const y = (v: number) => bottom - ((v - vmin) / (vmax - vmin)) * (bottom - top);
+  let path = `M0 ${y(punti[0].v).toFixed(1)}`;
+  punti.slice(1).forEach(p => { path += ` H${x(p.d).toFixed(1)} V${y(p.v).toFixed(1)}`; });
+  path += ` H${W}`;
+  const ultimo = punti[punti.length - 1];
+  const tacche = [vmax, (vmax + vmin) / 2, vmin];
+  return <svg className="te-flows-svg" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" role="img"
+              aria-label={etichetta(punti.length, eur(ultimo.v, 0))}>
+    <defs><linearGradient id="te-flows-fill" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0" stopColor="var(--bbn-good)" stopOpacity=".26" /><stop offset="1" stopColor="var(--bbn-good)" stopOpacity="0" />
+    </linearGradient></defs>
+    {tacche.map((v, i) => <line key={i} x1="0" x2={W} y1={y(v)} y2={y(v)} className="te-flows-grid" />)}
+    <path d={`${path} V${y(vmin)} H0 Z`} fill="url(#te-flows-fill)" />
+    <path d={path} className="te-flows-line" vectorEffect="non-scaling-stroke" />
+    <text x="0" y={H - 4} className="te-flows-t">{gg(punti[0].d)}</text>
+    <text x={W} y={H - 4} className="te-flows-t" textAnchor="end">{oggi}</text>
+    <text x={W} y={y(vmax) - 4} className="te-flows-t" textAnchor="end">{eur(vmax, 0)}</text>
+  </svg>;
 }

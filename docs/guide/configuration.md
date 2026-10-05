@@ -44,6 +44,7 @@ explicit repair preserves a verified copy of the unreadable file.
 | News, earnings and company intelligence | `FINNHUB_API_KEY` | Coverage depends on endpoint and account |
 | Web research | `TAVILY_API_KEY` | Web-search tools cannot provide their results |
 | News feeds | `NEWS_API_KEY`, `MARKETAUX_API_KEY`, `THENEWSAPI_API_KEY`, `GNEWS_API_KEY`, `TIINGO_API_KEY` as needed | Individual sources may be absent; some legacy feeds appear empty |
+| News automatic refresh | `NEWS_REFRESH_INTERVAL_MINUTES` (default `15`) and `NEWS_AUTO_REFRESH_ENABLED` (default `true`) | Backend refresh is disabled only when explicitly set to false; the manual refresh remains available |
 | US filings / European reports | `SEC_CONTACT_EMAIL` | Requests needing a contact User-Agent fail |
 | Congress, lobbying and government-contract data | `QUIVER_API_KEY` | Those tools cannot provide data |
 | Optional email output | `EMAIL_FROM`, `EMAIL_PASSWORD`, `EMAIL_TO` | No configured delivery |
@@ -54,12 +55,32 @@ entitlement or rate limit. Check your own provider account. This guide does not
 quote subscription prices or promise coverage for every instrument.
 [IBKR setup](../setup/IBKR.md) is optional.
 
+The News feed has two independent clocks: the backend provider refresh, configured
+by the variables above, and the frontend local read, which checks the stored feed
+every 60 seconds. The News page exposes the provider job, its last result and its
+next scheduled run. Manual refreshes use the same single-flight job as the
+automatic worker, so a click received while a provider pull is running is reported
+as already in progress.
+
+Automatic portfolio price refreshes run every 60 seconds from the persistent app
+shell and deliberately exclude IBKR. IBKR remains available for manual or
+specialist requests. The local LLM cost ledger uses provider-reported USD costs
+when available; otherwise unknown models are reported as `model_unknown` instead
+of being assigned a similar model's tariff. Missing FX leaves the USD amount
+visible and does not invent a EUR conversion.
+
 Model choices are resolved from `CHAT_MODEL`, `CONSIGLIERE_MODEL`, the individual
 desk overrides and variables for synthesis, red team, reflection and extraction.
 Review the template; leaving a required model variable blank produces an explicit
 configuration error. A model identifier in a sample is not a guarantee that a
 provider still serves it or supports every requested feature. Verify availability
 in your provider's catalogue. Do not replace all model variables blindly.
+
+`NEWS_SUMMARY_MODEL` is optional. It selects the model for the AI summary of a
+single news article, which runs only when you ask for it on the News page and
+is then kept on disk per article and language. While it is blank the feature
+reports that it is not configured and nothing else is affected. An inexpensive
+model is sufficient.
 
 `CHAT_MAX_TOKENS` limits each chat model call, including reasoning where applicable.
 It is a token budget, not a character count or a promised answer length. Larger

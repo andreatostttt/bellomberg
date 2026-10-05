@@ -39,10 +39,12 @@ def verify_filing_pdf(document):
                 or declared['periodo_inizio'] != metadata['report_start']):
             raise ValueError('declared metadata mismatch')
         rules = packet['rules']
-        expected = {field: _cerca_prova(body[:20_000] if field == 'emittente' else body,
-            rules[field], field, url, digest) for field in ('emittente', 'lingua', 'tipo', 'perimetro')}
-        start, end, expected['periodo'] = _periodo_con_prova(body, rules['periodo'],
-            declared['tipo'], date.fromisoformat(declared['periodo_fine']), url, digest)
+        from bellomberg.market_data import regex_sandbox
+        with regex_sandbox.budget(regex_sandbox.TEMPO_DOCUMENTO_S):  # REV2_G2b C4: tempo TOTALE
+            expected = {field: _cerca_prova(body[:20_000] if field == 'emittente' else body,
+                rules[field], field, url, digest) for field in ('emittente', 'lingua', 'tipo', 'perimetro')}
+            start, end, expected['periodo'] = _periodo_con_prova(body, rules['periodo'],
+                declared['tipo'], date.fromisoformat(declared['periodo_fine']), url, digest)
         low, high = _DURATE[declared['tipo']]
         available = document.get('published_at') or document.get('available_at')
         if (start.isoformat() != declared['periodo_inizio'] or not low <= (end-start).days+1 <= high

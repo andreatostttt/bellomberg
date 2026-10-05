@@ -1,0 +1,69 @@
+/* Page owners keep the global mode selector above their confirmations in both
+   modes. Dashboard/Chat do not opt in; Classic geometry and palette stay intact. */
+.cfm-overlay.bb-page-confirm-owner { z-index: 50; }
+.cfm-modal.bb-page-confirm-owner { z-index: 51; }
+.cfm-overlay.bb-page-confirm-overlay {
+  z-index: 50;
+  background: rgb(15 23 42 / 30%);
+  backdrop-filter: blur(2px);
+}
+.cfm-modal.bb-page-confirm {
+  z-index: 51;
+  width: min(600px, calc(100vw - 32px));
+  max-height: calc(100dvh - 96px);
+  overflow-y: auto;
+  border: 1px solid #dfe7f3;
+  border-radius: 12px;
+  background: #fff;
+  color: #1e293b;
+  box-shadow: 0 16px 60px rgb(15 23 42 / 18%);
+  color-scheme: light;
+  font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+.cfm-modal.bb-page-confirm .cfm-head {
+  padding: 18px 20px;
+  border-color: #dfe7f3;
+  color: #1e293b;
+  font-size: 19px;
+  letter-spacing: normal;
+  text-transform: none;
+}
+.cfm-modal.bb-page-confirm .cfm-intro { padding: 16px 20px 4px; color: #64748b; font-size: 14px; }
+.cfm-modal.bb-page-confirm .cfm-rows { padding: 12px 20px 4px; }
+.cfm-modal.bb-page-confirm .cfm-row { padding: 9px 0; border-color: #dfe7f3; font-size: 14px; }
+.cfm-modal.bb-page-confirm .cfm-row .k { flex: 0 0 36%; min-width: 0; color: #64748b; font-size: 12px; letter-spacing: normal; text-transform: none; }
+.cfm-modal.bb-page-confirm .cfm-row .v { min-width: 0; color: #1e293b; overflow-wrap: anywhere; }
+.cfm-modal.bb-page-confirm .cfm-row .v.amber { color: #9a6500; }
+.cfm-modal.bb-page-confirm .cfm-row .v.crimson { color: #c52943; }
+.cfm-modal.bb-page-confirm .cfm-row .v.cyan { color: #1455ff; }
+.cfm-modal.bb-page-confirm .cfm-warn { margin: 12px 20px 0; padding: 10px 12px; border-color: #9a6500; border-radius: 6px; background: #fff7df; color: #7c5200; font-size: 13px; }
+.cfm-modal.bb-page-confirm.is-crimson .cfm-warn { border-color: #c52943; background: #fff0f2; color: #9b2035; }
+.cfm-modal.bb-page-confirm .cfm-actions { flex-wrap: wrap; gap: 12px; padding: 20px; }
+.cfm-modal.bb-page-confirm .cfm-btn { min-width: 120px; min-height: 40px; padding: 10px 14px; border: 1px solid #dfe7f3; border-radius: 7px; color: #475569; background: #fff; font: 600 14px/1.4 Inter, ui-sans-serif, system-ui, sans-serif; letter-spacing: normal; }
+.cfm-modal.bb-page-confirm .cfm-btn:hover { border-color: #1455ff; background: #eef3ff; color: #1455ff; }
+.cfm-modal.bb-page-confirm .cfm-btn.go { border-color: #1455ff; background: #1455ff; color: #fff; }
+.cfm-modal.bb-page-confirm.is-crimson .cfm-btn.go { border-color: #c52943; background: #c52943; color: #fff; }
+.cfm-modal.bb-page-confirm .cfm-btn.go:hover { filter: brightness(.92); }
+.cfm-modal.bb-page-confirm .cfm-btn:focus { outline: 3px solid #a7c0ff; outline-offset: 2px; }
+.cfm-modal.bb-page-confirm .cfm-hint { padding: 10px 20px; border-color: #dfe7f3; color: #64748b; font-size: 12px; font-weight: 400; letter-spacing: normal; }
+
+/* ===== Dark Nuova: page confirmations ===== */
+:root[data-bb-theme="dark"] .cfm-overlay.bb-page-confirm-overlay { background: var(--bbt-overlay); }
+:root[data-bb-theme="dark"] .cfm-modal.bb-page-confirm {
+  border-color: var(--bbt-line-strong); background: var(--bbt-raised); color: var(--bbt-text);
+  box-shadow: 0 16px 60px rgba(0, 0, 0, .55); color-scheme: dark;
+}
+:root[data-bb-theme="dark"] .cfm-modal.bb-page-confirm :is(.cfm-head, .cfm-row, .cfm-hint) { border-color: var(--bbt-line); }
+:root[data-bb-theme="dark"] .cfm-modal.bb-page-confirm .cfm-head,
+:root[data-bb-theme="dark"] .cfm-modal.bb-page-confirm .cfm-row .v { color: var(--bbt-text); }
+:root[data-bb-theme="dark"] .cfm-modal.bb-page-confirm :is(.cfm-intro, .cfm-row .k, .cfm-hint) { color: var(--bbt-muted); }
+:root[data-bb-theme="dark"] .cfm-modal.bb-page-confirm .cfm-row .v.amber { color: var(--bbt-warn-text); }
+:root[data-bb-theme="dark"] .cfm-modal.bb-page-confirm .cfm-row .v.crimson { color: var(--bbt-bad-text); }
+:root[data-bb-theme="dark"] .cfm-modal.bb-page-confirm .cfm-row .v.cyan { color: var(--bbt-accent-text); }
+:root[data-bb-theme="dark"] .cfm-modal.bb-page-confirm .cfm-warn { border-color: var(--bbt-warn); background: var(--bbt-warn-soft); color: var(--bbt-warn-text); }
+:root[data-bb-theme="dark"] .cfm-modal.bb-page-confirm.is-crimson .cfm-warn { border-color: var(--bbt-bad); background: var(--bbt-bad-soft); color: var(--bbt-bad-text); }
+:root[data-bb-theme="dark"] .cfm-modal.bb-page-confirm .cfm-btn { border-color: var(--bbt-line-strong); background: var(--bbt-surface-2); color: var(--bbt-text-2); }
+:root[data-bb-theme="dark"] .cfm-modal.bb-page-confirm .cfm-btn:hover { border-color: var(--bbt-accent); background: var(--bbt-accent-soft); color: var(--bbt-accent-text); }
+:root[data-bb-theme="dark"] .cfm-modal.bb-page-confirm .cfm-btn.go { border-color: var(--bbt-accent-fill); background: var(--bbt-accent-fill); color: var(--bbt-on-accent); }
+:root[data-bb-theme="dark"] .cfm-modal.bb-page-confirm.is-crimson .cfm-btn.go { border-color: #c52943; background: #c52943; color: #fff; }
+:root[data-bb-theme="dark"] .cfm-modal.bb-page-confirm .cfm-btn:focus { outline-color: var(--bbt-focus); }

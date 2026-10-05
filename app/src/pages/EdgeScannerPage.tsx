@@ -1,4 +1,8 @@
 import { useT } from '@/i18n/provider';
+import ModernPage from '@/components/ModernPage';
+import { useInterfaceTheme, useThemePalette } from '@/components/InterfaceThemeProvider';
+import type { ThemePalette } from '@/lib/theme-palette';
+import './risk-modern.css';
 import { t as tr } from '@/i18n/t';
 import { linguaCorrente, localeDi } from '@/i18n/lingua';
 import { localizePayload } from '@/lib/api-presentation';
@@ -39,11 +43,17 @@ const DIR_STYLE: Record<string, { c: string; icon: any }> = {
   neutral: { c: 'text-muted', icon: Minus },
 };
 
-function strengthColor(s: number): string {
-  if (s >= 85) return '#A12B2B';
-  if (s >= 65) return '#B07A1E';
-  if (s >= 50) return '#5B7997';
-  return '#5A6472';
+// `dark` carries the dark palette (only passed while that theme is painted):
+// the light modern shades below are calibrated on white and would vanish on navy.
+function strengthColor(s: number, dark: ThemePalette | null = null): string {
+  if (dark) {
+    if (s >= 85) return dark.badText;
+    if (s >= 65) return dark.warnText;
+    return dark.muted;
+  }
+  if (s >= 85) return '#a12b2b';
+  if (s >= 65) return '#7a4f00';
+  return '#475569';
 }
 
 /** La risposta buona più recente, con la soglia con cui è stata chiesta: un filtro
@@ -67,6 +77,9 @@ const failureTitles = (): Record<string, string> => ({
 
 export default function EdgeScannerPage() {
   const tr = useT();
+  const { effective: effectiveTheme } = useInterfaceTheme();
+  const themePalette = useThemePalette();
+  const darkPalette = effectiveTheme === 'dark' ? themePalette : null;
   const CAT_LABEL = categoryLabels();
   const TITOLO_GUASTO = failureTitles();
   const directionLabels: Record<string, string> = {
@@ -151,6 +164,7 @@ export default function EdgeScannerPage() {
     + tr('edge.f016');
 
   return (
+    <ModernPage page="edge" render={() => (
     <div className="space-y-3">
       <div className="flex items-baseline gap-3 flex-wrap">
         <span className="font-mono text-amber text-lg font-semibold uppercase tracking-[0.25em] flex items-center gap-2">
@@ -307,7 +321,7 @@ export default function EdgeScannerPage() {
             return (
               <div key={i} className="border border-border bg-bg-elev hover:border-gold/40 flex">
                 {/* strength bar */}
-                <div className="w-1.5 shrink-0" style={{ backgroundColor: strengthColor(s.strength) }} />
+                <div className="w-1.5 shrink-0" style={{ backgroundColor: strengthColor(s.strength, darkPalette) }} />
                 <div className="flex-1 px-3 py-2">
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="font-mono text-sm font-bold text-gold">{s.ticker}</span>
@@ -321,7 +335,7 @@ export default function EdgeScannerPage() {
                     <span className={`flex items-center gap-1 font-mono text-3xs ${dir.c}`}>
                       <Icon size={11} /> {directionLabels[s.direction] || s.direction}
                     </span>
-                    <span className="ml-auto font-mono text-2xs tabular-nums" style={{ color: strengthColor(s.strength) }}>
+                    <span className="ml-auto font-mono text-2xs tabular-nums" style={{ color: strengthColor(s.strength, darkPalette) }}>
                       {tr('edge.f046')} {s.strength}
                     </span>
                   </div>
@@ -342,5 +356,6 @@ export default function EdgeScannerPage() {
         {tr('edge.f050')}
       </p>
     </div>
+    )} />
   );
 }

@@ -82,6 +82,14 @@ PRICING_USD_PER_MTOK: Dict[str, Dict[str, float]] = {
 # Alias dated -> id canonico (le model string in giro per il progetto sono anche dated)
 MODEL_ALIASES: Dict[str, str] = {
     "claude-haiku-4-5-20251001": "claude-haiku-4-5",
+    # OpenRouter returns provider/model slugs.  These exact aliases are kept
+    # explicit so an unknown provider/model is never priced as a similar model.
+    "anthropic/claude-opus-5": "claude-opus-5",
+    "anthropic/claude-sonnet-5": "claude-sonnet-5",
+    "anthropic/claude-opus-4-8": "claude-opus-4-8",
+    "anthropic/claude-sonnet-4-6": "claude-sonnet-4-6",
+    "anthropic/claude-haiku-4-5": "claude-haiku-4-5",
+    "anthropic/claude-haiku-4-5-20251001": "claude-haiku-4-5",
 }
 
 # Moltiplicatori sul prezzo INPUT (regola Anthropic). Fonte unica delle tariffe derivate.

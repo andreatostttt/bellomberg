@@ -15,6 +15,11 @@ DICHIARATO: il backtest gira sul book CORRENTE proiettato all'indietro (pesi
 di oggi), non sulla storia reale del conto — misura la qualita' del MODELLO
 di VaR su questo book, non la P&L storica del PM. VaR99 su 252 obs = 2-3
 osservazioni di coda: test poco potente, verdetto da leggere con cautela.
+
+Voce 7 b (04/10): serie vuote/insufficienti ESCLUSE e dichiarate col loro peso
+(`excluded_detail`, `excluded_weight_pct`; oltre SOGLIA_PESO_ESCLUSO_PCT il verdetto e'
+"NON AFFIDABILE"); verdetto su due assi nominati (`coverage`, `independence`) con
+`verdict_detail` che dice quale asse fallisce; p esatti quando le eccezioni attese sono poche.
 """
 import math
 from datetime import datetime
@@ -83,6 +88,146 @@ def christoffersen_independence(exceptions: "np.ndarray") -> Dict[str, Any]:
             "pass_5pct": bool(pval >= 0.05),
             "transitions": {"n00": n00, "n01": n01, "n10": n10, "n11": n11},
             "consecutive_exceptions": n11}
+
+
+# voce 7 b (04/10, Opus 5.5): perimetro DICHIARATO e verdetto a due assi.
+# - Una colonna presente ma vuota (download fallito) NON e' un nome coperto: prima contava
+#   come presente ed `excluded_tickers` usciva [] su un backtest girato su 18 nomi su 27.
+# - Soglia di osservazioni valide = la stessa del risk engine (portfolio_risk: `len(r) < 20`
+#   salta il nome), cosi' il backtest valida lo STESSO perimetro del VaR ufficiale.
+MIN_OSS_SERIE = 20
+# Oltre questa quota del perimetro (per peso) esclusa, il verdetto PASS/FAIL non parla del
+# book: esce "NON AFFIDABILE" dichiarato invece di un PASS/FAIL su un altro portafoglio.
+SOGLIA_PESO_ESCLUSO_PCT = 10.0
+# Sotto queste eccezioni attese il chi2 asintotico e' fragile: si usano i p esatti e si
+# dichiara la bassa potenza (VaR99 su ~500 giorni = 5 eccezioni attese).
+POCHE_ECCEZIONI_ATTESE = 10.0
+
+
+def serie_utilizzabili(returns: "Any", syms, weights, min_obs: int = MIN_OSS_SERIE):
+    """Separa i simboli con serie utilizzabile da quelli esclusi, con MOTIVO e PESO.
+
+    `weights` e' allineato a `syms` (quote del perimetro, somma 1). Una colonna assente,
+    tutta vuota o con meno di `min_obs` rendimenti validi e' ESCLUSA e dichiarata.
+    Ritorna (cols, esclusi) con esclusi = [{ticker, motivo, obs_valide, peso_pct}].
+    """
+    cols, esclusi = [], []
+    for s, wi in zip(syms, weights):
+        if s not in returns.columns:
+            n_ok, motivo = 0, "serie assente nel download"
+        else:
+            n_ok = int(returns[s].notna().sum())
+            if n_ok == 0:
+                motivo = "serie vuota (download fallito)"
+            elif n_ok < min_obs:
+                motivo = f"storia insufficiente ({n_ok} obs < {min_obs})"
+            else:
+                cols.append(s)
+                continue
+        esclusi.append({"ticker": s, "motivo": motivo, "obs_valide": n_ok,
+                        "peso_pct": round(float(wi) * 100, 2)})
+    return cols, esclusi
+
+
+def binomiale_esatto(n_obs: int, n_exceptions: int, coverage_p: float) -> Optional[float]:
+    """p-value ESATTO (binomiale, bilaterale) del numero di eccezioni: il gemello di Kupiec
+    senza l'approssimazione chi2, che con poche eccezioni attese e' fragile."""
+    if n_obs <= 0:
+        return None
+    return float(_st.binomtest(int(n_exceptions), int(n_obs), float(coverage_p),
+                               alternative="two-sided").pvalue)
+
+
+def indipendenza_esatta(n_obs: int, n_exceptions: int, n11: int) -> Optional[float]:
+    """P(coppie consecutive >= n11 | n_exceptions eccezioni in n_obs giorni), ESATTO.
+
+    Sotto H0 (nessun grappolo), date x eccezioni, ogni disposizione e' equiprobabile.
+    Con k "blocchi" di eccezioni consecutive n11 = x - k, e le disposizioni con k blocchi
+    sono C(x-1, k-1) * C(n-x+1, k) su C(n, x). Test a una coda (il rischio e' il grappolo).
+    """
+    n, x, obs = int(n_obs), int(n_exceptions), int(n11)
+    if n <= 0 or x <= 0 or x >= n:
+        return None
+    tot = math.comb(n, x)
+    k_max = x - obs
+    if k_max < 1:  # n11 >= x e' impossibile (al massimo x-1 coppie)
+        return 0.0
+    favorevoli = sum(math.comb(x - 1, k - 1) * math.comb(n - x + 1, k)
+                     for k in range(1, min(k_max, n - x + 1) + 1))
+    return float(favorevoli) / float(tot)
+
+
+def verdetto_assi(kup: Dict[str, Any], ind: Dict[str, Any], alpha: float,
+                  inaffidabile: Optional[str] = None) -> Dict[str, Any]:
+    """Verdetto su DUE assi nominati (copertura / indipendenza) + combinato spiegato.
+
+    Con poche eccezioni attese l'asse usa il p esatto (dichiarato in `test`); il chi2
+    resta riportato. `inaffidabile` (motivo) sostituisce il combinato con NON AFFIDABILE.
+    """
+    T, x = kup.get("obs") or 0, kup.get("exceptions") or 0
+    attese = T * alpha
+    poca_potenza = attese < POCHE_ECCEZIONI_ATTESE
+    cov = {"name": "copertura (numero di eccezioni)", "test": "Kupiec POF (chi2 1 gdl)",
+           "p_value_chi2": kup.get("p_value")}
+    # review RV-R (P3): il verdetto si decide sul p GREZZO — `kup["p_value"]` e' gia'
+    # arrotondato a 4 decimali (p 0.049968 -> 0.05 = PASS falso); per il chi2 vale
+    # `pass_5pct`, calcolato da kupiec_pof prima dell'arrotondamento.
+    p_cov, ok_cov = kup.get("p_value"), kup.get("pass_5pct")
+    if poca_potenza and T > 0:
+        p_ex = binomiale_esatto(T, x, alpha)
+        cov["p_value_binomial_exact"] = round(p_ex, 4)
+        cov["test"] = "binomiale esatto (poche eccezioni attese: chi2 non affidabile)"
+        p_cov, ok_cov = p_ex, p_ex >= 0.05
+    cov["p_value"] = None if p_cov is None else round(p_cov, 4)
+    cov["verdict"] = ("n.d." if (p_cov is None or ok_cov is None)
+                      else ("PASS" if ok_cov else "FAIL"))
+
+    indep = {"name": "indipendenza (eccezioni a grappoli)",
+             "test": "Christoffersen (chi2 1 gdl)", "p_value_chi2": ind.get("p_value"),
+             "consecutive_exceptions": ind.get("consecutive_exceptions")}
+    p_ind, ok_ind = ind.get("p_value"), ind.get("pass_5pct")
+    if poca_potenza and "transitions" in ind:
+        p_ex = indipendenza_esatta(T, x, ind["consecutive_exceptions"])
+        if p_ex is not None:
+            indep["p_value_exact_conditional"] = round(p_ex, 4)
+            indep["test"] = ("esatto condizionato al numero di eccezioni "
+                             "(poche eccezioni attese: chi2 non affidabile)")
+            p_ind, ok_ind = p_ex, p_ex >= 0.05
+    indep["p_value"] = None if p_ind is None else round(p_ind, 4)
+    indep["verdict"] = ("n.d." if (p_ind is None or ok_ind is None)
+                        else ("PASS" if ok_ind else "FAIL"))
+
+    assi = (("copertura", cov), ("indipendenza", indep))
+    falliti = [nome for nome, a in assi if a["verdict"] == "FAIL"]
+    # review RV-R (P3): un asse n.d. (test in errore) non e' un FAIL ne' un PASS
+    nd = [nome for nome, a in assi if a["verdict"] == "n.d."]
+    if inaffidabile:
+        verdict = "NON AFFIDABILE"
+        dettaglio = "NON AFFIDABILE: " + inaffidabile
+    elif not falliti and nd:
+        verdict = "n.d."
+        dettaglio = ("n.d.: asse " + " e ".join(nd) + " non calcolabile — " + "; ".join(
+            f"{nome} {a['verdict']} (p {a['p_value']})" for nome, a in assi))
+    elif not falliti:
+        verdict, dettaglio = "PASS", "PASS su entrambi gli assi (copertura e indipendenza)"
+    else:
+        verdict = "FAIL"
+        parti = []
+        for nome, a in (("copertura", cov), ("indipendenza", indep)):
+            parti.append(f"{nome} {a['verdict']} (p {a['p_value']})")
+        spiega = ""
+        if falliti == ["indipendenza"] and not nd:
+            spiega = (": il numero di eccezioni e' coerente, ma arrivano a grappoli "
+                      "(limite noto del VaR storico, non si adatta ai regimi di volatilita')")
+        elif falliti == ["copertura"] and not nd:
+            spiega = ": il numero di eccezioni non e' coerente con il livello di confidenza"
+        dettaglio = "FAIL sull'asse " + " e ".join(falliti) + spiega + " — " + "; ".join(parti)
+    if poca_potenza:
+        dettaglio += (f" — bassa potenza: {round(attese, 1)} eccezioni attese "
+                      f"(< {POCHE_ECCEZIONI_ATTESE:g}), verdetto indicativo")
+    return {"coverage": cov, "independence": indep, "verdict": verdict,
+            "verdict_detail": dettaglio, "expected_exceptions": round(attese, 1),
+            "low_power": bool(poca_potenza)}
 
 
 def backtest_var(window: int = 252, period: str = "3y",
@@ -155,12 +300,44 @@ def backtest_var(window: int = 252, period: str = "3y",
 
     # review 14/07: il period dell'FX deve coprire lo stesso orizzonte dei prezzi
     returns, fx_meta = _convert_returns_to_eur(returns, cur_of, period=period)
-    cols = [c for c in yf_syms if c in returns.columns]
+    # voce 7 b: una colonna presente ma VUOTA (download fallito) non e' un nome coperto
+    cols, esclusi = serie_utilizzabili(returns, yf_syms, w)
+    peso_escluso_pct = round(sum(e["peso_pct"] for e in esclusi), 2)
+    if esclusi:
+        _log("serie escluse dal backtest: " + ", ".join(
+            f"{e['ticker']} ({e['motivo']}, peso {e['peso_pct']}%)" for e in esclusi))
     if len(cols) < 2:
-        return {"error": "serie insufficienti dopo il download", "timestamp": datetime.now().isoformat()}
+        return {"error": "serie insufficienti dopo il download", "excluded_tickers": [e["ticker"] for e in esclusi],
+                "excluded_detail": esclusi, "excluded_weight_pct": peso_escluso_pct,
+                "timestamp": datetime.now().isoformat()}
     w2 = np.array([w[yf_syms.index(c)] for c in cols])
     w2 = w2 / w2.sum()
     port_r, sample_meta = _weighted_portfolio_returns(returns, w2, cols)
+
+    # review RV-R (P2): `serie_utilizzabili` guarda la serie INTERA; un nome con poche
+    # quotazioni (o fermo a meta' periodo) supera min_obs ma manca nei giorni testati e
+    # _weighted_portfolio_returns rinormalizza zitto. Si misura il peso del perimetro
+    # MANCANTE in media nei giorni testati (pesi del perimetro, esclusi = sempre mancanti;
+    # include le festivita' locali dei singoli mercati, dichiarato).
+    giorni_testati = port_r.index[window:]
+    w_perim = pd.Series(w, index=yf_syms)
+    presenti = returns.reindex(index=giorni_testati, columns=cols).notna()
+    peso_presente = presenti.mul(w_perim[cols], axis=1).sum(axis=1)
+    peso_mancante_pct = (round(float((1.0 - peso_presente.mean()) * 100), 2)
+                         if len(giorni_testati) else None)
+    copertura_nomi = {c: f"{int(presenti[c].sum())}/{len(giorni_testati)}" for c in cols
+                      if len(giorni_testati) and presenti[c].mean() < 0.9}
+    inaffidabile = None
+    if peso_escluso_pct > SOGLIA_PESO_ESCLUSO_PCT:
+        inaffidabile = (f"{len(esclusi)} nomi esclusi per serie mancanti/insufficienti pesano il "
+                        f"{peso_escluso_pct}% del perimetro (soglia {SOGLIA_PESO_ESCLUSO_PCT:g}%): "
+                        "il backtest non valida il VaR di QUESTO book")
+    elif peso_mancante_pct is not None and peso_mancante_pct > SOGLIA_PESO_ESCLUSO_PCT:
+        inaffidabile = (f"nei giorni testati manca in media il {peso_mancante_pct}% del perimetro "
+                        f"(soglia {SOGLIA_PESO_ESCLUSO_PCT:g}%; nomi con copertura < 90% dei giorni "
+                        f"testati: " + (", ".join(f"{k} {v}" for k, v in copertura_nomi.items())
+                                        or "nessuno") +
+                        "): il backtest non valida il VaR di QUESTO book")
 
     if len(port_r) < window + 60:
         return {"error": f"campione troppo corto per il backtest: {len(port_r)} obs "
@@ -179,7 +356,20 @@ def backtest_var(window: int = 252, period: str = "3y",
         # review 22/07 (E9): ticker senza dati esclusi e pesi rinormalizzati —
         # prima in silenzio, ora DICHIARATI (il backtest valida il perimetro
         # elencato qui, non necessariamente il book intero)
-        "excluded_tickers": [s for s in yf_syms if s not in cols],
+        "excluded_tickers": [e["ticker"] for e in esclusi],
+        # voce 7 b: motivo, osservazioni valide e peso di ogni escluso; peso escluso totale
+        # sul perimetro analizzabile (posizioni SKIP fuori, come nel VaR ufficiale)
+        "excluded_detail": esclusi,
+        "excluded_weight_pct": peso_escluso_pct,
+        "excluded_weight_threshold_pct": SOGLIA_PESO_ESCLUSO_PCT,
+        # review RV-R (P2): peso del perimetro mancante in media nei giorni TESTATI (esclusi
+        # compresi) e nomi presenti in meno del 90% di quei giorni ("presenti/testati")
+        "missing_weight_tested_window_pct": peso_mancante_pct,
+        "partial_coverage_tested_window": copertura_nomi,
+        "min_obs_per_series": MIN_OSS_SERIE,
+        "n_tickers_tested": len(cols),
+        "n_tickers_perimeter": len(yf_syms),
+        "reliable": inaffidabile is None,
         "skipped_positions": skipped_positions,
         "declared_scope": ("backtest sul book CORRENTE proiettato all'indietro (pesi di oggi): "
                            "valida il MODELLO di VaR su questo book, non la P&L storica del conto"),
@@ -198,11 +388,15 @@ def backtest_var(window: int = 252, period: str = "3y",
             p_cc = float(1 - _st.chi2.cdf(lr_cc, df=2))
             cc = {"LR": round(lr_cc, 3), "p_value": round(p_cc, 4),
                   "pass_5pct": bool(p_cc >= 0.05)}
+        assi = verdetto_assi(kup, ind, alpha, inaffidabile)
         out["var" + conf] = {
             "kupiec_pof": kup,
             "christoffersen_ind": ind,
             "conditional_coverage": cc,
-            "verdict": ("PASS" if (kup.get("pass_5pct") and ind.get("pass_5pct")) else "FAIL"),
+            # voce 7 b: combinato = PASS solo se ENTRAMBI gli assi passano; `verdict_detail`
+            # dice quale asse fallisce, `coverage`/`independence` portano i p (esatti se poche
+            # eccezioni attese); NON AFFIDABILE se il perimetro escluso supera la soglia
+            **assi,
         }
     out["var99"]["note"] = ("code a ~1%: con questa finestra le eccezioni attese sono poche, "
                             "il test ha bassa potenza — verdetto indicativo")
@@ -210,7 +404,8 @@ def backtest_var(window: int = 252, period: str = "3y",
     _log(f"backtest: {out['n_obs_tested']} giorni testati | "
          f"VaR95 {out['var95']['verdict']} ({out['var95']['kupiec_pof'].get('exceptions')}/"
          f"{out['var95']['kupiec_pof'].get('expected')} attese) | "
-         f"VaR99 {out['var99']['verdict']}")
+         f"VaR99 {out['var99']['verdict']} | perimetro {len(cols)}/{len(yf_syms)} nomi, "
+         f"peso escluso {peso_escluso_pct}%")
     return out
 
 

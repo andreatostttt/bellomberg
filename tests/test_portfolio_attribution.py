@@ -270,6 +270,25 @@ def test_periodi_ytd_30d_inception():
     assert not any("non e' misurato" in n for n in outi["notes"])
 
 
+def test_periodi_1w_e_3m():
+    """Selettore unico della pagina Performance (02/10/2026): 1S e 3M."""
+    trades = _trades(("AAA.MI", "BUY", 10, 100, "EUR", "2026-01-15"))
+    # 1W: 7 giorni di calendario (end-6 .. end), base = ultimo giorno di borsa prima
+    d1 = pd.to_datetime(["2026-07-23", "2026-07-24", "2026-07-30"])
+    p1 = pd.DataFrame({"AAA.MI": [100.0, 105.0, 110.0]}, index=d1)
+    o1 = pa.compute_attribution(period="1W", end_date="2026-07-30", trades=trades,
+                                prices=p1, fx=pd.DataFrame(), fetch=_NOFETCH)
+    assert o1["period"]["base_day"] == "2026-07-23"
+    assert o1["portfolio_return_pct"] == pytest.approx(10.0, abs=1e-6)
+    # 3M: 90 giorni di calendario (end-89 .. end)
+    d3 = pd.to_datetime(["2026-05-01", "2026-05-02", "2026-07-30"])
+    p3 = pd.DataFrame({"AAA.MI": [100.0, 80.0, 120.0]}, index=d3)
+    o3 = pa.compute_attribution(period="3M", end_date="2026-07-30", trades=trades,
+                                prices=p3, fx=pd.DataFrame(), fetch=_NOFETCH)
+    assert o3["period"]["base_day"] == "2026-05-01"
+    assert o3["portfolio_return_pct"] == pytest.approx(20.0, abs=1e-6)
+
+
 def test_mtd_conta_il_rendimento_del_giorno_1_del_mese():
     """Bug trovato al collaudo live: base <= 01/07 mangiava il rendimento del
     1° luglio. La base MTD e' l'ultimo giorno di borsa PRIMA del mese."""

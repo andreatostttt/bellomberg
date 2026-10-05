@@ -23,4 +23,7 @@ export default defineConfig(({ command }) => ({
     alias: { '@': path.resolve(__dirname, './src') },
   },
   server: { port: 5173, strictPort: true },
+  // Fonts are always separate files: the production CSP allows font-src 'self'
+  // only, so a woff2 subset inlined as data: (Vite's 4 KB default) would be blocked.
+  build: { assetsInlineLimit: (file: string) => (/\.woff2?$/.test(file) ? false : undefined) },
 }));

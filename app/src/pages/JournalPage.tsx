@@ -1,17 +1,32 @@
 import { showNotice, type Notice } from '@/lib/mandato-presentation';
+import type { ReactNode } from 'react';
 import { useLingua, useT } from '@/i18n/provider';
 import { localeDi } from '@/i18n/lingua';
 import { t as tr } from '@/i18n/t';
 import { useEffect, useRef, useState } from 'react';
+import ModernPage from '@/components/ModernPage';
+import NewInterfaceBoundary from '@/components/NewInterfaceBoundary';
 import { Bellomberg } from '@/lib/api';
 import { Journal, JournalError, journalChanged, journalDraft,
   type JournalDraft, type JournalEntry, type JournalKind, type JournalPageResult,
   type JournalRevision, type JournalStatus, type JournalSummary } from '@/lib/journal';
 import './journal.css';
+import './operations-modern.css';
 
 
 const BODY_LIMIT = 30000;
 type Destination = { id: number } | 'new';
+
+function DeferredJournalView({ render }: { render: () => ReactNode }) {
+  return render();
+}
+
+function JournalViewBoundary({ render }: { render: () => ReactNode }) {
+  const language = useLingua();
+  return <NewInterfaceBoundary language={language}>
+    <DeferredJournalView render={render} />
+  </NewInterfaceBoundary>;
+}
 // Bozza solo in memoria della sessione: sopravvive alla navigazione interna,
 // senza scrivere contenuti privati in localStorage o fuori da SQLite.
 let sessionDraft: { entry: JournalEntry | null; draft: JournalDraft } | null = null;
@@ -171,7 +186,8 @@ const ACTION = { create: tr('journal.created'), update: tr('journal.updated'), a
     finally { if (stillCurrent()) setVersionsBusy(false); }
   };
 
-  return <section className="journal-page" data-layout="worktable" aria-label={tr('journal.aria')}>
+  return <ModernPage page="journal" render={() => <JournalViewBoundary render={() => (
+  <section className="journal-page" data-layout="worktable" aria-label={tr('journal.aria')}>
     <header className="journal-head">
       <div><h1>{tr('journal.title')}</h1><p>{tr('journal.subtitle')}</p></div>
       <div className="journal-private"><span aria-hidden="true">◇</span><div>{tr('journal.private')}<small>{tr('journal.privacy')}</small></div></div>
@@ -227,5 +243,6 @@ const ACTION = { create: tr('journal.created'), update: tr('journal.updated'), a
         {versions.length < versionsTotal && <button disabled={versionsBusy} onClick={moreVersions}>{tr('journal.history_more')}</button>}
       </aside>
     </div>
-  </section>;
+  </section>
+  )} />} />;
 }

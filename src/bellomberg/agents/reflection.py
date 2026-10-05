@@ -98,7 +98,7 @@ def generate_lesson(memo_markdown: str = "", memo_id: Optional[int] = None,
                        "model": None, "api_calls": 0, "duration_s": None,
                        "status": "skipped"})
     try:
-        from bellomberg.core.llm_client import OpenRouterClient, modello as _modello_llm, somma_usage
+        from bellomberg.core.llm_client import OpenRouterClient, modello as _modello_llm, somma_usage, thinking_fase
         from bellomberg.agents.specialists.base import timeout_specialisti
         from bellomberg.agents.scorekeeper import compute_scorecard, format_track_record_for_capo
         # 05/09 (ordine PM): modello dal .env (REFLECTION_MODEL); assente = errore col nome
@@ -140,9 +140,9 @@ def generate_lesson(memo_markdown: str = "", memo_id: Optional[int] = None,
             model=MODEL_SYNTHESIZER,
             # PM 02/10: 8k; una lezione troncata non viene salvata nel priming.
             max_tokens=REFLECTION_MAX_TOKENS,
-            # Sonnet 5 (26/07): omesso = adaptive acceso; SPENTO esplicito — con
-            # un budget cosi' corto il thinking mangerebbe la lezione stessa
-            thinking={"type": "disabled"},
+            # Lezione sintetica della run: effort dal .env (REFLECTION_EFFORT, default
+            # low: limita costo e latenza).
+            thinking=thinking_fase("reflection"),
             system=prompt_for_language(REFLECTION_PROMPT),
             messages=[{"role": "user", "content": user_msg}],
         )

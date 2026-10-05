@@ -25,6 +25,16 @@ from bellomberg.market_data.lettore_trimestrali import estrai_testo, scarica_doc
 
 MAX_CARATTERI = 5_000_000
 MAX_UNITA = 10_000
+MAX_COPPIE = 10_000
+FINESTRA = 25
+FINESTRA_RIDOTTA = 3
+# Confronti di abbinamento per documento: oltre, solo finestre locali (costo lineare nei segmenti).
+BUDGET_CONFRONTI = 30_000
+# Limite dei run precedenti (abbinamento globale saltato): il contesto lo riconosce ancora.
+LIMITE_COPPIE = "Troppe coppie: estratti non identici elencati separatamente."
+LIMITE_FINESTRA = ("Abbinamento dei modificati limitato a finestre locali (tratti molto lunghi senza "
+                   "testo uguale o documento oltre il budget di confronti): alcuni riformulati "
+                   "possono restare rimossi e aggiunti.")
 
 
 def _norm(testo):
@@ -141,20 +151,71 @@ def _compatibilita(prima, dopo):
     return motivi
 
 
+# HTML SEC (nessun confine di pagina): «Table of Contents» con il numero di pagina sulla
+# riga accanto, prima o dopo («45 | 2025 Q3 10-Q», «18»).
+_NUMERO_PAGINA = r"(?:\d{1,4}(?:[ \t]*\|[^\n|]{1,60})?|[^\n|]{1,60}\|[ \t]*\d{1,4})"
+_INDICE_HTML = re.compile(
+    r"(?m)^[ \t]*" + _NUMERO_PAGINA + r"[ \t]*\s+Table of Contents[ \t]*$"
+    r"|^[ \t]*Table of Contents[ \t]*\s+" + _NUMERO_PAGINA + r"[ \t]*$")
+MIN_PAGINE_INTESTAZIONE = 3
+_PAGINA = re.compile(r"(?i)\b(?:page|pag\.?|pagina|seite)\s*\d+(?:\s*(?:of|di|von|/)\s*\d+)?\b"
+                     r"|^\s*-?\s*\d{1,4}\s*-?(?=\s|$)|(?<!\S)-?\s*\d{1,4}\s*-?\s*$|\b\d{1,4}\s*/\s*\d{1,4}\b")
+
+
+def _puo_essere_intestazione(riga):
+    """Al piu' un gruppo di cifre oltre al numero di pagina: una riga di totali non lo e'."""
+    return len(re.findall(r"\d[\d.,]*", _PAGINA.sub(" ", riga))) <= 1
+
+
+def _intestazioni(estrazione):
+    """Intervalli (inizio, fine) di intestazioni e piè di pagina nel testo estratto.
+
+    PDF: prima o ultima riga non vuota uguale (cifre normalizzate) su almeno 3 pagine.
+    Altri formati: solo «Table of Contents» con numero di pagina. Si tolgono dai segmenti,
+    mai dal documento archiviato (sha256 invariato).
+    """
+    testo = estrazione.get("testo") or ""
+    pagine = estrazione.get("riferimenti") or []
+    if estrazione.get("formato") != "pdf" or len(pagine) < MIN_PAGINE_INTESTAZIONE:
+        return [m.span() for m in _INDICE_HTML.finditer(testo)]
+    candidati = defaultdict(list)
+    for pagina in pagine:
+        righe = [m for m in re.finditer(r"[^\n]+", testo[pagina["inizio"]:pagina["fine"]]) if m.group().strip()]
+        for m in {id(x): x for x in righe[:1] + righe[-1:]}.values():
+            if not _puo_essere_intestazione(m.group()):
+                continue
+            chiave = re.sub(r"\d+", "#", _norm(m.group()))
+            candidati[chiave].append((pagina["inizio"] + m.start(), pagina["inizio"] + m.end()))
+    return sorted(span for chiave, spans in candidati.items()
+                  if len({s for s, _ in spans}) >= MIN_PAGINE_INTESTAZIONE for span in spans)
+
+
 def _unita(doc, nomi):
-    """Segmenti testuali con offset: gli estratti citati restano letterali."""
+    """Segmenti testuali con offset: gli estratti citati restano letterali.
+
+    Le intestazioni di pagina interrompono il segmento e restano fuori dal suo testo.
+    """
     testo, risultato = doc["estrazione"]["testo"], []
+    intestazioni = _intestazioni(doc["estrazione"])
     for nome in sorted(nomi):
         sezione = doc["sezioni"][nome]
-        a, b = sezione["inizio"], sezione["fine"]
-        # Punteggiatura seguita da spazio, senza spezzare numeri decimali.
-        for match in re.finditer(r"\S.*?(?:[.!?;](?=\s|$)|$)", testo[a:b], re.S):
-            inizio, fine = a + match.start(), a + match.end()
-            while fine > inizio and testo[fine - 1].isspace():
-                fine -= 1
-            if fine > inizio:
-                risultato.append({"sezione": nome, "inizio": inizio, "fine": fine,
-                                   "testo": testo[inizio:fine]})
+        tratti, a = [], sezione["inizio"]
+        for x, y in intestazioni:
+            if y <= a or x >= sezione["fine"]:
+                continue
+            if x > a:
+                tratti.append((a, x))
+            a = max(a, y)
+        tratti.append((a, sezione["fine"]))
+        for a, b in tratti:
+            # Punteggiatura seguita da spazio, senza spezzare numeri decimali.
+            for match in re.finditer(r"\S.*?(?:[.!?;](?=\s|$)|$)", testo[a:b], re.S):
+                inizio, fine = a + match.start(), a + match.end()
+                while fine > inizio and testo[fine - 1].isspace():
+                    fine -= 1
+                if fine > inizio:
+                    risultato.append({"sezione": nome, "inizio": inizio, "fine": fine,
+                                       "testo": testo[inizio:fine]})
     return risultato
 
 
@@ -210,16 +271,22 @@ def confronta_documenti(prima, dopo):
         motivi.append(f"oltre il limite di {MAX_UNITA} segmenti; nessun troncamento applicato")
         return risultato
     residui_old, residui_new, abbinati = set(range(len(old))), set(range(len(new))), []
+    buchi = {}  # sezione -> [(indici prima, indici dopo)] tra blocchi uguali consecutivi
     # Conserva la sequenza: un riordino interno puo' cambiare il senso del testo.
     for nome in sorted(comuni):
         oi = [i for i, s in enumerate(old) if s["sezione"] == nome]
         ni = [i for i, s in enumerate(new) if s["sezione"] == nome]
         matcher = SequenceMatcher(None, [_norm(old[i]["testo"]) for i in oi],
                                   [_norm(new[i]["testo"]) for i in ni], autojunk=False)
+        fa = fb = 0
+        buchi[nome] = []
         for blocco in matcher.get_matching_blocks():
+            if blocco.a > fa or blocco.b > fb:
+                buchi[nome].append((oi[fa:blocco.a], ni[fb:blocco.b]))
             for offset in range(blocco.size):
                 residui_old.remove(oi[blocco.a + offset])
                 residui_new.remove(ni[blocco.b + offset])
+            fa, fb = blocco.a + blocco.size, blocco.b + blocco.size
     # Prima nella stessa sezione, poi fra sezioni: preserva anche le ripetizioni.
     for stessa_sezione in (True, False):
         indice = defaultdict(deque)
@@ -234,18 +301,44 @@ def confronta_documenti(prima, dopo):
                 residui_new.remove(j)
                 abbinati.append(("spostato", i, j))
     # Similarita' solo per accoppiare estratti, mai come giudizio sul rischio.
-    coppie = []
-    if len(residui_old) * len(residui_new) <= 10_000:
-        for i in sorted(residui_old):
-            for j in sorted(residui_new):
-                a, b = _norm(old[i]["testo"]), _norm(new[j]["testo"])
-                if old[i]["sezione"] != new[j]["sezione"] or max(len(a), len(b)) > 4000:
-                    continue
-                ratio = SequenceMatcher(None, a, b, autojunk=False).ratio()
-                if ratio >= 0.6:
-                    coppie.append((ratio, i, j))
-    else:
-        risultato["limiti"].append("Troppe coppie: estratti non identici elencati separatamente.")
+    coppie, finestra, conti = [], False, [0]
+
+    def prova(i, j):
+        conti[0] += 1
+        a, b = _norm(old[i]["testo"]), _norm(new[j]["testo"])
+        if old[i]["sezione"] != new[j]["sezione"] or max(len(a), len(b)) > 4000:
+            return
+        m = SequenceMatcher(None, a, b, autojunk=False)
+        # real_quick_ratio/quick_ratio sono limiti superiori di ratio: stesso esito, meno calcolo
+        if m.real_quick_ratio() >= 0.6 and m.quick_ratio() >= 0.6:
+            ratio = m.ratio()
+            if ratio >= 0.6:
+                coppie.append((ratio, i, j))
+
+    for nome in sorted(comuni):
+        ro = sorted(i for i in residui_old if old[i]["sezione"] == nome)
+        rn = sorted(j for j in residui_new if new[j]["sezione"] == nome)
+        if len(ro) * len(rn) <= MAX_COPPIE:
+            gruppi = [(ro, rn)]  # sezione intera, come sempre: anche i riformulati spostati
+        else:  # solo dentro i buchi tra i blocchi uguali della sequenza
+            gruppi = [([i for i in a if i in residui_old], [j for j in b if j in residui_new])
+                      for a, b in buchi[nome]]
+        for go, gn in gruppi:
+            if not go or not gn:
+                continue
+            if len(go) * len(gn) <= MAX_COPPIE and conti[0] + len(go) * len(gn) <= BUDGET_CONFRONTI:
+                for i in go:
+                    for j in gn:
+                        prova(i, j)
+                continue
+            finestra = True
+            lato = FINESTRA if conti[0] + len(go) * (2 * FINESTRA + 1) <= BUDGET_CONFRONTI else FINESTRA_RIDOTTA
+            for r, i in enumerate(go):
+                centro = r * len(gn) // len(go)
+                for j in gn[max(0, centro - lato):centro + lato + 1]:
+                    prova(i, j)
+    if finestra:
+        risultato["limiti"].append(LIMITE_FINESTRA)
     for _, i, j in sorted(coppie, key=lambda c: (-c[0], c[1], c[2])):
         if i in residui_old and j in residui_new:
             residui_old.remove(i)
@@ -263,7 +356,7 @@ def confronta_documenti(prima, dopo):
                 continue
             risultato["cambiamenti"].append({"tipo": tipo, lato: _citazione(doc, unita[i])})
     risultato["misure"] = {"segmenti_prima": len(old), "segmenti_dopo": len(new),
-                            "cambiamenti": len(risultato["cambiamenti"])}
+                            "cambiamenti": len(risultato["cambiamenti"]), "confronti_abbinamento": conti[0]}
     return risultato
 
 

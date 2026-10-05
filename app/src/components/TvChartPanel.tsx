@@ -1,8 +1,11 @@
+import PagePresentation from './PagePresentation';
 import { useEffect, useState } from 'react';
 import { Bellomberg, OhlcBar } from '@/lib/api';
 import TerminalChart from '@/components/TerminalChart';
 import { Cpu } from 'lucide-react';
 import { useT } from '@/i18n/provider';
+import type { Chiave } from '@/i18n/t';
+import { frase } from '@/lib/frase';
 
 const NO_CHART_DATA = Symbol('no-chart-data');
 
@@ -47,8 +50,10 @@ function resample(bars: OhlcBar[], group: number): OhlcBar[] {
   return out;
 }
 
-export default function TvChartPanel({ ticker, height = 360, fill = false, defaultRange = 5, defaultInterval = 4 }: {
-  ticker: string; height?: number; fill?: boolean; defaultRange?: number; defaultInterval?: number;
+export default function TvChartPanel({ ticker, height = 360, fill = false, defaultRange = 5, defaultInterval = 4, pageRecovery = false, timeSelects = false }: {
+  ticker: string; height?: number; fill?: boolean; defaultRange?: number; defaultInterval?: number; pageRecovery?: boolean;
+  /** Dashboard Nuova: two labelled menus (period, candle) instead of two rows of short buttons that both contain «1G», and sentence-case chart labels. */
+  timeSelects?: boolean;
 }) {
   const tr = useT();
   const rangeLabel = (label: string) => label.endsWith('G') ? tr('ui.chart_day', { n: label.slice(0, -1) })
@@ -64,15 +69,6 @@ export default function TvChartPanel({ ticker, height = 360, fill = false, defau
   const [showRsi, setShowRsi] = useState(false);
   const [bars, setBars] = useState<OhlcBar[] | null>(null);
   const [err, setErr] = useState<string | typeof NO_CHART_DATA | null>(null);
-  // al passaggio del breakpoint impilato (grid<->flex) il chart viene RIMONTATO
-  // pulito: evita il race dei binding interni di lightweight-charts sul reflow
-  const [stacked, setStacked] = useState(() => typeof window !== 'undefined' && window.matchMedia('(max-width:1160px)').matches);
-  useEffect(() => {
-    const mq = window.matchMedia('(max-width:1160px)');
-    const on = () => setStacked(mq.matches);
-    try { mq.addEventListener('change', on); } catch { return; }
-    return () => { try { mq.removeEventListener('change', on); } catch {} };
-  }, []);
 
   const rangeDays = RANGES[ri][2];
   // se il cambio range invalida il timeframe, ripiega su 1G (dichiarato dal bottone che si accende)
@@ -102,9 +98,26 @@ export default function TvChartPanel({ ticker, height = 360, fill = false, defau
     ? { flex: 1, minHeight: 220, padding: '4px 4px 0', display: 'flex', flexDirection: 'column' as const }
     : { flex: 1, minHeight: 0, padding: '4px 4px 0' };
 
-  return (
+  const render = () => (
     <>
-      <div className="tbar num">
+      <div className="tbar num chart-tools-modern">
+        {timeSelects ? <>
+          <label className="tsel">
+            <span className="tlab">{tr('ui.chart_period_label')}</span>
+            <select value={ri} onChange={e => setRi(Number(e.target.value))}>
+              {RANGES.map(([lab, period], i) => <option key={lab} value={i}>{tr(`ui.chart_span_${period}` as Chiave)}</option>)}
+            </select>
+          </label>
+          <label className="tsel" title={INTERVALS[ii][1] === '4h' ? tr('ui.chart_resample_hint') : undefined}>
+            <span className="tlab">{tr('ui.chart_candle_label')}</span>
+            <select value={ii} onChange={e => setIi(Number(e.target.value))}>
+              {INTERVALS.map(([lab, iv], i) => {
+                const okIv = intervalOk(iv, rangeDays);
+                return <option key={lab} value={i} disabled={!okIv} title={okIv ? undefined : tr('ui.chart_interval_unavailable')}>{tr(`ui.chart_bar_${iv}` as Chiave)}</option>;
+              })}
+            </select>
+          </label>
+        </> : <>
         <span className="tlab">{tr('ui.chart_range')}</span>
         <span className="tfg">
           {RANGES.map(([lab], i) => (
@@ -122,10 +135,11 @@ export default function TvChartPanel({ ticker, height = 360, fill = false, defau
             );
           })}
         </span>
+        </>}
         <span className="tfg">
-          <button onClick={() => setMode('candle')} className={'tb' + (mode === 'candle' ? ' on' : '')}>{tr('ui.chart_candles')}</button>
-          <button onClick={() => setMode('area')} className={'tb' + (mode === 'area' ? ' on' : '')}>{tr('ui.chart_area')}</button>
-          <button onClick={() => setMode('line')} className={'tb' + (mode === 'line' ? ' on' : '')}>{tr('ui.chart_line')}</button>
+          <button onClick={() => setMode('candle')} className={'tb' + (mode === 'candle' ? ' on' : '')}>{(timeSelects ? frase(tr('ui.chart_candles')) : tr('ui.chart_candles'))}</button>
+          <button onClick={() => setMode('area')} className={'tb' + (mode === 'area' ? ' on' : '')}>{(timeSelects ? frase(tr('ui.chart_area')) : tr('ui.chart_area'))}</button>
+          <button onClick={() => setMode('line')} className={'tb' + (mode === 'line' ? ' on' : '')}>{(timeSelects ? frase(tr('ui.chart_line')) : tr('ui.chart_line'))}</button>
         </span>
         <button onClick={() => setShowSma(s => !s)} className={ind(showSma)}>SMA 20/50</button>
         <button onClick={() => setShowVwap(s => !s)} className={ind(showVwap)}>VWAP</button>
@@ -143,8 +157,9 @@ export default function TvChartPanel({ ticker, height = 360, fill = false, defau
           ? <div className="flex items-center justify-center text-crimson text-2xs font-mono" style={{ height: fill ? '100%' : height, minHeight: 200 }}>{err === NO_CHART_DATA ? tr('ui.no_data') : err}</div>
           : !bars
             ? <div className="flex items-center justify-center text-faint text-2xs font-mono" style={{ height: fill ? '100%' : height, minHeight: 200 }}><Cpu size={12} className="animate-pulse mr-2" /> {tr('ui.chart_loading', { ticker })}</div>
-            : <TerminalChart key={stacked ? 'stk' : 'wide'} bars={bars} mode={mode} height={height} fill={fill} log={log} showSma={showSma} showVwap={showVwap} showRsi={showRsi} />}
+            : <TerminalChart bars={bars} mode={mode} height={height} fill={fill} log={log} showSma={showSma} showVwap={showVwap} showRsi={showRsi} />}
       </div>
     </>
   );
+  return pageRecovery ? <PagePresentation render={render} /> : render();
 }

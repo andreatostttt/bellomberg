@@ -709,12 +709,33 @@ class BudgetedProposer:
             # same economic work. Validate the original key above, then permit
             # only these two known old caps with every other field identical.
             # Return the original row, preserving failures, cost and ownership.
+            caps = [request.get("max_tokens")]
             if (requested_max_tokens == 128000
                     and type(request.get("max_tokens")) is int
                     and request["max_tokens"] in (16000, 65536)):
-                request["max_tokens"] = requested_max_tokens
-                if sha256(_json(request).encode("utf-8")).hexdigest() == key:
-                    return row
+                caps.append(requested_max_tokens)
+            # G7/C2 (04/10): l'effort del preparer e' passato dalla policy storica
+            # (thinking_consigliere: max per Muse, adaptive altrove) a VALUATION_PREPARER_EFFORT.
+            # Cambiare effort non ricompra lo stesso lavoro economico: una riga pagata con un
+            # altro thinking NOTO (uno di quelli che una variabile *_EFFORT puo' produrre) e
+            # ogni altro campo identico resta la risposta, con il suo stato e il suo costo.
+            from bellomberg.core.llm_client import THINKING_DA_EFFORT
+            originale = request.get("thinking")
+            thinkings = [originale] + ([t for t in THINKING_DA_EFFORT if t != originale]
+                                       if originale in THINKING_DA_EFFORT else [])
+            for cap in caps:
+                for thinking in thinkings:
+                    if cap == caps[0] and thinking == originale:
+                        continue  # gia' confrontata sopra
+                    # REV G7/R2: un altro thinking vale solo per denaro speso con risposta o
+                    # per un esito irrisolto (che blocca); un rifiuto pre-provider a costo 0
+                    # resta ritentabile con la chiave di oggi, non si congela.
+                    if thinking != originale and row["state"] not in ("received", "reserved",
+                                                                       "unknown", "overrun"):
+                        continue
+                    request["max_tokens"], request["thinking"] = cap, thinking
+                    if sha256(_json(request).encode("utf-8")).hexdigest() == key:
+                        return row
         return None
 
     @staticmethod
@@ -1603,10 +1624,15 @@ class StagedProposer:
 
 
 def configured_proposer(journal, *, authorized_usd):
-    from bellomberg.core.llm_client import modello, thinking_consigliere
+    from bellomberg.core.llm_client import modello, thinking_fase
     model = modello("consigliere", "fundamentals", 1)
-    # PM 02/10: all existing models retain their identity and thinking policy.
+    # PM 02/10: the model keeps its identity (fundamentals R1). G7/C2 (04/10): the
+    # reasoning effort is no longer the historical policy (Muse max / adaptive) nor the
+    # desks' variables: it is VALUATION_PREPARER_EFFORT (default high, the contributor's
+    # value). Already paid preparations under another effort are still recognised
+    # by _existing, never bought again.
     output_limit = 128000
     return BudgetedProposer(journal, authorized_usd=authorized_usd, model=model,
-                            max_tokens=output_limit, thinking=thinking_consigliere(model),
+                            max_tokens=output_limit,
+                            thinking=thinking_fase("valuation_preparer"),
                             automatic_sections=True)

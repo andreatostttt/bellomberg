@@ -4,11 +4,13 @@ import { t as tr, type Chiave, type Parametri } from '@/i18n/t';
 import { linguaCorrente, localeDi, type Lingua } from '@/i18n/lingua';
 import { leggiDetail } from '@/lib/quota';
 import { useNavigate } from 'react-router-dom';
+import ModernPage from '@/components/ModernPage';
 import { Bellomberg, Decision, DecisionNote } from '@/lib/api';
 import { fmtEUR, fmtNum, fmtPct } from '@/lib/format';
 import { leggiNumeroConSegno } from '@/lib/cassa';
-import { decisioneCompatibile } from '@/lib/trade-entry';
+import { assessmentAllowsExecution, decisioneCompatibile, statoDivergenza } from '@/lib/trade-entry';
 import { ChevronDown, ChevronRight, Check, X, Clock, MinusCircle, FlaskConical, Send, Archive, ArchiveRestore } from 'lucide-react';
+import './committee-modern.css';
 
 // F10 v4 — restyle stile C scelto dal PM (17/07, mockup renderizzato F17, regola
 // 15/07: "fai anche l'opzione C per F10"): board scura con header arancio, righe con
@@ -325,6 +327,21 @@ export default function Decisions() {
               <p className="text-muted whitespace-pre-wrap">{d.outcome_notes}</p>
             </div>
           )}
+          {!!d.manual_divergences?.length && <div className="border border-crimson/40 bg-crimson/5 rounded px-3 py-2">
+            <div className="text-[10px] uppercase tracking-wider text-crimson mb-1">
+              {tr('decisiondesk.manual_divergence_title')}
+            </div>
+            {d.manual_divergences.map(event => <p key={event.id} className="text-xs text-white/80">
+              {tr('decisiondesk.manual_divergence_trade', {
+                id: event.details.trade_id,
+                action: event.details.trade_action,
+                ticker: event.details.ticker_eseguito,
+                date: displayDate(event.details.trade_data, true),
+                reason: event.reason,
+              })}
+              {event.details.isin ? tr('decisiondesk.manual_divergence_isin', { isin: event.details.isin }) : ''}
+            </p>)}
+          </div>}
           <div className="border-t border-border/40 pt-3 space-y-2" onClick={e => e.stopPropagation()}>
             <div className="flex gap-2 items-center flex-wrap">
               <input value={feedback} onChange={e => setFeedback(e.target.value)}
@@ -348,20 +365,28 @@ export default function Decisions() {
                   {tr('decisiondesk.f024')}
                 </button>
               )}
+              {statoDivergenza(d) !== null && (
+                <button onClick={() => navigate(`/trades?divergence=${d.id}`)}
+                  className="px-3 py-1 text-xs rounded border border-crimson/60 text-crimson hover:bg-crimson/10">
+                  {tr('decisiondesk.record_manual_divergence')}
+                </button>
+              )}
               {d.esecuzione && <span className="text-xs text-muted">
                 {tr('decisiondesk.f025')} {fmtEUR(d.esecuzione.eur)}
                 {d.esecuzione.pct != null ? tr('decisiondesk.f026', {a: fmtNum(d.esecuzione.pct, 1)}) : tr('decisiondesk.f027')}
                 {' · '}{d.esecuzione.trade_ids.map(id => `#${id}`).join(', ')}
                 {d.esecuzione.inferito ? tr('decisiondesk.f028') : tr('decisiondesk.f029')}
               </span>}
-              <button disabled={saving} onClick={() => setStatus(d, 'EXECUTED')}
-                className="px-3 py-1 text-xs rounded bg-emerald/20 text-emerald hover:bg-emerald/30 flex items-center gap-1 disabled:opacity-50">
-                <Check size={12} /> {statusLabel('EXECUTED')}
-              </button>
-              <button disabled={saving} onClick={() => setStatus(d, 'PARTIAL')}
-                className="px-3 py-1 text-xs rounded bg-cyan/20 text-cyan hover:bg-cyan/30 flex items-center gap-1 disabled:opacity-50">
-                <MinusCircle size={12} /> {statusLabel('PARTIAL')}
-              </button>
+              {assessmentAllowsExecution(d) && <>
+                <button disabled={saving} onClick={() => setStatus(d, 'EXECUTED')}
+                  className="px-3 py-1 text-xs rounded bg-emerald/20 text-emerald hover:bg-emerald/30 flex items-center gap-1 disabled:opacity-50">
+                  <Check size={12} /> {statusLabel('EXECUTED')}
+                </button>
+                <button disabled={saving} onClick={() => setStatus(d, 'PARTIAL')}
+                  className="px-3 py-1 text-xs rounded bg-cyan/20 text-cyan hover:bg-cyan/30 flex items-center gap-1 disabled:opacity-50">
+                  <MinusCircle size={12} /> {statusLabel('PARTIAL')}
+                </button>
+              </>}
               <button disabled={saving} onClick={() => setStatus(d, 'SKIPPED')}
                 className="px-3 py-1 text-xs rounded bg-crimson/20 text-crimson hover:bg-crimson/30 flex items-center gap-1 disabled:opacity-50">
                 <X size={12} /> {statusLabel('SKIPPED')}
@@ -414,6 +439,9 @@ export default function Decisions() {
           <div className="text-[10px] text-faint truncate max-w-[260px]">
             {displayDate(d.timestamp)}{d.rationale ? ` · ${d.rationale}` : ''}
           </div>
+          {d.assessment_status && <div className={`text-[10px] mt-0.5 ${d.assessment_status === 'OPERATIVE' ? 'text-emerald' : 'text-crimson'}`}>
+            {d.assessment_status}{d.assessment_reason ? ` · ${d.assessment_reason}` : ''}
+          </div>}
         </td>
         <td className="text-right text-xs font-mono">{d.eur_amount != null ? fmtEUR(d.eur_amount, true) : '-'}</td>
         <td className="text-center">
@@ -541,6 +569,7 @@ export default function Decisions() {
   };
 
   return (
+    <ModernPage page="decisions" render={() => (
     <div className="space-y-4">
       <div className="flex items-baseline justify-between border-b-2 border-[#ff8c00] pb-2">
         <h1 className={`text-lg font-bold font-mono ${ORANGE}`}>{tr('decisiondesk.f056')}</h1>
@@ -624,5 +653,6 @@ export default function Decisions() {
         {tr('decisiondesk.f073')}
       </p>
     </div>
+    )} />
   );
 }

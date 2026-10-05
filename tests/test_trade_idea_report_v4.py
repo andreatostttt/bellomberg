@@ -190,7 +190,9 @@ def test_v4_memo_is_ready_complete_and_prints_every_new_field(tmp_path):
 def test_v4_section_sources_come_from_evidence_ids(tmp_path):
     text = " ".join(_text(_build(tmp_path, "src.pdf")["path"]).split())
     thesis = text[text.find("2. Tesi in sintesi"):text.find("3. Rischi")]
-    risks = text[text.find("3. Rischi"):text.find("4. Executive")]
+    end = text.find("4. Sintesi e giudizio")  # fixed /4 section title (PM 04/10)
+    assert end >= 0
+    risks = text[text.find("3. Rischi"):end]
     # Section 2 cites ev-filing and ev-quote (second pillar); section 3 cites both through the exits.
     for block in (thesis, risks):
         assert "synthetic_filing" in block and "synthetic_quote" in block, block[-300:]

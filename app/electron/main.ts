@@ -18,6 +18,8 @@ const PROJECT_ROOT = process.env.BELLOMBERG_BACKEND_DIR
   ? path.resolve(process.env.BELLOMBERG_BACKEND_DIR)
   : !app.isPackaged ? path.dirname(app.getAppPath()) : null;
 const API_PORT = apiPort(process.env.BELLOMBERG_API_PORT);
+// L'import a freddo del backend Python/ChromaDB può superare i 30 secondi.
+const BACKEND_START_TIMEOUT_MS = 120_000;
 process.env.BELLOMBERG_DESKTOP_API_URL = `http://127.0.0.1:${API_PORT}`;
 let quitting = false;
 
@@ -140,16 +142,17 @@ async function startPythonBackend() {
           'Ultimo errore su stderr / Last stderr error: ' + (lastError || 'nessuno ricevuto / none received')));
       }
     });
-    const deadline = Date.now() + 30000;
+    const deadline = Date.now() + BACKEND_START_TIMEOUT_MS;
     while (Date.now() < deadline && pythonBackend === child && !quitting) {
       if (await pingBackend()) return;
       await new Promise(resolve => setTimeout(resolve, 500));
     }
     if (pythonBackend === child && !quitting) {
       stopOwnedBackend();
+      const timeoutSeconds = Math.round(BACKEND_START_TIMEOUT_MS / 1000);
       backendError(bilingue(
-        'Il backend non è pronto dopo 30 secondi. Controlla la configurazione e i log Python, poi riavvia l’app.',
-        'The backend was not ready after 30 seconds. Check the configuration and the Python logs, then restart the app.'));
+        `Il backend non è pronto dopo ${timeoutSeconds} secondi. Controlla la configurazione e i log Python, poi riavvia l’app.`,
+        `The backend was not ready after ${timeoutSeconds} seconds. Check the configuration and the Python logs, then restart the app.`));
     }
   } catch (e) {
     backendError(bilingue(

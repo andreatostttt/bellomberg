@@ -39,7 +39,16 @@ def test_generated_scoreboard_languages_keep_scores_metrics_and_cache_unchanged(
     results = [scores.quant_score({}, copy.deepcopy(risk), language=lang) for lang in ('it','en')]
     assert results[0]['metrics'] == results[1]['metrics']
     assert results[0]['score'] == results[1]['score'] and results[0]['max_score'] == results[1]['max_score']
-    assert [r[1:] for r in results[0]['lines']] == [r[1:] for r in results[1]['lines']]
+    # A7 04/10: righe n.d. dichiarate (punti None) hanno il motivo nella lingua; stesse righe,
+    # stesso ordine, stessi punti, e stesso valore per ogni riga punteggiata.
+    it_lines, en_lines = results[0]['lines'], results[1]['lines']
+    assert len(it_lines) == len(en_lines)
+    assert [r[2] for r in it_lines] == [r[2] for r in en_lines]
+    for it_row, en_row in zip(it_lines, en_lines):
+        if it_row[2] is None:
+            assert it_row[1].startswith('n.d.:') and en_row[1].startswith('n/a:'), (it_row, en_row)
+        else:
+            assert it_row[1] == en_row[1]
     assert 'RISCHIO' in results[0]['verdict'] and 'RISK' in results[1]['verdict']
     cache = {'quant': results[1]}; before = copy.deepcopy(cache)
     rendered = scores.format_scoreboard(cache, language='en')
@@ -75,6 +84,117 @@ def test_institutional_pdf_extracts_localised_labels_preserving_memo(tmp_path, m
     for value, x, size in drawn:
         width = pdf_institutional.pdfmetrics.stringWidth(value, bold, size)
         assert x + width <= pdf_institutional.A4[0] * .38 - pdf_institutional.cm + .1
+
+
+def test_institutional_pdf_wraps_long_action_cells_inside_their_column(tmp_path, monkeypatch):
+    monkeypatch.setattr(pdf_institutional, "REPORT_DIR", str(tmp_path))
+    monkeypatch.setattr(pdf_institutional, "_gen_charts", lambda *a: (None, None, None))
+    long_timing = ("Wait for the earnings release, preserve the cash reserve, and reassess the position " * 4).strip()
+    memo = (
+        "## ACTION TABLE\n"
+        "| Action | Ticker | EUR | Timing | Confidence |\n"
+        "|---|---|---:|---|---|\n"
+        f"| HOLD | ALFA | 0 | {long_timing} | HIGH |\n"
+        "| BUY | BETA | 100 | After results | MEDIUM |\n"
+        "\n## BLUF\nA compact summary.\n"
+    )
+    path = tmp_path / "wrapped-action-table.pdf"
+    pdf_institutional.build_institutional_memo(memo, {}, output_path=str(path), language="en")
+
+    events = []
+    def record_position(text, cm, tm, _font, size):
+        if text.strip():
+            x=cm[0]*tm[4]+cm[2]*tm[5]+cm[4]
+            y=cm[1]*tm[4]+cm[3]*tm[5]+cm[5]
+            scale=(cm[0]**2+cm[1]**2)**0.5
+            events.append((text.strip(),x,y,size,scale))
+
+    PdfReader(path).pages[1].extract_text(visitor_text=record_position)
+    timing_x = next(x for text, x, _y, _size, _scale in events if text == "Timing")
+    confidence_x = next(x for text, x, _y, _size, _scale in events if text == "Confidence")
+    alfa_y = next(y for text, _x, y, _size, _scale in events if text == "ALFA")
+    beta_y = next(y for text, _x, y, _size, _scale in events if text == "BETA")
+    reg, _bold, _italic = pdf_institutional._register_fonts()
+    timing_lines = [
+        (text, x, size, scale)
+        for text, x, y, size, scale in events
+        if timing_x <= x < confidence_x and beta_y < y <= alfa_y and text
+    ]
+
+    assert timing_lines
+    assert all(
+        x + pdf_institutional.pdfmetrics.stringWidth(text, reg, size) * scale <= confidence_x - 2
+        for text, x, size, scale in timing_lines
+    )
+
+
+def test_institutional_pdf_cleans_fenced_tables_and_moves_checks_to_appendix(tmp_path, monkeypatch):
+    monkeypatch.setattr(pdf_institutional, "REPORT_DIR", str(tmp_path))
+    monkeypatch.setattr(pdf_institutional, "_gen_charts", lambda *a: (None, None, None))
+    memo = """## ACTION TABLE
+| Action | Ticker | EUR | Timing | Confidence |
+|---|---|---:|---|---|
+| HOLD | ALFA | 0 | Wait | HIGH |
+
+## BLUF
+The table layout should stay readable.
+
+## 2. Portfolio
+Portfolio details follow.
+```markdown
+| Ticker | Weight | Note |
+|---|---:|---|
+| ALFA.DE | 25% | Long term allocation |
+```
+```text
+==============================
+Ticker     Issuer                Weight
+NOVA.DE    Example Holdings      25%
+==============================
+```
+```text
+Asset | Target weight | Base case | Risk note
+----- | ------------- | --------- | ---------
+NOVA.DE | 25% | Hold | Margin
+```
+
+## 12. Closing note
+The body ends before the audit appendix.
+
+## MEMO LINTER
+- Arithmetic warning preserved.
+
+## ACTION VALIDATOR
+- Risk flag preserved.
+
+## QUALITA' DATI
+- fred.us_10y: stale observation preserved.
+"""
+    path = tmp_path / "clean-fenced-table.pdf"
+    pdf_institutional.build_institutional_memo(memo, {}, output_path=str(path), language="en")
+    reader = PdfReader(path)
+    pages = [page.extract_text() or "" for page in reader.pages]
+    text = "\n".join(pages)
+
+    assert "```" not in text
+    assert "=====\n" not in text
+    assert "ALFA.DE" in text and "Long term allocation" in text
+    assert "NOVA.DE" in text and "Example Holdings" in text and "25%" in text
+    assert "Base case" in text and "Margin" in text
+    assert "Automated checks" in text
+    assert "Arithmetic warning preserved." in text
+    assert "Risk flag preserved." in text
+    assert "fred.us_10y: stale observation preserved." in text
+    assert pages[-1].find("Automated checks") < pages[-1].find("MEMO LINTER")
+    assert pages[-1].find("The body ends before the audit appendix.") == -1
+
+    cell_positions = {}
+    reader.pages[1].extract_text(visitor_text=lambda value, cm, tm, _font, _size:
+        cell_positions.setdefault(value.strip(), (cm[4] + tm[4], cm[5] + tm[5]))
+        if value.strip() in {"Asset", "Target weight", "Base case", "Risk note"} else None)
+    header_positions = [cell_positions[label] for label in ("Asset", "Target weight", "Base case", "Risk note")]
+    assert len(header_positions) == 4
+    assert max(y for _x, y in header_positions) - min(y for _x, y in header_positions) < 1
 
 
 @pytest.mark.parametrize("language,expected,unwanted", [

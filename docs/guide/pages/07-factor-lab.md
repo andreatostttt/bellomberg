@@ -1,6 +1,6 @@
 # F7 — Factor Lab
 
-[Handbook](../README.md) · [Previous: F6](./06-fundamentals.md) · [Next: F8](./08-monte-carlo.md)
+[Handbook](../README.md) · [Previous: F20](./20-filing.md) · [Next: F8](./08-monte-carlo.md)
 
 ![F7 Factor Lab: Factors — English DEMO screenshot](../../assets/screenshots/factor-lab-en.png)
 

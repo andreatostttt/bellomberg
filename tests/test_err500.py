@@ -177,7 +177,13 @@ def test_ogni_chiamata_dichiara_un_where_non_vuoto():
     # il PM in due posti diversi. Il censimento ha pescato anche questo (era a 68).
     # 73 dal 09/09 (Codex GPT-6): guardia mandato della run e due anteprime
     # GET/POST. Ogni nuovo ramo continua a loggare causa e funzione reale.
-    assert len(siti) == 73, f"call site attesi 73, trovati {len(siti)}"
+    # 74 dal 02/10/2026 (Claude Opus 5.5): GET /market/logos.
+    # 76 dal 02/10/2026 (Claude Opus 5.5): +2 per GET e POST /news/{news_id}/article-summary
+    # (sintesi AI di un articolo su richiesta).
+    # 77 dal 03/10/2026 (Claude Opus 5.5): GET /market/movers (classifica dei piu' mossi
+    # di Mercati globali).
+    # 78 dal 03/10/2026 (Claude Opus 5.5): POST /market/news/translate.
+    assert len(siti) == 78, f"call site attesi 78, trovati {len(siti)}"
 
 
 def test_il_where_e_il_nome_vero_della_funzione_ospitante():

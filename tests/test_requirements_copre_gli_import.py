@@ -21,6 +21,11 @@ ALIAS = {"dotenv": "python-dotenv", "yaml": "pyyaml", "PIL": "pillow", "sklearn"
          "bs4": "beautifulsoup4", "dateutil": "python-dateutil", "ib_insync": "ib_async"}
 # import opzionali dichiarati nel codice (try/except con feature spenta): non obbligatori
 OPZIONALI = {"chromadb", "ib_async", "ib_insync", "win32com", "pythoncom", "pywintypes"}
+# dipendenze runtime INDIRETTE: nessuno le importa, ma servono a un modulo che il prodotto
+# importa davvero (chiave -> import che le giustifica; None = lanciata, non importata).
+# tzdata: su Windows zoneinfo non ha il database dei fusi senza il pacchetto (REV2 G2b).
+# Se l'import che la giustifica sparisce dal prodotto, la riga torna «inutile» e il test cade.
+INDIRETTI = {"uvicorn": None, "tzdata": "zoneinfo"}
 
 
 def _file_py():
@@ -47,13 +52,16 @@ def _nomi_importati(testo):
     return nomi
 
 
-def _importati():
-    files = _file_py()
+def _tutti_gli_import():
     nomi = set()
-    for f in files:
+    for f in _file_py():
         testo = open(os.path.join(REPO, f), encoding="utf-8", errors="replace").read()
         nomi.update(_nomi_importati(testo))
-    return nomi - set(sys.stdlib_module_names) - _moduli_locali(files) - OPZIONALI
+    return nomi
+
+
+def _importati():
+    return _tutti_gli_import() - set(sys.stdlib_module_names) - _moduli_locali(_file_py()) - OPZIONALI
 
 
 def _requirements():
@@ -95,8 +103,11 @@ def test_ogni_import_di_terze_parti_e_in_requirements():
 
 def test_requirements_non_elenca_pacchetti_che_nessuno_importa():
     """Il verso contrario: una riga di requirements che nessun modulo importa e' un
-    peso per chi installa. `uvicorn` e' l'eccezione dichiarata (lo lancia
-    bellomberg_api a runtime, non lo importa a inizio riga)."""
-    usati = {_normalizza(n) for n in _importati()} | {_normalizza(n) for n in OPZIONALI} | {"uvicorn"}
+    peso per chi installa. Eccezioni dichiarate in INDIRETTI: `uvicorn` (lo lancia
+    bellomberg_api a runtime, non lo importa a inizio riga) e `tzdata` (lo legge zoneinfo
+    su Windows), questa valida solo finche' il prodotto importa zoneinfo."""
+    tutti = _tutti_gli_import()
+    indiretti = {d for d, via in INDIRETTI.items() if via is None or via in tutti}
+    usati = {_normalizza(n) for n in _importati()} | {_normalizza(n) for n in OPZIONALI} | indiretti
     inutili = sorted(r for r in _requirements() if r not in usati)
     assert not inutili, f"in requirements.txt ma nessun modulo di prodotto li importa: {inutili}"

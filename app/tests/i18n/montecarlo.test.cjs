@@ -50,6 +50,11 @@ function retained(data = fixture(), mods = [], overrides = {}) {
   const language = load('i18n/lingua.ts'), Page = load('pages/MonteCarloPage.tsx').default;
   function Capture() { render.tree = Page(); return render.tree; }
   const render = selected => { state = memoIndex = effectIndex = refIndex = 0; effects.length = 0; language.impostaLinguaCorrente(selected); return renderToStaticMarkup(React.createElement(Capture)); };
+  // ModernPage defers page-surface construction to a `render` prop so its
+  // presentation boundary can catch view-only faults without re-running the
+  // page controller. The hand-driven hook harness should probe that callback
+  // for controls while leaving all existing controller/API assertions intact.
+  render.view = () => typeof render.tree?.props?.render === 'function' ? render.tree.props.render() : render.tree;
   render.effects = async () => { for (const fn of effects) fn(); await new Promise(resolve => setImmediate(resolve)); };
   return { render, calls, load };
 }
@@ -89,7 +94,7 @@ test('the explicit what-if run submits the preserved draft value after language 
   const mods = [{ id: 1, action: 'add', ticker: 'SYNTH.X', amount_eur: '1.234,50', amount_pct: '', inputLanguage: 'it' }];
   const { render, calls } = retained(fixture(), mods);
   render('it'); await render.effects(); render('en'); await render.effects();
-  const button = find(render.tree, n => n.type === 'button' && n.props.className === 'go');
+  const button = find(render.view(), n => n.type === 'button' && n.props.className === 'go');
   assert.equal(button.props.disabled, false); await button.props.onClick();
   assert.equal(calls.filter(c => c[0] === 'whatif').length, 2);
   const sent = calls.at(-1)[1]; assert.equal(sent.force, true);
@@ -100,14 +105,14 @@ test('the explicit what-if run submits the preserved draft value after language 
 test('new rows capture input grammar and keep the same raw text and amount after switching language', async () => {
   const { render, calls } = retained();
   render('it'); await render.effects(); render('it');
-  const add = find(render.tree, n => n.type === 'button' && n.props.className === 'addb'); add.props.onClick();
+  const add = find(render.view(), n => n.type === 'button' && n.props.className === 'addb'); add.props.onClick();
   render('it');
-  find(render.tree, n => n.type === 'input' && n.props.placeholder?.startsWith('ticker')).props.onChange({ target: { value: 'SYNTH.X' } });
+  find(render.view(), n => n.type === 'input' && n.props.placeholder?.startsWith('ticker')).props.onChange({ target: { value: 'SYNTH.X' } });
   render('it');
-  find(render.tree, n => n.type === 'input' && n.props.placeholder === 'importo in euro').props.onChange({ target: { value: '1.234,50' } });
+  find(render.view(), n => n.type === 'input' && n.props.placeholder === 'importo in euro').props.onChange({ target: { value: '1.234,50' } });
   const en = render('en');
   assert.match(en, /value="1\.234,50"/);
-  const run = find(render.tree, n => n.type === 'button' && n.props.className === 'go');
+  const run = find(render.view(), n => n.type === 'button' && n.props.className === 'go');
   assert.equal(run.props.disabled, false); await run.props.onClick();
   assert.deepEqual(calls.at(-1)[1].modifications, [{ action: 'add', ticker: 'SYNTH.X', amount_eur: 1234.5 }]);
 });

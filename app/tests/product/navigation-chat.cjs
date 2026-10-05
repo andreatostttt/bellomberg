@@ -7,12 +7,20 @@ const ts = require('typescript');
 const root = path.resolve(__dirname, '../..');
 const carica = require('../i18n/_carica.cjs').creaCaricatore();
 function load(name) { return carica('lib/' + name + '.ts'); }
-test('every destination has one consecutive key and settings comes last', () => {
+test('every destination has one key and settings comes last', () => {
   const { NAVIGATION, pageKey } = load('navigation');
-  assert.equal(NAVIGATION.length, 19);
-  assert.equal(new Set(NAVIGATION.map(x => x.to)).size, 19);
-  assert.deepEqual(Array.from(NAVIGATION, x => x.key), Array.from({length:19}, (_,i) => 'F'+(i+1)));
+  assert.equal(NAVIGATION.length, 20);
+  assert.equal(new Set(NAVIGATION.map(x => x.to)).size, 20);
+  // 03/10/2026 (filing fase E): Filing sta nel gruppo Ricerca ma prende F20; gli altri tasti non cambiano.
+  const senzaFiling = NAVIGATION.filter(x => x.id !== 'filing');
+  assert.deepEqual(Array.from(senzaFiling, x => x.key), Array.from({length:19}, (_,i) => 'F'+(i+1)));
+  assert.equal(NAVIGATION.find(x => x.id === 'filing').key, 'F20');
+  assert.equal(pageKey('/filing'), 'F20');
+  assert.equal(NAVIGATION.findIndex(x=>x.id==='filing'), NAVIGATION.findIndex(x=>x.id==='fundamentals')+1);
+  assert.equal(NAVIGATION.find(x => x.id === 'filing').group, 'Ricerca');
+  assert.equal(new Set(NAVIGATION.map(x => x.key)).size, 20);
   assert.equal(NAVIGATION.at(-1).id, 'settings');
+  assert.equal(NAVIGATION.at(-1).key, 'F19');
   assert.equal(pageKey('/agent-progress'), 'F13');
   assert.equal(NAVIGATION.findIndex(x=>x.id==='progress'), NAVIGATION.findIndex(x=>x.id==='agents')+1);
 });

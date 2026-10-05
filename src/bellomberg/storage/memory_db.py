@@ -83,6 +83,10 @@ RESEARCH_NOTES_DIR = str(_RESEARCH_NOTES_DIR)
 # CHIUSURA dopo il taglio — il troncamento si travestiva da citazione completa, e
 # il Capo nella run non ha tool per recuperare la coda.
 MAX_CHAR_FEEDBACK_PM = 2000   # stessa policy di current_facts.MAX_CHAR_TESI: sono le stesse parole
+# 04/10 (G6, REV2 N1/N2): marcatore della chiusura fatta dal GATE DI PUBBLICAZIONE (non dal PM)
+# quando il memo pubblicato dichiara non operativa una proposta che il registro aveva OPERATIVE.
+MARCA_CHIUSA_DAL_GATE = "[NON OPERATIVA NEL MEMO PUBBLICATO:"
+_STATI_ESITO = ("OPERATIVE", "BLOCKED", "OVERRIDE_PENDING", "CHECK_UNAVAILABLE")
 MAX_RIGHE_FEEDBACK_PM = 60    # tetto sulle RIGHE, non sul testo. Oggi ne esistono 28.
 # Audit 11/09 (Fable 5.1): una run RIPETUTA (10/09 22:45, memo #54, sette ore dopo la run
 # 15:30 del memo #53) si archivia in modo reversibile marcando `memos.notes` e
@@ -121,6 +125,22 @@ def _fingerprint_mandato_corrente():
         return mandato_pm.impronta(mandato_pm.carica())
     except mandato_pm.MandatoMancante:
         return None
+
+
+def _isin_checksum_valid(isin):
+    """Validate the ISO 6166 ISIN check digit with the Luhn algorithm."""
+    if not isinstance(isin, str) or not re.fullmatch(r"[A-Z]{2}[A-Z0-9]{10}", isin):
+        return False
+    expanded = "".join(str(ord(char) - 55) if char.isalpha() else char for char in isin)
+    total = 0
+    for index, digit in enumerate(reversed(expanded)):
+        value = int(digit)
+        if index % 2 == 1:
+            value *= 2
+            if value > 9:
+                value -= 9
+        total += value
+    return total % 10 == 0
 
 
 def _etichetta_mandato_storico(testo_memo, fingerprint_corrente):
@@ -265,6 +285,21 @@ CREATE TABLE IF NOT EXISTS position_prices (
 );
 CREATE INDEX IF NOT EXISTS idx_prices_ticker_time ON position_prices(ticker, timestamp);
 
+-- 17/09 (allineamento TR): chiusure ufficiali della sede retail. 04/10
+-- (review P1-C/P2-D): ogni riga porta la DATA DI SESSIONE dichiarata dalla
+-- sede (`data_sessione`); `timestamp` e' solo l'ora dell'INSERT. Una chiusura
+-- non datata non si salva e non e' mai baseline. Tabella ADDITIVA: vuota =
+-- baseline snapshot invariata.
+CREATE TABLE IF NOT EXISTS venue_closes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    prezzo REAL NOT NULL,
+    source TEXT,
+    timestamp TEXT DEFAULT (datetime('now')),
+    data_sessione TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_venue_ticker_time ON venue_closes(ticker, timestamp);
+
 CREATE TABLE IF NOT EXISTS memos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,
@@ -390,7 +425,8 @@ CREATE TABLE IF NOT EXISTS news_feed (
     relevance INTEGER,
     notified INTEGER DEFAULT 0,
     headline_it TEXT,
-    why_matters TEXT
+    why_matters TEXT,
+    classified INTEGER  -- G3 04/10: 1 classificata, 0 NON classificata (sentiment/relevance NULL), NULL = riga precedente
 );
 
 CREATE INDEX IF NOT EXISTS idx_news_pulled ON news_feed(pulled_at DESC);
@@ -698,6 +734,58 @@ OUTPUT_LANGUAGE_MIGRATION = (
     [f"ALTER TABLE {table} ADD COLUMN output_language TEXT CHECK(output_language IN ('it','en'))"
      for table in ("memos", "specialist_reports", "llm_usage", "chat_sessions", "chat_messages")])
 MIGRATIONS.append(OUTPUT_LANGUAGE_MIGRATION)
+
+DECISION_PROPOSAL_AUDIT_MIGRATION = (
+    13, "proposal assessment, decision event journal, and manually verified instrument identity",
+    [
+        "ALTER TABLE decisions ADD COLUMN proposal_row_index INTEGER",
+        "ALTER TABLE decisions ADD COLUMN proposal_action TEXT",
+        "ALTER TABLE decisions ADD COLUMN proposal_ticker TEXT",
+        "ALTER TABLE decisions ADD COLUMN proposal_ticker_cell TEXT",
+        "ALTER TABLE decisions ADD COLUMN assessment_status TEXT CHECK(assessment_status IN ('OPERATIVE','BLOCKED','OVERRIDE_PENDING','CHECK_UNAVAILABLE'))",
+        "ALTER TABLE decisions ADD COLUMN assessment_reason TEXT",
+        "ALTER TABLE decisions ADD COLUMN assessment_override_rationale TEXT",
+        """CREATE TABLE IF NOT EXISTS decision_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            decision_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            from_status TEXT,
+            to_status TEXT,
+            actor TEXT NOT NULL DEFAULT 'system',
+            reason TEXT,
+            details_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(decision_id) REFERENCES decisions(id)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_decision_events_decision ON decision_events(decision_id, id)",
+        """CREATE TRIGGER IF NOT EXISTS decision_events_no_update
+            BEFORE UPDATE ON decision_events
+            BEGIN SELECT RAISE(ABORT, 'decision_events is append-only'); END""",
+        """CREATE TRIGGER IF NOT EXISTS decision_events_no_delete
+            BEFORE DELETE ON decision_events
+            BEGIN SELECT RAISE(ABORT, 'decision_events is append-only'); END""",
+        """CREATE TABLE IF NOT EXISTS instrument_identity_verifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposed_ticker TEXT NOT NULL,
+            execution_ticker TEXT NOT NULL,
+            isin TEXT NOT NULL,
+            source TEXT NOT NULL,
+            verified_at TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            verified_by TEXT NOT NULL DEFAULT 'PM',
+            created_at TEXT NOT NULL,
+            CHECK(proposed_ticker <> execution_ticker)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_instrument_identity_pair ON instrument_identity_verifications(proposed_ticker, execution_ticker, id)",
+        "CREATE INDEX IF NOT EXISTS idx_instrument_identity_isin ON instrument_identity_verifications(isin, id)",
+        """CREATE TRIGGER IF NOT EXISTS instrument_identity_verifications_no_update
+            BEFORE UPDATE ON instrument_identity_verifications
+            BEGIN SELECT RAISE(ABORT, 'instrument identity verifications are append-only'); END""",
+        """CREATE TRIGGER IF NOT EXISTS instrument_identity_verifications_no_delete
+            BEFORE DELETE ON instrument_identity_verifications
+            BEGIN SELECT RAISE(ABORT, 'instrument identity verifications are append-only'); END""",
+    ])
+MIGRATIONS.append(DECISION_PROPOSAL_AUDIT_MIGRATION)
 
 
 class DataTradeNonValida(ValueError):
@@ -1015,6 +1103,10 @@ class MemoryDB:
                 if cols and col not in cols:
                     conn.execute(f"ALTER TABLE news_feed ADD COLUMN {col} TEXT")
                     print(f"[memory_db] added news_feed.{col} (riallineamento F-04)")
+            # G3 (04/10/2026): marcatura esplicita delle notizie NON classificate (additiva).
+            if cols and "classified" not in cols:
+                conn.execute("ALTER TABLE news_feed ADD COLUMN classified INTEGER")
+                print("[memory_db] added news_feed.classified (G3)")
         except Exception as e:
             print(f"[memory_db] news_i18n migration failed: {e}")
 
@@ -1536,7 +1628,7 @@ class MemoryDB:
                 self._apply_position_replay(conn, ticker, trade_id, baseline_plan)
             return trade_id
 
-    def trade_context(self, ticker, linked_decision_id=None, _conn=None):
+    def trade_context(self, ticker, linked_decision_id=None, _conn=None, pending_identity=None):
         """Read the rows that a trade may change; no price/provider calls or writes."""
         from contextlib import nullcontext
         from hashlib import sha256
@@ -1573,10 +1665,28 @@ class MemoryDB:
                         'provenienza Trade Idea mancante per la decisione collegata',
                         'Trade Idea provenance missing for linked decision'))
             opening = conn.execute("SELECT * FROM position_openings WHERE ticker=?", (ticker,)).fetchone()
+            identity = None
+            if decision and str(decision["ticker"] or "").strip().upper() != str(ticker or "").strip().upper():
+                identity_row = conn.execute(
+                    "SELECT proposed_ticker,execution_ticker,isin,source,verified_at,reason,verified_by "
+                    "FROM instrument_identity_verifications WHERE "
+                    "(UPPER(proposed_ticker)=UPPER(?) AND UPPER(execution_ticker)=UPPER(?)) OR "
+                    "(UPPER(proposed_ticker)=UPPER(?) AND UPPER(execution_ticker)=UPPER(?)) "
+                    "ORDER BY id DESC LIMIT 1",
+                    (decision["ticker"], ticker, ticker, decision["ticker"])).fetchone()
+                identity = dict(identity_row) if identity_row else None
+                # A verification the PM is confirming with this trade is not in the
+                # table yet (preview) and will be its newest row (confirmation):
+                # both phases see it, so the fingerprint is the same.
+                pair = {str(decision["ticker"] or "").strip().upper(), str(ticker or "").strip().upper()}
+                if pending_identity and {pending_identity["proposed_ticker"],
+                                         pending_identity["execution_ticker"]} == pair:
+                    identity = dict(pending_identity)
             context = {"position": dict(row) if row else None, "cash": dict(cash) if cash else None,
                         "opening": dict(opening) if opening else None,
                         "decision": dict(decision) if decision else None,
                         "trade_idea": trade_idea,
+                        "instrument_identity": identity,
                         "trades": [dict(r) for r in conn.execute(
                            "SELECT * FROM trade_history WHERE ticker=? ORDER BY data,id", (ticker,))]}
         context["fingerprint"] = sha256(json.dumps(context, sort_keys=True, allow_nan=False,
@@ -1597,8 +1707,10 @@ class MemoryDB:
         decision = context["decision"]
         if not decision:
             raise ValueError(_storage_text(f'decisione {did} inesistente', f'Decision {did} does not exist'))
-        if str(decision["ticker"]).strip().upper() != trade["ticker"]:
-            raise ValueError(_storage_text(f"decisione {did} riguarda {decision['ticker']}, non {trade['ticker']}", f"Decision {did} concerns {decision['ticker']}, not {trade['ticker']}"))
+        exact_ticker = str(decision["ticker"]).strip().upper() == trade["ticker"]
+        identity = context.get("instrument_identity") if not exact_ticker else None
+        if not exact_ticker and not identity:
+            raise ValueError(_storage_text(f"decisione {did} riguarda {decision['ticker']}, non {trade['ticker']}; manca una verifica ISIN registrata", f"Decision {did} concerns {decision['ticker']}, not {trade['ticker']}; no registered ISIN verification"))
         trade_idea = context.get("trade_idea")
         if trade_idea is not None:
             if (trade_idea["destination_decision_id"] != did
@@ -1619,8 +1731,12 @@ class MemoryDB:
         verso = cls._VERSO.get(trade["action"])
         if verso is None or verso != cls._VERSO.get(decision["action"]):
             raise ValueError(_storage_text(f'decisione {did}: verso incompatibile con il trade', f'Decision {did}: direction incompatible with the trade'))
-        if decision["status"] not in ("PENDING", "PARTIAL", "EXECUTED") or decision.get("veto"):
-            raise ValueError(_storage_text(f"decisione {did}: stato {decision['status']} o veto incompatibile", f"Decision {did}: status {decision['status']} or veto incompatible"))
+        assessment_status = cls._effective_assessment_status(decision)
+        if (decision["status"] not in ("PENDING", "PARTIAL", "EXECUTED") or decision.get("veto")
+                or assessment_status not in (None, "OPERATIVE")):
+            raise ValueError(_storage_text(
+                f"decisione {did}: stato {decision['status']} o assessment {assessment_status or 'non operativo'} incompatibile",
+                f"Decision {did}: status {decision['status']} or assessment {assessment_status or 'not operative'} incompatible"))
         try:
             t_dec = datetime.fromisoformat(decision["timestamp"])
             t_trade = datetime.fromisoformat(trade["data"])
@@ -1632,6 +1748,8 @@ class MemoryDB:
         if before:
             raise ValueError(_storage_text(f'trade precedente alla decisione {did}: legame rifiutato', f'Trade predates decision {did}: link refused'))
         return {"id": did, "status": decision["status"],
+                "ticker_proposto": decision["ticker"], "ticker_eseguito": trade["ticker"],
+                "identita_verificata": identity,
                 "nota": (_storage_text('Decisione PENDING: il trade non cambia lo stato scelto dal PM.', 'PENDING decision: the trade does not change the status chosen by the PM.')
                          if decision["status"] == "PENDING" else None)}
 
@@ -1739,11 +1857,18 @@ class MemoryDB:
                 "baseline": opening,
                 "updates": updates}
 
-    def execute_trade(self, *, cash_delta_cents, expected_context=None, realized_fx=None, **trade):
+    def execute_trade(self, *, cash_delta_cents, expected_context=None, realized_fx=None,
+                      instrument_identity=None, manual_divergence=None, **trade):
         """Registra trade, posizione e saldo cassa nella stessa transazione.
 
         `log_trade` resta il percorso esplicito per importazioni storiche e
         fixture: registra lo storico senza modificare il saldo corrente.
+
+        `instrument_identity` (dict di `_normalized_identity`) e `manual_divergence`
+        ({decision_id, reason}) arrivano dall'anteprima confermata dal PM e si
+        scrivono QUI, nella stessa transazione: le due tabelle sono append-only,
+        quindi una verifica scritta prima della conferma non si toglierebbe piu'.
+        Un errore in qualunque punto annulla trade, verifica ed evento insieme.
         """
         if isinstance(cash_delta_cents, bool) or not isinstance(cash_delta_cents, int):
             raise ValueError(_storage_text('cash_delta_cents deve essere un intero', 'cash_delta_cents must be an integer'))
@@ -1758,12 +1883,42 @@ class MemoryDB:
             trade["valuta"] = trade.get("valuta", "EUR").strip().upper()
             trade["data"], conventional = normalizza_data_trade(trade.get("data"))
             trade.setdefault("ora_convenzionale", conventional)
-            context = self.trade_context(trade["ticker"], trade.get("linked_decision_id"), _conn=conn)
+            context = self.trade_context(trade["ticker"], trade.get("linked_decision_id"), _conn=conn,
+                                         pending_identity=instrument_identity)
             if expected_context is not None and context["fingerprint"] != expected_context:
                 raise RicalcoloImpossibile(_storage_text('anteprima cambiata: cassa, posizione, trade o decisione modificati; ripeti la conferma', 'Preview changed: cash, position, trade or decision changed; preview and confirm again'))
             decision = self._validate_trade_decision(trade, context)
             plan = self._trade_replay_plan(trade, context, realized_fx)
+            identity_row = None
+            if instrument_identity is not None:
+                identity_row = self.verify_instrument_identity(
+                    instrument_identity["proposed_ticker"], instrument_identity["execution_ticker"],
+                    instrument_identity["isin"], instrument_identity["source"],
+                    instrument_identity["verified_at"], instrument_identity["reason"],
+                    instrument_identity.get("verified_by") or "PM", _conn=conn)
             trade_id = self.log_trade(_conn=conn, **trade)
+            if decision:
+                identity = decision.get("identita_verificata")
+                details = {
+                    "trade_id": trade_id,
+                    "ticker_proposto": decision.get("ticker_proposto"),
+                    "ticker_eseguito": trade["ticker"],
+                    "isin": identity.get("isin") if identity else None,
+                    "identity_source": identity.get("source") if identity else None,
+                    "identity_verified_at": identity.get("verified_at") if identity else None,
+                    "identity_reason": identity.get("reason") if identity else None,
+                }
+                conn.execute(
+                    "INSERT INTO decision_events (decision_id,event_type,actor,reason,details_json,created_at) "
+                    "VALUES (?,'TRADE_LINKED','PM',?,?,?)",
+                    (decision["id"], identity.get("reason") if identity else None,
+                     json.dumps(details, ensure_ascii=False, sort_keys=True),
+                     datetime.now().isoformat(timespec="seconds")))
+            divergence_event = None
+            if manual_divergence is not None:
+                divergence_event = self.record_manual_trade_divergence(
+                    manual_divergence["decision_id"], trade_id, manual_divergence["reason"],
+                    actor="PM", _conn=conn)
             if plan:
                 self._apply_position_replay(conn, trade["ticker"], trade_id, plan)
                 plan.pop("updates")
@@ -1776,7 +1931,8 @@ class MemoryDB:
             if n != 1:
                 raise RuntimeError(_storage_text('saldo cassa cambiato durante il trade: rollback', 'Cash balance changed during the trade: rolled back'))
             return {"trade_id": trade_id, "cash_eur": new_cents / 100.0,
-                    "ricalcolo": plan, "decisione": decision}
+                    "ricalcolo": plan, "decisione": decision,
+                    "instrument_identity": identity_row, "manual_divergence": divergence_event}
 
     # Soglia di conferma sui movimenti cassa (delega PM 13/08 "come meglio
     # credi", finding 5 review): sopra questo importo serve conferma=True.
@@ -1788,6 +1944,26 @@ class MemoryDB:
     # significa che qualcosa si e' rotto, non che la borsa e' chiusa. POLICY,
     # non fisica: un numero solo, qui.
     PRICE_STALE_AFTER_MIN = 120
+
+    # Sede retail dei prezzi live (price_updater.VENUE_SOURCE) e sua chiusura
+    # serale in ora di Berlino: dopo, la quotazione resta ferma fino al mattino.
+    VENUE_SOURCE = "tradegate"
+    VENUE_CLOSE_HOUR_BERLIN = 22
+
+    @classmethod
+    def _a_sede_chiusa(cls, ts_utc):
+        """True se lo snapshot (UTC naive, come position_prices) e' stato preso
+        dopo la chiusura serale della sede nel suo giorno di borsa. Illeggibile
+        = False: si resta sul `close` di sede."""
+        try:
+            from datetime import timezone as _tz
+            from zoneinfo import ZoneInfo
+            utc = datetime.fromisoformat(str(ts_utc)[:19]).replace(tzinfo=_tz.utc)
+            berlino = utc.astimezone(ZoneInfo("Europe/Berlin"))
+        except Exception:
+            return False
+        return (berlino.hour >= cls.VENUE_CLOSE_HOUR_BERLIN
+                or berlino.date() > utc.date())
 
     def log_cash_movement(self, tipo, importo_eur, data=None, nota=None,
                           cassa_disponibile=None, conferma=False,
@@ -2008,6 +2184,80 @@ class MemoryDB:
                 prev_close = prev_row["prezzo"] if prev_row else None
                 prev_close_ts = prev_row["timestamp"] if prev_row else None
                 prev_close_source = "position_prices" if prev_row else None
+                # Baseline DI SEDE (17/09, allineamento TR): la chiusura
+                # ufficiale della sede retail ha lo stesso orologio dell'app TR.
+                # 04/10 (review P1-C/P2-D/P2-E): vale SOLO se la sede l'ha
+                # DATATA (`data_sessione`) e la sessione e' quella giusta:
+                # anteriore all'ultimo giorno con prezzi e non piu' vecchia
+                # dello snapshot del giorno prima. Una chiusura vecchia di giorni
+                # non batte piu' lo snapshot di ieri, e `prev_close_ts` e' la
+                # data della SESSIONE, non l'ora dell'INSERT. Ogni scarto e'
+                # dichiarato in `prev_close_nota`; tabella assente = baseline
+                # snapshot invariata (lettura mai rotta).
+                prev_close_nota = None
+                _giorno_prev = str(prev_row["timestamp"])[:10] if prev_row else None
+                _giorno_live = (str(last_price_row["timestamp"] or "")[:10]
+                                if last_price_row is not None else "")
+                _sessione_sede = None
+                try:
+                    venue_row = conn.execute(
+                        "SELECT prezzo, data_sessione, source FROM venue_closes "
+                        "WHERE ticker=? AND data_sessione IS NOT NULL "
+                        "AND data_sessione < ? "
+                        "ORDER BY data_sessione DESC, timestamp DESC LIMIT 1",
+                        (r["ticker"], _giorno_live)).fetchone()
+                except sqlite3.OperationalError as _vc_e:
+                    venue_row = None
+                    if "no such table" not in str(_vc_e):
+                        prev_close_nota = _message(
+                            'chiusure di sede illeggibili ({v0}): baseline = snapshot',
+                            'venue closes unreadable ({v0}): baseline = snapshot', v0=_vc_e)
+                if venue_row is not None:
+                    _sessione_sede = str(venue_row["data_sessione"])[:10]
+                    if _giorno_prev is not None and _sessione_sede < _giorno_prev:
+                        prev_close_nota = _message(
+                            "chiusura di sede del {v0} piu' vecchia dello snapshot del {v1}: baseline = snapshot",
+                            'venue close of {v0} older than the {v1} snapshot: baseline = snapshot',
+                            v0=_sessione_sede, v1=_giorno_prev)
+                        _sessione_sede = None
+                    else:
+                        prev_close = venue_row["prezzo"]
+                        prev_close_ts = _sessione_sede
+                        prev_close_source = venue_row["source"] or self.VENUE_SOURCE
+                # 02/10 (confronto col broker: P&L GG nostro sotto il suo): il
+                # `close` di sede e' l'ultimo SCAMBIO eseguito, che sui titoli
+                # poco liquidi puo' avere ore (un titolo sottile: 10,70 delle
+                # 17:00 contro 10,60 quotato a chiusura). Il broker
+                # usa la QUOTAZIONE di sede a chiusura (22:00 Berlino), la stessa
+                # natura del nostro live (last o medio bid/ask). Quindi: se c'e'
+                # uno snapshot di sede del giorno precedente preso a sede chiusa,
+                # vince lui; altrimenti (updater spento la sera) resta il `close`.
+                # 04/10 (review P1-C): solo se e' della STESSA sessione dello
+                # snapshot del giorno prima (e non piu' vecchio della chiusura
+                # di sede accettata): uno snapshot serale di una settimana fa
+                # non e' la baseline di oggi.
+                try:
+                    venue_snap = conn.execute(
+                        "SELECT prezzo, timestamp FROM position_prices WHERE ticker=? "
+                        "AND source=? AND date(timestamp) < (SELECT date(MAX(timestamp)) "
+                        "FROM position_prices WHERE ticker=?) "
+                        "ORDER BY timestamp DESC LIMIT 1",
+                        (r["ticker"], self.VENUE_SOURCE, r["ticker"])).fetchone()
+                except Exception:
+                    venue_snap = None
+                if venue_snap is not None and self._a_sede_chiusa(venue_snap["timestamp"]):
+                    _giorno_snap = str(venue_snap["timestamp"])[:10]
+                    if _giorno_snap != _giorno_prev or (
+                            _sessione_sede is not None and _giorno_snap < _sessione_sede):
+                        if prev_close_nota is None:
+                            prev_close_nota = _message(
+                                'snapshot di sede a chiusura del {v0} non della sessione precedente ({v1}): non usato',
+                                'venue snapshot at close of {v0} not from the previous session ({v1}): not used',
+                                v0=_giorno_snap, v1=_sessione_sede or _giorno_prev)
+                    else:
+                        prev_close = venue_snap["prezzo"]
+                        prev_close_ts = venue_snap["timestamp"]
+                        prev_close_source = self.VENUE_SOURCE
                 # 28/08 (decisione PM 27/08 sera, «P&L GG dal carico»): una posizione
                 # APERTA il giorno dell'ultimo prezzo non ha una chiusura precedente
                 # (l'updater fotografa solo le posizioni in book): il suo daily e' il
@@ -2028,6 +2278,7 @@ class MemoryDB:
                         prev_close = float(r["prezzo_medio"])
                         prev_close_ts = r["data_apertura"]
                         prev_close_source = "carico"
+                        prev_close_nota = None
                 val_mercato = (r["quantita"] or 0) * (last_price or r["prezzo_medio"] or 0)
                 pl_eur = ((last_price - r["prezzo_medio"]) * r["quantita"]) if (last_price is not None and r["prezzo_medio"] is not None) else None
                 pl_pct = ((last_price - r["prezzo_medio"]) / r["prezzo_medio"] * 100) if (last_price and r["prezzo_medio"]) else None
@@ -2047,6 +2298,8 @@ class MemoryDB:
                     "prev_close_ts": prev_close_ts,
                     # 28/08: da dove viene prev_close — "position_prices" | "carico" | None
                     "prev_close_source": prev_close_source,
+                    # 04/10: perche' una baseline di sede e' stata scartata (None = nulla da dire)
+                    "prev_close_nota": prev_close_nota,
                     # F-CONT-4 (riallineamento 23/07, regola no-fallback 14/07): senza
                     # snapshot prezzo la posizione vale il COSTO (P&L n.d.) — prima
                     # accadeva IN SILENZIO, ora e' un flag che UI/agenti possono dire.
@@ -2311,6 +2564,32 @@ class MemoryDB:
             conn.execute("INSERT INTO position_prices (ticker, prezzo, valuta, source) VALUES (?,?,?,?)",
                           (ticker, prezzo, valuta, source))
 
+    def save_venue_close(self, ticker, prezzo, source="tradegate", *, data_sessione):
+        """Chiusura ufficiale della sede retail (17/09, baseline P&L GG con
+        l'orologio di TR). 04/10: `data_sessione` (YYYY-MM-DD, la sessione che
+        la sede dichiara per quella chiusura) e' OBBLIGATORIA: una chiusura non
+        datata si rifiuta (ValueError), non si indovina. Un nuovo giro sulla
+        stessa sessione con lo stesso prezzo non aggiunge righe (review P3-H).
+        Scrittura additiva: non tocca snapshot ne' posizioni."""
+        giorno = str(data_sessione or "").strip()[:10]
+        try:
+            datetime.strptime(giorno, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError("chiusura di sede non datata o data illeggibile (%r): non salvata"
+                             % (data_sessione,))
+        with self._conn() as conn:
+            colonne = {c[1] for c in conn.execute("PRAGMA table_info(venue_closes)")}
+            if "data_sessione" not in colonne:
+                # tabella nata prima del 04/10 (righe senza sessione: mai baseline)
+                conn.execute("ALTER TABLE venue_closes ADD COLUMN data_sessione TEXT")
+            gia = conn.execute(
+                "SELECT 1 FROM venue_closes WHERE ticker=? AND data_sessione=? AND prezzo=? "
+                "AND COALESCE(source,'')=COALESCE(?,'') LIMIT 1",
+                (ticker, giorno, prezzo, source)).fetchone()
+            if gia is None:
+                conn.execute("INSERT INTO venue_closes (ticker, prezzo, source, data_sessione) "
+                             "VALUES (?,?,?,?)", (ticker, prezzo, source, giorno))
+
     # ========================================================
     # IMPORT FROM EXCEL (one-shot migration)
     # ========================================================
@@ -2508,6 +2787,41 @@ class MemoryDB:
                                 "ORDER BY id DESC LIMIT ?", (n,)).fetchall()
             return [dict(r) for r in rows]
 
+    def get_archive_memos(self, limit=20, offset=0, include_trade_ideas=True):
+        """Memo per l'ARCHIVIO (decisione PM 04/10): Consigliere + Trade Idea insieme,
+        ciascuno etichettato. NON sostituisce get_recent_memos, che resta il solo
+        canale del memo precedente per il Capo (lì i Trade Idea restano esclusi).
+
+        Campi aggiunti a ogni riga: kind ('consigliere'|'trade_idea'), label
+        ('Consigliere'|'Trade Idea'), trade_idea_run_id (UUID dalle notes
+        'trade_idea:{run_id}', None per il Consigliere) e trade_idea_provenance_error
+        (None se valido; una frase se le notes TI sono malformate: dichiarato, non nascosto).
+        """
+        import uuid
+        prefix = "trade_idea:"
+        where = "" if include_trade_ideas else \
+            "WHERE substr(COALESCE(notes,''),1,11) <> 'trade_idea:' "
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM memos " + where + "ORDER BY id DESC LIMIT ? OFFSET ?",
+                                (int(limit), int(offset))).fetchall()
+        out = []
+        for r in rows:
+            m = dict(r)
+            notes = str(m.get("notes") or "")
+            m["trade_idea_run_id"] = None
+            m["trade_idea_provenance_error"] = None
+            if notes.startswith(prefix):
+                m["kind"], m["label"] = "trade_idea", "Trade Idea"
+                raw = notes[len(prefix):]
+                try:
+                    m["trade_idea_run_id"] = str(uuid.UUID(raw))
+                except ValueError:
+                    m["trade_idea_provenance_error"] = "run_id Trade Idea non valido nelle notes del memo"
+            else:
+                m["kind"], m["label"] = "consigliere", "Consigliere"
+            out.append(m)
+        return out
+
     def save_specialist_report(self, memo_id, specialist, round_n, content, output_language=None):
         from bellomberg.core.language import capture_language
         selected = capture_language(output_language)
@@ -2575,8 +2889,8 @@ class MemoryDB:
     # DECISIONS (extracted from Capo memo ACTION TABLE)
     # ========================================================
 
-    def extract_and_save_decisions(self, memo_id, memo_markdown, usage_out=None, *,
-                                   _prepare_only=False, _strict=False):
+    def extract_and_save_decisions(self, memo_id, memo_markdown, usage_out=None,
+                                   raw_rows=None, *, _prepare_only=False, _strict=False):
         """Parse ACTION TABLE dal memo del Capo. Estrae righe e salva in decisions.
         #200c (15/07): prima via = estrazione STRUTTURATA (Sonnet, tool forzato,
         celle verbatim); la regex storica resta come FALLBACK DICHIARATO. L'EUR
@@ -2587,64 +2901,85 @@ class MemoryDB:
         (il chiamante la registra su blackboard.record_usage). Firma retro-compatibile:
         regenerate_memo.py e gli altri chiamanti restano invariati."""
         ts = datetime.now().isoformat(timespec="seconds")
-        rows = []
-        structured_ok = False
-        try:
-            from bellomberg.agents.action_table_extract import extract_rows_structured
-            sr = extract_rows_structured(memo_markdown, usage_out=usage_out)
-            if sr.get("error"):
-                print("[MemoryDB] #200c estrazione strutturata KO ("
-                      + str(sr["error"])[:150] + "): fallback parser regex")
-            else:
-                rows = [(r["action"], r["ticker"], _parse_eur_amount(r["size_raw"]),
-                         r["timing"], r["confidence"]) for r in sr["rows"]]
-                structured_ok = True
-                print("[MemoryDB] #200c ACTION TABLE strutturata: "
-                      + str(len(rows)) + " righe (tool forzato)")
-                # Fable 5 16/07 (residuo del bug run #45): 0 righe SENZA errore con il
-                # marker '## ACTION TABLE' PRESENTE nel memo = risposta sospetta di
-                # Sonnet, non prova di assenza -> si attiva il fallback regex invece
-                # di salvare una pagina decisioni vuota in silenzio.
-                if not rows and re.search(r"##\s*ACTION TABLE", memo_markdown or "",
-                                          re.IGNORECASE):
-                    structured_ok = False
-                    print("[MemoryDB] #200c CROSS-CHECK: 0 righe ma il marker ACTION "
-                          "TABLE esiste nel memo -> fallback parser regex (dichiarato)")
-        except Exception as e:
-            print("[MemoryDB] #200c estrazione strutturata exception ("
-                  + str(e)[:120] + "): fallback parser regex")
+        from bellomberg.agents.action_table_extract import parse_action_table_rows
+        source = parse_action_table_rows(memo_markdown)
+        # 04/10 (G6): il parser e' quello UNICO del gate. Una riga senza azione o ticker
+        # leggibili non diventa una decisione: il gate la pubblica CHECK_UNAVAILABLE.
+        source_rows = [r for r in source["rows"] if r.get("action") and r.get("ticker")]
+        if len(source_rows) != len(source["rows"]):
+            print("[MemoryDB] ACTION TABLE: " + str(len(source["rows"]) - len(source_rows))
+                  + " righe senza azione/ticker leggibili non salvate come decisioni")
+        structured_unavailable = False
+        if raw_rows is not None:
+            candidate_rows = list(raw_rows)
+        else:
+            # Keep the structured extractor for diagnostics and existing usage
+            # accounting, but reconcile its output against local source cells.
+            # A model-selected alias must never replace the symbol in the memo.
+            try:
+                from bellomberg.agents.action_table_extract import extract_rows_structured
+                structured = extract_rows_structured(memo_markdown, usage_out=usage_out)
+                model_rows = structured.get("rows", []) if isinstance(structured, dict) else []
+                model_tickers = [str(r.get("ticker") or "").strip() for r in model_rows
+                                 if isinstance(r, dict)]
+                source_tickers = [str(r.get("ticker") or "").strip() for r in source_rows]
+                if source["table_found"] and source_rows and model_tickers != source_tickers:
+                    print("[MemoryDB] ACTION TABLE ticker cross-check mismatch; "
+                          "uso le celle ticker originali del memo")
+                elif not source["table_found"] and structured.get("error"):
+                    structured_unavailable = True
+                    print("[MemoryDB] #200c estrazione non disponibile ("
+                          + str(structured["error"])[:150] + ")")
+            except Exception as e:
+                structured_unavailable = True
+                print("[MemoryDB] estrazione strutturata indisponibile ("
+                      + str(e)[:120] + "); parser locale dichiarato")
+            candidate_rows = source_rows
 
-        if not structured_ok:
-            # --- FALLBACK: parser regex storico (invariato) ---
-            action_table_match = re.search(
-                r"##\s*ACTION TABLE.*?\n(\|.*?\|.*?\n)+",
-                memo_markdown, re.IGNORECASE | re.DOTALL)
-            if not action_table_match:
-                if _strict and not structured_ok:
-                    raise ValueError("Estrazione decisioni non verificata: proposte precedenti conservate")
-                return []
-            table_text = action_table_match.group(0)
-            for line in table_text.split("\n"):
-                if not line.startswith("|"): continue
-                cells = [c.strip() for c in line.strip().strip("|").split("|")]
-                # Skip header e separator
-                from bellomberg.core.language import ACTION_TABLE_HEADERS
-                if not cells or "---" in cells[0] or cells[0].lower() in ACTION_TABLE_HEADERS:
-                    continue
-                if len(cells) < 5:
-                    continue
-                action = cells[0]
-                ticker = cells[1]
-                eur_str = cells[2]
-                timing = cells[3]
-                confidence = cells[4]
-                # Parse EUR amount (robusto: gestisce k/mila/mln, formato europeo, range)
-                eur = _parse_eur_amount(eur_str)
-                rows.append((action, ticker, eur, timing, confidence))
-        if not rows:
-            if _strict and not structured_ok:
-                raise ValueError("ACTION TABLE presente ma nessuna decisione verificata")
+        if source.get("error") and raw_rows is None:
+            # 04/10 (REV R2): col gate (raw_rows esplicite) un'intestazione illeggibile vale
+            # ZERO decisioni e l'errore lo dichiara la pubblicazione; qui solleva solo per
+            # chi chiama senza gate.
+            raise ValueError(str(source["error"]))
+        if not candidate_rows:
+            if source["table_found"] and source["rows"]:
+                raise ValueError("ACTION TABLE presente ma parser locale senza righe verificabili")
+            if _strict and structured_unavailable:
+                raise ValueError("Estrazione decisioni non verificata: proposte precedenti conservate")
             return []
+        if source["table_found"]:
+            by_index = {int(r["row_index"]): r for r in source_rows}
+            submitted_indices = []
+            for position, candidate in enumerate(candidate_rows):
+                if not isinstance(candidate, dict):
+                    raise ValueError("raw_rows deve contenere righe strutturate")
+                index = candidate.get("row_index", position)
+                if isinstance(index, bool) or not isinstance(index, int):
+                    raise ValueError("raw_rows row_index deve essere un intero 0-based")
+                submitted_indices.append(index)
+                source_row = by_index.get(index)
+                if (source_row is None
+                        or str(candidate.get("ticker") or "").strip() != source_row["ticker"]
+                        or str(candidate.get("ticker_cell") or source_row["ticker_cell"]).strip()
+                           != source_row["ticker_cell"]):
+                    raise ValueError(f"ticker/row_index non coincide con la cella memo (riga {index})")
+            if (len(submitted_indices) != len(set(submitted_indices))
+                    or set(submitted_indices) != set(by_index)):
+                raise ValueError("raw_rows incompleto o con row_index duplicati rispetto al memo")
+        elif raw_rows is not None:
+            raise ValueError("raw_rows fornito ma memo senza ACTION TABLE locale verificabile")
+        rows = [
+            (str(r.get("action") or "").strip().upper(),
+             str(r.get("ticker") or "").strip(),
+             _parse_eur_amount(r.get("size_raw", "")),
+             str(r.get("timing") or "").strip(),
+             str(r.get("confidence") or "").strip(),
+             int(r.get("row_index", pos)),
+             str(r.get("ticker_cell") or r.get("ticker") or "").strip())
+            for pos, r in enumerate(candidate_rows)
+        ]
+        if any(not action or not ticker for action, ticker, *_ in rows):
+            raise ValueError("riga ACTION TABLE senza action/ticker verificabile")
 
         # ---- GUARDIA BOOK-AWARE (#31, deterministica) ----
         # Riconcilia OGNI decisione parsata con il book reale PRIMA del salvataggio:
@@ -2688,7 +3023,8 @@ class MemoryDB:
                     raise RuntimeError("Storico trade non verificabile: decisioni precedenti conservate") from e
                 print("[MemoryDB] book-guard: trade_history non disponibile (" + str(e) + ")")
 
-            for (action, ticker, eur, timing, confidence) in rows:
+            for (action, ticker, eur, timing, confidence, row_index, ticker_cell) in rows:
+                proposal_action = action
                 rationale = None
                 try:
                     tk = (ticker or "").upper()
@@ -2719,13 +3055,18 @@ class MemoryDB:
                     if not isinstance(action, str) or not action.strip() or not isinstance(ticker, str) or not ticker.strip():
                         raise ValueError("Decisione priva di azione o ticker: sostituzione rifiutata")
                     prepared.append({"action": action, "ticker": ticker, "eur_amount": eur,
-                                     "timing": timing, "confidence": confidence, "rationale": rationale})
+                                     "timing": timing, "confidence": confidence, "rationale": rationale,
+                                     "proposal_row_index": row_index, "proposal_action": proposal_action,
+                                     "proposal_ticker": ticker, "proposal_ticker_cell": ticker_cell})
                     continue
                 cur = conn.execute("""INSERT INTO decisions (memo_id, timestamp, action, ticker,
                                                               eur_amount, timing, confidence,
-                                                              rationale, status)
-                                       VALUES (?,?,?,?,?,?,?,?,'PENDING')""",
-                                    (memo_id, ts, action, ticker, eur, timing, confidence, rationale))
+                                                              rationale, status, proposal_row_index,
+                                                              proposal_action, proposal_ticker,
+                                                              proposal_ticker_cell)
+                                       VALUES (?,?,?,?,?,?,?,?,'PENDING',?,?,?,?)""",
+                                    (memo_id, ts, action, ticker, eur, timing, confidence, rationale,
+                                     row_index, proposal_action, ticker, ticker_cell))
                 decision_ids.append(cur.lastrowid)
         return prepared if _prepare_only else decision_ids
 
@@ -2778,9 +3119,13 @@ class MemoryDB:
                     ids.append(matching["id"])
                     continue
                 cur = conn.execute("INSERT INTO decisions (memo_id,timestamp,action,ticker,eur_amount,timing,"
-                                   "confidence,rationale,status) VALUES (?,?,?,?,?,?,?,?,'PENDING')",
+                                   "confidence,rationale,status,proposal_row_index,proposal_action,"
+                                   "proposal_ticker,proposal_ticker_cell) "
+                                   "VALUES (?,?,?,?,?,?,?,?,'PENDING',?,?,?,?)",
                                    (memo_id, ts, row["action"], row["ticker"], row.get("eur_amount"),
-                                    row.get("timing"), row.get("confidence"), row.get("rationale")))
+                                    row.get("timing"), row.get("confidence"), row.get("rationale"),
+                                    row.get("proposal_row_index"), row.get("proposal_action"),
+                                    row.get("proposal_ticker"), row.get("proposal_ticker_cell")))
                 ids.append(cur.lastrowid)
             if update_memo is not None:
                 update_memo(conn)
@@ -3419,7 +3764,375 @@ class MemoryDB:
                                      (status_filter, n)).fetchall()
             else:
                 rows = conn.execute("SELECT * FROM decisions ORDER BY id DESC LIMIT ?", (n,)).fetchall()
-            return [dict(r) for r in rows]
+            return [self._decision_read_model(dict(r)) for r in rows]
+
+    @staticmethod
+    def _effective_assessment_status(decision):
+        notes = str(decision.get("outcome_notes") or "")
+        if MARCA_CHIUSA_DAL_GATE in notes:
+            # REV2 N1: il memo pubblicato l'ha dichiarata non operativa; l'esito registrato
+            # (immutabile) puo' dire OPERATIVE, ma vale lo stato pubblicato: niente EXECUTED
+            # ne' legame di trade, la via d'uscita e' la divergenza manuale.
+            tail = notes.split(MARCA_CHIUSA_DAL_GATE, 1)[1].strip().split(" ", 1)[0].upper()
+            return tail if tail in _STATI_ESITO and tail != "OPERATIVE" else "CHECK_UNAVAILABLE"
+        status = str(decision.get("assessment_status") or "").strip().upper()
+        if status:
+            return status
+        # Historical AUTO-ESCLUSA annotations are evidence already in the record.
+        # Project them at read time; do not rewrite historical status or add backfill.
+        if "AUTO-ESCLUSA" in str(decision.get("outcome_notes") or "").upper():
+            return "BLOCKED"
+        # 04/10 (G6, review 04 G4): a row written by the ACTION TABLE parser carries
+        # proposal_row_index; without an assessment it never went through the gate (or
+        # the assessment write failed after the decision commit): not verifiable, never
+        # operative. Pre-gate history and Trade Idea rows have no row index: unchanged.
+        if decision.get("proposal_row_index") is not None:
+            return "CHECK_UNAVAILABLE"
+        return None
+
+    @classmethod
+    def _decision_read_model(cls, decision):
+        decision["assessment_status"] = cls._effective_assessment_status(decision)
+        decision.setdefault("assessment_reason", None)
+        decision.setdefault("assessment_override_rationale", None)
+        return decision
+
+    def close_decision_by_publication_gate(self, decision_id, published_status, reason):
+        """REV2 N1: chiusura SKIPPED fatta dal gate di pubblicazione, MAI attribuita al PM.
+
+        Solo una PENDING; nota col marcatore (lo stato effettivo diventa quello pubblicato,
+        v. _effective_assessment_status) ed evento PUBLICATION_WITHDRAWN con actor
+        'publication_gate'. Ritorna True se ha chiuso."""
+        now = datetime.now().isoformat(timespec="seconds")
+        status = str(published_status or "CHECK_UNAVAILABLE").upper()
+        note = (MARCA_CHIUSA_DAL_GATE + " " + status + " — " + str(reason or "motivo n.d.")[:200]
+                + " — chiusa dal gate, non dal PM] ")
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT status, outcome_notes FROM decisions WHERE id=?",
+                               (decision_id,)).fetchone()
+            if row is None or row[0] != "PENDING":
+                return False
+            conn.execute("UPDATE decisions SET status='SKIPPED', closed_at=?, outcome_notes=? WHERE id=?",
+                         (now, (row[1] or "") + note, decision_id))
+            conn.execute(
+                "INSERT INTO decision_events (decision_id,event_type,from_status,to_status,actor,reason,details_json,created_at) "
+                "VALUES (?,'PUBLICATION_WITHDRAWN','PENDING','SKIPPED','publication_gate',?,?,?)",
+                (decision_id, note.strip(), json.dumps({"published_status": status}, sort_keys=True), now))
+        return True
+
+    def get_decision_events(self, decision_id):
+        with self._conn() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM decision_events WHERE decision_id=? ORDER BY id", (decision_id,))]
+
+    @staticmethod
+    def _assessment_action_key(action):
+        return str(action or "").strip().upper()
+
+    def record_action_assessments(self, memo_id, assessments):
+        """Persist publication assessments without changing execution lifecycle.
+
+        The row index is the zero-based position among ACTION TABLE data rows.
+        The full batch is checked before any write so a stale/mismatched sidecar
+        cannot leave a partial assessment journal.
+        """
+        if not isinstance(assessments, list):
+            raise ValueError("assessments deve essere una lista")
+        allowed = {"OPERATIVE", "BLOCKED", "OVERRIDE_PENDING", "CHECK_UNAVAILABLE"}
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = [dict(row) for row in conn.execute(
+                "SELECT * FROM decisions WHERE memo_id=? AND proposal_row_index IS NOT NULL "
+                "ORDER BY proposal_row_index,id", (memo_id,))]
+            by_index = {int(row["proposal_row_index"]): row for row in rows}
+            parsed = []
+            seen = set()
+            for assessment in assessments:
+                if not isinstance(assessment, dict):
+                    raise ValueError("assessment deve essere un oggetto")
+                index = assessment.get("row_index")
+                if isinstance(index, bool) or not isinstance(index, int) or index < 0 or index in seen:
+                    raise ValueError("row_index mancante, duplicato o non valido")
+                seen.add(index)
+                row = by_index.get(index)
+                ticker = str(assessment.get("ticker") or "").strip()
+                ticker_symbol = str(row.get("proposal_ticker") or row["ticker"]).strip() if row else ""
+                ticker_cell = str(row.get("proposal_ticker_cell") or ticker_symbol).strip() if row else ""
+                if (not row or (ticker != ticker_cell
+                                and ticker.upper() != ticker_symbol.upper())):
+                    raise ValueError(f"ticker assessment non coincide con la proposta alla riga {index}")
+                action = str(assessment.get("action") or "").strip().upper()
+                source_action = row.get("proposal_action") or row["action"]
+                if self._assessment_action_key(action) != self._assessment_action_key(source_action):
+                    raise ValueError(f"action assessment non coincide con la proposta alla riga {index}")
+                status = assessment.get("status")
+                if status not in allowed:
+                    raise ValueError(f"assessment status non valido alla riga {index}: {status}")
+                parsed.append((row, assessment, status))
+            if seen != set(by_index):
+                missing = sorted(set(by_index) - seen)
+                extra = sorted(seen - set(by_index))
+                raise ValueError(f"batch assessment incompleto (missing={missing}, extra={extra})")
+
+            # The first assessment is the publication snapshot. Exact retries are
+            # idempotent; a changed result needs a new proposal/revalidation record.
+            any_recorded = any(row.get("assessment_status") is not None for row in rows)
+            if any_recorded:
+                if not all(row.get("assessment_status") is not None for row in rows):
+                    raise ValueError("snapshot assessment parziale: registrazione rifiutata")
+                for row, assessment, status in parsed:
+                    previous_event = conn.execute(
+                        "SELECT reason,details_json FROM decision_events WHERE decision_id=? "
+                        "AND event_type='ASSESSMENT_RECORDED' ORDER BY id DESC LIMIT 1",
+                        (row["id"],)).fetchone()
+                    if not previous_event:
+                        raise ValueError("snapshot assessment senza evento audit: registrazione rifiutata")
+                    reason = str(assessment.get("reason") or "").strip()
+                    rationale = str(assessment.get("override_rationale") or "").strip()
+                    detail = {
+                        "row_index": row["proposal_row_index"],
+                        "action": assessment.get("action"),
+                        "ticker": assessment.get("ticker"),
+                        "proposal_ticker": row.get("proposal_ticker"),
+                        "proposal_ticker_cell": row.get("proposal_ticker_cell"),
+                        "eur": assessment.get("eur"),
+                        "reason": reason or None,
+                        "override_rationale": rationale or None,
+                    }
+                    try:
+                        recorded_detail = json.loads(previous_event["details_json"] or "{}")
+                    except (ValueError, TypeError):
+                        recorded_detail = None
+                    if (status != row["assessment_status"]
+                            or reason != str(row.get("assessment_reason") or "")
+                            or rationale != str(row.get("assessment_override_rationale") or "")
+                            or recorded_detail != detail
+                            or previous_event["reason"] != (reason or None)):
+                        raise ValueError("assessment già registrato e immutabile: creare una nuova proposta per la rivalutazione")
+                return {"recorded": len(parsed),
+                        "blocked": sum(1 for _, _, status in parsed if status == "BLOCKED"),
+                        "overrides": sum(1 for _, _, status in parsed if status == "OVERRIDE_PENDING"),
+                        "statuses": [status for _, _, status in parsed],
+                        "idempotent": True}
+
+            for row, assessment, status in parsed:
+                previous = row.get("assessment_status")
+                reason = str(assessment.get("reason") or "").strip()
+                rationale = str(assessment.get("override_rationale") or "").strip()
+                conn.execute(
+                    "UPDATE decisions SET assessment_status=?,assessment_reason=?, "
+                    "assessment_override_rationale=? WHERE id=?",
+                    (status, reason or None, rationale or None, row["id"]))
+                detail = {
+                    "row_index": row["proposal_row_index"],
+                    "action": assessment.get("action"),
+                    "ticker": assessment.get("ticker"),
+                    "proposal_ticker": row.get("proposal_ticker"),
+                    "proposal_ticker_cell": row.get("proposal_ticker_cell"),
+                    "eur": assessment.get("eur"),
+                    "reason": reason or None,
+                    "override_rationale": rationale or None,
+                }
+                conn.execute(
+                    "INSERT INTO decision_events (decision_id,event_type,from_status,to_status,actor,reason,details_json,created_at) "
+                    "VALUES (?,'ASSESSMENT_RECORDED',?,?,'risk_flow',?,?,?)",
+                    (row["id"], previous, status, reason or None,
+                     json.dumps(detail, ensure_ascii=False, sort_keys=True, default=str), now))
+            return {"recorded": len(parsed),
+                    "blocked": sum(1 for _, _, status in parsed if status == "BLOCKED"),
+                    "overrides": sum(1 for _, _, status in parsed if status == "OVERRIDE_PENDING"),
+                    "statuses": [status for _, _, status in parsed],
+                    "idempotent": False}
+
+    @staticmethod
+    def _normalized_identity(proposed_ticker, execution_ticker, isin, source, verified_at,
+                             reason, verified_by="PM"):
+        """Validate an identity verification WITHOUT writing it.
+
+        The returned dict has exactly the columns that `trade_context` reads back,
+        so a preview computed with a pending verification fingerprints the same
+        context that the confirmed transaction sees after the INSERT.
+        """
+        proposed = str(proposed_ticker or "").strip().upper()
+        execution = str(execution_ticker or "").strip().upper()
+        isin = str(isin or "").strip().upper()
+        source = str(source or "").strip()
+        reason = str(reason or "").strip()
+        verified_at = str(verified_at or "").strip()
+        if not proposed or not execution or proposed == execution:
+            raise ValueError(_storage_text("proposed_ticker e execution_ticker devono essere ticker distinti", "proposed_ticker and execution_ticker must be different tickers"))
+        if not _isin_checksum_valid(isin):
+            raise ValueError(_storage_text("ISIN non valido", "Invalid ISIN"))
+        if not source or not reason:
+            raise ValueError(_storage_text("source e reason della verifica sono obbligatori", "Verification source and reason are required"))
+        try:
+            datetime.fromisoformat(verified_at.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError(_storage_text("verified_at deve essere una data/ora ISO 8601", "verified_at must be an ISO 8601 date/time"))
+        return {"proposed_ticker": proposed, "execution_ticker": execution, "isin": isin,
+                "source": source, "verified_at": verified_at, "reason": reason,
+                "verified_by": str(verified_by or "PM")}
+
+    def verify_instrument_identity(self, proposed_ticker, execution_ticker, isin,
+                                   source, verified_at, reason, verified_by="PM", _conn=None):
+        """Record an explicit, auditable same-ISIN relationship between two tickers.
+
+        The table is append-only: Trade Entry never calls this before the PM
+        confirms; `execute_trade(instrument_identity=...)` writes it inside the
+        trade transaction (`_conn`), so a cancelled preview leaves no row.
+        """
+        identity = self._normalized_identity(proposed_ticker, execution_ticker, isin,
+                                             source, verified_at, reason, verified_by)
+        now = datetime.now().isoformat(timespec="seconds")
+        from contextlib import nullcontext
+        with (nullcontext(_conn) if _conn is not None else self._conn()) as conn:
+            cur = conn.execute(
+                "INSERT INTO instrument_identity_verifications "
+                "(proposed_ticker,execution_ticker,isin,source,verified_at,reason,verified_by,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (identity["proposed_ticker"], identity["execution_ticker"], identity["isin"],
+                 identity["source"], identity["verified_at"], identity["reason"],
+                 identity["verified_by"], now))
+            row = conn.execute("SELECT * FROM instrument_identity_verifications WHERE id=?",
+                               (cur.lastrowid,)).fetchone()
+            return dict(row)
+
+    @staticmethod
+    def _identity_for_pair(conn, proposal_ticker, execution_ticker, pending_identity=None):
+        """Latest recorded identity for the pair, or the pending one the PM is confirming.
+
+        A pending verification is not yet in the table (preview) or has just been
+        inserted in the same transaction (confirmation): both resolve to the same
+        values, because the newest row wins (`ORDER BY id DESC`).
+        """
+        pair = {proposal_ticker, execution_ticker}
+        if pending_identity and {pending_identity["proposed_ticker"],
+                                 pending_identity["execution_ticker"]} == pair:
+            return {k: pending_identity[k] for k in
+                    ("isin", "source", "verified_at", "reason", "verified_by")}
+        row = conn.execute(
+            "SELECT isin,source,verified_at,reason,verified_by "
+            "FROM instrument_identity_verifications WHERE "
+            "(UPPER(proposed_ticker)=? AND UPPER(execution_ticker)=?) OR "
+            "(UPPER(proposed_ticker)=? AND UPPER(execution_ticker)=?) "
+            "ORDER BY id DESC LIMIT 1",
+            (proposal_ticker, execution_ticker, execution_ticker, proposal_ticker)).fetchone()
+        return dict(row) if row else None
+
+    def manual_divergence_details(self, conn, decision_id, trade, pending_identity=None):
+        """Read-only checks of a manual divergence; returns the event details.
+
+        Shared by the trade preview (nothing written) and by the write inside the
+        trade transaction, so what the PM confirms is what gets recorded.
+        `trade` needs ticker/action/data/quantita/prezzo/valuta/linked_decision_id/link_origin.
+        """
+        decision_row = conn.execute("SELECT * FROM decisions WHERE id=?", (decision_id,)).fetchone()
+        if not decision_row:
+            raise ValueError(_storage_text(f"decisione {decision_id} non trovata", f"Decision {decision_id} not found"))
+        decision = dict(decision_row)
+        # 04/10 (G6, review 04 G8): BLOCKED, OVERRIDE_PENDING and CHECK_UNAVAILABLE all
+        # have this way out; before, only BLOCKED did, and a BUY without a check (e.g.
+        # a missing valuation) could never be reconciled with what the PM executed.
+        effective_status = self._effective_assessment_status(decision)
+        if effective_status not in ("BLOCKED", "OVERRIDE_PENDING", "CHECK_UNAVAILABLE"):
+            raise ValueError(_storage_text(
+                "la divergenza richiede una proposta non operativa (BLOCKED, OVERRIDE_PENDING o CHECK_UNAVAILABLE)",
+                "A divergence requires a non-operative proposal (BLOCKED, OVERRIDE_PENDING or CHECK_UNAVAILABLE)"))
+        if trade.get("linked_decision_id") is not None or trade.get("link_origin") != "none":
+            raise ValueError(_storage_text("il trade deve restare manuale e senza linked_decision_id", "The trade must stay manual, without linked_decision_id"))
+        if self._VERSO.get(decision.get("action")) != self._VERSO.get(trade.get("action")):
+            raise ValueError(_storage_text("verso del trade incompatibile con la proposta", "Trade direction incompatible with the proposal"))
+        proposal_ticker = str(decision.get("proposal_ticker") or decision.get("ticker") or "").strip().upper()
+        execution_ticker = str(trade.get("ticker") or "").strip().upper()
+        identity = None
+        if proposal_ticker != execution_ticker:
+            identity = self._identity_for_pair(conn, proposal_ticker, execution_ticker, pending_identity)
+            if not identity:
+                raise ValueError(_storage_text("la divergenza con ticker diverso richiede una verifica ISIN registrata", "A divergence on a different ticker requires a recorded ISIN verification"))
+        try:
+            decision_date = datetime.fromisoformat(decision["timestamp"])
+            trade_date = datetime.fromisoformat(trade["data"])
+            if decision_date.tzinfo is not None and trade_date.tzinfo is None:
+                trade_date = trade_date.replace(tzinfo=decision_date.tzinfo)
+            elif trade_date.tzinfo is not None and decision_date.tzinfo is None:
+                decision_date = decision_date.replace(tzinfo=trade_date.tzinfo)
+        except (ValueError, TypeError):
+            raise ValueError(_storage_text("data decisione/trade non valida per registrare la divergenza", "Invalid decision/trade date: divergence cannot be recorded"))
+        # «Solo giorno» (ora convenzionale 12:00): l'ordine nella giornata non e'
+        # noto, si confronta la sola data — stessa regola del legame esplicito.
+        # NULL legacy = confronto pieno (prudente).
+        if (trade_date.date() < decision_date.date() if trade.get("ora_convenzionale")
+                else trade_date < decision_date):
+            raise ValueError(_storage_text("il trade manuale precede la proposta", "The manual trade predates the proposal"))
+        return {
+            "ticker_proposto": proposal_ticker,
+            "ticker_eseguito": execution_ticker,
+            "trade_action": trade.get("action"),
+            "trade_data": trade.get("data"),
+            "quantita": trade.get("quantita"),
+            "prezzo": trade.get("prezzo"),
+            "valuta": trade.get("valuta"),
+            "assessment_status": effective_status,
+            "isin": identity.get("isin") if identity else None,
+            "identity_source": identity.get("source") if identity else None,
+            "identity_verified_at": identity.get("verified_at") if identity else None,
+            "identity_reason": identity.get("reason") if identity else None,
+        }
+
+    def record_manual_trade_divergence(self, decision_id, trade_id, reason, actor="PM", _conn=None):
+        """Link a manual fill to a NON-operative proposal as a divergence, never execution
+        (BLOCKED, OVERRIDE_PENDING or CHECK_UNAVAILABLE: G6, checks in manual_divergence_details).
+
+        With `_conn` it runs inside the caller's transaction (Trade Entry writes it
+        together with the trade, via `execute_trade(manual_divergence=...)`).
+        """
+        reason = str(reason or "").strip()
+        if not reason:
+            raise ValueError(_storage_text("il motivo della divergenza manuale è obbligatorio", "The manual divergence reason is required"))
+        now = datetime.now().isoformat(timespec="seconds")
+        from contextlib import nullcontext
+        with (nullcontext(_conn) if _conn is not None else self._conn()) as conn:
+            if _conn is None:
+                conn.execute("BEGIN IMMEDIATE")
+            trade_row = conn.execute("SELECT * FROM trade_history WHERE id=?", (trade_id,)).fetchone()
+            if not trade_row:
+                raise ValueError(_storage_text("decisione o trade non trovato", "Decision or trade not found"))
+            details = {"trade_id": trade_id,
+                       **self.manual_divergence_details(conn, decision_id, dict(trade_row))}
+            prior = conn.execute(
+                "SELECT * FROM decision_events WHERE decision_id=? "
+                "AND event_type='MANUAL_TRADE_DIVERGENCE_RECORDED' ORDER BY id",
+                (decision_id,)).fetchall()
+            for event in prior:
+                old = json.loads(event["details_json"] or "{}")
+                if old.get("trade_id") == trade_id:
+                    if old == details and event["reason"] == reason:
+                        return dict(event)
+                    raise ValueError(_storage_text("divergenza già registrata con contenuto diverso", "Divergence already recorded with different content"))
+            cur = conn.execute(
+                "INSERT INTO decision_events (decision_id,event_type,actor,reason,details_json,created_at) "
+                "VALUES (?,'MANUAL_TRADE_DIVERGENCE_RECORDED',?,?,?,?)",
+                (decision_id, str(actor or "PM"), reason,
+                 json.dumps(details, ensure_ascii=False, sort_keys=True, default=str), now))
+            return dict(conn.execute("SELECT * FROM decision_events WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def get_manual_trade_divergences(self, decision_id):
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM decision_events WHERE decision_id=? "
+                "AND event_type='MANUAL_TRADE_DIVERGENCE_RECORDED' ORDER BY id",
+                (decision_id,)).fetchall()
+        out = []
+        for row in rows:
+            event = dict(row)
+            try:
+                event["details"] = json.loads(event.pop("details_json") or "{}")
+            except (ValueError, TypeError):
+                event["details"] = {}
+            out.append(event)
+        return out
 
     def update_decision(self, decision_id, status=None, pm_feedback=None,
                         outcome_pct=None, outcome_eur=None, outcome_notes=None):
@@ -3436,7 +4149,44 @@ class MemoryDB:
         if not fields: return False
         values.append(decision_id)
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute("SELECT * FROM decisions WHERE id=?", (decision_id,)).fetchone()
+            if not current:
+                return False
+            current = dict(current)
+            if (outcome_notes is not None
+                    and "AUTO-ESCLUSA" in str(current.get("outcome_notes") or "").upper()
+                    and "AUTO-ESCLUSA" not in str(outcome_notes).upper()):
+                raise ValueError("il marcatore AUTO-ESCLUSA storico è immutabile")
+            if (status in ("EXECUTED", "PARTIAL")
+                    and self._effective_assessment_status(current) != "OPERATIVE"):
+                effective = self._effective_assessment_status(current)
+                if effective in ("BLOCKED", "OVERRIDE_PENDING", "CHECK_UNAVAILABLE"):
+                    raise ValueError(f"proposta {effective}: lo status generico non può approvarla o eseguirla")
+            old_status = current.get("status")
             conn.execute("UPDATE decisions SET " + ", ".join(fields) + " WHERE id=?", values)
+            if status is not None and status != old_status:
+                conn.execute(
+                    "INSERT INTO decision_events (decision_id,event_type,from_status,to_status,actor,reason,details_json,created_at) "
+                    "VALUES (?,'STATUS_CHANGED',?,?,'PM',?,?,?)",
+                    (decision_id, old_status, status,
+                     str(outcome_notes or pm_feedback or "").strip() or None,
+                     json.dumps({"pm_feedback": pm_feedback}, ensure_ascii=False, sort_keys=True),
+                     datetime.now().isoformat(timespec="seconds")))
+            note_changes = {}
+            if pm_feedback is not None and pm_feedback != current.get("pm_feedback"):
+                note_changes["pm_feedback"] = {"previous": current.get("pm_feedback"),
+                                                "current": pm_feedback}
+            if outcome_notes is not None and outcome_notes != current.get("outcome_notes"):
+                note_changes["outcome_notes"] = {"previous": current.get("outcome_notes"),
+                                                 "current": outcome_notes}
+            if note_changes:
+                conn.execute(
+                    "INSERT INTO decision_events (decision_id,event_type,from_status,to_status,actor,reason,details_json,created_at) "
+                    "VALUES (?,'NOTE_UPDATED',?,?,'PM','decision note revision',?,?)",
+                    (decision_id, old_status, status if status is not None else old_status,
+                     json.dumps(note_changes, ensure_ascii=False, sort_keys=True),
+                     datetime.now().isoformat(timespec="seconds")))
         return True
 
     def set_decision_veto(self, decision_id, reason):
@@ -4020,6 +4770,10 @@ class MemoryDB:
             if decisions:
                 ex = [d for d in decisions if (d.get("status") or "").upper() == "EXECUTED"]
                 sk = [d for d in decisions if (d.get("status") or "").upper() == "SKIPPED"]
+                # REV2 N1: le chiusure del gate di pubblicazione NON sono un «no» del PM e non
+                # contano per l'anti-insistenza: riga a parte, dichiarata
+                gate_sk = [d for d in sk if MARCA_CHIUSA_DAL_GATE in str(d.get("outcome_notes") or "")]
+                sk = [d for d in sk if d not in gate_sk]
                 pe = [d for d in decisions if (d.get("status") or "").upper() == "PENDING"]
                 # review 16/07: con l'auto-archivio (>7g -> EXPIRED) le decadute sparivano
                 # da OGNI bucket: la regola "riproponila ricordando che era gia' suggerita"
@@ -4053,6 +4807,10 @@ class MemoryDB:
                 if sk:
                     parts.append("NON eseguite questa volta (SKIPPED, non rifiutate per sempre): "
                                  + "; ".join(_fmt(d) for d in sk[:10]))
+                if gate_sk:
+                    parts.append("CHIUSE DAL GATE DI PUBBLICAZIONE (non operative nel memo pubblicato per "
+                                 "un controllo o un guasto tecnico: NON sono una scelta del PM e non contano "
+                                 "per l'anti-insistenza): " + "; ".join(_fmt(d) for d in gate_sk[:10]))
                 if pe:
                     parts.append("ANCORA PENDENTI: " + "; ".join(_fmt(d) for d in pe[:10]))
                 if xp:

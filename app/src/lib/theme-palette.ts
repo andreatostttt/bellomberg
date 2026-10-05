@@ -1,0 +1,190 @@
+// Generated from components/theme-tokens.css — keep both in sync (tests/product/interface-theme.mts checks).
+// Canvas, SVG and chart libraries that cannot read CSS variables take colours from here.
+export interface ThemePalette {
+  bg: string;
+  surface: string;
+  surface2: string;
+  surface3: string;
+  raised: string;
+  overlay: string;
+  shadow: string;
+  text: string;
+  textStrong: string;
+  text2: string;
+  muted: string;
+  faint: string;
+  line: string;
+  lineStrong: string;
+  hover: string;
+  selected: string;
+  selectedLine: string;
+  focus: string;
+  accent: string;
+  accentText: string;
+  accentSoft: string;
+  accentFill: string;
+  onAccent: string;
+  good: string;
+  goodText: string;
+  goodSoft: string;
+  bad: string;
+  badText: string;
+  badSoft: string;
+  warn: string;
+  warnText: string;
+  warnSoft: string;
+  stale: string;
+  staleSoft: string;
+  chartBg: string;
+  chartGrid: string;
+  chartAxis: string;
+  chartLabel: string;
+  chartLegend: string;
+  chartUp: string;
+  chartDown: string;
+  tooltipBg: string;
+  tooltipText: string;
+  tooltipLine: string;
+}
+
+export const LIGHT_PALETTE: ThemePalette = {
+  bg: '#f7f9fc',
+  surface: '#fff',
+  surface2: '#f8fafc',
+  surface3: '#f1f5f9',
+  raised: '#fff',
+  overlay: 'rgba(15, 23, 42, .28)',
+  shadow: 'rgba(15, 23, 42, .12)',
+  text: '#1e293b',
+  textStrong: '#172554',
+  text2: '#334155',
+  muted: '#64748b',
+  faint: '#94a3b8',
+  line: '#dfe7f3',
+  lineStrong: '#cbd5e1',
+  hover: '#edf2f8',
+  selected: '#eef3ff',
+  selectedLine: '#c6d5f7',
+  focus: '#0f172a',
+  accent: '#1455ff',
+  accentText: '#1747c8',
+  accentSoft: '#eef3ff',
+  accentFill: '#1455ff',
+  onAccent: '#fff',
+  good: '#008f63',
+  goodText: '#047857',
+  goodSoft: '#edf8f3',
+  bad: '#c52943',
+  badText: '#b4233d',
+  badSoft: '#fff0f2',
+  warn: '#9a6500',
+  warnText: '#815400',
+  warnSoft: '#fff7df',
+  stale: '#805900',
+  staleSoft: '#fff9e8',
+  chartBg: '#fff',
+  chartGrid: '#e8edf5',
+  chartAxis: '#cbd5e1',
+  chartLabel: '#64748b',
+  chartLegend: '#475569',
+  chartUp: '#008f63',
+  chartDown: '#c52943',
+  tooltipBg: '#fff',
+  tooltipText: '#1e293b',
+  tooltipLine: '#cbd5e1',
+};
+
+export const DARK_PALETTE: ThemePalette = {
+  bg: '#0e1522',
+  surface: '#151e2d',
+  surface2: '#1a2436',
+  surface3: '#202b3f',
+  raised: '#1c2639',
+  overlay: 'rgba(3, 7, 15, .62)',
+  shadow: 'rgba(0, 0, 0, .45)',
+  text: '#e3e9f3',
+  textStrong: '#f2f5fa',
+  text2: '#c7d1df',
+  muted: '#9aa8bd',
+  faint: '#75849b',
+  line: '#29364b',
+  lineStrong: '#384861',
+  hover: '#223049',
+  selected: '#1d2f57',
+  selectedLine: '#3d5aa0',
+  focus: '#9db8ff',
+  accent: '#6b93ff',
+  accentText: '#9db8ff',
+  accentSoft: '#1b2a4c',
+  accentFill: '#2f62f5',
+  onAccent: '#fff',
+  good: '#34c98f',
+  goodText: '#4fd8a1',
+  goodSoft: '#10302a',
+  bad: '#f0647a',
+  badText: '#ff8597',
+  badSoft: '#3a1922',
+  warn: '#e7ae45',
+  warnText: '#f0c062',
+  warnSoft: '#34290f',
+  stale: '#d9a94c',
+  staleSoft: '#2f2712',
+  chartBg: '#151e2d',
+  chartGrid: '#243149',
+  chartAxis: '#3a4a64',
+  chartLabel: '#9aa8bd',
+  chartLegend: '#c7d1df',
+  chartUp: '#34c98f',
+  chartDown: '#f0647a',
+  tooltipBg: '#1c2639',
+  tooltipText: '#e3e9f3',
+  tooltipLine: '#3a4a64',
+};
+
+/** CSS custom-property name for each palette key (e.g. chartGrid -> --bbt-chart-grid). */
+export const PALETTE_TOKENS: Record<keyof ThemePalette, string> = {
+  bg: '--bbt-bg',
+  surface: '--bbt-surface',
+  surface2: '--bbt-surface-2',
+  surface3: '--bbt-surface-3',
+  raised: '--bbt-raised',
+  overlay: '--bbt-overlay',
+  shadow: '--bbt-shadow',
+  text: '--bbt-text',
+  textStrong: '--bbt-text-strong',
+  text2: '--bbt-text-2',
+  muted: '--bbt-muted',
+  faint: '--bbt-faint',
+  line: '--bbt-line',
+  lineStrong: '--bbt-line-strong',
+  hover: '--bbt-hover',
+  selected: '--bbt-selected',
+  selectedLine: '--bbt-selected-line',
+  focus: '--bbt-focus',
+  accent: '--bbt-accent',
+  accentText: '--bbt-accent-text',
+  accentSoft: '--bbt-accent-soft',
+  accentFill: '--bbt-accent-fill',
+  onAccent: '--bbt-on-accent',
+  good: '--bbt-good',
+  goodText: '--bbt-good-text',
+  goodSoft: '--bbt-good-soft',
+  bad: '--bbt-bad',
+  badText: '--bbt-bad-text',
+  badSoft: '--bbt-bad-soft',
+  warn: '--bbt-warn',
+  warnText: '--bbt-warn-text',
+  warnSoft: '--bbt-warn-soft',
+  stale: '--bbt-stale',
+  staleSoft: '--bbt-stale-soft',
+  chartBg: '--bbt-chart-bg',
+  chartGrid: '--bbt-chart-grid',
+  chartAxis: '--bbt-chart-axis',
+  chartLabel: '--bbt-chart-label',
+  chartLegend: '--bbt-chart-legend',
+  chartUp: '--bbt-chart-up',
+  chartDown: '--bbt-chart-down',
+  tooltipBg: '--bbt-tooltip-bg',
+  tooltipText: '--bbt-tooltip-text',
+  tooltipLine: '--bbt-tooltip-line',
+};

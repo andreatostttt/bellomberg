@@ -1005,7 +1005,7 @@ def _memo_styles():
 
 
 # ---------------------------------------------------------------------------
-# Impianto B (scelta PM 04/10/2026): memo per il comitato d'investimento.
+# Impianto M (scelta PM 04/10/2026): memo d'investimento a sezioni numerate per il comitato.
 # Il testo del Capo e' mostrato con UNA trasformazione deterministica e dichiarata,
 # applicata identica dal renderer e dal controllo d'integrita':
 #  - [src: x] / [evidence: id] -> numero della fonte (elenco numerato in fondo);
@@ -1693,10 +1693,75 @@ def _consensus_table(facts, language, st, width):
 # Where each deterministic exhibit is discussed: the figures sit inside that section.
 _M_EXHIBITS = {
     "financial_quality": ["table:history", "revenue_margin", "revenue_path", "margins", "cash", "capital_allocation", "balance"],
-    "valuation": ["table:market", "table:consensus", "price_targets", "eps_path", "recommendations"],
-    "portfolio_risk": ["risk", "tail_risk"],
-    "positioning": ["returns"],
+    "valuation": ["table:market", "table:consensus", "price_targets", "eps_path", "recommendations", "multiples"],
+    "portfolio_risk": ["risk", "tail_risk", "fat_tails", "vol_cone", "drawdown", "acf_abs", "rolling_beta",
+                       "vix_sensitivity"],
+    "positioning": ["price_history", "returns"],
 }
+
+
+# Policy /4 memo: fixed section titles from the section key (PM 04/10/2026); the Capo writes the text,
+# not the headings. A key without an entry keeps the Capo's title, declared in the data note.
+_M_SECTION_TITLES = {
+    "executive": ("Sintesi e giudizio", "Executive summary and judgment"),
+    "pm_view": ("La tesi del PM alla prova", "The PM thesis tested"),
+    "business": ("Il business", "The business"),
+    "financial_quality": ("Qualità finanziaria", "Financial quality"),
+    "valuation": ("Valutazione", "Valuation"),
+    "scenarios": ("Scenari", "Scenarios"),
+    "portfolio_risk": ("Rischio di portafoglio", "Portfolio risk"),
+    "catalysts": ("Catalizzatori", "Catalysts"),
+    "positioning": ("Posizionamento", "Positioning"),
+    "red_team": ("Red Team", "Red Team"),
+    "decision": ("Decisione", "Decision"),
+}
+
+
+def _m_section_title(key, capo_title, language):
+    """(printed title, declared line or None) of a /4 dossier section."""
+    fixed = _M_SECTION_TITLES.get(key)
+    if fixed:
+        return fixed[0 if language == "it" else 1], None
+    return capo_title, (f"Sezione «{capo_title}»: titolo scritto dal Capo, nessun titolo fisso per questa sezione"
+                        if language == "it" else
+                        f"Section «{capo_title}»: title written by the Capo, no fixed title for this section")
+
+
+def _market_absent_line(pack, language):
+    """The declared line printed when the run carries no usable market data pack."""
+    it = language == "it"
+    why = (("la run non lo contiene" if it else "the run does not carry it") if pack is None else
+           ("formato non riconosciuto" if it else "unrecognised format"))
+    return ("Pacchetto dati di mercato non disponibile: " if it else "Market data pack not available: ") + why + "."
+
+
+def _market_missing_lines(missing, language):
+    """Market figures not drawn, grouped by their declared reason (one line per reason)."""
+    groups = {}
+    for chart in missing:
+        groups.setdefault(str(chart["missing"]), []).append(str(chart["title"]))
+    head = "Figure di mercato non prodotte" if language == "it" else "Market figures not produced"
+    return [f"{head} ({'; '.join(titles)}): {reason}" for reason, titles in groups.items()]
+
+
+def _market_exhibits(pack, chart_dir, language, ticker):
+    """(drawn charts, missing charts, gap lines) of the market data pack (Lotto 3).
+
+    The pack lives in run["market_pack"], never inside facts: its daily series would flood
+    the 3-decimal rule of the Capo prose (_known_values). No pack = no figure, one line."""
+    if not isinstance(pack, dict):
+        return [], [], [_market_absent_line(pack, language)]
+    try:
+        from bellomberg.reporting.trade_idea_market_charts import build_market_charts
+        from bellomberg.reporting.trade_idea_market_stats import market_stats
+        stats = market_stats(pack, language=language)
+        charts = build_market_charts(stats, pack, chart_dir, language=language, ticker=ticker)
+    except Exception as exc:  # declared, never silent: the integrity check flags it too
+        return [], [], [("Figure di mercato non prodotte: errore " if language == "it" else
+                         "Market figures not produced: error ") + type(exc).__name__ + "."]
+    drawn = [c for c in charts if not c.get("missing")]
+    missing = [c for c in charts if c.get("missing")]
+    return drawn, missing, [*(stats.get("gaps") or []), *_market_missing_lines(missing, language)]
 
 
 def _it_date(value):
@@ -1805,6 +1870,7 @@ def _render_company_memo(path, run, result, language, partial_reasons, *, locali
             story.append(Paragraph(_text(unit), st["unit"]))
 
     charts, missing = {}, []
+    title_gaps = []
 
     def exhibit(key, chart_dir):
         if key == "table:history":
@@ -1831,6 +1897,24 @@ def _render_company_memo(path, run, result, language, partial_reasons, *, locali
             if table is not None:
                 caption("table", label("Consenso degli analisti in dettaglio", "Analyst consensus in detail"))
                 story.extend([table, Paragraph(_text(note), st["note"])])
+        elif key in charts and charts[key].get("table"):  # market multiples: a table (PM 04/10), not a PNG
+            chart = charts.pop(key)
+            spec = chart["table"]
+            caption("table", chart["title"], chart.get("subtitle"))
+            bold_tag = f'<font name="{_bold_face()}">'
+            rows = [[Paragraph(_text(v), st["head"] if i == 0 else st["headr"]) for i, v in enumerate(spec["columns"])]]
+            for index, row in enumerate(spec["rows"]):
+                wrap = (lambda s: bold_tag + s + "</font>") if index in spec.get("bold_rows", ()) else (lambda s: s)
+                rows.append([Paragraph(wrap(_text(v)), st["cell"] if i == 0 else st["cellr"]) for i, v in enumerate(row)])
+            count = len(spec["columns"])
+            table = Table(rows, colWidths=[width * .34] + [width * .66 / (count - 1)] * (count - 1), repeatRows=1,
+                          hAlign="LEFT")
+            table.setStyle(TableStyle(_M_TABLE))
+            story.extend([table, Paragraph(_text(spec.get("foot") or ""), st["note"]),
+                          Paragraph(_text(label("Fonte: ", "Source: ") + str(chart.get("source") or "n.d.")), st["note"])])
+            if chart.get("notes"):
+                story.append(Paragraph("<b>" + escape(label("Lettura.", "Reading.")) + "</b> "
+                                       + " ".join(_text(n) for n in chart["notes"]), st["reading"]))
         elif key in charts:
             chart = charts.pop(key)
             caption("figure", chart["title"], chart.get("subtitle"))
@@ -1850,6 +1934,10 @@ def _render_company_memo(path, run, result, language, partial_reasons, *, locali
                     missing.append(chart)
                 else:
                     charts[chart["key"]] = chart
+        # Lotto 3 market figures belong to the /4 memo; the /2-/3 output stays frozen byte for byte.
+        market_drawn, _market_missing, market_gaps = (_market_exhibits(run.get("market_pack"), chart_dir, language, ticker)
+                                                       if v4 else ([], [], []))
+        charts.update((chart["key"], chart) for chart in market_drawn)
 
         # Intestazione del memo.
         story.append(Paragraph(_text(label("MEMO D'INVESTIMENTO", "INVESTMENT MEMO") + f" — {name} ({ticker})"), st["title"]))
@@ -1969,7 +2057,12 @@ def _render_company_memo(path, run, result, language, partial_reasons, *, locali
         # 4..N. The Capo's dossier, each section with its own exhibits.
         for dossier in result.get("dossier", []):
             key = dossier["key"]
-            number = section(key, _clean(dossier["title"], sources, language, plain=True))
+            capo_title = _clean(dossier["title"], sources, language, plain=True)
+            if v4:  # fixed heading from the key (PM 04/10); /2-/3 keep the Capo's title (frozen output)
+                capo_title, declared = _m_section_title(key, capo_title, language)
+                if declared:
+                    title_gaps.append(declared)
+            number = section(key, capo_title)
             sub, texts = 0, list(dossier.get("paragraphs", []))
             if key == "pm_view":
                 story.append(Paragraph(_text(_label("pm_view", language)), st["h2"]))
@@ -2053,8 +2146,8 @@ def _render_company_memo(path, run, result, language, partial_reasons, *, locali
                 story.extend([rendered, Paragraph(show(f"{table_data['unit']} | {table_data['period']} | "
                                                        f"{table_data['source']}", cell=True), st["note"])])
                 texts.append(table_data["source"])
-            if facts:
-                for exhibit_key in _M_EXHIBITS.get(key, []):
+            for exhibit_key in _M_EXHIBITS.get(key, []):
+                if facts or not exhibit_key.startswith("table:"):  # market figures do not need facts
                     exhibit(exhibit_key, chart_dir)
             sources_line(texts, [*(dossier.get("evidence_ids") or []),
                                  *((result.get("pm_view_evidence_ids") or []) if key == "pm_view" else []),
@@ -2065,7 +2158,7 @@ def _render_company_memo(path, run, result, language, partial_reasons, *, locali
         leftovers = [k for keys in _M_EXHIBITS.values() for k in keys
                      if k in charts or (k.startswith("table:") and not any(
                          d["key"] in [s for s, ks in _M_EXHIBITS.items() if k in ks] for d in result.get("dossier", [])))]
-        gaps = [*((facts or {}).get("gaps") or []), *(f"{c['title']}: {c['missing']}" for c in missing)]
+        gaps = [*((facts or {}).get("gaps") or []), *(f"{c['title']}: {c['missing']}" for c in missing), *market_gaps, *title_gaps]
         if leftovers or gaps or not facts:
             number = section("data_notes", label("Nota sui dati della run", "Note on the run data"))
             for exhibit_key in leftovers:
@@ -2400,8 +2493,50 @@ def _normalized_text(value, rendered=False):
     return re.sub(r"\s+", "", unicodedata.normalize("NFKC", value).replace("\u00ad", "")).casefold()
 
 
+_NO_MARKET = object()  # inspect called without the run (direct calls): no market check
+
+
+def _market_not_reread(pack, normalized, raw, language, ticker):
+    """(lost fragments, unreconciled numbers) of the market figures (Lotto 3).
+
+    The statistics are RECOMPUTED here from the pack (never taken from the renderer), the
+    readings regenerated without drawing, then: every title, reading, missing-figure line and
+    statistics gap must be in the PDF text, and every number of every reading must map one to
+    one onto the value read back from the statistics at its printed rounding
+    (trade_idea_market_charts.verify_readings)."""
+    present = lambda text: _normalized_text(text) in normalized or _normalized_text(text) in raw
+    if not isinstance(pack, dict):
+        return ([] if present(_market_absent_line(pack, language)) else ["market.absent_line"]), []
+    try:
+        from bellomberg.reporting.trade_idea_market_charts import market_readings, verify_readings
+        from bellomberg.reporting.trade_idea_market_stats import market_stats
+        stats = market_stats(pack, language=language)
+        readings = market_readings(stats, pack, language=language, ticker=ticker)
+    except Exception as exc:
+        return [f"market.recompute.{type(exc).__name__}"], []
+    lost = []
+    for item in readings:
+        if item.get("missing"):
+            continue
+        if not present(item["title"]):
+            lost.append(f"market.{item['key']}.title")
+        if not present(" ".join(item["notes"])):
+            lost.append(f"market.{item['key']}.reading")
+        table = item.get("table") or {}
+        for index, row in enumerate(table.get("rows") or []):  # every printed row, its numbers verified below
+            if not present(" ".join(row)):
+                lost.append(f"market.{item['key']}.row.{index}")
+        if table.get("foot") and not present(table["foot"]):
+            lost.append(f"market.{item['key']}.foot")
+    missing = [item for item in readings if item.get("missing")]
+    for index, line in enumerate([*(stats.get("gaps") or []), *_market_missing_lines(missing, language)]):
+        if not present(line):
+            lost.append(f"market.gap.{index}")
+    return lost, verify_readings(stats, readings, language, ticker)
+
+
 def _inspect_company_memo(path, result, section_pages, language, execution_policy=EXECUTION_POLICY_V2,
-                          annex=None, facts=None):
+                          annex=None, facts=None, market=_NO_MARKET):
     reader = PdfReader(str(path))
     pages = [page.extract_text() or "" for page in reader.pages]
     # Page furniture and repeated table headings can interrupt a split paragraph/cell.
@@ -2428,6 +2563,10 @@ def _inspect_company_memo(path, result, section_pages, language, execution_polic
                    if printed not in normalized and printed not in raw})
     if _is_memo_v4(result):  # policy /4: structured numbers are read back at their printed rounding
         lost = sorted({*lost, *_m_numbers_not_reread(result, pages, section_pages, language)})
+    market_unreconciled = []
+    if market is not _NO_MARKET and _is_memo_v4(result):  # Lotto 3 (/4 memo): market figures re-read from recomputed stats
+        market_lost, market_unreconciled = _market_not_reread(market, normalized, raw, language, result.get("ticker"))
+        lost = sorted({*lost, *market_lost})
     sections = result.get("dossier", [])
     keys = [section["key"] for section in sections]
     missing = sorted(set(DOSSIER_KEYS) - set(keys))
@@ -2498,6 +2637,9 @@ def _inspect_company_memo(path, result, section_pages, language, execution_polic
                            (lost, "Testo originale non integro nel PDF", "Original text missing from PDF")):
         if values:
             reasons.append((it if language == "it" else en) + ": " + ", ".join(values))
+    if market_unreconciled:
+        reasons.append(("Numeri delle letture di mercato non riconciliati con le statistiche: " if language == "it" else
+                        "Market reading numbers not reconciled with the statistics: ") + "; ".join(market_unreconciled))
     # Extra text is not lost text: a raw source marker in print is caught on its own.
     raw_markers = len(re.findall(r"\[\s*(?:src|evidence)\s*:", "\n".join(pages), re.I))
     if raw_markers:
@@ -2525,10 +2667,11 @@ def _inspect_company_memo(path, result, section_pages, language, execution_polic
 
 
 def inspect_research_pdf(path, result, section_pages, *, language="it", execution_policy=None, annex=None,
-                         facts=None):
-    """Measure actual selectable text; cover/bibliography/PM quotes do not qualify."""
+                         facts=None, market=_NO_MARKET):
+    """Measure actual selectable text; cover/bibliography/PM quotes do not qualify.
+    ``market`` = run["market_pack"] (None included): its figures and readings are re-read."""
     if execution_policy in RESEARCH_POLICIES:
-        return _inspect_company_memo(path, result, section_pages, language, execution_policy, annex, facts)
+        return _inspect_company_memo(path, result, section_pages, language, execution_policy, annex, facts, market)
     if execution_policy is not None:
         raise ValueError("Unknown Trade Idea report execution policy")
     reader = PdfReader(str(path))
@@ -2578,11 +2721,11 @@ def build_trade_idea_report(run, result, *, output_path, valuations=(), language
         lambda reasons: _render(path, run, result, valuations, language, reasons))
     sections = render([])
     quality = inspect_research_pdf(path, result, sections, language=language, execution_policy=policy,
-                                   annex=run.get("desk_annex"), facts=run.get("facts"))
+                                   annex=run.get("desk_annex"), facts=run.get("facts"), market=run.get("market_pack"))
     if quality["status"] != "ready":
         sections = render(quality["reasons"])
         quality = inspect_research_pdf(path, result, sections, language=language, execution_policy=policy,
-                                   annex=run.get("desk_annex"), facts=run.get("facts"))
+                                   annex=run.get("desk_annex"), facts=run.get("facts"), market=run.get("market_pack"))
     return {"path": str(path.resolve()), "sha256": sha256(path.read_bytes()).hexdigest(),
             "quality": quality, "status": quality["status"], "reason": "; ".join(quality["reasons"])}
 

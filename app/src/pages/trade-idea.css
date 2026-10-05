@@ -206,3 +206,32 @@
 .ti-document-receipt a { overflow-wrap: anywhere; }
 .ti-source-metadata { margin: 12px 0 18px; }
 .ti-document-sources textarea { min-height: 72px; }
+
+/* Costi incerti di una run ferma (stile Nuova: card --bbn-*, pulsanti bbn-btn). */
+.ti-page .tic-card { margin-top: 14px; }
+.ti-page .tic-card .bbn-card-head { color: var(--bbn-text); }
+.ti-page .tic-card .bbn-card-head h2 { font: 700 16px/1.3 'Manrope Variable', Manrope, system-ui, sans-serif; color: var(--bbn-text); }
+.ti-page .tic-card .bbn-btn { font-family: 'Manrope Variable', Manrope, system-ui, sans-serif; font-size: 13px; }
+.tic-body { display: grid; gap: 10px; padding: 0 20px 18px; color: var(--bbn-text); font-size: 13px; line-height: 1.45; }
+.tic-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.tic-note { display: flex; align-items: flex-start; gap: 6px; margin: 0; color: var(--bbn-muted); font-size: 12px; font-weight: 600; }
+.tic-note > svg { flex: 0 0 auto; margin-top: 1px; }
+.tic-note.is-bad { color: var(--bbn-bad); }
+.tic-note.is-good { color: var(--bbn-good); }
+.tic-summary { margin: 0; font-weight: 700; }
+.tic-summary span { color: var(--bbn-muted); font-weight: 600; }
+.tic-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.tic-list li { display: grid; gap: 4px; padding: 10px 14px; border-radius: 14px; background: var(--bbn-raised); }
+.tic-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.tic-row code { overflow-wrap: anywhere; font: 600 12px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.tic-pill { padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 700; white-space: nowrap; }
+.tic-pill.is-good { color: var(--bbn-good); background: var(--bbn-good-soft); }
+.tic-pill.is-warn { color: var(--bbn-warn); background: var(--bbn-warn-soft); }
+.tic-reason { color: var(--bbn-warn); font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+
+/* Sezioni del PDF consegnato (section_pages del manifest). */
+.ti-pdf-sections { margin-top: 12px; }
+.ti-pdf-sections h4 { margin: 0 0 4px; font-size: 12px; color: #d4ddee; }
+.ti-pdf-sections ol { display: grid; gap: 2px; margin: 8px 0 0; padding: 0; list-style: none; font-size: 11px; }
+.ti-pdf-sections li { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; border-bottom: 1px solid #26314b; }
+.ti-pdf-sections li b { font: 500 11px 'JetBrains Mono', monospace; color: #e5c978; white-space: nowrap; }

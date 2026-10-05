@@ -60,9 +60,20 @@ _MULTI_PREFIX = "Multi-settore"
 
 def settori_tema_del_negozio(negozio=None) -> Dict[str, str]:
     """La VISTA che sostituisce SECTOR_OVERRIDES cablato: {TICKER: settore_tema} per le voci
-    che lo dichiarano. Negozio assente/illeggibile = dict vuoto (motivo in carica_veicoli)."""
+    che lo dichiarano. Normalizza anche il vecchio prefisso DAT per allinearlo al prompt.
+    Negozio assente/illeggibile = dict vuoto (motivo in carica_veicoli)."""
     n = negozio if negozio is not None else cl.carica_veicoli()
-    return {t: v["settore_tema"] for t, v in n["veicoli"].items() if v["settore_tema"]}
+    settori = {}
+    for ticker, voce in n["veicoli"].items():
+        tema = voce["settore_tema"]
+        if not tema:
+            continue
+        prefisso_dat_legacy = "Digital asset treasury"
+        if voce.get("tipo") == "dat" and tema.casefold().startswith(prefisso_dat_legacy.casefold()):
+            sottostante = tema[len(prefisso_dat_legacy):].strip()
+            tema = "Crypto treasury" + (" " + sottostante if sottostante else "")
+        settori[ticker] = tema
+    return settori
 
 
 def bucket_economici_del_negozio(negozio=None) -> Dict[str, str]:

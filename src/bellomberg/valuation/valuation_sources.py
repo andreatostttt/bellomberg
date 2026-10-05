@@ -73,10 +73,48 @@ def collect_documents(ticker, *, as_of, archive_root, filing_results=(), catalog
                 from bellomberg.market_data.lettore_trimestrali import LEGACY_HTML_TEXT_EXTRACTOR
                 extractor['html_extractor'] = accepted_verification.get('text_extraction', LEGACY_HTML_TEXT_EXTRACTOR)
             extracted = estrai_testo(str(path), contenuto=raw, **extractor)
+            if (accepted_verification.get('contract') == 'trade-idea-pm-documents/1'
+                    and (accepted_verification.get('deposit_receipt') is not None
+                         or accepted_verification.get('publication_basis') == 'emarket_sdir_deposit_receipt')):
+                # Data di pubblicazione dal deposito eMarket SDIR: si riverifica qui, senza rete.
+                from bellomberg.agents.trade_idea_sources import (verify_deposit_companion,
+                    _deposit_document_type, _deposit_declaration)
+                deposit = accepted_verification.get('deposit_receipt')
+                tipo = _deposit_document_type(extracted.get("testo", ""))
+                if (accepted_verification.get('publication_basis') != 'emarket_sdir_deposit_receipt'
+                        or not isinstance(deposit, dict) or tipo is None
+                        or not isinstance(accepted_metadata.get('report_date'), str)):
+                    raise ValueError("eMarket SDIR deposit publication declaration is incomplete")
+                verify_deposit_companion(deposit, root / "pm-public-documents", accepted_verification.get('ticker'),
+                    tipo, accepted_metadata['report_date'], as_of)
+                if (deposit['data_deposito'] != published
+                        or accepted_verification.get('publication_declaration') != _deposit_declaration(deposit)):
+                    raise ValueError("publication date differs from the declared eMarket SDIR deposit")
             if extracted.get("stato") not in ("ok", "parziale") or not extracted.get("testo", "").strip():
                 raise ValueError("document text unavailable: " + str(extracted.get("motivo")))
+            if accepted_verification.get('contract') == 'trade-idea-pm-documents/1':
+                # Periodo dalla copertina ed emittente nel testo intero: base e prova dichiarate insieme.
+                cover_basis = accepted_verification.get('report_date_basis') == 'cover_report_title_period/1'
+                issuer_basis = accepted_verification.get('issuer_basis') == 'confirmed_issuer_name_in_full_text/1'
+                if (cover_basis != (accepted_verification.get('report_date_locator') is not None)
+                        or issuer_basis != (accepted_verification.get('issuer_locator') is not None)):
+                    raise ValueError("declared reporting-period or issuer locator is incomplete")
+                if cover_basis or issuer_basis:
+                    from bellomberg.agents.trade_idea_sources import verify_european_locators
+                    verify_european_locators(extracted.get("testo", ""), extracted, accepted_verification,
+                                             accepted_metadata)
             if extracted.get("pagine_senza_testo"):
-                raise ValueError("document contains pages without extractable text")
+                # Ammesse SOLO per un documento PM verificato che le dichiara
+                # esattamente come le ricalcola la stessa regola (<=5%, 0 immagini).
+                declared = (accepted_verification.get('textless_pages')
+                            if accepted_verification.get('contract') == 'trade-idea-pm-documents/1' else None)
+                if declared is None:
+                    raise ValueError("document contains pages without extractable text")
+                from bellomberg.agents.trade_idea_sources import textless_pages_declaration, same_exact_value
+                if not same_exact_value(textless_pages_declaration(raw, extracted), declared):
+                    raise ValueError("document pages without extractable text differ from the verified declaration")
+            elif accepted_verification.get('textless_pages') is not None:
+                raise ValueError("declared pages without extractable text are absent from the document")
             text = extracted["testo"]
             metadata = candidate.get("metadati")
             if not isinstance(metadata, dict):

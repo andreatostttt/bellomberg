@@ -4,7 +4,7 @@ import ConfirmDialog, { ConfirmRow } from './ConfirmDialog';
 import { Bellomberg } from '../lib/api';
 import { fmtEUR } from '../lib/format';
 
-type Props = { open: boolean; onConfirm: () => void; onCancel: () => void };
+type Props = { open: boolean; onConfirm: () => void; onCancel: () => void; pagePresentation?: boolean };
 type CostReading = { kind: 'loading' } | { kind: 'missing' }
   | { kind: 'measured'; value: number; partial: boolean }
   | { kind: 'aggregation' | 'heartbeat'; detail: string | null };
@@ -22,7 +22,7 @@ type CostReading = { kind: 'loading' } | { kind: 'missing' }
  * In piu': se una run risulta GIA' ATTIVA, il dialog cambia tono e lo dice — lanciarne
  * una seconda spende due volte.
  */
-export default function RunConfirmDialog({ open, onConfirm, onCancel }: Props) {
+export default function RunConfirmDialog({ open, onConfirm, onCancel, pagePresentation }: Props) {
   const tr = useT();
   const [cost, setCost] = useState<CostReading>({ kind: 'loading' });
   const [costTone, setCostTone] = useState<ConfirmRow['tone']>(undefined);
@@ -65,6 +65,7 @@ export default function RunConfirmDialog({ open, onConfirm, onCancel }: Props) {
 
   return (
     <ConfirmDialog
+      pagePresentation={pagePresentation}
       open={open}
       tone={running ? 'crimson' : 'amber'}
       title={running ? tr('communications.runAlreadyActive') : tr('communications.runLaunchQuestion')}

@@ -174,6 +174,128 @@ def test_earnings_senza_ticker_dichiara_il_non_interrogato():
     assert motivo and "nessun ticker" in motivo[0], motivo
 
 
+def test_selettore_earnings_include_xetra_con_alias_finnhub_verificato(tmp_path, monkeypatch):
+    """Rottura catturata: il filtro sul punto elimina anche un alias Xetra -> USA dichiarato."""
+    from bellomberg.api import bellomberg_api
+    from bellomberg.storage import negozi_privati
+
+    alias = tmp_path / "alias_fonti.json"
+    alias.write_text('{"finnhub": {"ACME.DE": "ACM"}, "sec": {}, '
+                     '"yfinance": {}, "correlazione": {}}', encoding="utf-8")
+    monkeypatch.setattr(negozi_privati, "PERCORSO_ALIAS", str(alias))
+    negozio = {
+        "origine": "fixture/veicoli.json", "motivo": None,
+        "veicoli": {"ACME.DE": {"tipo": "operating"}},
+    }
+
+    tickers, nota = bellomberg_api._tickers_earnings_da_negozio(
+        [{"ticker": "ACME.DE"}], negozio)
+
+    assert tickers == ["ACME.DE"]
+    assert nota is None
+
+
+def test_earnings_xetra_restituisce_ticker_portafoglio_e_conserva_simbolo_fonte(
+        tmp_path, monkeypatch):
+    """Il simbolo Finnhub serve al trasporto, non deve sostituire l'identita' Xetra."""
+    from bellomberg.storage import negozi_privati
+
+    alias = tmp_path / "alias_fonti.json"
+    alias.write_text('{"finnhub": {"ACME.DE": "ACM"}, "sec": {}, '
+                     '"yfinance": {}, "correlazione": {}}', encoding="utf-8")
+    monkeypatch.setattr(negozi_privati, "PERCORSO_ALIAS", str(alias))
+    _trasporto(monkeypatch, {"/calendar/earnings": _R(200, {"earningsCalendar": [{
+        "symbol": "ACM", "date": "2026-09-20", "hour": "amc",
+        "epsEstimate": 1.2, "year": 2026, "quarter": 3,
+    }]})})
+
+    out = finnhub_news.fetch_earnings_for_portfolio(["ACME.DE"], days_ahead=30)
+
+    assert out[0]["symbol"] == "ACME.DE"
+    assert out[0]["source_symbol"] == "ACM"
+
+
+def test_earnings_estero_senza_alias_non_deduce_il_ticker_e_non_fa_http(
+        tmp_path, monkeypatch):
+    from bellomberg.storage import negozi_privati
+
+    alias = tmp_path / "alias_fonti.json"
+    alias.write_text('{"finnhub": {}, "sec": {}, "yfinance": {}, '
+                     '"correlazione": {}}', encoding="utf-8")
+    monkeypatch.setattr(negozi_privati, "PERCORSO_ALIAS", str(alias))
+    toccati = _trasporto(monkeypatch, {})
+    motivo = []
+
+    out = finnhub_news.fetch_earnings_for_portfolio(
+        ["ACME.DE"], days_ahead=30, motivo=motivo)
+
+    assert out == [] and toccati == []
+    assert motivo and "alias Finnhub mancante" in motivo[0] and "ACME.DE" in motivo[0]
+
+
+def test_earnings_deduplica_la_stessa_identita_di_portafoglio(tmp_path, monkeypatch):
+    from bellomberg.storage import negozi_privati
+
+    alias = tmp_path / "alias_fonti.json"
+    alias.write_text('{"finnhub": {"ACME.DE": "ACM"}, "sec": {}, '
+                     '"yfinance": {}, "correlazione": {}}', encoding="utf-8")
+    monkeypatch.setattr(negozi_privati, "PERCORSO_ALIAS", str(alias))
+    _trasporto(monkeypatch, {"/calendar/earnings": _R(200, {"earningsCalendar": [{
+        "symbol": "ACM", "date": "2026-09-20", "hour": "amc",
+    }]})})
+
+    out = finnhub_news.fetch_earnings_for_portfolio(
+        ["ACME.DE", "ACME.DE"], days_ahead=30)
+
+    assert len(out) == 1 and out[0]["symbol"] == "ACME.DE"
+
+
+def test_selettore_earnings_dichiara_alias_estero_mancante(tmp_path, monkeypatch):
+    from bellomberg.api import bellomberg_api
+    from bellomberg.storage import negozi_privati
+
+    monkeypatch.setattr(negozi_privati, "PERCORSO_ALIAS",
+                        str(tmp_path / "alias_fonti_assente.json"))
+    negozio = {
+        "origine": "fixture/veicoli.json", "motivo": None,
+        "veicoli": {"ACME.DE": {"tipo": "operating"}},
+    }
+
+    tickers, nota = bellomberg_api._tickers_earnings_da_negozio(
+        [{"ticker": "ACME.DE"}], negozio)
+
+    assert tickers == []
+    assert "alias_fonti assente" in nota and "ACME.DE" in nota
+
+
+def test_endpoint_earnings_mostra_xetra_non_il_simbolo_finnhub(tmp_path, monkeypatch):
+    from bellomberg.api import bellomberg_api
+    from bellomberg.storage import classificazione, memory_db, negozi_privati
+
+    alias = tmp_path / "alias_fonti.json"
+    alias.write_text('{"finnhub": {"ACME.DE": "ACM"}, "sec": {}, '
+                     '"yfinance": {}, "correlazione": {}}', encoding="utf-8")
+    monkeypatch.setattr(negozi_privati, "PERCORSO_ALIAS", str(alias))
+    monkeypatch.setattr(memory_db, "MemoryDB", lambda: type("DB", (), {
+        "get_portfolio_summary": lambda self: {"positions": [{"ticker": "ACME.DE"}]},
+    })())
+    monkeypatch.setattr(classificazione, "carica_veicoli", lambda: {
+        "origine": "fixture/veicoli.json", "motivo": None,
+        "veicoli": {"ACME.DE": {"tipo": "operating"}},
+    })
+    _trasporto(monkeypatch, {"/calendar/earnings": _R(200, {"earningsCalendar": [{
+        "symbol": "ACM", "date": "2026-09-20", "hour": "amc",
+        "epsEstimate": 1.2, "year": 2026, "quarter": 3,
+    }]})})
+
+    out = bellomberg_api.get_economic_calendar(days_ahead=30)
+    evento = next(e for e in out["items"] if e.get("type") == "Earnings")
+
+    assert evento["title"].startswith("ACME.DE Earnings")
+    # G8 (04/10/2026): paese dal suffisso di borsa (.DE -> DE), non piu' "EU" fisso
+    assert evento["country"] == "DE"
+
+
 # ------------------------------------------------- calendario economico
 
 def test_fetch_economic_calendar_non_fa_http_e_dice_perche(monkeypatch):

@@ -62,6 +62,57 @@ SPECIALIST_ORDER = [
 R1_STAGES = [["macro", "eventdesk"], ["crypto", "fundamentals"], ["quant"], ["options"]]
 R2_SPECIALISTS = {"fundamentals", "quant", "options"}
 
+# Fase D filing: attesa massima dell'aggiornamento pre-run, dall'AVVIO della run (non
+# dall'avvio dell'aggiornamento). Oltre, la scheda usa l'ultimo confronto e lo dichiara.
+FILING_ATTESA_MAX_S = 60
+
+
+def _filing_service():
+    """Servizio filing della run (monkeypatchabile nei test)."""
+    from bellomberg.api.filing_routes import default_service
+    return default_service()
+
+
+# Aggiornamenti pre-run aperti: a fine run (o su crash) i lavori non partiti si annullano.
+_PRERUN_FILING = []
+
+
+def _chiudi_prerun_filing():
+    """Annulla i lavori pre-run in coda (cancel_futures); quelli in corso finiscono. Mai solleva."""
+    while _PRERUN_FILING:
+        agg = _PRERUN_FILING.pop()
+        try:
+            agg.chiudi()
+        except Exception as exc:
+            _log("  [!] Filing: chiusura dell'aggiornamento pre-run non riuscita: "
+                 + type(exc).__name__ + ": " + str(exc)[:160])
+
+
+def _memo_per_novita(db):
+    """(memo recenti, None) oppure ([], motivo): memo illeggibili o archivio assente si dichiarano
+    (log + contesto), mai «nessuna novità» zitta (REV_G2b B3)."""
+    if not db:
+        motivo = "archivio dei memo assente"
+    else:
+        try:
+            return db.get_recent_memos(5), None
+        except Exception as exc:
+            motivo = f"memo illeggibili: {type(exc).__name__}: {exc}"[:200]
+    _log("  [!] Filing: " + motivo + " -> NOVITÀ non determinabile")
+    return [], motivo
+
+
+def _con_novita(contesto, errore):
+    """Contesto filing con la NOVITÀ n.d. dichiarata in testa quando i memo non si leggono."""
+    if not errore:
+        return contesto
+    return "NOVITÀ: n.d. (" + errore + "): nessun titolo e' marcato come novità\n" + str(contesto)
+
+
+def _filing_tickers(portfolio):
+    return [p.get("ticker") for p in (portfolio or {}).get("positions", [])
+            if isinstance(p, dict) and p.get("ticker")]
+
 
 def _classes_for_round(round_n):
     """Chi gira in questo round (R2 = solo il sottoinsieme selettivo)."""
@@ -93,6 +144,653 @@ def _log(msg):
     print("[" + datetime.now().strftime("%H:%M:%S") + "] " + msg)
 
 
+_ACTION_STATUSES = {"OPERATIVE", "BLOCKED", "OVERRIDE_PENDING", "CHECK_UNAVAILABLE"}
+_BUY_ACTIONS = {"BUY", "ADD"}
+# 04/10 (G6): azioni a cui nessun gate d'ingresso si applica; TUTTO il resto (BUY/ADD,
+# azioni fuori elenco, righe illeggibili) e' operativo solo con un esito OPERATIVE.
+_NON_ENTRY_ACTIONS = {"SELL", "TRIM", "HOLD", "RESEARCH", "HEDGE", "WATCH"}
+
+
+def _action_cell_text(value):
+    """Strip Markdown decoration for matching an assessment to its source row."""
+    import re
+    text = str(value or "").strip()
+    text = re.sub(r"^\s*[*_`]+|[*_`]+\s*$", "", text)
+    return text.strip()
+
+
+def _action_ticker_symbol(value):
+    """Keep the source symbol while dropping cell formatting/company suffixes."""
+    import re
+    cell = _action_cell_text(value)
+    link = re.match(r"^\[([^\]]+)\]\([^)]*\)", cell)
+    if link:
+        cell = link.group(1).strip()
+    match = re.match(r"([A-Za-z0-9^][A-Za-z0-9.^=_-]{0,19})", cell)
+    return match.group(1) if match else cell
+
+
+def build_publication_snapshot(memo_markdown, assessments, *, finalization_error=None,
+                               source_markdown=None):
+    """Return a fail-closed Markdown projection and its matching action snapshot.
+
+    The supplied memo is never mutated. A row stays in the published ACTION TABLE
+    only when a row-index, action and ticker matched assessment says OPERATIVE
+    and every persistence/apply step succeeded; TRIM/SELL/HOLD/RESEARCH/HEDGE/
+    WATCH without an assessment stay (no entry gate applies). The caller retains
+    the untouched Capo text in ``source_markdown`` (raw sidecar).
+
+    04/10 (G6, review 04 G1/G5): rows come from the single ACTION TABLE parser
+    (action_table_extract), the same one that fed the gate and the register. An
+    unreadable header removes the whole table from the operative view and lists
+    its lines as CHECK_UNAVAILABLE; OPERATIVE rows without a valuation model are
+    listed under «PROPOSTE OPERATIVE SENZA VALUTAZIONE» (decisione PM 04/10).
+    """
+    import re
+    from bellomberg.agents.action_table_extract import parse_action_table_rows, _split_markdown_row
+
+    source = str(memo_markdown or "")
+    assessments = list(assessments or [])
+    by_index = {}
+    for item in assessments:
+        if isinstance(item, dict):
+            try:
+                by_index[int(item.get("row_index"))] = dict(item)
+            except (TypeError, ValueError):
+                continue
+
+    lines = source.splitlines()
+    parsed = parse_action_table_rows(source)
+    heading_index = (next((i for i, line in enumerate(lines)
+                           if re.match(r"^\s*##\s*ACTION\s+TABLE\b", line, re.I)), None)
+                     if parsed.get("table_found") else None)
+    table_lines = parsed.get("table_lines")
+    parse_error = parsed.get("error")
+
+    safe_assessments = []
+    removed_lines = set()
+    replaced_lines = {}
+    nonoperative = []
+    senza_valutazione = []
+    columns = parsed.get("columns") or {}
+    for row in parsed.get("rows") or []:
+        row_index = row["row_index"]
+        action = row["action"]
+        ticker = row["ticker"]
+        assessment = by_index.get(row_index)
+        valid = bool(assessment)
+        if valid:
+            valid = (_action_ticker_symbol(assessment.get("ticker", "")).upper() == ticker.upper()
+                     and _action_cell_text(assessment.get("action", "")).upper() == action
+                     and assessment.get("status") in _ACTION_STATUSES)
+        if not valid and action in _NON_ENTRY_ACTIONS and ticker:
+            assessment = {
+                "row_index": row_index, "action": action, "ticker": ticker,
+                "eur": None, "status": "OPERATIVE",
+                "reason": "Nessun gate d'ingresso applicabile.",
+                "override_rationale": None,
+            }
+        elif not valid:
+            assessment = {
+                "row_index": row_index, "action": action, "ticker": ticker,
+                "eur": None, "status": "CHECK_UNAVAILABLE",
+                "reason": "Esito del gate non disponibile o non allineato alla riga sorgente.",
+                "override_rationale": None,
+            }
+        else:
+            assessment = dict(assessment)
+            assessment["row_index"] = row_index
+            assessment["action"] = action
+            assessment["ticker"] = ticker
+
+        status = assessment.get("status")
+        if action not in _NON_ENTRY_ACTIONS and finalization_error and status == "OPERATIVE":
+            assessment["status"] = status = "CHECK_UNAVAILABLE"
+            assessment["reason"] = str(finalization_error)
+            assessment["override_rationale"] = None
+            assessment["senza_valutazione"] = False
+
+        assessment.setdefault("reason", "Motivo non disponibile.")
+        assessment.setdefault("override_rationale", None)
+        safe_assessments.append(assessment)
+        amount = assessment.get("eur")
+        if amount is None:
+            amount = row.get("size_raw")
+        if status != "OPERATIVE":
+            removed_lines.add(row["line_index"])
+            nonoperative.append({
+                "action": action, "ticker": ticker, "eur": amount,
+                "status": status, "reason": str(assessment.get("reason") or "Motivo non disponibile."),
+                "override_rationale": str(assessment.get("override_rationale") or ""),
+            })
+        elif assessment.get("senza_valutazione"):
+            senza_valutazione.append({"action": action, "ticker": ticker, "eur": amount,
+                                      "reason": str(assessment.get("reason") or "")})
+            # REV R4 (decisione PM): l'etichetta sta nella RIGA del pannello operativo,
+            # nella cella Timing (larga nel PDF) o, senza Timing, accanto al ticker
+            cells = _split_markdown_row(lines[row["line_index"]])
+            col = columns.get("timing", columns.get("ticker"))
+            if col is not None:
+                cells += [""] * (col + 1 - len(cells))
+                label = "**SENZA VALUTAZIONE**"
+                if col == columns.get("timing"):
+                    cells[col] = label + (" — " + cells[col] if cells[col] else "")
+                else:
+                    cells[col] = (cells[col] + " " + label).strip()
+                replaced_lines[row["line_index"]] = "| " + " | ".join(c.replace("|", "\\|") for c in cells) + " |"
+
+    def _declare_line(i, reason):
+        cells = _split_markdown_row(lines[i])
+        item = {"action": _action_cell_text(cells[0]).upper() if cells else "",
+                "ticker": _action_ticker_symbol(cells[1]) if len(cells) > 1 else "",
+                "eur": _action_cell_text(cells[2]) if len(cells) > 2 else None,
+                "status": "CHECK_UNAVAILABLE", "reason": reason, "override_rationale": ""}
+        nonoperative.append(item)
+        # REV R2/R3: anche l'email (corpo_azioni legge gli esiti) elenca queste righe; senza
+        # row_index non diventano decisioni.
+        safe_assessments.append(dict(item, row_index=None, override_rationale=None))
+
+    def _is_separator(i):
+        cells = [c for c in _split_markdown_row(lines[i]) if c]
+        return bool(cells) and all(re.fullmatch(r":?-{3,}:?", c.replace(" ", "")) for c in cells)
+
+    if heading_index is not None:
+        # Every `|` line of the ACTION TABLE section that is NOT a row the gate read
+        # (unreadable header, second table, table split by a blank line) leaves the
+        # operative view and is declared «non valutata» (REV R3): memo and PDFs show
+        # exactly the rows the gate assessed.
+        section_end = next((i for i in range(heading_index + 1, len(lines))
+                            if re.match(r"^##\s+", lines[i])), len(lines))
+        in_table = (set(range(table_lines[0], table_lines[1]))
+                    if table_lines and not parse_error else set())
+        # REV2 N3: una seconda intestazione «## ACTION TABLE …» piu' avanti non e' letta dal
+        # parser: le sue righe valgono come le altre tabelle non valutate
+        scan = list(range(heading_index + 1, section_end))
+        for other in (j for j in range(section_end, len(lines))
+                      if re.match(r"^\s*##\s*ACTION\s+TABLE\b", lines[j], re.I)):
+            other_end = next((k for k in range(other + 1, len(lines)) if re.match(r"^##\s+", lines[k])), len(lines))
+            scan += list(range(other + 1, other_end))
+        for i in scan:
+            section_end_i = next((k for k in range(i, len(lines)) if re.match(r"^##\s+", lines[k])), len(lines))
+            if i in in_table or not lines[i].strip().startswith("|"):
+                continue
+            removed_lines.add(i)
+            if _is_separator(i) or (i + 1 < section_end_i and lines[i + 1].strip().startswith("|")
+                                    and _is_separator(i + 1)):
+                continue      # separator or header line of a table: nothing to declare
+            _declare_line(i, str(parse_error) if (parse_error and table_lines
+                                                  and table_lines[0] <= i < table_lines[1])
+                          else "riga fuori dalla tabella delle proposte (seconda tabella o tabella "
+                               "spezzata da una riga vuota): non valutata dal gate")
+
+    rendered = [replaced_lines.get(i, line) for i, line in enumerate(lines) if i not in removed_lines]
+
+    def _table_line(vals):
+        return "| " + " | ".join(str(v if v is not None else "").replace("|", "\\|").replace("\n", " ")
+                                 for v in vals) + " |"
+
+    advisory = (
+        "## Stato operativo\n\n"
+        "Il testo analitico seguente conserva la valutazione originale del Capo. "
+        "Le sole righe che restano nella ACTION TABLE sono operative; "
+        "eventuali richiami nel testo discorsivo non costituiscono istruzioni d'esecuzione; "
+        "le altre proposte sono riportate separatamente.\n"
+    )
+    if senza_valutazione:
+        rows = [
+            "## PROPOSTE OPERATIVE SENZA VALUTAZIONE",
+            "",
+            "| Azione | Ticker | EUR | Motivo |",
+            "|---|---|---:|---|",
+        ]
+        rows += [_table_line([item["action"], item["ticker"], item["eur"], item["reason"]])
+                 for item in senza_valutazione]
+        advisory += "\n" + "\n".join(rows) + "\n"
+    if nonoperative:
+        rows = [
+            "## PROPOSTE NON OPERATIVE",
+            "",
+            "| Azione | Ticker | EUR | Stato | Motivo | Deroga dichiarata |",
+            "|---|---|---:|---|---|---|",
+        ]
+        rows += [_table_line([item["action"], item["ticker"], item["eur"], item["status"],
+                              item["reason"], item["override_rationale"]]) for item in nonoperative]
+        advisory += "\n" + "\n".join(rows) + "\n"
+
+    projected = "\n".join(rendered)
+    if heading_index is not None:
+        # Put the notice before the ACTION TABLE so both PDF renderers keep it close
+        # to the operational panel.
+        action_pos = next((m.start() for m in re.finditer(r"(?m)^\s*##\s*ACTION\s+TABLE\b", projected, re.I)), 0)
+        projected = projected[:action_pos] + advisory + "\n" + projected[action_pos:]
+    else:
+        projected = advisory + "\n" + projected
+    return {
+        "source_markdown": str(source_markdown if source_markdown is not None else source),
+        "memo_markdown": projected,
+        "assessments": safe_assessments,
+        "nonoperative": nonoperative,
+        "senza_valutazione": senza_valutazione,
+        "finalization_error": str(finalization_error) if finalization_error else None,
+    }
+
+
+def _publication_db_assessments(assessments, source_rows):
+    """DB identity of each assessment: the parser's actual source ticker token."""
+    source_by_index = {
+        int(row.get("row_index", index)): row
+        for index, row in enumerate(source_rows or [])
+        if isinstance(row, dict)
+    }
+    out = []
+    for assessment in assessments or []:
+        db_assessment = dict(assessment)
+        source_row = source_by_index.get(assessment.get("row_index"))
+        if source_row:
+            source_ticker = str(source_row.get("ticker") or "").strip()
+            source_action = str(source_row.get("action") or "").strip().upper()
+            if (_action_ticker_symbol(assessment.get("ticker")) == source_ticker
+                    and _action_cell_text(assessment.get("action")).upper() == source_action):
+                # The persisted identity is the parser's actual source ticker token;
+                # original cell spelling stays in decisions.proposal_ticker_cell/raw sidecar.
+                db_assessment["ticker"] = source_ticker
+                db_assessment["action"] = source_action
+        out.append(db_assessment)
+    return out
+
+
+def _publication_hard_pairs(db_assessments, sanity_records, sanity_pairs):
+    """BUY/ADD rows closed by a sanity BLOCK (assessment records + legacy memo pairs)."""
+    blocked_tickers = {
+        str(item.get("ticker") or "").strip().upper()
+        for item in (sanity_records or [])
+        if isinstance(item, dict) and str(item.get("severity") or "").upper() == "BLOCK"
+    }
+    legacy_hard_pairs = {
+        (str(action or "").upper(), _action_ticker_symbol(ticker))
+        for action, ticker in (sanity_pairs or [])
+    }
+    return list(dict.fromkeys(
+        (str(item.get("action") or "").upper(), str(item.get("ticker") or ""))
+        for item in db_assessments
+        if str(item.get("action") or "").upper() in _BUY_ACTIONS
+        and (str(item.get("ticker") or "").upper() in blocked_tickers
+             or (str(item.get("action") or "").upper(), str(item.get("ticker") or "")) in legacy_hard_pairs)
+    ))
+
+
+_SEVERITA_ESITO = {"OPERATIVE": 0, "OVERRIDE_PENDING": 1, "CHECK_UNAVAILABLE": 2, "BLOCKED": 3}
+_RITENTATIVI_TRANSITORI = 3
+
+
+def _retry_transient(fn, *args, **kwargs):
+    """REV2 N1: un guasto TRANSITORIO del registro («database is locked/busy») si ritenta
+    prima di chiudere o declassare qualsiasi cosa. Ogni altro errore passa subito."""
+    import sqlite3
+    for attempt in range(_RITENTATIVI_TRANSITORI):
+        try:
+            return fn(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            text_ = str(exc).lower()
+            if attempt == _RITENTATIVI_TRANSITORI - 1 or not ("locked" in text_ or "busy" in text_):
+                raise
+            _log("[!] registro occupato (" + str(exc)[:80] + "): nuovo tentativo " + str(attempt + 2)
+                 + "/" + str(_RITENTATIVI_TRANSITORI))
+            time.sleep(0.2 * (attempt + 1))
+
+
+def _recorded_assessments(db, decision_ids):
+    """{row_index: esito} GIA' scritto nel registro per le decisioni di questa pubblicazione.
+
+    04/10 (G6, REV R1): l'esito registrato e' immutabile; ripresa e retry pubblicano da
+    QUI (prima scrittura vince) invece di ricalcolarlo e sbattere sull'immutabilita'."""
+    ids = [int(i) for i in decision_ids or []]
+    if not ids:
+        return {}
+    with db._conn() as conn:
+        rows = conn.execute(
+            "SELECT id, proposal_row_index, proposal_action, action, proposal_ticker, ticker, eur_amount, "
+            "assessment_status, assessment_reason, assessment_override_rationale, outcome_notes FROM decisions "
+            "WHERE id IN (" + ",".join("?" * len(ids)) + ")", ids).fetchall()
+    from bellomberg.storage.memory_db import MARCA_CHIUSA_DAL_GATE, MemoryDB
+    out = {}
+    for row in rows:
+        (did, index, p_action, action, p_ticker, ticker, eur, status, reason, rationale, notes) = tuple(row)
+        if index is None or status is None:
+            continue
+        if MARCA_CHIUSA_DAL_GATE in str(notes or ""):
+            # REV2 N7: gia' ritirata dal gate in una pubblicazione precedente: vale lo
+            # stato pubblicato allora, non l'OPERATIVE immutabile della prima scrittura
+            status = MemoryDB._effective_assessment_status({"outcome_notes": notes, "assessment_status": status})
+            reason = str(notes).split(MARCA_CHIUSA_DAL_GATE, 1)[1].strip().rstrip("] ")
+        out[int(index)] = {"decision_id": did, "row_index": int(index),
+                           "action": str(p_action or action or ""), "ticker": str(p_ticker or ticker or ""),
+                           "eur": eur, "status": status, "reason": reason or "",
+                           "override_rationale": rationale,
+                           "senza_valutazione": status == "OPERATIVE"
+                           and str(reason or "").startswith("SENZA VALUTAZIONE")}
+    return out
+
+
+def _persist_and_read(bb, db, store, memo_id, capo_source_memo, source_rows, db_assessments):
+    """Decisioni + esiti dal testo intatto del Capo; ritorna (ids, esiti registrati).
+    Parser deterministico (nessuna chiamata LLM); il replace settimanale e' atomico e
+    idempotente per testo del memo, quindi una ripresa non duplica le proposte. Se gli
+    esiti sono gia' registrati (ripresa, retry) NON si riscrivono: si rileggono."""
+    from bellomberg.core.llm_client import request_scope
+    at_usage = {}
+    try:
+        with request_scope(getattr(store, "request_journal", None),
+                           phase="action_extraction", agent="_action_table"):
+            prepared = db.extract_and_save_decisions(
+                memo_id, capo_source_memo, usage_out=at_usage, raw_rows=source_rows,
+                _prepare_only=True, _strict=True)
+            decision_ids = db.replace_memo_decisions(
+                memo_id, capo_source_memo, usage_out=at_usage, prepared_rows=prepared)
+        _log("Decisions persisted from Capo source: " + str(len(decision_ids)))
+        expected = {a.get("row_index") for a in db_assessments or []}
+        recorded = _retry_transient(_recorded_assessments, db, decision_ids)
+        if recorded:
+            if set(recorded) != expected:
+                raise RuntimeError("esiti registrati non allineati alle righe del memo: registrati "
+                                   + str(sorted(recorded)) + ", attesi " + str(sorted(expected)))
+            _log("Esiti gia' registrati per questo memo: pubblicazione dal registro (prima scrittura vince)")
+            return decision_ids, recorded
+        assessment_result = db.record_action_assessments(memo_id, db_assessments)
+        if isinstance(assessment_result, dict) and assessment_result.get("recorded") is not None:
+            if int(assessment_result["recorded"]) != len(db_assessments):
+                raise RuntimeError("assessment persist count mismatch")
+        return decision_ids, _retry_transient(_recorded_assessments, db, decision_ids)
+    finally:
+        _record_side_usage(bb, "_action_table", at_usage)
+
+
+def _close_sanity_blocks(db, memo_id, hard_pairs):
+    """Auto-chiusura (SKIPPED + AUTO-ESCLUSA) delle BUY/ADD registrate BLOCKED. Ritorna
+    None o il guasto DICHIARATO (mai inghiottito: REV R1). L'esito BLOCKED e' gia' nel
+    registro, quindi la proposta resta non eseguibile anche se la chiusura manca."""
+    if not hard_pairs:
+        return None
+    from bellomberg.agents.action_validator import apply_sanity_exclusions, sanity_exclusions_not_closed
+    try:
+        n_applied = _retry_transient(apply_sanity_exclusions, db, memo_id, hard_pairs, strict=True)
+        # 04/10 (G2): conta lo stato FINALE, non le righe toccate in questo giro: in
+        # ripresa o al retry le decisioni sono gia' SKIPPED + AUTO-ESCLUSA.
+        not_closed = sanity_exclusions_not_closed(db, memo_id, hard_pairs)
+    except Exception as exc:
+        return "auto-chiusura sanity BLOCK fallita: " + type(exc).__name__ + ": " + str(exc)[:160]
+    _log("Sanity BLOCK apply: " + str(n_applied) + " chiuse ora, "
+         + str(len(hard_pairs) - len(not_closed)) + "/" + str(len(hard_pairs)) + " chiuse nel registro")
+    if not_closed:
+        return "sanity BLOCK non chiuse nel registro: " + str(not_closed)[:160]
+    return None
+
+
+def _recorded_hard_pairs(recorded):
+    return list(dict.fromkeys((str(r["action"]).upper(), str(r["ticker"]))
+                              for r in (recorded or {}).values()
+                              if r.get("status") == "BLOCKED" and str(r["action"]).upper() in _BUY_ACTIONS))
+
+
+def _persist_publication_decisions(bb, db, store, memo_id, capo_source_memo, source_rows,
+                                   db_assessments, hard_pairs):
+    """Source decisions + assessments + hard sanity closures, from the untouched Capo text.
+    Idempotente (G2, REV R1). Un guasto dell'auto-chiusura qui SOLLEVA dichiarato."""
+    decision_ids, recorded = _persist_and_read(bb, db, store, memo_id, capo_source_memo,
+                                               source_rows, db_assessments)
+    closure_error = _close_sanity_blocks(db, memo_id, hard_pairs)
+    if closure_error:
+        raise RuntimeError(closure_error)
+    return decision_ids
+
+
+def _reconcile_register(db, recorded, published):
+    """REV R1 / REV2 N1: il registro non puo' essere piu' permissivo del memo pubblicato.
+    Una riga registrata OPERATIVE che il memo dichiara non operativa viene chiusa SKIPPED
+    DAL GATE (actor 'publication_gate', mai il PM: close_decision_by_publication_gate),
+    e il suo stato effettivo diventa quello pubblicato. Ritorna {row_index: decision_id}."""
+    withdrawn = {}
+    for index, rec in (recorded or {}).items():
+        pub = published.get(index) or {}
+        if rec.get("status") != "OPERATIVE" or pub.get("status") == "OPERATIVE":
+            continue
+        if db.close_decision_by_publication_gate(rec["decision_id"], pub.get("status"), pub.get("reason")):
+            withdrawn[index] = rec["decision_id"]
+    if withdrawn:
+        _log("[!] Registro riallineato al memo pubblicato (chiusura del gate, non del PM): "
+             + str(sorted(withdrawn.values())))
+    return withdrawn
+
+
+_NOTA_RITIRO = ("; chiusa SKIPPED nel registro dal gate (non dal PM): via d'uscita la "
+                "divergenza manuale se viene eseguita")
+
+
+def _annota_esiti(assessments, by_index, nota):
+    for assessment in assessments or []:
+        if assessment.get("row_index") in by_index and nota not in str(assessment.get("reason") or ""):
+            assessment["reason"] = str(assessment.get("reason") or "") + nota
+
+
+def _finalize_publication_decisions(bb, db, store, memo_id, capo_source_memo, publication, decision_ids):
+    """Retry della finalizzazione (decisions_error dal gate). Idempotente e mai bloccante
+    per sempre (REV R1/R2): pubblica gia' congelata = verita'; il registro si riallinea a
+    lei; ogni guasto residuo torna DICHIARATO e la consegna procede (il memo dichiara gia'
+    CHECK_UNAVAILABLE le righe che il gate non ha potuto confermare)."""
+    from bellomberg.agents.action_table_extract import parse_action_table_rows
+    errors = []
+    published = {a.get("row_index"): a for a in publication.get("assessments") or []
+                 if isinstance(a, dict) and isinstance(a.get("row_index"), int)}
+    recorded = {}
+    try:
+        rows = list((parse_action_table_rows(capo_source_memo) or {}).get("rows") or [])
+        rows, db_assessments = _persistable(
+            rows, _publication_db_assessments(publication.get("assessments") or [], rows))
+        decision_ids, recorded = _persist_and_read(bb, db, store, memo_id, capo_source_memo,
+                                                   rows, db_assessments)
+    except Exception as exc:
+        errors.append("decisioni/esiti non persistiti: " + type(exc).__name__ + ": " + str(exc)[:160])
+    try:
+        withdrawn = _reconcile_register(db, recorded, published)
+        # il memo e' congelato: lo dice l'email (corpo_azioni legge questi esiti)
+        _annota_esiti(publication.get("assessments"), withdrawn, _NOTA_RITIRO)
+    except Exception as exc:
+        errors.append("riallineamento registro/memo fallito: " + type(exc).__name__ + ": " + str(exc)[:160])
+    hard_pairs = _recorded_hard_pairs(recorded)
+    closure_error = _close_sanity_blocks(db, memo_id, hard_pairs)
+    if closure_error:
+        errors.append(closure_error)
+        # REV2 N5: l'errore arriva nell'email, riga per riga
+        _annota_esiti(publication.get("assessments"),
+                      {i for i, r in recorded.items() if (str(r["action"]).upper(), str(r["ticker"])) in hard_pairs},
+                      "; auto-chiusura nel registro non riuscita (" + closure_error[:120]
+                      + "): resta PENDING ma non eseguibile")
+    try:
+        _link_publication_decisions(bb, db, memo_id)
+    except Exception as exc:
+        errors.append("collegamento snapshot valutazione/decisione non salvato: " + str(exc)[:160])
+    return list(decision_ids or []), ("; ".join(errors) or None)
+
+
+def _persistable(source_rows, db_assessments):
+    """Rows (and their assessments) that can become decisions: action AND ticker read.
+    An unreadable row is declared CHECK_UNAVAILABLE in the publication, never a
+    decision with an empty action/ticker (04/10, G6)."""
+    rows = [r for r in source_rows or [] if str(r.get("action") or "").strip() and str(r.get("ticker") or "").strip()]
+    indices = {int(r.get("row_index", i)) for i, r in enumerate(rows)}
+    return rows, [a for a in db_assessments or [] if a.get("row_index") in indices]
+
+
+def _publication_gate(bb, db, store, memo_id, memo, capo_source_memo, raw_sidecar_error, sanity_pairs):
+    """Publication gate: source decisions, assessments, and hard sanity closures are
+    committed before either PDF renderer sees the memo; the returned projection IS
+    the memo every later artifact carries. One function for the fresh run and for a
+    resumed run whose memo_validated predates the gate (review 04 G7).
+
+    REV R1: se il registro porta gia' gli esiti (ripresa dopo un crash), il memo si
+    pubblica da quelli; un guasto dell'auto-chiusura e' `decisions_error` dichiarato,
+    non un errore di pubblicazione (l'esito BLOCKED e' gia' nel registro).
+    `sanity_pairs` (blocco legacy del validator) resta per firma: le chiusure seguono
+    gli esiti REGISTRATI, non una seconda lettura dei sidecar.
+
+    Returns {"publication", "decision_ids", "decisions_error", "hard_pairs"}."""
+    from bellomberg.storage.memory_db import _parse_eur_amount
+    publication_error = raw_sidecar_error
+    assessments = []
+    source_rows = []
+    try:
+        from bellomberg.agents.action_table_extract import parse_action_table_rows
+        parsed = parse_action_table_rows(capo_source_memo)
+        source_rows = list((parsed or {}).get("rows") or [])
+        if (parsed or {}).get("error"):
+            publication_error = publication_error or str(parsed["error"])
+    except Exception as parse_error:
+        publication_error = publication_error or (
+            "parser della ACTION TABLE non disponibile: " + type(parse_error).__name__ + ": " + str(parse_error)[:120])
+
+    try:
+        from bellomberg.agents.action_validator import collect_sanity_exclusions, assess_action_table
+        sanity_records = collect_sanity_exclusions(capo_source_memo, report_dir=REPORT_DIR)
+        assessments = assess_action_table(
+            capo_source_memo, bb.data.get("_sizing"), sanity_exclusions=sanity_records)
+    except Exception as assessment_error:
+        _log("[!] Action assessment unavailable: " + str(assessment_error))
+        assessments = []
+        for idx, row in enumerate(source_rows):
+            act = str(row.get("action") or "").strip()
+            entry = act.upper() not in _NON_ENTRY_ACTIONS
+            assessments.append({
+                "row_index": int(row.get("row_index", idx)), "action": act,
+                "ticker": str(row.get("ticker") or "").strip(),
+                "eur": _parse_eur_amount(row.get("size_raw")),
+                "status": "CHECK_UNAVAILABLE" if entry else "OPERATIVE",
+                "reason": "valutazione del gate non disponibile" if entry else "nessun gate d'ingresso applicabile",
+                "override_rationale": None,
+            })
+
+    if publication_error:
+        for assessment in assessments:
+            if (str(assessment.get("action") or "").upper() not in _NON_ENTRY_ACTIONS
+                    and assessment.get("status") == "OPERATIVE"):
+                assessment["status"] = "CHECK_UNAVAILABLE"
+                assessment["reason"] = publication_error
+                assessment["override_rationale"] = None
+                assessment["senza_valutazione"] = False
+
+    persist_rows, db_assessments = _persistable(
+        source_rows, _publication_db_assessments(assessments, source_rows))
+
+    decision_ids = []
+    decisions_error = None
+    recorded = {}
+    if db is None or memo_id is None:
+        publication_error = publication_error or "registro decisioni non disponibile"
+        decisions_error = publication_error
+    else:
+        try:
+            decision_ids, recorded = _persist_and_read(
+                bb, db, store, memo_id, capo_source_memo, persist_rows, db_assessments)
+        except Exception as persist_error:
+            publication_error = publication_error or (
+                "persistenza decisioni/esiti fallita: " + type(persist_error).__name__ + ": " + str(persist_error)[:160])
+            decisions_error = publication_error
+            _log("[!] " + publication_error)
+        for assessment in assessments:
+            rec = recorded.get(assessment.get("row_index"))
+            if rec is None:
+                continue
+            fresh = str(assessment.get("status"))
+            if _SEVERITA_ESITO.get(fresh, 2) > _SEVERITA_ESITO.get(rec["status"], 2):
+                # REV2 N2: «BUY su BLOCK mai operativa» vince sempre sulla prima scrittura:
+                # il controllo ATTUALE e' piu' severo e si pubblica, con la causa
+                assessment["reason"] = ("esito attuale " + fresh + " piu' severo di quello registrato ("
+                                        + rec["status"] + "): " + str(assessment.get("reason") or ""))
+                assessment["senza_valutazione"] = False
+                _log("[!] riga " + str(rec["row_index"]) + " " + rec["ticker"] + ": " + assessment["reason"][:160])
+                continue
+            if rec["status"] != fresh:
+                _log("[!] riga " + str(rec["row_index"]) + " " + rec["ticker"] + ": esito registrato "
+                     + rec["status"] + " (prima scrittura) al posto del ricalcolo " + fresh)
+            assessment.update(status=rec["status"], reason=rec["reason"],
+                              override_rationale=rec["override_rationale"],
+                              senza_valutazione=rec["senza_valutazione"])
+        if decisions_error is None:
+            hard_pairs = _recorded_hard_pairs(recorded)
+            closure_error = _close_sanity_blocks(db, memo_id, hard_pairs)
+            if closure_error:
+                decisions_error = closure_error
+                _log("[!] " + closure_error + " — esito BLOCKED gia' nel registro; nuovo tentativo in finalizzazione")
+                # REV2 N5: dichiarato nel memo e nell'email, sulla riga
+                _annota_esiti(assessments, {i for i, r in recorded.items()
+                                            if (str(r["action"]).upper(), str(r["ticker"])) in hard_pairs},
+                              "; auto-chiusura nel registro non riuscita (" + closure_error[:120]
+                              + "): resta PENDING ma non eseguibile")
+        if decisions_error is None:
+            # Link the parsed source proposals to the reviewed valuation generation.
+            try:
+                _link_publication_decisions(bb, db, memo_id)
+            except Exception as link_error:
+                decisions_error = "collegamento snapshot valutazione/decisione non salvato: " + str(link_error)[:160]
+                _log("[!] Valuation snapshot link skipped: " + str(link_error))
+
+    publication = build_publication_snapshot(
+        memo, assessments, finalization_error=publication_error,
+        source_markdown=capo_source_memo)
+    if recorded:
+        # REV R1: il registro non resta piu' permissivo del memo (es. errore di
+        # pubblicazione su righe gia' registrate OPERATIVE)
+        try:
+            withdrawn = _reconcile_register(db, recorded, {a.get("row_index"): a for a in publication["assessments"]
+                                                           if isinstance(a.get("row_index"), int)})
+            if withdrawn:
+                # REV2 N1: memo ed email dicono che la proposta e' chiusa e perche'
+                final_rows = [dict(a) for a in publication["assessments"] if isinstance(a.get("row_index"), int)]
+                _annota_esiti(final_rows, withdrawn, _NOTA_RITIRO)
+                publication = dict(build_publication_snapshot(memo, final_rows, finalization_error=None,
+                                                              source_markdown=capo_source_memo),
+                                   finalization_error=publication.get("finalization_error"))
+        except Exception as reconcile_error:
+            decisions_error = decisions_error or (
+                "riallineamento registro/memo fallito: " + type(reconcile_error).__name__ + ": " + str(reconcile_error)[:160])
+            _log("[!] " + decisions_error)
+    return {"publication": publication, "decision_ids": decision_ids,
+            "decisions_error": decisions_error, "hard_pairs": _recorded_hard_pairs(recorded)}
+
+
+def _restore_validated(validated, capo_source_memo, run_gate):
+    """memo_validated of a resumed run. A payload written by the gate restores the
+    published snapshot as it was. A payload from before the gate (no `publication`)
+    used to finalize with `ids: []` and lose the run's decisions in silence (review
+    04 G7): the gate runs now on the untouched Capo source, declared in the log."""
+    memo = validated["memo"]
+    sanity_pairs = validated.get("sanity_pairs") or []
+    if "publication" in validated:
+        return {"memo": memo, "sanity_pairs": sanity_pairs,
+                "publication": dict(validated.get("publication") or {"memo_markdown": memo, "assessments": []},
+                                    source_markdown=capo_source_memo),
+                "hard_pairs": [tuple(pair) for pair in (validated.get("hard_pairs") or [])],
+                "decision_ids": list(validated.get("decision_ids") or []),
+                "decisions_error": validated.get("decisions_error")}
+    _log("[!] memo validato nel formato precedente al gate di pubblicazione: gate eseguito ora "
+         "sulla sorgente del Capo (decisioni e esiti persistiti, memo proiettato)")
+    gate = run_gate(memo, sanity_pairs)
+    publication = dict(gate["publication"])
+    return {"memo": publication["memo_markdown"], "sanity_pairs": sanity_pairs,
+            "publication": publication, "hard_pairs": list(gate["hard_pairs"]),
+            "decision_ids": list(gate["decision_ids"]), "decisions_error": gate["decisions_error"]}
+
+
+def _link_publication_decisions(bb, db, memo_id):
+    """Link newly extracted proposals to the exact generation reviewed by this committee."""
+    with db._conn() as conn:
+        candidates = conn.execute("SELECT id,ticker FROM decisions WHERE memo_id=?", (memo_id,)).fetchall()
+    for decision_id, ticker in candidates:
+        result = bb.valuation_results.get(str(ticker).upper())
+        if result and result.get("snapshot_id"):
+            db.link_valuation_snapshot(result["snapshot_id"], generation_id=result["generation_id"],
+                                       decision_id=decision_id)
+
+
 _MOTIVO_USCITA = {"testo": ""}   # letto dal gestore di crash del __main__: F4 vede il motivo, non «2»
 _LAST_WEEKLY_OUTCOME = {}
 
@@ -103,7 +801,9 @@ def mandato_o_esci():
     mandato letto dal disco; assente/incompleto = messaggio con la causa e uscita 2."""
     from bellomberg.core import mandato_pm
     try:
-        return mandato_pm.carica()
+        # 04/10 (G6): il comitato pretende anche i campi che lo schema lascia facoltativi
+        # per Trade Idea e chat (tolleranza di sforo del sizing): senza, non parte e lo dice.
+        return mandato_pm.richiedi_per_comitato(mandato_pm.carica())
     except mandato_pm.MandatoMancante as e:
         _log("MANDATO NON DICHIARATO: " + str(e))
         _log("Il comitato non parte senza il mandato del PM: compila la pagina Mandato e Diario (F18) e rilancia.")
@@ -526,7 +1226,7 @@ def _weekly_terminal_heartbeat(store):
 @scoped_language
 @paid_run_exclusive
 def run_multi_agent(*, resume_memo_id=None, delivery_only=False,
-                    authorize_new_ai=False, send_email=True):
+                    authorize_new_ai=False, send_email=True, acknowledge_uncertain_email=False):
     """Normal run, explicit continuation, or artifact-only recovery of one memo."""
     from pathlib import Path
     from bellomberg.agents.weekly_lifecycle import create_run, validate_resume, recover_delivery, require_existing_database
@@ -536,6 +1236,11 @@ def run_multi_agent(*, resume_memo_id=None, delivery_only=False,
     _LAST_WEEKLY_OUTCOME.clear()
     if delivery_only and resume_memo_id is None:
         raise WeeklyRunBlocked("Seleziona esplicitamente il memo da recuperare")
+    if not delivery_only:
+        # REV G7/R7 (04/10): effort non valido = run rifiutata PRIMA di nascere (create_run),
+        # col nome della variabile; il controllo in _run_multi_agent resta come seconda rete.
+        from bellomberg.core.llm_client import valida_effort_env
+        valida_effort_env()
     from bellomberg.storage import memory_db as _memory_db
     require_existing_database(_memory_db.SQLITE_PATH)
     db = MemoryDB()  # A failed database is a hard prerequisite, before any tool/provider.
@@ -560,10 +1265,12 @@ def run_multi_agent(*, resume_memo_id=None, delivery_only=False,
             try:
                 with language_context(selected):
                     if delivery_only:
-                        result = recover_delivery(store, sys.modules[__name__], send_email=send_email)
+                        result = recover_delivery(store, sys.modules[__name__], send_email=send_email,
+                                                  acknowledge_uncertain_email=acknowledge_uncertain_email)
                     elif resume_memo_id is not None and store.get("decisions_finalized") is not None:
                         # Idempotent second continuation: verify/recover delivery without any AI.
-                        result = recover_delivery(store, sys.modules[__name__], send_email=send_email)
+                        result = recover_delivery(store, sys.modules[__name__], send_email=send_email,
+                                                  acknowledge_uncertain_email=acknowledge_uncertain_email)
                     else:
                         if resume_memo_id is not None:
                             if not authorize_new_ai:
@@ -593,6 +1300,7 @@ def run_multi_agent(*, resume_memo_id=None, delivery_only=False,
                     _log("[!] Persistenza errore run fallita: " + str(state_error))
                 raise
     except BaseException:
+        _chiudi_prerun_filing()  # run interrotta: nessun aggiornamento filing ancora in coda
         _LAST_WEEKLY_OUTCOME.update(store.status())
         _weekly_terminal_heartbeat(store)
         raise
@@ -603,10 +1311,15 @@ def run_multi_agent(*, resume_memo_id=None, delivery_only=False,
 
 
 def _run_multi_agent(store, db, *, send_email=True):
-    from bellomberg.core.llm_client import request_scope
+    from bellomberg.core.llm_client import request_scope, valida_effort_env
+    # G7/M1 (04/10): TUTTE le variabili *_EFFORT validate qui, prima di qualunque chiamata
+    # pagata (sonda, desk, red team, Capo): un valore vuoto o non valido ferma la run col
+    # NOME della variabile, invece di emergere al Capo a desk gia' pagati.
+    valida_effort_env()
     start_time = datetime.now()
+    avvio_monotonic = time.monotonic()   # scadenza assoluta dell'aggiornamento filing pre-run
     print_banner()
-    mandato_o_esci()   # 05/09 (criterio 5): niente mandato = niente run, dichiarato subito
+    _mandato_run = mandato_o_esci()   # 05/09 (criterio 5): niente mandato = niente run, dichiarato subito
     # log dai valori VERI (doc-fix audit/21 App. C: diceva "All agents on
     # claude-opus-4-8" ma R0 e' Sonnet dal 15/07 — il log ora non puo' mentire)
     try:
@@ -637,6 +1350,26 @@ def _run_multi_agent(store, db, *, send_email=True):
     portfolio = store.context["portfolio"]
     memo_id = store.memo_id
     macro = None
+
+    # Fase D filing: profili scaduti aggiornati IN BACKGROUND mentre la run prosegue;
+    # il passo filing (I-20) attende al più fino a avvio + FILING_ATTESA_MAX_S. Mai bloccante.
+    # Solo se il priming (dove vive il passo I-20) non e' gia' persistito: una ripresa
+    # oltre il priming non rilegge il contesto filing e non deve avviare download.
+    _filing_agg = None
+    if store.get("priming") is None:
+        try:
+            _tickers_filing = _filing_tickers(portfolio)
+            if _tickers_filing:
+                from bellomberg.market_data.filing_prerun import AggiornamentoPreRun
+                _filing_agg = AggiornamentoPreRun(_filing_service(), _tickers_filing,
+                                                  avvio_run=avvio_monotonic, attesa_max_s=FILING_ATTESA_MAX_S)
+                _filing_agg.avvia()
+                _PRERUN_FILING.append(_filing_agg)
+                _log(f"  Filing: aggiornamento dei profili scaduti avviato (attesa max {FILING_ATTESA_MAX_S:g} s dall'avvio)")
+        except Exception as exc:
+            _filing_agg = None   # freschezza dall'archivio: la scheda dichiara NON AGGIORNATO dove serve
+            _log("  [!] Filing: aggiornamento pre-run non avviato: " + type(exc).__name__ + ": " + str(exc)[:160])
+
     correlation_matrix = None
 
     # BLACKBOARD con DB + memo_id
@@ -677,10 +1410,19 @@ def _run_multi_agent(store, db, *, send_email=True):
         # I-20: fotografia read-only dell'archivio per i ticker realmente presenti nel DB.
         # Il contesto non e' un desk e non altera expected_reports o i round.
         try:
-            from bellomberg.agents.filing_context import committee_filing_context
-            _filing_tickers = [p.get("ticker") for p in (portfolio or {}).get("positions", [])
-                               if isinstance(p, dict) and p.get("ticker")]
-            bb.data["_filing_context"] = committee_filing_context(_filing_tickers)
+            from bellomberg.agents.filing_context import committee_filing_context, ultima_run_comitato
+            _freschezza = None
+            try:
+                _freschezza = _filing_agg.esiti() if _filing_agg else None
+            except Exception as exc:
+                _log("  [!] Filing: esiti dell'aggiornamento non disponibili: " + type(exc).__name__ + ": " + str(exc)[:160])
+            _memos, _memos_errore = _memo_per_novita(db)  # REV_G2b B3: illeggibili = NOVITÀ n.d.
+            bb.data["_filing_context"] = _con_novita(committee_filing_context(
+                _filing_tickers(portfolio), freschezza=_freschezza,
+                novita_dopo=ultima_run_comitato(_memos, escludi_id=memo_id)), _memos_errore)
+            _non_agg = [t for t, e in (_freschezza or {}).items() if e.get("stato") != "aggiornato"]
+            _log(f"  Filing: contesto {len(bb.data['_filing_context'])} caratteri; "
+                 f"non aggiornati: {', '.join(_non_agg) or 'nessuno'}")
         except Exception as exc:
             bb.data["_filing_context"] = ("ARCHIVIO FILING NON DISPONIBILE: "
                                           + type(exc).__name__ + ": " + str(exc)[:200])
@@ -887,15 +1629,27 @@ def _run_multi_agent(store, db, *, send_email=True):
         _progress_score_error = _priming["score_error"]
 
     # ROUND 0 (recon) + ROUND 1 (draft)
+    from bellomberg.agents import weekly_lifecycle as _wl
     for r in [0, 1]:
         store.update(phase="round_" + str(r))
         run_round(bb, r)
+        # Comitato a lacune (PM 04/10): quorum perso = stop PRIMA di pagare altri round.
+        try:
+            _wl.quorum_still_reachable(bb, store)
+        except Exception:
+            _wl.committee_summary(bb, store)
+            raise
 
     # AUTO299: a desk omitting the tool must not silently omit the DB holdings.
     # Existing attempts (including failures) are never automatically retried.
     if is_research_mode(bb):
         store.update(phase='research_dossier')
-        sealed = seal_research_thesis(bb, desks=[cls.name for cls in SPECIALIST_ORDER])
+        try:
+            _present, _missing = _wl.committee_quorum(bb, store)
+        except Exception:
+            _wl.committee_summary(bb, store)
+            raise
+        sealed = seal_research_thesis(bb, desks=_present, missing=_missing)
         if store.get('research_dossier') is None:
             store.complete('research_dossier', sealed, bb)
         elif store.get('research_dossier') != sealed:
@@ -918,17 +1672,25 @@ def _run_multi_agent(store, db, *, send_email=True):
             if crit:
                 _log("Red team critica: " + str(len(crit)) + " chars (visibile in R2)")
         except Exception as e:
-            _log("[!] Red team skipped: " + str(e))
+            _log("[!] Red team: " + str(e))
             bb.record_run_failure(e, desk="_red_team", round_n=1)
-            raise
+            if bb.data.get("_red_team_gap") is None:
+                raise
+            crit = None   # lacuna dichiarata (PM 04/10): la run prosegue senza contraddittorio
 
         bb.raise_if_run_blocked()
         from bellomberg.agents.red_team import motivo_critica_non_utilizzabile
         _red_report = bb.data.get("_red_team", {}).get(1) or crit
         _red_reason = motivo_critica_non_utilizzabile(_red_report)
-        if _red_reason or "CRITICA TRONCATA" in str(_red_report):
-            raise RuntimeError(_red_reason or str(_red_report))
+        if bb.data.get("_red_team_gap") is None and (_red_reason or "CRITICA TRONCATA" in str(_red_report)):
+            bb.record_run_failure(RuntimeError(_wl.RED_TEAM_UNUSABLE + (_red_reason or "CRITICA TRONCATA")),
+                                  desk="_red_team", round_n=1)
+            if bb.data.get("_red_team_gap") is None:
+                raise RuntimeError(_red_reason or str(_red_report))
         red_payload = {'report': _red_report}
+        if bb.data.get("_red_team_gap") is not None:
+            red_payload['gap'] = bb.data["_red_team_gap"].get("message")
+            _log("[!] Red Team in LACUNA DICHIARATA: R2 e Capo procedono senza contraddittorio")
         if is_research_mode(bb):
             red_payload['research_ref'] = research_reference(bb)
         store.complete("red_team", red_payload, bb)
@@ -940,7 +1702,7 @@ def _run_multi_agent(store, db, *, send_email=True):
     run_round(bb, 2)
     if is_research_mode(bb):
         from bellomberg.agents.weekly_lifecycle import validate_research_reviews
-        validate_research_reviews(bb, [cls.name for cls in _classes_for_round(2)])
+        validate_research_reviews(bb, _wl.reviewed_desks(bb, [cls.name for cls in _classes_for_round(2)]))
 
     _synthesis = store.get("synthesis_context")
     if _synthesis is None:
@@ -1058,6 +1820,11 @@ def _run_multi_agent(store, db, *, send_email=True):
             sizing_context = (sizing_context or "") + "\n\n" + preparation_status_text(
                 bb.data["_valuation_preparation"], language=bb.language)
         from bellomberg.core.llm_client import request_scope
+        if is_research_mode(bb) and not _wl.committee_summary(bb, store).get("high_conviction_allowed", False):
+            sizing_context = (sizing_context or "") + (
+                "\n\nRED TEAM MANCANTE O PARZIALE in questa run (regola PM 04/10): nessuna proposta "
+                "puo' avere confidence ALTA; il codice declassa ALTA a MEDIA nella colonna confidence "
+                "della ACTION TABLE e lo dichiara nel memo.")
         with request_scope(store.request_journal, phase="capo", agent="capo", round_n=3):
             memo, capo_usage = run_capo(bb, portfolio_data=portfolio, memory_db=db, sizing_context=sizing_context, scoring_context=scoring_context)
         _capo_dur = time.perf_counter() - _capo_t0
@@ -1069,13 +1836,52 @@ def _run_multi_agent(store, db, *, send_email=True):
         bb.mark_specialist_done("capo")
 
         from bellomberg.agents.weekly_lifecycle import validate_memo
-        validate_memo(memo, capo_usage)
+        from bellomberg.storage.weekly_run_store import WeeklyRunBlocked as _CapoNonCompleto
+        try:
+            validate_memo(memo, capo_usage)
+        except _CapoNonCompleto as _capo_error:
+            # PM 04/10: memo PARZIALE marcato INCOMPLETO, nessuna decisione, nessuna email.
+            _log("[!] " + str(_capo_error) + ": memo parziale INCOMPLETO, nessuna decisione, nessuna email")
+            _chiudi_prerun_filing()
+            return _wl.capo_partial_package(store, bb, sys.modules[__name__], memo=memo,
+                                            usage=capo_usage, error=_capo_error)
         capo_payload = {'memo': memo, 'usage': capo_usage}
         if is_research_mode(bb):
             capo_payload['research_ref'] = research_reference(bb)
         store.complete("capo", capo_payload, bb)
+        _prev_partial = store.status().get("capo_partial")
+        if _prev_partial:
+            # ripresa riuscita: il memo parziale di prima resta solo come storico
+            store.update(capo_partial=None, capo_partial_superseded=_prev_partial)
     else:
         memo, capo_usage = _capo_saved["memo"], _capo_saved["usage"]
+
+    # Comitato a lacune (PM 04/10): stato del comitato (desk, Red Team, Capo) e, con il Red
+    # Team mancante, ALTA -> MEDIA applicato dal codice PRIMA del gate (decisioni coerenti).
+    # Deterministico: in ripresa si ricalcola dallo stesso checkpoint 'capo'.
+    _committee = _wl.committee_summary(bb, store, memo=memo, usage=capo_usage)
+    _conviction_block = ""
+    if is_research_mode(bb) and not _committee.get("high_conviction_allowed", False):
+        memo, _capped, _residual = _wl.cap_high_conviction(memo)
+        _conviction_block = _wl.conviction_cap_block(_capped, _residual, store.context.get("language"))
+
+    # PUBLICATION GATE (Andrea, ported): il testo intatto del Capo resta in un
+    # sidecar *_capo_raw.md mai sovrascritto (stessa via congelata degli artefatti
+    # della run, idempotente in ripresa); il memo pubblicato e' una proiezione.
+    capo_source_memo = str(memo or "")
+    _raw_sidecar_path = None
+    _raw_sidecar_error = None
+    try:
+        from bellomberg.agents.weekly_lifecycle import write_frozen_text
+        os.makedirs(RESEARCH_NOTES_DIR, exist_ok=True)
+        _raw_sidecar_path = os.path.join(RESEARCH_NOTES_DIR,
+                                         "bellomberg_memo_" + str(memo_id) + "_capo_raw.md")
+        # Exclusive/frozen create: a run never overwrites a prior Capo source artifact.
+        write_frozen_text(_raw_sidecar_path, capo_source_memo)
+        _log("Capo source preserved: " + _raw_sidecar_path)
+    except Exception as _raw_error:
+        _raw_sidecar_error = "testo sorgente Capo non archiviato: " + type(_raw_error).__name__ + ": " + str(_raw_error)[:160]
+        _log("[!] " + _raw_sidecar_error)
 
     _validated = store.get("memo_validated")
     if _validated is None:
@@ -1098,7 +1904,8 @@ def _run_multi_agent(store, db, *, send_email=True):
         # intoccati e un guasto del validator non tocca la run.
         try:
             from bellomberg.agents.action_validator import build_validator_block
-            _vblock = build_validator_block(memo, bb.data.get("_sizing"), db, exclude_memo_id=memo_id)
+            _vblock = build_validator_block(memo, bb.data.get("_sizing"), db, exclude_memo_id=memo_id,
+                                            mandato=_mandato_run)
             if _vblock:
                 memo = memo + "\n\n" + _vblock
                 _log("ACTION VALIDATOR: " + str(_vblock.count("\n- ")) + " avvertimenti aggiunti al memo")
@@ -1132,11 +1939,54 @@ def _run_multi_agent(store, db, *, send_email=True):
         except Exception as e:
             _log("[!] blocco QUALITA' DATI skipped: " + str(e))
 
+        # COMITATO: LACUNE DICHIARATE (PM 04/10, elenco in coda, scelta «C»): il blocco lo
+        # scrive il codice dal registro della run, non il Capo.
+        for _cblock in (_wl.committee_memo_block(_committee), _conviction_block):
+            if _cblock:
+                memo = memo + "\n\n" + _cblock
+        if _committee.get("status") != "complete":
+            _log("COMITATO: " + str(_committee.get("status")) + " (blocco lacune nel memo)")
+
+        # Publication gate (_publication_gate): decisions, assessments and hard sanity
+        # closures are committed before either PDF renderer sees the memo. The memo
+        # validated here IS the publication projection, so every later artifact
+        # (Markdown, PDF, DB row, recovery) carries the same fail-closed text.
+        _analysis_memo = memo
+        # Difesa in piu' (PM 04/10): sotto quorum o Capo non completo NESSUNA decisione si
+        # persiste. Riepilogo non calcolato = non ammesso (mai «ammesso» per default).
+        if not _committee.get("decisions_allowed", False):
+            from bellomberg.storage.weekly_run_store import WeeklyRunBlocked as _NonAmmesse
+            raise _NonAmmesse("Decisioni non ammesse dal comitato (stato " + str(_committee.get("status"))
+                                   + "): nessuna decisione persistita")
+        _gate = _publication_gate(bb, db, store, memo_id, memo, capo_source_memo,
+                                  _raw_sidecar_error, _sanity_pairs)
+        publication = _gate["publication"]
+        decision_ids = _gate["decision_ids"]
+        _decisions_error = _gate["decisions_error"]
+        _hard_pairs = _gate["hard_pairs"]
+        memo = publication["memo_markdown"]
         store.complete("memo_validated", {"memo": memo, "capo_usage": capo_usage,
-                                           "sanity_pairs": _sanity_pairs}, bb)
+                                           "sanity_pairs": _sanity_pairs,
+                                           "analysis_memo": _analysis_memo,
+                                           "publication": {k: v for k, v in publication.items()
+                                                           if k != "source_markdown"},
+                                           "hard_pairs": [list(pair) for pair in _hard_pairs],
+                                           "decision_ids": decision_ids,
+                                           "decisions_error": _decisions_error}, bb)
     else:
-        memo, capo_usage = _validated["memo"], _validated["capo_usage"]
-        _sanity_pairs = _validated["sanity_pairs"]
+        capo_usage = _validated["capo_usage"]
+        _analysis_memo = _validated.get("analysis_memo", _validated["memo"])
+        _restored = _restore_validated(
+            _validated, capo_source_memo,
+            lambda _memo, _pairs: _publication_gate(bb, db, store, memo_id, _memo, capo_source_memo,
+                                                    _raw_sidecar_error, _pairs))
+        memo = _restored["memo"]
+        _sanity_pairs = _restored["sanity_pairs"]
+        publication = _restored["publication"]
+        _hard_pairs = _restored["hard_pairs"]
+        decision_ids = _restored["decision_ids"]
+        _decisions_error = _restored["decisions_error"]
+    publication_memo = memo
     store.update(analytical_status="complete", phase="artifacts")
     # Save memo markdown archivio
     os.makedirs(RESEARCH_NOTES_DIR, exist_ok=True)
@@ -1165,7 +2015,7 @@ def _run_multi_agent(store, db, *, send_email=True):
             _refl_usage = {}
             try:
                 with request_scope(store.request_journal, phase="reflection", agent="_reflection"):
-                    _lesson = generate_lesson(memo, memo_id=memo_id, usage_out=_refl_usage)
+                    _lesson = generate_lesson(_analysis_memo, memo_id=memo_id, usage_out=_refl_usage)
             finally:
                 _record_side_usage(bb, "_reflection", _refl_usage)
             if _lesson:
@@ -1182,16 +2032,17 @@ def _run_multi_agent(store, db, *, send_email=True):
     else:
         _lesson, _progress_reflection_status = _reflection["lesson"], _reflection["status"]
 
-    # Blackboard JSON archive
-    debug_path = md_path.replace(".md", "_blackboard.json")
-    try:
-        with open(debug_path, "w", encoding="utf-8") as f:
-            json.dump({"data": bb.data, "tool_log": bb.tool_log, "language": bb.language,
-                       "valuation_results": bb.valuation_results,
-                       "valuation_attempts": bb.valuation_attempts},
-                      f, indent=2, default=str)
-    except Exception:
-        pass
+    # Blackboard JSON archive retains diagnostics; it is separate from the memo.
+    debug_path = md_path.replace(".md", "_blackboard.json") if md_path else None
+    if debug_path:
+        try:
+            with open(debug_path, "w", encoding="utf-8") as f:
+                json.dump({"data": bb.data, "tool_log": bb.tool_log, "language": bb.language,
+                          "valuation_results": bb.valuation_results,
+                          "valuation_attempts": bb.valuation_attempts},
+                          f, indent=2, default=str)
+        except Exception:
+            pass
 
     # PDF MEMO PRINCIPALE (#183 istituzionale Aurum-style, fallback al builder classico)
     from bellomberg.agents.weekly_lifecycle import (
@@ -1226,7 +2077,7 @@ def _run_multi_agent(store, db, *, send_email=True):
         try:
             from bellomberg.reporting.pdf_institutional import build_institutional_memo
             pdf_memo_path = render_pdf_once(store, sys.modules[__name__], build_institutional_memo,
-                memo_markdown=memo, portfolio_data=portfolio,
+                memo_markdown=publication_memo, portfolio_data=portfolio,
                 risk_data=risk_data, nav_history=nav_history,
                 sizing_data=bb.data.get("_sizing"),
                 scoring_data=bb.data.get("_score_cache"),
@@ -1242,7 +2093,7 @@ def _run_multi_agent(store, db, *, send_email=True):
         try:
             from bellomberg.reporting.pdf_report import build_pdf_report
             pdf_memo_path = render_pdf_once(store, sys.modules[__name__], build_pdf_report,
-                memo_markdown=memo, portfolio_data=portfolio,
+                memo_markdown=publication_memo, portfolio_data=portfolio,
                 macro_data=macro, options_data_dict={})
             if pdf_memo_path:
                 _log("PDF MEMO (classico fallback): " + pdf_memo_path)
@@ -1300,12 +2151,12 @@ def _run_multi_agent(store, db, *, send_email=True):
             with db._conn() as conn:
                 conn.execute("""UPDATE memos SET full_markdown=?, pdf_path=?, appendix_path=?,
                                 dcf_files=?, capo_tokens_in=?, capo_tokens_out=? WHERE id=?""",
-                              (memo, pdf_memo_path, pdf_appendix_path,
+                              (publication_memo, pdf_memo_path, pdf_appendix_path,
                                json.dumps(dcf_files), capo_usage["input_tokens"],
                                capo_usage["output_tokens"], memo_id))
             # Re-embed in ChromaDB
             if db.col_memos:
-                chunks = db._chunk_markdown(memo)
+                chunks = db._chunk_markdown(publication_memo)
                 if chunks:
                     # audit/11 §2: con gli stessi id chromadb add() MANTIENE il documento
                     # vecchio -> il chunk 0 restava '[IN PROGRESS]' per sempre. upsert.
@@ -1314,45 +2165,23 @@ def _run_multi_agent(store, db, *, send_email=True):
                         metadatas=[{"memo_id": memo_id, "chunk_idx": i} for i in range(len(chunks))],
                         ids=["memo_" + str(memo_id) + "_chunk_" + str(i) for i in range(len(chunks))]
                     )
-            # Extract & save decisions from ACTION TABLE
-            # #44/finding 4: dentro c'e' una chiamata Sonnet REALE (#200c estrazione
-            # strutturata) che prima non entrava nel conto della run. Registrata QUI,
-            # cioe' PRIMA di save_llm_usage sotto, altrimenti finirebbe nell'heartbeat
-            # ma non nel DB.
-            _at_usage = {}
-            try:
-                with request_scope(store.request_journal, phase="action_extraction", agent="_action_table"):
-                    decision_ids = db.replace_memo_decisions(memo_id, memo, usage_out=_at_usage)
-                # Link newly extracted proposals to the exact generation reviewed
-                # by this committee. Missing metadata is declared, never backfilled.
-                try:
-                    with db._conn() as conn:
-                        candidates = conn.execute("SELECT id,ticker FROM decisions WHERE memo_id=?", (memo_id,)).fetchall()
-                    for decision_id, ticker in candidates:
-                        result = bb.valuation_results.get(str(ticker).upper())
-                        if result and result.get("snapshot_id"):
-                            db.link_valuation_snapshot(result["snapshot_id"], generation_id=result["generation_id"],
-                                                       decision_id=decision_id)
-                except Exception as exc:
-                    _log("[!] Collegamento snapshot valutazione/decisione non salvato: " + str(exc))
-                    raise
-                _log("Decisions extracted from ACTION TABLE: " + str(len(decision_ids)))
-            finally:
-                _record_side_usage(bb, "_action_table", _at_usage)
-            # #204b HARD fase APPLY (dopo il salvataggio: ora le righe ESISTONO)
-            try:
-                if _sanity_pairs:
-                    from bellomberg.agents.action_validator import apply_sanity_exclusions
-                    _n_x = apply_sanity_exclusions(db, memo_id, _sanity_pairs)
-                    _log("ACTION VALIDATOR: esclusioni HARD applicate al registro: "
-                         + str(_n_x) + "/" + str(len(_sanity_pairs)))
-                    if _n_x < len(_sanity_pairs):
-                        raise RuntimeError("Esclusioni HARD non confermate nel registro: "
-                                           + str(len(_sanity_pairs) - _n_x))
-            except Exception as _xe:
-                _log("[!] esclusioni HARD non applicate: " + str(_xe))
-                raise
-            store.complete("decisions_finalized", {"ids": decision_ids}, bb)
+            # Decisions, assessments and hard sanity closures were persisted by the
+            # publication gate BEFORE rendering (from the untouched Capo source).
+            # Here they become final for the weekly lifecycle; a gate that could not
+            # persist them is retried once with the snapshot that was published.
+            _finalize_error = None
+            if _decisions_error is not None:
+                # REV R1/R2: retry idempotente e mai bloccante per sempre. Il memo e' gia'
+                # congelato e dichiara cio' che il gate non ha confermato; il registro si
+                # riallinea a lui e un guasto residuo resta DICHIARATO nel payload e nel log.
+                _log("[!] Decisioni non finalizzate dal gate: " + str(_decisions_error) + " - nuovo tentativo")
+                decision_ids, _finalize_error = _finalize_publication_decisions(
+                    bb, db, store, memo_id, capo_source_memo, publication, decision_ids)
+                if _finalize_error:
+                    _log("[!] FINALIZZAZIONE CON GUASTO DICHIARATO (la consegna procede): " + _finalize_error)
+                _decisions_error = None
+            _log("Decisions extracted from ACTION TABLE: " + str(len(decision_ids)))
+            store.complete("decisions_finalized", {"ids": decision_ids, "error": _finalize_error}, bb)
             _persistence_ok = True
         except Exception as e:
             _log("[!] DB memo finalize failed: " + str(e))
@@ -1376,13 +2205,26 @@ def _run_multi_agent(store, db, *, send_email=True):
     # (FV o n.d. col motivo) e se manca l'Excel lo dice — prima il piede prometteva "DCF
     # Excel models" anche con zero .xlsx e il FV n.d. restava solo dentro il PDF.
     try:
+        from bellomberg.reporting.email_sender import corpo_azioni
         _corpo_email = weekly_email_body(bb, delivery)
+        _corpo_email += "\n" + corpo_azioni(publication.get("assessments") or [])
     except Exception as _ce:
         _corpo_email = ("<p>[esito valutazioni non costruito: %s: %s]</p>"
                         % (type(_ce).__name__, str(_ce)[:120]))
         _log("[!] corpo email valutazioni non costruito: " + type(_ce).__name__ + ": " + str(_ce)[:120])
-    sent = deliver_once(store, sys.modules[__name__], all_attachments,
-        body_extra=_corpo_email, delivery=delivery, send_email=send_email)
+    if pdf_memo_path and send_email and not _committee.get("automatic_email_allowed", False):
+        # Difesa in piu' (PM 04/10): comitato senza email automatica = nessun invio, dichiarato.
+        sent = False
+        store.update(delivery_requested=True,   # chiesta e non partita: run incompleta, dichiarata
+                     email_blocked_reason="Email automatica non ammessa dal comitato (stato "
+                     + str(_committee.get("status")) + ")")
+        _log("[!] Email settimanale NON inviata: email automatica non ammessa dal comitato")
+    elif pdf_memo_path:
+        sent = deliver_once(store, sys.modules[__name__], all_attachments,
+            body_extra=_corpo_email, delivery=delivery, send_email=send_email)
+    else:
+        sent = False
+        _log("[!] Email settimanale omessa: memo PDF non disponibile, nessuno snapshot pubblicabile")
     record_email_outcome(delivery, sent)
     save_manifest(delivery_path, delivery)
 
@@ -1435,6 +2277,8 @@ def _run_multi_agent(store, db, *, send_email=True):
         _log("[!] Costo run non calcolabile (aggregazione fallita): " + str(e))
     _log("Memo ID in DB: #" + str(memo_id))
     _log("Decisioni auto-estratte salvate nel DB (tabella decisions): GET /decisions o la pagina Decisions dell'app")
+    # Fase D: il contesto filing e' gia' stato scritto; i titoli non ancora partiti non servono piu'.
+    _chiudi_prerun_filing()
     return outcome
 
 
@@ -1445,6 +2289,8 @@ if __name__ == "__main__":
     parser.add_argument("--delivery-only", action="store_true")
     parser.add_argument("--authorize-new-ai", action="store_true")
     parser.add_argument("--no-email", action="store_true")
+    parser.add_argument("--acknowledge-uncertain-email", action="store_true",
+                        help="Conferma del PM: ripete un invio precedente INCERTO (possibile duplicato)")
     parser.add_argument("--outcome")
     parser.add_argument("--task-id")
     args = parser.parse_args()
@@ -1458,11 +2304,13 @@ if __name__ == "__main__":
                 raise RuntimeError("Esito finale non persistito: " + str(error))
     try:
         outcome = run_multi_agent(resume_memo_id=args.resume_memo_id, delivery_only=args.delivery_only,
-                                   authorize_new_ai=args.authorize_new_ai, send_email=not args.no_email)
+                                   authorize_new_ai=args.authorize_new_ai, send_email=not args.no_email,
+                                   acknowledge_uncertain_email=args.acknowledge_uncertain_email)
         _write_cli_outcome(outcome)
         if outcome.get("status") != "completed":
             raise SystemExit(2)
     except BaseException as e:
+        _chiudi_prerun_filing()  # run interrotta: nessun aggiornamento filing ancora in coda
         _write_cli_outcome(_LAST_WEEKLY_OUTCOME or {"status": "failed", "error": str(e),
             "analytical_status": "incomplete", "artifact_status": "unknown", "delivery_status": "not_attempted"})
         if not _LAST_WEEKLY_OUTCOME:

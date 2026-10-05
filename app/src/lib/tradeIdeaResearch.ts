@@ -1,5 +1,6 @@
 import { API_BASE, clearSessionAndReload, requestHeaders } from './api';
 import { tradeIdeaRequest, TradeIdeaApiError } from './tradeIdeas';
+import { t } from '../i18n/t';
 
 export type ResearchObject = Record<string, unknown>;
 export interface ResearchEvent {
@@ -37,7 +38,7 @@ export const TradeIdeaResearch = {
   view: async (run: string, generation?: string): Promise<ResearchState> => {
     const value = await tradeIdeaRequest<ResearchState>(root(run) + (generation ? `?generation_id=${encodeURIComponent(generation)}` : ''));
     if (!value || value.run_id !== run || !value.model || !Array.isArray(value.history) || !Array.isArray(value.versions) || !value.cost) {
-      throw new TradeIdeaApiError('Research response is incomplete', 502);
+      throw new TradeIdeaApiError(t('tradeIdeaResearch.responseIncomplete'), 502);
     }
     return value;
   },
@@ -47,7 +48,7 @@ export const TradeIdeaResearch = {
   preview: (run: string) => tradeIdeaRequest<ResearchExportPreview>(root(run) + '/export-preview'),
 };
 export async function researchArtifactBlob(event: ResearchEvent): Promise<Blob> {
-  if (!event.artifact) throw new Error('Artifact unavailable');
+  if (!event.artifact) throw new Error(t('tradeIdeaResearch.artifactUnavailable'));
   const response = await fetch(API_BASE + event.artifact.download_url, {headers: requestHeaders(), cache: 'no-store'});
   if (response.status === 401 || response.status === 403) clearSessionAndReload();
   if (!response.ok) {

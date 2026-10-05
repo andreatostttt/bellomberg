@@ -25,7 +25,7 @@ def _rete_finta(monkeypatch, risposte):
     """Solo il confine HTTP e' finto; risposta, file e hash restano reali."""
     chiamate = []
 
-    def get(url, *, timeout, headers, allow_redirects=True):
+    def get(url, *, timeout, headers, allow_redirects=True, stream=False):
         chiamate.append((url, timeout, headers.copy(), allow_redirects))
         risposta = risposte[url]
         if isinstance(risposta, Exception):
@@ -114,7 +114,7 @@ def test_redirect_relativo_e_cdn_consentiti_salvano_snapshot_immutabile(
     assert list(tmp_path.iterdir()) == [percorso]
     assert [c[0] for c in chiamate] == [iniziale, intermedio, finale]
     assert all(c[1:] == (17, {"User-Agent": UA}, False) for c in chiamate)
-    assert all(set(c.kwargs) == {"timeout", "headers", "allow_redirects"}
+    assert all(set(c.kwargs) == {"timeout", "headers", "allow_redirects", "stream"}
                for c in spy.call_args_list)  # nessun bypass TLS/auth
     ripetuto = scarica_documento(iniziale, str(tmp_path),
                                 host_consentiti={"ir.example", "cdn.example"})

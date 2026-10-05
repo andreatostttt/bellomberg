@@ -4,12 +4,14 @@ import { linguaCorrente, localeDi } from '@/i18n/lingua';
 import { localizePayload } from '@/lib/api-presentation';
 import { useEffect, useMemo, useState } from 'react';
 import { AlertCircle, ArrowUpRight, BookOpen, CheckCircle2, CircleDashed, RefreshCw } from 'lucide-react';
+import ModernPage from '@/components/ModernPage';
 import { useBox } from '@/lib/useBox';
 import {
   getAgentProgress, progressNumber as num, progressPercent as pct, qualityLabels,
   type AgentProgress, type ProgressAgent, type ProgressPoint, type ProgressRun,
 } from '@/lib/agent-progress';
 import './agent-progress.css';
+import './committee-modern.css';
 
 function stamp(value: string | null | undefined) {
   if (!value) return tr('progress.na');
@@ -135,7 +137,7 @@ export default function AgentProgressPage() {
   const delta = current ? null : point?.delta || agent?.delta;
   const usage = point?.operational.usage;
   const unsupported = agent?.attribution === 'unsupported';
-  return <section className="agent-progress" aria-busy={loading}>
+  return <ModernPage page="agent-progress" render={() => (<section className="agent-progress" aria-busy={loading}>
     <header className="ap-header"><div><h1>{tr('progress.title')}</h1>
       <p>{tr('progress.subtitle')}</p></div>
       <button type="button" className="ap-refresh" onClick={() => setReload(value => value + 1)} disabled={loading}>
@@ -248,5 +250,5 @@ export default function AgentProgressPage() {
         </section>
       </div>
     </>}
-  </section>;
+  </section>)} />;
 }

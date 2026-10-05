@@ -4,6 +4,7 @@ import { linguaCorrente, localeDi, type Lingua } from '@/i18n/lingua';
 import { localizePayload } from '@/lib/api-presentation';
 import { leggiDetail } from '@/lib/quota';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import ModernPage from '@/components/ModernPage';
 import { Cpu, Play, RefreshCw, AlertCircle, Plus, X, Check } from 'lucide-react';
 import {
   Bellomberg, MonteCarloResult, TickerValidation, Position
@@ -16,6 +17,7 @@ import {
 import { useBox } from '@/lib/useBox';
 import './dashboard-command.css';
 import './montecarlo-plancia.css';
+import './risk-modern.css';
 
 type Method = 'fhs' | 'block_bootstrap' | 'parametric_t';
 type Drift  = 'zero' | 'shrinkage' | 'historical';
@@ -221,6 +223,7 @@ export default function MonteCarloPage() {
   }, [result?.terminal_hist, view]);
 
   return (
+    <ModernPage page="montecarlo" render={() => (
     <div className="obsx f5p animate-fadeIn">
       <div className="asst">
         <span className="lab">// Monte Carlo</span>
@@ -679,6 +682,7 @@ export default function MonteCarloPage() {
         </>
       )}
     </div>
+    )} />
   );
 }
 
@@ -797,7 +801,10 @@ function ScopeSvg({ r, view, w, h, idx, onHover, onPick }: {
   const tr = useT();
   const fb = r.fan_bands!;
   if (w < 80 || h < 80) return <svg />;
-  const L = 66, R = w - 104, T = 46, B = h - 42;
+  // Keep the five plot keys readable in a narrow dashboard column: the wide
+  // view uses one legend row, while compact widths reserve two extra rows.
+  const compactLegend = w < 760;
+  const L = 66, R = w - 104, T = compactLegend ? 88 : 46, B = h - 42;
   const d0 = fb.days[0], d1 = fb.days[fb.days.length - 1];
   const y = (v: number) => B - ((v - view.lo) / (view.hi - view.lo)) * (B - T);
   const x = (d: number) => L + ((d - d0) / Math.max(1, d1 - d0)) * (R - L);
@@ -933,9 +940,9 @@ function ScopeSvg({ r, view, w, h, idx, onHover, onPick }: {
             {/* 20px di piastra per 12px di corpo: l'anello con cui il cancello
                 campiona il fondo esce di ~3px dalla scatola del testo — con la
                 piastra da 15 pescava le bande ambra e misurava 2,2:1. */}
-            <rect x={L + 1} y={y(nav) - 21} width={qlab.length * 8.7 + 14} height={20}
+            <rect data-nav-start-plate x={L + 1} y={y(nav) - 21} width={qlab.length * 8.7 + 14} height={20}
                   fill="#0A0F1C" opacity={0.95} />
-            <text x={L + 6} y={y(nav) - 7} fontSize={12} fill={AM} letterSpacing=".12em" fontFamily={MONO}>
+            <text data-nav-start-label x={L + 6} y={y(nav) - 7} fontSize={12} fill={AM} letterSpacing=".12em" fontFamily={MONO}>
               {qlab}
             </text>
           </>
@@ -962,23 +969,23 @@ function ScopeSvg({ r, view, w, h, idx, onHover, onPick }: {
           corpi a 10px servono >=14px fra le due baseline — a T-26 le scatole
           si toccavano del 15% (misurato, giro 2 del cancello 03/08). */}
       {legend.map(([lab, c, op], i) => (
-        <g key={lab} transform={`translate(${L + i * 96} ${T - 22})`}>
+        <g key={lab} transform={`translate(${compactLegend ? L + i * ((R - L) / 3) : L + i * 96} ${T - (compactLegend ? 54 : 22)})`}>
           <rect x={0} y={-6} width={16} height={8} fill={c} opacity={op * 3.2} />
           <text x={21} y={1} fontSize={10} fill={FNT} letterSpacing=".1em" fontFamily={MONO}>{lab}</text>
         </g>
       ))}
-      <g transform={`translate(${L + 3 * 96} ${T - 22})`}>
+      <g transform={`translate(${compactLegend ? L : L + 3 * 96} ${T - (compactLegend ? 32 : 22)})`}>
         <line x1={0} x2={16} y1={-2} y2={-2} stroke={AM} strokeWidth={1.7} />
         <text x={21} y={1} fontSize={10} fill={FNT} letterSpacing=".1em" fontFamily={MONO}>{tr('montecarlo.f049')}</text>
       </g>
-      <g transform={`translate(${L + 4 * 96} ${T - 22})`}>
+      <g transform={`translate(${compactLegend ? L : L + 4 * 96} ${T - (compactLegend ? 10 : 22)})`}>
         <line x1={0} x2={16} y1={-2} y2={-2} stroke="#7FC4DC" strokeWidth={1} opacity={0.7} />
         <text x={21} y={1} fontSize={10} fill={FNT} letterSpacing=".1em" fontFamily={MONO}>
           {fmtInt(paths.length)} {tr('montecarlo.f108')} {fmtInt(r.n_sims)} {tr('montecarlo.f109')}
         </text>
       </g>
       {/* T-36 e non T-38: a 10px la riga usciva di 2px dal bordo alto (misurato) */}
-      <text x={L} y={T - 36} fontSize={10} fill={AXT} letterSpacing=".14em" fontFamily={MONO}>
+      <text x={L} y={T - (compactLegend ? 74 : 36)} fontSize={10} fill={AXT} letterSpacing=".14em" fontFamily={MONO}>
         {tr('montecarlo.f110')} {fmtInt(r.n_sims)} {tr('montecarlo.f111')} {fmtInt(paths.length)} {tr('montecarlo.f112')}
         {!pdays && paths.length > 0 ? tr('montecarlo.f113') : ''}
       </text>

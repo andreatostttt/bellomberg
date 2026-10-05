@@ -95,8 +95,11 @@ def test_nessuno_costruisce_etichette_fuori_dalla_fabbrica():
     chiamata = re.compile(r"\b" + "Etichetta" + r"\(")
     colpevoli = []
     for cartella, sotto, file in os.walk(RADICE):
-        sotto[:] = [d for d in sotto if d not in ("attic", "node_modules", "app", ".git",
-                                                    "mappa", "__pycache__")]
+        sotto[:] = [d for d in sotto if d not in (
+            "attic", "node_modules", "app", ".git", "mappa", "__pycache__",
+            ".venv", ".worktrees", ".pytest_cache", "build", "data", "report",
+            "research_notes", "release", "dist", "dist-electron",
+        )]
         for f in file:
             if not f.endswith(".py") or f == "classificazione.py":
                 continue

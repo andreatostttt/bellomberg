@@ -14,6 +14,7 @@ import { t as tr } from '@/i18n/t';
 // Le derivazioni sui TITOLI (corsie, realizzato, cancello, arco) restano sui
 // soli `Trade[]`: un flusso non ha titolo, prezzo, ne' un realizzato, e
 // lasciarcelo entrare lo farebbe contare dove non c'entra.
+import type { ReactNode } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { RefreshCw, Wallet } from 'lucide-react';
@@ -21,7 +22,9 @@ import { Bellomberg } from '@/lib/api';
 import type { MovimentoCassa } from '@/lib/api';
 import { fmtNum } from '@/lib/format';
 import { leggiDetail } from '@/lib/quota';
-import { useT } from '@/i18n/provider';
+import { useLingua, useT } from '@/i18n/provider';
+import ModernPage from '@/components/ModernPage';
+import NewInterfaceBoundary from '@/components/NewInterfaceBoundary';
 import {
   Trade,
   raggruppaPerMese, arcoDi, costruisciCorsie,
@@ -32,6 +35,18 @@ import Registro from '@/components/movimenti/Registro';
 import Scie, { contaVerbi } from '@/components/movimenti/Scie';
 import Diario from '@/components/movimenti/Diario';
 import './movimenti.css';
+import './operations-modern.css';
+
+function DeferredMovementView({ render }: { render: () => ReactNode }) {
+  return render();
+}
+
+function MovementViewBoundary({ render }: { render: () => ReactNode }) {
+  const language = useLingua();
+  return <NewInterfaceBoundary language={language}>
+    <DeferredMovementView render={render} />
+  </NewInterfaceBoundary>;
+}
 
 type Vista = 'registro' | 'scie' | 'diario';
 type Filtro = 'TUTTI' | 'BUY' | 'TRIM' | 'ADD' | 'DIVIDEND' | 'CASSA' | 'COMMENTO';
@@ -267,7 +282,7 @@ export default function MovementsPage() {
      arrivata. Due cartelli impilati che si smentiscono. */
   const vuoto = !loading && totaleIntero && !err && !errCassa && registro.length === 0;
 
-  return (
+  return <ModernPage page="movements" render={() => <MovementViewBoundary render={() => (
     <div className="f14m">
       {/* ── la plancia: viste, filtri o legenda, contatori ───────── */}
       <div className="cmd">
@@ -688,5 +703,5 @@ export default function MovementsPage() {
         </div>
       )}
     </div>
-  );
+  )} />} />;
 }

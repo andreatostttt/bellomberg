@@ -42,6 +42,19 @@ Convenzione percentuali in uscita: punti percentuali (41.29 = 41,29%). Per tool:
 - get_portfolio_risk: vol_annual_pct, var_99_1d_pct, max_dd_1y_pct gia' in punti;
 - get_portfolio_montecarlo: campi *_pct gia' in punti; i pesi sono FRAZIONI -> * 100.
 VaR, ES e drawdown mantengono il segno del tool (negativi = perdita).
+
+Voce 7 D (04/10, Opus 5.5) — campi di rischio nuovi, letti dai payload curati:
+- ``risk.book_beta``: beta del book contro SPY con ``observations``/``error`` del tool
+  (beta non misurato = None + motivo nei gap, mai 0 o 1 inventati);
+  ``risk.book_factor_beta``: beta sul fattore di mercato Fama-French del desk, con la
+  SUA base, cosi' i due beta non sembrano in contraddizione;
+- ``risk.var_backtest``: verdetto per asse (copertura / indipendenza), peso escluso,
+  bassa potenza, NON AFFIDABILE: mai un «FAIL» senza l'asse;
+- ``montecarlo.*.calibration`` e ``tail_reliability_warning``; ``pro_forma.allocation``
+  (origine della quota simulata: l'ES al 99% del pro-forma esce sempre con la quota e
+  la sua origine nei gap).
+Payload di run salvate prima della cura: i campi che non portano restano None con
+``status`` = «n.d. (run precedente alla cura)», mai ricostruiti a indovinare.
 """
 
 from __future__ import annotations
@@ -111,6 +124,9 @@ _MC_PCT_FIELDS = ("expected_return_pct", "median_return_pct", "stdev_pct",
 
 # tolleranza per riconoscere lo stesso esercizio fra consensus e storico (arrotondamenti)
 _FY_MATCH_TOLERANCE = 0.005
+
+# payload salvati prima della cura del 04/10 (voci 7 a/b/c/g): il campo non c'era
+_ANTE_CURA = "n.d. (run precedente alla cura)"
 
 
 # ---------------------------------------------------------------- utilita'
@@ -190,6 +206,16 @@ def _n(value, decimals=2):
     """Numero all'italiana: 1.234,56."""
     text = f"{value:,.{decimals}f}"
     return text.replace(",", "§").replace(".", ",").replace("§", ".")
+
+
+def _data_it(value):
+    """Data ISO del tool (AAAA-MM-GG...) in gg/mm/aaaa; illeggibile = «data n.d.»."""
+    match = re.match(r"(\d{4})-(\d{2})-(\d{2})", value) if isinstance(value, str) else None
+    return match.group(3) + "/" + match.group(2) + "/" + match.group(1) if match else "data n.d."
+
+
+def _testo(value):
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def _importo(value, unit=None):
@@ -732,15 +758,16 @@ def _risk(picker, ticker, gaps):
                          tool="quant_compute",
                          as_of=_latest([p.get("_timestamp") or r.get("timestamp") for r, p in used]))
 
-    book = None
+    book = book_beta = None
     book_label = "Rischio del portafoglio"
     receipt, got = picker.pick("get_portfolio_risk", book_label, lambda r, p: None)
     if receipt is not None:
         parsed, data = got
         port = data.get("portfolio") if isinstance(data.get("portfolio"), dict) else {}
         basis = data.get("beta_basis")
+        beta, beta_why, beta_new = _book_beta_status(data)
         book = {"vol_pct": _num(port.get("vol_annual_pct")),
-                "beta": _num(port.get("beta_vs_spy")),
+                "beta": beta,
                 # la nota del tool porta un riferimento interno «(fix gg/mm; ...)»: si toglie
                 "beta_basis": (re.sub(r"\s*\(fix[^)]*\)", "", basis).strip() or None
                                if isinstance(basis, str) else None),
@@ -749,10 +776,12 @@ def _risk(picker, ticker, gaps):
                 "vol_target_pct": None,
                 "source": _source(receipt, parsed), "tool": "get_portfolio_risk",
                 "as_of": _iso_or_none(data.get("timestamp")) or _iso_or_none(parsed.get("_timestamp"))}
+        # beta non misurato con un motivo: frase propria (non il generico «non disponibile»)
         sentence = _mancano(book_label, [n for n in ("vol_pct", "beta", "var99_1d_pct", "max_drawdown_pct")
-                                         if book[n] is None])
+                                         if book[n] is None and not (n == "beta" and beta_why)])
         if sentence:
             gaps.append(sentence)
+        book_beta = _book_beta_block(picker, receipt, data, book, beta_why, beta_new, book_label, gaps)
         skipped = _as_list(data.get("skipped_tickers"))
         if skipped:
             gaps.append(book_label + ": calcolato senza " + _elenco(skipped)
@@ -766,15 +795,251 @@ def _risk(picker, ticker, gaps):
         gaps.append("I due beta sono calcolati su basi diverse (titolo: " + candidate["beta_basis"]
                     + "; portafoglio: " + (book["beta_basis"] or "base non dichiarata")
                     + "): non vanno confrontati direttamente.")
+    factor_beta = _book_factor_beta(picker, book_beta, gaps)
+    backtest = _var_backtest(picker, gaps)
 
-    if candidate is None and book is None:
+    if candidate is None and book is None and factor_beta is None and backtest is None:
         return None
-    parts = [p for p in (candidate, book) if p]
+    # source/tool/as_of del blocco = candidato e book (il grafico del rischio); i sotto-blocchi
+    # nuovi portano la loro fonte e la loro data
+    parts = [p for p in (candidate, book) if p] or [p for p in (factor_beta, backtest) if p]
     return {"candidate": candidate, "book": book,
+            "book_beta": book_beta, "book_factor_beta": factor_beta, "var_backtest": backtest,
             "source": " + ".join(p["source"] for p in parts),
             "tool": " + ".join(p["tool"] for p in parts),
             # il piu' vecchio dei due: il blocco e' fresco almeno fino a li'
             "as_of": _earliest([p.get("as_of") for p in parts])}
+
+
+def _book_beta_status(data):
+    """(beta, motivo, formato_nuovo) del beta del book contro SPY da get_portfolio_risk.
+
+    Formato nuovo (dal 04/10): il tool scrive ``beta_error``/``beta_obs``; beta None =
+    non misurato, col motivo. Formato vecchio: lo 0.0 era ANCHE il valore di ripiego
+    quando SPY non veniva scaricato (R6 a), quindi uno zero non e' usabile come misura.
+    """
+    port = data.get("portfolio") if isinstance(data.get("portfolio"), dict) else {}
+    raw = _num(port.get("beta_vs_spy"))
+    new = "beta_error" in data or "beta_obs" in data
+    if new:
+        if raw is None:
+            return None, _testo(data.get("beta_error")) or "motivo non dichiarato", True
+        return raw, None, True
+    if raw == 0:
+        return None, ("la lettura riporta 0,00 ma è di una versione precedente alla cura, in cui lo "
+                      "zero veniva scritto anche quando l'indice SPY non era stato scaricato: non "
+                      "distingue un beta misurato da un dato mancante, " + _ANTE_CURA), False
+    return raw, None, False
+
+
+def _book_beta_block(picker, receipt, data, book, why, new, label, gaps):
+    """Beta del book contro SPY con osservazioni e motivo; dichiara le letture discordi."""
+    obs = _int_if_whole(data.get("beta_obs")) if new else None
+    block = {"value": book["beta"], "benchmark": "SPY",
+             "label": "beta del portafoglio contro l'indice SPY (rendimenti giornalieri)",
+             "basis": book["beta_basis"], "observations": obs,
+             "observations_status": None if new else _ANTE_CURA, "error": why,
+             # avviso del tool (pochi giorni comuni: stima indicativa); vale solo su un beta misurato
+             "note": _testo(data.get("beta_note")) if book["beta"] is not None else None}
+    if why:
+        gaps.append(label + ": beta contro l'indice SPY non misurato (" + why.rstrip(".") + ").")
+    elif block["note"]:
+        gaps.append(label + ": beta contro l'indice SPY " + _n(book["beta"]) + " da leggere con cautela: "
+                    + block["note"].rstrip(".") + ".")
+    # l'ultima ricevuta vale (unica fonte), ma una lettura discorde non si nasconde
+    other_measured, other_missing = [], []
+    for other, _, payload in picker.valid("get_portfolio_risk", lambda r, p: None):
+        if other is receipt:
+            continue
+        value, other_why, _ = _book_beta_status(payload)
+        if book["beta"] is None and value is not None:
+            other_measured.append(_quando(other.get("timestamp")) + " (" + _n(value) + ")")
+        elif book["beta"] is not None and value is None:
+            other_missing.append(_quando(other.get("timestamp")))
+    if other_measured:
+        gaps.append(label + ": il beta contro l'indice SPY era stato misurato nelle letture del "
+                    + _elenco(other_measured) + ", ma si usa la più recente, del "
+                    + _quando(receipt.get("timestamp")) + ", che non lo misura: le letture non si mescolano.")
+    if other_missing:
+        gaps.append(label + ": nelle letture del " + _elenco(other_missing) + " il beta contro l'indice "
+                    "SPY non risultava misurato; si usa quella del " + _quando(receipt.get("timestamp"))
+                    + ", che lo misura.")
+    return block
+
+
+def _book_factor_beta(picker, book_beta, gaps):
+    """Beta del book sul fattore di mercato Fama-French (get_portfolio_factors), con la SUA base.
+
+    Facoltativo: senza ricevuta non e' un buco (il beta del book e' quello contro SPY).
+    """
+    if not any(r.get("tool") == "get_portfolio_factors" for r in picker.receipts):
+        return None
+    label = "Fattori di rischio del portafoglio"
+    receipt, got = picker.pick("get_portfolio_factors", label,
+                               lambda r, p: None if isinstance(p.get("portfolio_aggregate"), dict)
+                               else "aggregato assente")
+    if receipt is None:
+        return None
+    parsed, data = got
+    model = _testo(data.get("model"))
+    regional = " regionale" if model and "REGIONAL" in model.upper() else ""
+    block = {"value": _num(data["portfolio_aggregate"].get("beta_market")),
+             "factor": "mercato",
+             "label": ("beta del portafoglio sul fattore di mercato del modello Fama-French"
+                       + regional + " (non contro l'indice SPY)"),
+             "model": model, "period": data.get("period"),
+             "r_squared": _num(data.get("portfolio_avg_r_squared")),
+             "coverage_weight_pct": _num(data.get("coverage_weight_pct")),
+             "source": _source(receipt, parsed), "tool": "get_portfolio_factors",
+             "as_of": _iso_or_none(data.get("timestamp")) or _iso_or_none(parsed.get("_timestamp"))}
+    if block["value"] is None:
+        gaps.append(label + ": non è disponibile il beta sul fattore di mercato.")
+        return block
+    spy = (book_beta or {}).get("value")
+    where = "sul fattore di mercato del modello Fama-French" + regional + " (" + _finestra(block["period"]) + ")"
+    if spy is not None:
+        gaps.append("Il portafoglio ha due beta su basi diverse: " + _n(spy) + " contro l'indice SPY e "
+                    + _n(block["value"]) + " " + where + "; misurano cose diverse, non sono in "
+                    "contraddizione e non vanno confrontati direttamente.")
+    elif book_beta is not None:
+        gaps.append("Il beta del portafoglio " + where + " è " + _n(block["value"]) + ": è su un'altra "
+                    "base e non sostituisce il beta contro l'indice SPY, che resta non misurato.")
+    return block
+
+
+_ASSI = (("coverage", "copertura", "il numero di eccezioni non è coerente con il livello di confidenza"),
+         ("independence", "indipendenza", "le eccezioni arrivano a grappoli"))
+
+
+def _bt_level(row, new):
+    """Un livello (95/99) del backtest: verdetto per asse. Formato vecchio: gli assi sono i due
+    test riportati dal tool (pass al 5%), senza p esatti ne' bassa potenza (n.d.)."""
+    kup = row.get("kupiec_pof") if isinstance(row.get("kupiec_pof"), dict) else {}
+    ind = row.get("christoffersen_ind") if isinstance(row.get("christoffersen_ind"), dict) else {}
+    level = {"verdict": _testo(row.get("verdict")), "verdict_detail": _testo(row.get("verdict_detail")),
+             "exceptions": _int_if_whole(kup.get("exceptions")),
+             "expected_exceptions": _num(row.get("expected_exceptions") if new else kup.get("expected")),
+             "low_power": row.get("low_power") if isinstance(row.get("low_power"), bool) else None,
+             "detail_status": None if new else _ANTE_CURA}
+    for key, _, _ in _ASSI:
+        axis = row.get(key) if isinstance(row.get(key), dict) else None
+        if axis is not None:
+            verdict, p_value, test = _testo(axis.get("verdict")), _num(axis.get("p_value")), _testo(axis.get("test"))
+        else:
+            src = kup if key == "coverage" else ind
+            flag = src.get("pass_5pct")
+            verdict = ("PASS" if flag else "FAIL") if isinstance(flag, bool) else None
+            p_value, test = _num(src.get("p_value")), None
+        level[key] = {"verdict": verdict, "p_value": p_value, "test": test}
+    return level
+
+
+def _var_backtest(picker, gaps):
+    """Backtest del VaR del book (get_var_backtest): mai un «FAIL» senza l'asse e il perimetro."""
+    label = "Backtest del VaR del portafoglio"
+    receipt, got = picker.pick("get_var_backtest", label,
+                               lambda r, p: None if any(isinstance(p.get(k), dict) for k in ("var95", "var99"))
+                               else "livelli assenti")
+    if receipt is None:
+        return None
+    parsed, data = got
+    new = "reliable" in data or "excluded_weight_pct" in data
+    detail = [{"ticker": row.get("ticker"), "reason": _testo(row.get("motivo")),
+               "valid_obs": _int_if_whole(row.get("obs_valide")), "weight_pct": _num(row.get("peso_pct"))}
+              for row in (data.get("excluded_detail") if isinstance(data.get("excluded_detail"), list) else [])
+              if isinstance(row, dict)]
+    block = {"window": _int_if_whole(data.get("window")), "period": data.get("period"),
+             "observations_tested": _int_if_whole(data.get("n_obs_tested")),
+             "reliable": data.get("reliable") if isinstance(data.get("reliable"), bool) else None,
+             "excluded_tickers": _as_list(data.get("excluded_tickers")),
+             "excluded_detail": detail,
+             "excluded_weight_pct": _num(data.get("excluded_weight_pct")),
+             "excluded_weight_threshold_pct": _num(data.get("excluded_weight_threshold_pct")),
+             # review RV-R/RV-L3: peso MANCANTE in media nei giorni testati (anche con esclusi 0%)
+             # e nomi presenti in meno del 90% di quei giorni; None = campo assente nella lettura
+             "missing_weight_tested_window_pct": _num(data.get("missing_weight_tested_window_pct")),
+             "partial_coverage_tested_window": ({str(k): str(v) for k, v in
+                                                 data["partial_coverage_tested_window"].items()}
+                                                if isinstance(data.get("partial_coverage_tested_window"), dict)
+                                                else None),
+             "perimeter_status": None if new else _ANTE_CURA,
+             "levels": {conf: _bt_level(data["var" + conf], new) if isinstance(data.get("var" + conf), dict) else None
+                        for conf in ("95", "99")},
+             "source": _source(receipt, parsed), "tool": "get_var_backtest",
+             "as_of": _iso_or_none(data.get("timestamp")) or _iso_or_none(parsed.get("_timestamp"))}
+    weight, threshold = block["excluded_weight_pct"], block["excluded_weight_threshold_pct"]
+    if not new:
+        perimeter = "peso dei titoli esclusi " + _ANTE_CURA
+    elif weight is None:
+        perimeter = "peso dei titoli esclusi non dichiarato"
+    else:
+        perimeter = "titoli esclusi pari al " + _n(weight) + "% del perimetro"
+    missing = block["missing_weight_tested_window_pct"]
+    partial = block["partial_coverage_tested_window"] or {}
+    if new:
+        perimeter += ("; nei giorni testati manca in media il " + _n(missing) + "% del perimetro"
+                      if missing is not None else "; peso mancante nei giorni testati non dichiarato")
+    if detail:
+        gaps.append(label + ": esclusi " + _elenco([(d["ticker"] or "titolo senza nome")
+                                                     + (" (" + d["reason"] + ")" if d["reason"] else "")
+                                                     for d in detail])
+                    + (", che pesano il " + _n(weight) + "% del perimetro" if weight is not None else "")
+                    + (" (soglia " + _n(threshold, 0) + "%)" if threshold is not None else "") + ".")
+    elif not new and block["excluded_tickers"]:
+        gaps.append(label + ": esclusi " + _elenco(block["excluded_tickers"]) + ".")
+    if not new:
+        gaps.append(label + ": lettura di una versione precedente alla cura, in cui i titoli senza dati "
+                    "potevano risultare inclusi; peso escluso, p esatti e bassa potenza " + _ANTE_CURA + ".")
+    if block["reliable"] is False:
+        # la frase nomina la causa VERA: esclusi sopra soglia, oppure perimetro mancante nei
+        # giorni testati (esclusi anche 0%), altrimenti il dettaglio del tool
+        soglia = " (soglia " + _n(threshold, 0) + "%)" if threshold is not None else ""
+        if weight is not None and threshold is not None and weight > threshold:
+            cause = "i titoli esclusi pesano il " + _n(weight) + "% del perimetro" + soglia
+        elif missing is not None and threshold is not None and missing > threshold:
+            cause = ("nei giorni testati manca in media il " + _n(missing) + "% del perimetro" + soglia
+                     + (", per i titoli presenti solo in parte dei giorni: "
+                        + _elenco([t + " " + v.replace("/", " giorni su ") for t, v in partial.items()])
+                        if partial else ""))
+        else:
+            details = [lv["verdict_detail"] for lv in block["levels"].values() if lv and lv["verdict_detail"]]
+            cause = ("motivo dichiarato dal calcolo: " + details[0].rstrip(".") if details
+                     else "motivo non dichiarato")
+        gaps.append(label + ": NON AFFIDABILE, " + cause
+                    + ": l'esito non valida il VaR di questo portafoglio.")
+    for conf, level in block["levels"].items():
+        if level is None:
+            gaps.append(label + ": esito al " + conf + "% non disponibile.")
+            continue
+        verdict = level["verdict"] or "non dichiarato"
+        if verdict == "PASS" and not level["low_power"] and new:
+            continue
+        axes = []
+        failed = []
+        for key, name, why in _ASSI:
+            axis = level[key]
+            axes.append(name + " " + (axis["verdict"] or "n.d.")
+                        + (" (p " + _n(axis["p_value"], 4) + ")" if axis["p_value"] is not None else ""))
+            if axis["verdict"] == "FAIL":
+                failed.append((name, why))
+        if verdict == "NON AFFIDABILE":
+            head = "NON AFFIDABILE (esito statistico non valido per questo portafoglio)"
+        elif verdict == "FAIL" and failed:
+            head = ("FAIL sull'asse " + " e ".join(n for n, _ in failed) + " ("
+                    + "; ".join(w for _, w in failed) + ")")
+        elif verdict == "FAIL":
+            head = "FAIL senza indicazione dell'asse che fallisce"
+        else:
+            head = verdict
+        text = (label + " al " + conf + "%: " + head + "; " + ", ".join(axes))
+        if level["exceptions"] is not None and level["expected_exceptions"] is not None:
+            text += "; " + str(level["exceptions"]) + " eccezioni contro " + _n(level["expected_exceptions"], 1) + " attese"
+        if level["low_power"]:
+            text += "; verdetto indicativo per bassa potenza (poche eccezioni attese)"
+        elif level["low_power"] is None:
+            text += "; potenza del test " + _ANTE_CURA
+        gaps.append(text + "; " + perimeter + ".")
+    return block
 
 
 def _portfolio(picker, gaps):
@@ -900,7 +1165,9 @@ def _mc_notes(data, gaps):
     """Note del Monte Carlo in italiano piano (una frase per nota, i doppioni li toglie extract_facts)."""
     label = "Monte Carlo del portafoglio"
     note = data.get("calibration_note")
-    if isinstance(note, str) and note.strip():
+    # formato nuovo: la nota ripete il campione strutturato, che _mc_tail_notes scrive separando
+    # ticker limitante e calendari (la regex vecchia attribuiva tutto al ticker giovane)
+    if isinstance(note, str) and note.strip() and not isinstance(data.get("calibration_sample"), dict):
         match = re.search(r"(\d+)\s*obs dal ticker pi\S* giovane \(([^:]+):\s*(\d+)\s*obs su (\d+) del panel (\w+)\)",
                           note)
         if match:
@@ -922,6 +1189,171 @@ def _mc_notes(data, gaps):
     if fallback:
         gaps.append(label + ": per " + _elenco(fallback) + " la volatilità è stimata con un metodo "
                     "semplificato perché il modello principale (GARCH) non è riuscito.")
+
+
+def _mc_calibration(data):
+    """Campione di calibrazione dichiarato dal tool (formato nuovo) o n.d. (run precedente)."""
+    sample = data.get("calibration_sample")
+    warning = _testo(data.get("tail_reliability_warning"))
+    if not isinstance(sample, dict):
+        return {"calibration": {"observations": None, "start_date": None, "end_date": None,
+                                "limiting_ticker": None, "limiting_ticker_start_date": None,
+                                "obs_dropped_by_limiting_ticker": None, "obs_dropped_by_calendars": None,
+                                "min_obs_reliable_tails": None, "low_tail_reliability": None,
+                                "missing_days_by_ticker": None, "truncated_by_tool": None,
+                                "sentence": None, "status": _ANTE_CURA},
+                "tail_reliability_warning": warning}
+    low = sample.get("low_tail_reliability")
+    holes = sample.get("missing_days_in_window_by_ticker")
+    holes = ({str(k): _int_if_whole(v) for k, v in holes.items() if _int_if_whole(v)}
+             if isinstance(holes, dict) else None)   # None = campo assente (versione intermedia)
+    return {"calibration": {
+        "observations": _int_if_whole(sample.get("n_obs")),
+        "start_date": sample.get("start_date"), "end_date": sample.get("end_date"),
+        "limiting_ticker": _testo(sample.get("limiting_ticker")),
+        "limiting_ticker_start_date": sample.get("limiting_ticker_start_date"),
+        "obs_dropped_by_limiting_ticker": _int_if_whole(sample.get("obs_dropped_by_limiting_ticker")),
+        "obs_dropped_by_calendars": _int_if_whole(sample.get("obs_dropped_by_calendars")),
+        "min_obs_reliable_tails": _int_if_whole(sample.get("min_obs_reliable_tails")),
+        "low_tail_reliability": low if isinstance(low, bool) else None,
+        "missing_days_by_ticker": holes,
+        # il tool scrive calibration_note SOLO quando il campione e' tagliato (ticker giovane o
+        # giorni mancanti dentro le serie): la frase si scrive dai campi strutturati qui sotto
+        "truncated_by_tool": bool(_testo(data.get("calibration_note"))),
+        # frase del tool tale e quale (date ISO): i gap la riscrivono dai campi strutturati
+        "sentence": _testo(sample.get("sentence")), "status": None},
+        "tail_reliability_warning": warning}
+
+
+def _mc_excluded(data):
+    """Titoli tolti dalla simulazione per storia insufficiente; None = campo assente (run precedente)."""
+    rows = data.get("tickers_excluded_insufficient_history")
+    if not isinstance(rows, list):
+        return None
+    return [{"ticker": row.get("ticker"), "observations": _int_if_whole(row.get("n_obs"))}
+            for row in rows if isinstance(row, dict)]
+
+
+def _mc_excluded_text(rows):
+    return ("esclusi dalla simulazione per storia insufficiente "
+            + _elenco([(r["ticker"] or "titolo senza nome")
+                       + (" (" + str(r["observations"]) + " rendimenti validi)" if r["observations"] is not None else "")
+                       for r in rows]))
+
+
+def _mc_pro_forma_error(picker, accept, after, label, gaps):
+    """Pro-forma rifiutato dal tool (errore con allegati): dichiarato, MAI un ES.
+
+    Si guarda il tentativo pro-forma piu' recente; conta solo se e' successivo alla lettura
+    valida usata (``after``) o se una lettura valida non c'e'.
+    """
+    last = None
+    for receipt in picker.receipts:
+        if (receipt.get("tool") != "get_portfolio_montecarlo" or not receipt.get("success")
+                or not picker._in_window(receipt)):
+            continue
+        parsed, payload = _parse_output(receipt)
+        if isinstance(payload, dict) and payload.get("error") and not accept(receipt, payload):
+            last = (receipt, parsed, payload)
+    if last is None:
+        return None
+    receipt, parsed, payload = last
+    if after is not None:
+        when, used = _parse_ts(receipt.get("timestamp")), _parse_ts(after.get("timestamp"))
+        if when is None or used is None or when <= used:
+            return None
+    reason = _testo(str(payload.get("error"))) or "motivo non dichiarato"
+    sample = payload.get("calibration_sample") if isinstance(payload.get("calibration_sample"), dict) else {}
+    alloc = payload.get("what_if_allocation") if isinstance(payload.get("what_if_allocation"), dict) else {}
+    block = {"reason": reason, "excluded_insufficient_history": _mc_excluded(payload),
+             "calibration_observations": _int_if_whole(sample.get("n_obs")),
+             "allocation_origin": _testo(alloc.get("origin")),
+             "source": _source(receipt, parsed), "tool": "get_portfolio_montecarlo",
+             "as_of": _iso_or_none(payload.get("timestamp")) or _iso_or_none(parsed.get("_timestamp"))}
+    text = label + (": pro-forma non calcolabile nella simulazione del " + _quando(receipt.get("timestamp"))
+                    + " (" + reason.rstrip(".") + ")")
+    if block["excluded_insufficient_history"]:
+        text += "; " + _mc_excluded_text(block["excluded_insufficient_history"])
+    if after is not None:
+        text += "; resta riportata la simulazione precedente del " + _quando(after.get("timestamp"))
+    else:
+        text += "; nessuna perdita estrema del titolo aggiunto è riportata"
+    gaps.append(text + ".")
+    return block
+
+
+def _mc_tail_text(block):
+    """Inciso sull'affidabilita' delle code (VaR/ES al 99%) del blocco, o None se affidabili."""
+    cal = block["calibration"]
+    if cal["status"]:
+        return "affidabilità delle code " + cal["status"]
+    if cal["low_tail_reliability"] or block["tail_reliability_warning"]:
+        return ("code poco affidabili: calibrazione su "
+                + (str(cal["observations"]) if cal["observations"] is not None else "n.d.")
+                + " osservazioni, sotto la soglia di "
+                + (str(cal["min_obs_reliable_tails"]) if cal["min_obs_reliable_tails"] is not None else "n.d.")
+                + " (circa un anno di borsa)")
+    return None
+
+
+def _mc_tail_notes(label, block, gaps):
+    """Campione di calibrazione in italiano piano + avviso code se n sotto soglia."""
+    cal = block["calibration"]
+    if cal["status"] or cal["observations"] is None:
+        return
+    if (cal["limiting_ticker"] or cal["low_tail_reliability"] or block["tail_reliability_warning"]
+            or cal["truncated_by_tool"] or cal["missing_days_by_ticker"]):
+        n = cal["observations"]
+        text = (label + " calibrato su " + str(n) + " giorni di borsa (circa " + _n(n / 21, 0)
+                + " mesi, dal " + _data_it(cal["start_date"]) + " al " + _data_it(cal["end_date"]) + ")")
+        if cal["limiting_ticker"]:
+            text += (", finestra limitata da " + cal["limiting_ticker"] + " (storia dal "
+                     + _data_it(cal["limiting_ticker_start_date"]) + ": "
+                     + str(cal["obs_dropped_by_limiting_ticker"]) + " giorni in meno)")
+        if cal["obs_dropped_by_calendars"]:
+            text += ("; altri " + str(cal["obs_dropped_by_calendars"]) + " giorni tolti perché almeno un "
+                     "titolo non quotava (calendari di borsa diversi o buchi di dati)")
+        holes = cal["missing_days_by_ticker"]
+        if holes:
+            ordered = sorted(holes.items(), key=lambda kv: (-kv[1], kv[0]))
+            text += ("; giorni mancanti dentro la finestra: "
+                     + _elenco([t + " " + str(d) for t, d in ordered]))
+        gaps.append(text + ".")
+    tail = _mc_tail_text(block)
+    if tail:
+        gaps.append(label + ": " + tail + "; VaR ed ES al 99% vanno citati con questa riserva.")
+
+
+_ORIGINE = {"stress_fisso": "valore fisso di stress, NON la size proposta",
+            "parametro_chiamante": "quota passata alla simulazione come size proposta"}
+
+
+def _mc_allocation_notes(label, block, gaps):
+    """L'ES al 99% del pro-forma esce SEMPRE con la quota simulata e la sua origine."""
+    alloc = block["allocation"]
+    weight = block["candidate_weight_pct"]
+    if alloc["status"]:
+        origin = "origine della quota " + alloc["status"] + ": non è registrato se sia la size proposta"
+    else:
+        origin = _ORIGINE.get(alloc["origin"]) or ("origine della quota: " + (alloc["origin"] or "non dichiarata"))
+    share = ("con il titolo al " + _n(weight) + "% del portafoglio" if weight is not None
+             else "con un peso del titolo non indicato")
+    es99 = block.get("es_99_pct")
+    tail = _mc_tail_text(block)
+    gaps.append(label + ": " + ("la perdita media nel caso peggiore (ES al 99%), " + _n(es99) + "%, "
+                                if es99 is not None else "lo scenario ")
+                + "si riferisce a una simulazione " + share + " (" + origin + ")"
+                + ("; " + tail if tail else "") + ".")
+    requested = alloc["weight_pct_requested"]
+    if requested is not None and weight is not None and abs(requested - weight) > 0.005:
+        gaps.append(label + ": quota richiesta " + _n(requested) + "%, peso effettivo nella simulazione "
+                    + _n(weight) + "% dopo la rinormalizzazione del portafoglio.")
+    if alloc["tickers_skipped"]:
+        gaps.append(label + ": " + _elenco(alloc["tickers_skipped"]) + " è nella lista delle posizioni "
+                    "escluse dal calcolo e non è entrato nella simulazione.")
+    if alloc["tickers_without_returns"]:
+        gaps.append(label + ": " + _elenco(alloc["tickers_without_returns"]) + " non ha una serie di "
+                    "rendimenti, quindi il suo peso effettivo nella simulazione è zero.")
 
 
 def _montecarlo(picker, ticker, gaps):
@@ -953,13 +1385,37 @@ def _montecarlo(picker, ticker, gaps):
         ratios = data.get("percentiles_ratio") if isinstance(data.get("percentiles_ratio"), dict) else {}
         # rapporto NAV finale / NAV iniziale (1.0 = invariato), come dal tool: non sono punti %
         block["terminal_ratio_percentiles"] = {k: _num(v) for k, v in ratios.items()}
+        block.update(_mc_calibration(data))
+        block["excluded_insufficient_history"] = _mc_excluded(data)
+        if block["excluded_insufficient_history"]:
+            gaps.append(sub_label + ": " + _mc_excluded_text(block["excluded_insufficient_history"]) + ".")
         if kind == "pro_forma":
-            weights = data.get("weights") if isinstance(data.get("weights"), dict) else {}
-            weight = _num(weights.get(ticker))
-            block["candidate_weight_pct"] = round(weight * 100, 4) if weight is not None else None  # frazione -> punti
-            if weight is None:
+            alloc = data.get("what_if_allocation")
+            if isinstance(alloc, dict):
+                # peso VERO del candidato nella simulazione (dopo la rinormalizzazione), gia' in punti
+                block["candidate_weight_pct"] = _num(alloc.get("added_weight_pct_effective"))
+                block["allocation"] = {
+                    "origin": _testo(alloc.get("origin")),
+                    "is_proposed_size": (alloc.get("is_proposed_size")
+                                         if isinstance(alloc.get("is_proposed_size"), bool) else None),
+                    "weight_pct_requested": _num(alloc.get("added_weight_pct_requested")),
+                    "weight_pct_effective": block["candidate_weight_pct"],
+                    "note": _testo(alloc.get("note")),
+                    "tickers_skipped": _as_list(alloc.get("added_tickers_skipped")),
+                    "tickers_without_returns": _as_list(alloc.get("added_tickers_without_returns")),
+                    "status": None}
+            else:
+                weights = data.get("weights") if isinstance(data.get("weights"), dict) else {}
+                weight = _num(weights.get(ticker))
+                block["candidate_weight_pct"] = round(weight * 100, 4) if weight is not None else None  # frazione -> punti
+                block["allocation"] = {"origin": None, "is_proposed_size": None, "weight_pct_requested": None,
+                                       "weight_pct_effective": None, "note": None, "tickers_skipped": [],
+                                       "tickers_without_returns": [], "status": _ANTE_CURA}
+            if block["candidate_weight_pct"] is None:
                 gaps.append(sub_label + ": non è indicato il peso dato al titolo nella simulazione.")
+            _mc_allocation_notes(sub_label, block, gaps)
         _mc_notes(data, gaps)
+        _mc_tail_notes(sub_label, block, gaps)
         sentence = _mancano(sub_label, [n for n in ("horizon_days", "var_99_pct", "es_99_pct")
                                         if block[n] is None])
         if sentence:
@@ -986,10 +1442,11 @@ def _montecarlo(picker, ticker, gaps):
                 book_receipt, book_got = closest[0], (closest[1], closest[2])
     if book_receipt is not None:
         blocks["book"] = build("book", book_label, book_receipt, *book_got)
-    if blocks["book"] is None and blocks["pro_forma"] is None:
+    pro_error = _mc_pro_forma_error(picker, accept_for("pro_forma"), pro_receipt, pro_label, gaps)
+    if blocks["book"] is None and blocks["pro_forma"] is None and pro_error is None:
         return None
-    parts = [b for b in blocks.values() if b]
-    return {"book": blocks["book"], "pro_forma": blocks["pro_forma"],
+    parts = [b for b in blocks.values() if b] or [pro_error]
+    return {"book": blocks["book"], "pro_forma": blocks["pro_forma"], "pro_forma_error": pro_error,
             "source": parts[0]["source"], "tool": "get_portfolio_montecarlo",
             "as_of": _earliest([b.get("as_of") for b in parts])}
 

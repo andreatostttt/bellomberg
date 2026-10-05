@@ -357,7 +357,11 @@ export interface Taglie {
   massimo: number | null;
   /** valute per cui nessuna fonte ha dato un cambio: si DICHIARANO */
   scoperte: string[];
+  /** ordini con un cambio mancante (l'importo c'è) */
   senzaCambio: number;
+  /** ordini con quantità o prezzo illeggibile: esclusi dalle misurate, mai taglia 0 (revisione G9b);
+   *  la pagina Trade lo dichiara (trade.orders_no_amount). */
+  senzaImporto: number;
 }
 
 export function taglieStoriche(
@@ -372,10 +376,11 @@ export function taglieStoriche(
     if (!cache[v]) cache[v] = cambioPer(v, rates, posizioni);
     const c = cache[v];
     if (c.tasso == null && scoperte.indexOf(v) < 0) scoperte.push(v);
-    const locale = Math.abs((t.quantita || 0) * (t.prezzo || 0));
+    const importoLeggibile = Number.isFinite(t.quantita) && Number.isFinite(t.prezzo);
+    const locale = importoLeggibile ? Math.abs(t.quantita * t.prezzo) : NaN;
     return {
       ticker: t.ticker, action: t.action, data: t.data, valuta: v,
-      locale, eur: c.tasso == null ? null : locale * c.tasso,
+      locale, eur: c.tasso == null || !importoLeggibile ? null : locale * c.tasso,
     };
   });
 
@@ -393,7 +398,8 @@ export function taglieStoriche(
     mediana,
     massimo: val.length ? val[val.length - 1] : null,
     scoperte,
-    senzaCambio: taglie.length - misurate.length,
+    senzaCambio: taglie.filter(t => t.eur == null && Number.isFinite(t.locale)).length,
+    senzaImporto: taglie.filter(t => !Number.isFinite(t.locale)).length,
   };
 }
 

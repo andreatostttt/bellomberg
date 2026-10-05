@@ -71,3 +71,19 @@ def test_listino_modelli_attivi_26_07():
     # i modelli precedenti restano prezzabili (run/log storici)
     assert cost_usd("claude-opus-4-8", usage)["status"] == "ok"
     assert cost_usd("claude-sonnet-4-6", usage)["status"] == "ok"
+
+
+def test_alias_con_prefisso_provider_e_slug_sconosciuto_restano_espliciti():
+    usage = {"in": 1_000_000, "out": 0}
+
+    # OpenRouter puo' restituire il provider prefix anche quando il listino locale
+    # conosce il modello canonico.
+    resolved = resolve_model("anthropic/claude-opus-5")
+    assert resolved == "claude-opus-5"
+    assert cost_usd("anthropic/claude-opus-5", usage)["status"] == "ok"
+
+    # Un prefix non documentato non deve essere ricondotto a un modello "simile".
+    unknown = resolve_model("z-ai/glm-5.3-flash")
+    assert unknown == "z-ai/glm-5.3-flash"
+    result = cost_usd(unknown, usage)
+    assert result["cost"] is None and result["status"] == "model_unknown"

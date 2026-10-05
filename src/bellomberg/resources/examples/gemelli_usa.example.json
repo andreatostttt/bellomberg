@@ -1,0 +1,50 @@
+{
+  "_leggimi": "Copia questo file in data/gemelli_usa.json SOLO se vuoi scriverlo a mano: di norma lo scrive tools/ops/proponi_gemelli_usa.py (dry-run di default, --apply per scrivere, backup + scrittura atomica + rilettura). Il file in data/ e' privato e non viene mai pubblicato. Chiave = SIMBOLO NON-USA del book, MAIUSCOLO. stato: proposto | confermato | rifiutato — i desk leggono SOLO le voci confermate, sempre con l'etichetta PROXY in testa al payload. relazione: stesso_indice (ETF/fondo USA che replica lo stesso indice) | adr (stesso emittente quotato negli USA) | partecipazioni (nessun gemello unico: le principali posizioni USA, con fonte e data). gemello_usa: {simbolo, evidenza, fonte} — l'evidenza la scrive chi propone (KID, factsheet, 20-F, 13F), MAI dedotta dal simbolo: il simbolo USA omonimo e' di solito un altro strumento, e se proprio e' lui l'evidenza deve nominarlo. usi_ammessi fra: opzioni, congress, lobbying, gov_contracts, insider, fondamentali, notizie. confermato_tramite (obbligatorio se confermato): COME e' arrivata la conferma del PM, e l'etichetta PROXY lo cita. Date ISO. Simboli di questo esempio INVENTATI. Le chiavi con `_` davanti sono note.",
+  "ZZIDX.MI": {
+    "stato": "confermato",
+    "relazione": "stesso_indice",
+    "gemello_usa": {
+      "simbolo": "QQSYN",
+      "evidenza": "KID dell'ETF europeo e factsheet di QQSYN: stesso indice di riferimento (Indice Esempio 100 Net Return), replica fisica in entrambi",
+      "fonte": "KID emittente europeo 2026-09 + factsheet QQSYN 2026-09"
+    },
+    "usi_ammessi": ["opzioni", "notizie"],
+    "proposto_il": "2026-10-01",
+    "confermato_il": "2026-10-02",
+    "confermato_tramite": "istruzione PM in chat del 02/10, registrata da Claude"
+  },
+  "ZZBETA.DE": {
+    "stato": "proposto",
+    "relazione": "adr",
+    "gemello_usa": {
+      "simbolo": "ZZBETA",
+      "evidenza": "ZZBETA su NYSE e' l'ADR sponsorizzato della stessa societa' (rapporto 1:1), dichiarato nel 20-F dell'emittente",
+      "fonte": "20-F 2025 dell'emittente, sezione ADS"
+    },
+    "usi_ammessi": ["opzioni", "insider"],
+    "proposto_il": "2026-10-03"
+  },
+  "ZZGAMMA.L": {
+    "stato": "confermato",
+    "relazione": "partecipazioni",
+    "partecipazioni": {
+      "fonte": "factsheet mensile del fondo",
+      "data_riferimento": "2026-08-31",
+      "voci": [
+        {"simbolo_usa": "QQAAA", "peso_pct": 12.5},
+        {"simbolo_usa": "QQBBB", "peso_pct": 8.0}
+      ]
+    },
+    "usi_ammessi": ["congress", "lobbying", "gov_contracts"],
+    "proposto_il": "2026-10-01",
+    "confermato_il": "2026-10-02",
+    "confermato_tramite": "istruzione PM in chat del 02/10, registrata da Claude",
+    "note": "fondo con meta' del NAV in societa' USA: si guardano le prime due posizioni"
+  },
+  "ZZDELTA.MI": {
+    "stato": "rifiutato",
+    "proposto_il": "2026-10-01",
+    "rifiutato_il": "2026-10-02",
+    "motivo_rifiuto": "nessun gemello USA: indice solo europeo, nessun ETF USA lo replica"
+  }
+}

@@ -1,15 +1,19 @@
-import { useT } from '@/i18n/provider';
+import { useLingua, useT } from '@/i18n/provider';
 import { t as tr } from '@/i18n/t';
 import { linguaCorrente, localeDi } from '@/i18n/lingua';
 import { leggiDetail } from '@/lib/quota';
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import type { ReactNode } from 'react';
 import { Bellomberg, Memo, Decision, MemoSearchHit, API_BASE } from '@/lib/api';
 import { fmtEUR, fmtNum } from '@/lib/format';
 import { rendiMemo, sezioniDi, citazioni, MemoSezione } from '@/lib/memo-md';
 import { useBox } from '@/lib/useBox';
 import { AlertOctagon, RefreshCw, Search, X } from 'lucide-react';
+import ModernPage from '@/components/ModernPage';
+import NewInterfaceBoundary from '@/components/NewInterfaceBoundary';
 import './dashboard-command.css';
 import './memo-banco.css';
+import './committee-modern.css';
 
 /* ============================================================================
    F9 v3 — "IL BANCO DI LETTURA" (impianto scelto dal PM 27/07 sui PNG di
@@ -120,6 +124,11 @@ export default function MemoArchive() {
   const [cerca, setCerca] = useState(false);
 
   const docRef = useRef<HTMLDivElement>(null);
+  const searchLauncher = useRef<HTMLButtonElement>(null);
+  const closeSearch = useCallback(() => {
+    setCerca(false);
+    requestAnimationFrame(() => searchLauncher.current?.focus({ preventScroll: true }));
+  }, []);
 
   const load = useCallback(() => {
     setLoading(true); setErr(null);
@@ -232,7 +241,8 @@ export default function MemoArchive() {
     // Buco DICHIARATO (regola 14/07): un errore backend NON e' "nessun memo"
     // — il false-empty qui invitava a una run del consigliere da ~10 EUR.
     return (
-      <div className="obsx f9b">
+      <ModernPage page="memos" presentationBoundary={false} render={() => (
+      <MemoPresentationBoundary render={() => <div className="obsx f9b">
         <div className="p3">
           <i className="tick tl" /><i className="tick tr" /><i className="tick bl" /><i className="tick br" />
           <div className="p3h am">{tr('memoarchive.f001')}</div>
@@ -242,11 +252,15 @@ export default function MemoArchive() {
             <button onClick={load} className="btn btn-cyan ml-auto"><RefreshCw size={11} /> {tr('memoarchive.f004')}</button>
           </div>
         </div>
-      </div>
+      </div>} />
+      )} />
     );
   }
 
   return (
+    <ModernPage page="memos" presentationBoundary={false} render={() => (
+    <>
+    <MemoPresentationBoundary render={() => (
     <div className="obsx f9b">
       {/* ── barra d'assetto ──────────────────────────────────────────── */}
       <div className="bar">
@@ -263,7 +277,7 @@ export default function MemoArchive() {
             : campione === null ? <b>…</b> : <b>{campione.excluded ?? tr('memoarchive.f006')} {tr('memoarchive.f043')} {campione.rows}</b>}
         </span>
         <span className="sep" />
-        <button className="qcall" onClick={() => setCerca(true)} title={tr('memoarchive.f009')}>
+        <button ref={searchLauncher} className="qcall" onClick={() => setCerca(true)} title={tr('memoarchive.f009')}>
           <Search size={12} color="#73829F" />
           <span className="ph">{tr('memoarchive.f010')}</span>
           <span className="kb">{tr('memoarchive.f011')}</span>
@@ -510,14 +524,17 @@ export default function MemoArchive() {
         </div>
       </div>
 
-      {cerca && (
-        <RicercaMemo
-          memos={memos}
-          onChiudi={() => setCerca(false)}
-          onApri={id => { setSelId(id); setCerca(false); }}
-        />
-      )}
     </div>
+    )} />
+    {cerca && (
+      <RicercaMemo
+        memos={memos}
+        onChiudi={closeSearch}
+        onApri={id => { setSelId(id); setCerca(false); }}
+      />
+    )}
+    </>
+    )} />
   );
 }
 
@@ -528,6 +545,15 @@ export default function MemoArchive() {
    `distance` e' una distanza COSENO e si scrive com'e': tradurla in
    "rilevanza 87%" sarebbe un numero inventato.
    ========================================================================== */
+function DeferredMemoSearchView({ render }: { render: () => ReactNode }) { return render(); }
+
+function MemoPresentationBoundary({ render }: { render: () => ReactNode }) {
+  const language = useLingua();
+  return <NewInterfaceBoundary language={language}>
+    <DeferredMemoSearchView render={render} />
+  </NewInterfaceBoundary>;
+}
+
 function RicercaMemo({ memos, onChiudi, onApri }:
   { memos: Memo[]; onChiudi: () => void; onApri: (id: number) => void }) {
   const tr = useT();
@@ -581,12 +607,17 @@ function RicercaMemo({ memos, onChiudi, onApri }:
   const px = (t: number) => T1 === T0 ? ML : ML + (t - T0) / (T1 - T0) * Math.max(1, W - ML - MR);
   const py = (d: number) => MARGIN_TOP + (dMax === dMin ? 0 : (d - dMin) / (dMax - dMin)) * (yAx - MARGIN_TOP - 14);
 
-  return (
+  return <MemoPresentationBoundary render={() => (
     <div className="f9b-scrim" onMouseDown={e => { if (e.target === box) onChiudi(); }} ref={setBox}>
-      <div className="f9b-modal" onMouseDown={e => e.stopPropagation()}>
-        <div className="mh">{tr('memoarchive.f066')}
+      <div className="f9b-modal" role="dialog" aria-modal="true" aria-labelledby="f9b-search-title" onMouseDown={e => e.stopPropagation()}>
+        <div className="mh"><span id="f9b-search-title">{tr('memoarchive.f066')}</span>
           <span className="side">{memos.length} {tr('memoarchive.f067')}</span>
-          <X size={13} style={{ cursor: 'pointer', color: '#73829F' }} onClick={onChiudi} />
+          <button type="button" className="f9b-close" aria-label={tr('memoarchive.f086')} title={tr('memoarchive.f086')}
+            onClick={onChiudi} style={{ marginLeft: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              width: 13, height: 13, flex: '0 0 13px', padding: 0, border: 0, background: 'transparent',
+              color: '#73829F', lineHeight: 0, cursor: 'pointer' }}>
+            <X size={13} aria-hidden="true" />
+          </button>
         </div>
         <div className="mq">
           <Search size={17} color="#29D3F2" />
@@ -701,5 +732,5 @@ function RicercaMemo({ memos, onChiudi, onApri }:
         </div>
       </div>
     </div>
-  );
+  )} />;
 }

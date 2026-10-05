@@ -37,10 +37,13 @@ def _connect_error():
     return exc
 
 
-def _admission_402():
+def _admission_402(measured=True):
     metadata = {'reason': 'in_flight_budget_exhausted', 'limit_source': 'openrouter_in_flight_budget',
                 'provider_name': None, 'headers': {'Retry-After': '3'}}
-    return APIStatusError(402, 'In-flight budget exhausted | metadata: ' + json.dumps(metadata))
+    exc = APIStatusError(402, 'In-flight budget exhausted | metadata: ' + json.dumps(metadata))
+    if measured:
+        exc.http_status = 402  # as llm_client._invia measures it (KA 05/10: rule from core/unbilled)
+    return exc
 
 
 class Settled(Exception):
@@ -74,6 +77,22 @@ def test_possibly_billed_failure_stays_unknown_and_is_not_retried(migrated, monk
         def create(self, **call):
             calls.append(call)
             raise APIStatusError(502, 'upstream error')
+    with pytest.raises(APIStatusError):
+        trade_idea._BudgetedMessages(Inner(), budget, 'capo').create(**_call())
+    assert len(calls) == 1 and _states(migrated, ident) == ['unknown']
+
+
+def test_admission_402_without_a_measured_http_status_stays_unknown(migrated, monkeypatch):
+    """KA (05/10, main): the shared stricter rule. A 402 body whose HTTP status was not
+    measured by the client proves nothing: unknown, no retry."""
+    monkeypatch.setattr(time, 'sleep', lambda seconds: pytest.fail('no retry wait'))
+    budget, ident = _gate(migrated, 'unmeasured-402')
+    calls = []
+
+    class Inner:
+        def create(self, **call):
+            calls.append(call)
+            raise _admission_402(measured=False)
     with pytest.raises(APIStatusError):
         trade_idea._BudgetedMessages(Inner(), budget, 'capo').create(**_call())
     assert len(calls) == 1 and _states(migrated, ident) == ['unknown']

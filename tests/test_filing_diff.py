@@ -234,3 +234,145 @@ def test_pdf_citations_refer_to_same_snapshot_as_hash(tmp_path, monkeypatch):
            metadati={}, sezioni={"rischi": {"da_pagina": 1, "a_pagina": 1}})
     assert doc["sha256"] == hashlib.sha256(original).hexdigest()
     assert "2026" in doc["estrazione"]["testo"] and "2027" not in doc["estrazione"]["testo"]
+
+
+# --- prova reale fase D: riformulati sparsi in documenti lunghi ---
+
+def _frase(i, variante=False):
+    base = (f"Nova risk {i} concerns supply of component {i} from third parties and may affect "
+            f"margins in segment {i % 7} over the coming periods")
+    return (base.replace("may affect", "could materially affect") + " and beyond") if variante else base
+
+
+def _riformulati(tmp_path, n=600, ogni=4):
+    prima = " ".join(_frase(i) + "." for i in range(n))
+    dopo = " ".join(_frase(i, variante=(i % ogni == 0)) + "." for i in range(n))
+    return documento(tmp_path, 2025, html(prima)), documento(tmp_path, 2026, html(dopo))
+
+
+def test_riformulati_sparsi_oltre_la_vecchia_soglia_sono_modificati(tmp_path):
+    import time
+    from bellomberg.market_data.filing_diff import LIMITE_COPPIE, confronta_documenti
+    prima, dopo = _riformulati(tmp_path)
+    t0 = time.perf_counter()
+    r = confronta_documenti(prima, dopo)
+    durata = time.perf_counter() - t0
+    tipi = [c["tipo"] for c in r["cambiamenti"]]
+    assert tipi.count("modificato") == 150 and "aggiunto" not in tipi and "rimosso" not in tipi
+    assert LIMITE_COPPIE not in r["limiti"]
+    # ogni modificato abbina lo stesso paragrafo (stesso indice i)
+    for c in r["cambiamenti"]:
+        assert c["prima"]["testo"].split()[2] == c["dopo"]["testo"].split()[2]
+    assert durata < 3.0, durata
+
+
+def test_riformulati_deterministici(tmp_path):
+    from bellomberg.market_data.filing_diff import confronta_documenti
+    prima, dopo = _riformulati(tmp_path, n=300, ogni=3)
+    a, b = confronta_documenti(prima, dopo), confronta_documenti(prima, dopo)
+    assert [(c["tipo"], c["prima"]["inizio"], c["dopo"]["inizio"]) for c in a["cambiamenti"]] == \
+           [(c["tipo"], c["prima"]["inizio"], c["dopo"]["inizio"]) for c in b["cambiamenti"]]
+
+
+def test_buco_enorme_usa_la_finestra_locale_dichiarata(tmp_path):
+    # Un unico blocco di 150 frasi tutte riformulate per lato (22.500 coppie nel buco): finestra locale.
+    from bellomberg.market_data.filing_diff import LIMITE_FINESTRA, confronta_documenti
+    prima = " ".join(_frase(i) + "." for i in range(150))
+    dopo = " ".join(_frase(i, variante=True) + "." for i in range(150))
+    r = confronta_documenti(documento(tmp_path, 2025, html(prima)), documento(tmp_path, 2026, html(dopo)))
+    tipi = [c["tipo"] for c in r["cambiamenti"]]
+    assert tipi.count("modificato") == 150
+    assert LIMITE_FINESTRA in r["limiti"]
+
+
+def test_piccoli_documenti_abbinano_come_prima(tmp_path):
+    # Sotto la soglia nulla cambia: un riformulato spostato lontano resta "modificato".
+    from bellomberg.market_data.filing_diff import LIMITE_FINESTRA, confronta_documenti
+    frasi = [_frase(i) + "." for i in range(20)]
+    dopo = frasi[1:] + [_frase(0, variante=True) + "."]
+    r = confronta_documenti(documento(tmp_path, 2025, html(" ".join(frasi))),
+                            documento(tmp_path, 2026, html(" ".join(dopo))))
+    assert [c["tipo"] for c in r["cambiamenti"]] == ["modificato"]
+    assert LIMITE_FINESTRA not in r["limiti"]
+
+
+# --- prova reale fase D: intestazioni di pagina incollate nei segmenti ---
+
+def _doc_pdf(pagine):
+    riferimenti, pos = [], 0
+    for n, p in enumerate(pagine, 1):
+        riferimenti.append({"pagina": n, "inizio": pos, "fine": pos + len(p), "testo": p})
+        pos += len(p) + 1
+    testo = "\n".join(pagine)
+    return {"estrazione": {"testo": testo, "formato": "pdf", "riferimenti": riferimenti},
+            "sezioni": {"rischi": {"stato": "ok", "inizio": 0, "fine": len(testo)}}}
+
+
+def test_intestazione_ripetuta_su_quattro_pagine_tolta_dai_segmenti():
+    from bellomberg.market_data.filing_diff import _unita
+    pagine = [f"Acme Group | Interim report 2026 | page {n}\nAcme risk {n} is described here in full.\n{n + 10}"
+              for n in range(1, 5)]
+    doc = _doc_pdf(pagine)
+    segmenti = _unita(doc, {"rischi"})
+    testi = [s["testo"] for s in segmenti]
+    assert testi == [f"Acme risk {n} is described here in full." for n in range(1, 5)]
+    # citazioni letterali: offset sul testo originale
+    for s in segmenti:
+        assert doc["estrazione"]["testo"][s["inizio"]:s["fine"]] == s["testo"]
+
+
+def test_riga_su_due_pagine_non_e_intestazione():
+    from bellomberg.market_data.filing_diff import _unita
+    pagine = ["Acme header line\nFirst risk.", "Acme header line\nSecond risk.", "Other\nThird risk."]
+    testi = [s["testo"] for s in _unita(_doc_pdf(pagine), {"rischi"})]
+    assert testi[0].startswith("Acme header line")
+
+
+def test_table_of_contents_con_numero_di_pagina_nell_html(tmp_path):
+    # HTML SEC: nessun confine di pagina; solo "Table of Contents" con il numero di pagina accanto.
+    from bellomberg.market_data.filing_diff import confronta_documenti
+    p = "Kore risk one is stable. Kore risk two is stable."
+    a = html(f"{p}</p><p>45 | 2025 Q3 10-Q</p><p>Table of Contents</p><p>Kore risk three is stable.")
+    b = html(f"{p}</p><p>Kore risk three is stable.")
+    r = confronta_documenti(documento(tmp_path, 2025, a), documento(tmp_path, 2026, b))
+    assert r["cambiamenti"] == []
+    c = html(f"{p}</p><p>18</p><p>Table of Contents</p><p>Kore risk three is stable.")
+    assert confronta_documenti(documento(tmp_path, 2025, c), documento(tmp_path, 2026, b))["cambiamenti"] == []
+    # senza numero di pagina il testo resta (regola conservativa)
+    d = html(f"{p} See the Table of Contents for details.</p><p>Kore risk three is stable.")
+    assert confronta_documenti(documento(tmp_path, 2025, d), documento(tmp_path, 2026, b))["cambiamenti"]
+
+
+def test_costo_dell_abbinamento_limitato_per_documento(tmp_path):
+    # Caso peggiore della revisione: 20 buchi da 100×100 frasi tutte simili (200.000 confronti).
+    import time
+    from bellomberg.market_data.filing_diff import BUDGET_CONFRONTI, LIMITE_FINESTRA, confronta_documenti
+
+    def f(i, v):
+        return (f"Nova risk concerns supply of component {i:05d} from third parties "
+                f"{'and could materially affect' if v else 'and may affect'} margins over periods.")
+    pr, do, k = [], [], 0
+    for g in range(20):
+        pr.append(f"Anchor paragraph number {g} stays identical in both documents.")
+        do.append(pr[-1])
+        for _ in range(100):
+            pr.append(f(k, False))
+            do.append(f(k + 50000, True))
+            k += 1
+    a, b = documento(tmp_path, 2025, html(" ".join(pr))), documento(tmp_path, 2026, html(" ".join(do)))
+    t0 = time.perf_counter()
+    r = confronta_documenti(a, b)
+    durata = time.perf_counter() - t0
+    # Limite deterministico: confronti contati (prima 200.000); il tempo solo come rete larga.
+    assert LIMITE_FINESTRA in r["limiti"]
+    assert r["misure"]["confronti_abbinamento"] <= BUDGET_CONFRONTI + 7 * 2000
+    assert durata < 30.0, durata
+    assert sum(c["tipo"] == "modificato" for c in r["cambiamenti"]) >= 1500
+
+
+def test_riga_di_totale_ripetuta_non_e_intestazione():
+    # Revisione: una riga di totale di tabella in coda a 3+ pagine resta nel testo.
+    from bellomberg.market_data.filing_diff import _unita
+    pagine = [f"Acme segment {n} revenue table.\nTotal revenue {n},234 {n + 4},678" for n in range(1, 5)]
+    testi = [s["testo"] for s in _unita(_doc_pdf(pagine), {"rischi"})]
+    assert sum("Total revenue" in t for t in testi) == 4

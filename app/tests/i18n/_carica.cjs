@@ -1,7 +1,8 @@
 // Caricatore dei moduli TypeScript dell'app per i test node di app/tests/i18n.
 // Trascompila con il compilatore gia' in node_modules (come contratti.cjs) ma
 // RISOLVE gli import: '@/x' -> src/x, './x.js' -> ./x.ts (stile NodeNext usato
-// dentro src/i18n), '.css' -> modulo vuoto, pacchetti npm -> require vero.
+// dentro src/i18n), '.css' -> modulo vuoto, import.meta.glob -> {}, pacchetti
+// npm -> require vero.
 // Cosi' i test eseguono le funzioni VERE con i dizionari VERI, senza stub
 // nascosti: si stubba solo cio' che il chiamante dichiara (es. '@/lib/api').
 const fs = require('node:fs');
@@ -43,7 +44,10 @@ function creaCaricatore({ stub = {} } = {}) {
         module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022,
         jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true,
       },
-    }).outputText;
+    }).outputText
+      // import.meta.glob e' risolto da Vite in build (es. i loghi locali in
+      // src/assets/logos): fuori da Vite non ci sono file raccolti -> mappa vuota.
+      .replace(/import\.meta\.glob\b/g, '(() => ({}))');
     const modulo = { exports: {} };
     cache.set(abs, modulo);
     const richiedi = (spec) => {

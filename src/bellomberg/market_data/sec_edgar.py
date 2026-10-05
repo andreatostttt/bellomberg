@@ -20,9 +20,21 @@ API:
 """
 from bellomberg.core.paths import PROJECT_ROOT
 import os
+try:
+    import fcntl
+except ImportError:  # Windows: lock del ritmo con msvcrt (sotto)
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:  # macOS/Linux: lock del ritmo con fcntl
+    msvcrt = None
+import json
 import time
 import re
+import threading
 import requests
+from html.parser import HTMLParser
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from xml.etree import ElementTree as ET
@@ -137,7 +149,16 @@ def lookup_cik(ticker: str, motivo: Optional[List[str]] = None) -> Optional[str]
     dei tre. Serve a non scrivere «non e' un filer SEC» quando la verita' e' che
     la rete era giu': sarebbe inventare una misura, cioe' il difetto che stiamo
     curando. Chi non passa `motivo` ha il comportamento storico.
+    Seguito revisione G1 (04/10/2026): la guardia `ticker_ambiguo_per_cik` vale anche qui, per i
+    chiamanti futuri (quelli attuali la applicano gia' prima): un suffisso di listino senza alias
+    verificato non si risolve mai nel CIK di un omonimo USA, e il motivo e' dichiarato.
     """
+    ambiguo = ticker_ambiguo_per_cik(ticker)
+    if ambiguo:
+        _log("  " + ambiguo)
+        if motivo is not None:
+            motivo.append(ambiguo)
+        return None
     t = ticker.upper().split(".")[0]
     t = _alias_sec().get(t, t)
     if t in _CIK_CACHE:
@@ -151,6 +172,7 @@ def lookup_cik(ticker: str, motivo: Optional[List[str]] = None) -> Optional[str]
     try:
         # SEC mantiene un file con tutti i ticker -> CIK
         url = "https://www.sec.gov/files/company_tickers.json"
+        attendi_sec()
         r = requests.get(url, headers=_headers(), timeout=10)
         if r.status_code != 200:
             _perche(f"elenco ticker SEC: HTTP {r.status_code} (non e' un verdetto "
@@ -179,6 +201,265 @@ def lookup_cik(ticker: str, motivo: Optional[List[str]] = None) -> Optional[str]
 
 
 # ============================================================
+# FILING AUTOMATICI: ritmo, elenco emittenti, allegati
+# ============================================================
+_SEC_LOCK = threading.Lock()
+_SEC_ULTIMA = [0.0]
+_SEC_INTERVALLO_S = 0.125  # <= 8 richieste/s, sotto il limite SEC di 10
+
+
+def _ritmo_path():
+    """File del ritmo condiviso; DATA_DIR letto a chiamata (i test lo reindirizzano)."""
+    from bellomberg.core import paths
+    return Path(paths.DATA_DIR) / ".sec_ritmo"
+
+
+_RIPIEGO_DIVISORE = 4  # lock tra processi INUTILIZZABILE: ogni processo a 1/4 del tetto (<= 8 req/s fino a 4 processi)
+_RITMO_LARGHEZZA = 32  # byte del dato (istante) in testa al file
+_RITMO_BYTE_LOCK = 1 << 16  # byte bloccato su Windows: oltre il dato, letture e scritture mai in conflitto
+_RITMO_ATTESA_LOCK_S = 10.0  # oltre: attesa DICHIARATA (stato + log), si continua ad aspettare
+_RITMO_ATTESA_MAX_S = 120.0  # oltre: RitmoBloccato, nessuna richiesta fuori dal ritmo
+_RITMO_STATO: Dict[str, Dict[str, Any]] = {}
+_RITMO_STATO_LOCK = threading.Lock()
+
+
+class RitmoBloccato(RuntimeError):
+    """Il lock del ritmo resta occupato oltre _RITMO_ATTESA_MAX_S: la richiesta NON parte
+    (revisione 04/10 REV_G2a R-2: partire fuori dal file sfora il tetto con 3+ processi)."""
+
+
+def _blocca(fd, p=None) -> None:
+    """Lock esclusivo tra processi: fcntl (macOS/Linux) o msvcrt (Windows).
+
+    OSError solo se nessun lock esiste su questa piattaforma. Lock occupato: si aspetta;
+    oltre _RITMO_ATTESA_LOCK_S l'attesa e' dichiarata, oltre _RITMO_ATTESA_MAX_S RitmoBloccato.
+    """
+    if fcntl is None and msvcrt is None:
+        raise OSError("nessun lock tra processi disponibile (ne' fcntl ne' msvcrt)")
+    inizio = time.monotonic()
+    dichiarata = False
+    while True:
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                os.lseek(fd, _RITMO_BYTE_LOCK, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return
+        except OSError:
+            attesa = time.monotonic() - inizio
+            if attesa >= _RITMO_ATTESA_MAX_S:
+                motivo = (f"lock del ritmo occupato da oltre {_RITMO_ATTESA_MAX_S:.0f} s: richiesta NON eseguita")
+                if p is not None:
+                    _segna_ritmo(p, True, motivo)
+                raise RitmoBloccato(motivo)
+            if attesa >= _RITMO_ATTESA_LOCK_S and not dichiarata and p is not None:
+                _segna_ritmo(p, True, f"lock del ritmo occupato da oltre {_RITMO_ATTESA_LOCK_S:.0f} s da un "
+                                      "altro processo: attendo (mai richieste fuori dal ritmo)")
+                dichiarata = True
+            time.sleep(0.002)
+
+
+def _sblocca(fd) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    os.lseek(fd, _RITMO_BYTE_LOCK, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
+def _segna_ritmo(p, condiviso: bool, motivo: Optional[str]) -> None:
+    chiave = str(p)
+    with _RITMO_STATO_LOCK:
+        prima = _RITMO_STATO.get(chiave)
+        cambiato = prima is None or prima["condiviso"] != condiviso or prima["motivo"] != motivo
+        if cambiato:
+            _RITMO_STATO[chiave] = {"condiviso": condiviso, "motivo": motivo,
+                                    "dal": datetime.now().isoformat(timespec="seconds")}
+    if cambiato and not condiviso:
+        _log(f"ritmo NON condiviso tra processi su {Path(p).name}: {motivo}; "
+             f"ripiego per processo a 1/{_RIPIEGO_DIVISORE} del tetto (dichiarato)")
+    elif cambiato and motivo:
+        _log(f"ritmo su {Path(p).name}: {motivo}")
+
+
+def stato_ritmo() -> Dict[str, Dict[str, Any]]:
+    """Stato dei ritmi per file: {percorso: {"condiviso", "motivo", "dal"}}.
+
+    Tetto TOTALE verso la SEC: <= 8 richieste/s fra tutti i processi (limite SEC 10),
+    companyfacts e download compresi, finche' il lock su file e' usabile. Lock occupato a
+    lungo: si aspetta (motivo dichiarato), mai una richiesta fuori dal file; oltre
+    _RITMO_ATTESA_MAX_S la richiesta non parte (RitmoBloccato). `condiviso: False` = file
+    o lock INUTILIZZABILI su questa macchina: ogni processo va a 1/_RIPIEGO_DIVISORE del
+    tetto, quindi il tetto totale regge fino a 4 processi e NON oltre (dichiarato).
+    """
+    with _RITMO_STATO_LOCK:
+        return {k: dict(v) for k, v in _RITMO_STATO.items()}
+
+
+def _ripiego_locale(p, intervallo, ultima, motivo) -> None:
+    _segna_ritmo(p, False, motivo)
+    attesa = ultima[0] + intervallo * _RIPIEGO_DIVISORE - time.monotonic()
+    if attesa > 0:
+        time.sleep(attesa)
+    ultima[0] = time.monotonic()
+
+
+def _attendi(p, intervallo, lock, ultima) -> None:
+    """Ritmo condiviso tra processi con lock su file (usato per SEC ed ESEF).
+
+    Il file contiene in testa l'istante (time.time) dell'ultima richiesta; illeggibile =
+    nessuna attesa. Lock portabile (fcntl o msvcrt). Lock occupato: si aspetta, mai fuori
+    dal file (RitmoBloccato oltre _RITMO_ATTESA_MAX_S). Solo se file o lock NON esistono:
+    ritmo del solo processo a 1/_RIPIEGO_DIVISORE del tetto, DICHIARATO in log e stato_ritmo().
+    """
+    p = Path(p)
+    with lock:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(p, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o644)
+        except OSError as exc:
+            _ripiego_locale(p, intervallo, ultima, f"file del ritmo non apribile ({type(exc).__name__}: {exc})")
+            return
+        try:
+            try:
+                _blocca(fd, p)
+            except OSError as exc:  # nessun lock su questa piattaforma (RitmoBloccato risale al chiamante)
+                _ripiego_locale(p, intervallo, ultima, f"lock del ritmo non disponibile ({exc})")
+                return
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                try:
+                    precedente = float(os.read(fd, _RITMO_LARGHEZZA).decode("ascii").strip(" \x00\r\n\t") or 0)
+                except ValueError:  # anche UnicodeDecodeError
+                    precedente = 0.0
+                attesa = precedente + intervallo - time.time()
+                if 0 < attesa <= max(1.0, intervallo):
+                    time.sleep(attesa)
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, f"{time.time():.6f}".ljust(_RITMO_LARGHEZZA).encode("ascii"))
+            finally:
+                _sblocca(fd)
+        finally:
+            os.close(fd)
+        ultima[0] = time.monotonic()
+        _segna_ritmo(p, True, None)
+
+
+def attendi_sec(*, percorso=None) -> None:
+    """Ritmo condiviso dei percorsi SEC (fair access): <= 8 req/s in TOTALE fra i processi.
+
+    Il lock su file vale tra processi su Windows e su macOS/Linux. Lock occupato a lungo:
+    si aspetta e lo si dichiara; oltre il tetto di attesa RitmoBloccato (la richiesta non
+    parte). File o lock inesistenti: ripiego per processo dichiarato (v. stato_ritmo).
+    """
+    _attendi(Path(percorso) if percorso else _ritmo_path(), _SEC_INTERVALLO_S, _SEC_LOCK, _SEC_ULTIMA)
+
+
+def _scarica_elenco():
+    attendi_sec()
+    r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=_headers(), timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def elenco_emittenti_sec(*, cache_path=None, ttl_s: int = 86400, fetch=None) -> Dict[str, Any]:
+    """Elenco pubblico SEC ticker -> CIK -> nome, con cache su disco (24 h).
+
+    Rete giu' con cache vecchia: si usa la cache e lo si DICHIARA (origine
+    cache_scaduta). Senza cache e senza rete: RuntimeError, mai un elenco vuoto
+    che si leggerebbe «nessun emittente SEC».
+    """
+    _headers()  # ContattoMancante prima di qualsiasi lettura
+    if cache_path is None:
+        from bellomberg.core.paths import DATA_DIR
+        cache_path = Path(DATA_DIR) / "sec_cache" / "company_tickers.json"
+    cache_path = Path(cache_path)
+    fresca = cache_path.is_file() and time.time() - cache_path.stat().st_mtime < ttl_s
+    motivo, origine = None, "cache"
+    if fresca:
+        grezzo = json.loads(cache_path.read_text(encoding="utf-8"))
+    else:
+        try:
+            grezzo = (fetch or _scarica_elenco)()
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(grezzo), encoding="utf-8")
+            tmp.replace(cache_path)
+            origine = "rete"
+        except ContattoMancante:
+            raise
+        except Exception as exc:
+            motivo = f"elenco SEC non aggiornato: {type(exc).__name__}: {exc}"
+            if not cache_path.is_file():
+                raise RuntimeError(motivo) from exc
+            grezzo, origine = json.loads(cache_path.read_text(encoding="utf-8")), "cache_scaduta"
+    righe = [{"cik": str(v["cik_str"]).zfill(10), "ticker": str(v["ticker"]).upper(), "nome": str(v["title"])}
+             for v in grezzo.values() if v.get("cik_str") and v.get("ticker")]
+    return {"righe": righe, "origine": origine, "motivo": motivo}
+
+
+class _TabellaIndice(HTMLParser):
+    """Righe della tabella documenti della pagina indice di un filing SEC."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.righe, self._riga, self._cella, self._href, self._in_td = [], None, [], None, False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr":
+            self._riga = []
+        elif tag == "td" and self._riga is not None:
+            self._in_td, self._cella, self._href = True, [], None
+        elif tag == "a" and self._in_td and self._href is None:
+            self._href = dict(attrs).get("href")
+
+    def handle_endtag(self, tag):
+        if tag == "td" and self._in_td:
+            self._riga.append((" ".join("".join(self._cella).split()), self._href))
+            self._in_td = False
+        elif tag == "tr" and self._riga is not None:
+            if len(self._riga) >= 4:
+                self.righe.append(self._riga)
+            self._riga = None
+
+    def handle_data(self, data):
+        if self._in_td:
+            self._cella.append(data)
+
+
+def allegati_filing(cik: str, accession: str, *, fetch=None) -> List[Dict[str, Any]]:
+    """Documenti di un filing (principale e allegati) dalla pagina indice SEC.
+
+    Restituisce seq, descrizione, tipo (6-K, EX-99.1, ...), url e se il documento
+    e' Inline XBRL. Solo link dentro l'archivio EDGAR dello stesso filing.
+    """
+    acc = accession.replace("-", "")
+    cartella = f"/Archives/edgar/data/{int(cik)}/{acc}/"
+    url = f"https://www.sec.gov{cartella}{accession}-index.htm"
+    if fetch is None:
+        def fetch(u):
+            attendi_sec()
+            r = requests.get(u, headers=_headers(), timeout=30)
+            r.raise_for_status()
+            return r.content
+    parser = _TabellaIndice()
+    parser.feed(fetch(url).decode("utf-8", "replace"))
+    out = []
+    for celle in parser.righe:
+        seq, descrizione, (documento, href), tipo = celle[0][0], celle[1][0], celle[2], celle[3][0]
+        if href and href.startswith("/ix?doc="):  # documenti iXBRL: link al visualizzatore SEC
+            href = href[len("/ix?doc="):]
+        if not seq.isdigit() or not href or not href.startswith(cartella):
+            continue
+        dimensione = celle[4][0] if len(celle) > 4 else ""
+        out.append({"seq": int(seq), "descrizione": descrizione, "tipo": tipo,
+                    "ixbrl": "ixbrl" in documento.lower(), "url": "https://www.sec.gov" + href,
+                    "dimensione": int(dimensione) if dimensione.isdigit() else 0})
+    return out
+
+
+# ============================================================
 # RECENT FILINGS
 # ============================================================
 def get_recent_filings(ticker: str, form_types: Optional[List[str]] = None,
@@ -190,13 +471,35 @@ def get_recent_filings(ticker: str, form_types: Optional[List[str]] = None,
     (22/08): senza, una lista vuota da 403/500/timeout era indistinguibile da
     «nessun filing nel periodo», e chi chiamava dichiarava all'agente di aver
     interrogato la SEC quando la SEC non aveva risposto.
+    Revisione G1 (04/10/2026): un suffisso di listino senza alias verificato non si risolve
+    (`ticker_ambiguo_per_cik`): prima un .MI agganciava il fondo USA con le stesse lettere.
+
+    P1 (04/10, Opus 5.5): qui `lookup_cik` veniva chiamata SENZA la guardia
+    `ticker_ambiguo_per_cik`, quindi `get_insider_trades("BA.L")` cercava `BA` e
+    restituiva i Form 4 di Boeing intitolati BA.L. Ora un ticker col suffisso e
+    senza alias SEC verificato non viene risolto: lista vuota col MOTIVO.
+    Review RV-C (04/10): anche le crypto del registro (BTC, SOL, BTC-USD...) non
+    hanno punto e arrivavano a `lookup_cik`, che poteva agganciare un trust o una
+    societa' USA con quel simbolo. Si ferma SOLO la crypto: i suffissi di listino
+    restano decisi da `ticker_ambiguo_per_cik` (che conosce gli alias verificati).
     """
+    from bellomberg.market_data.copertura import copertura_usa
+    esito = copertura_usa(ticker, "sec_edgar")
+    ambiguo = (esito["motivo"] if esito["stato"] == "non_coperto"
+               and esito.get("mercato") == "crypto 24/7" else None)
+    ambiguo = ambiguo or ticker_ambiguo_per_cik(ticker)
+    if ambiguo:
+        _log("  " + ambiguo)
+        if motivo is not None:
+            motivo.append(ambiguo)
+        return []
     cik = lookup_cik(ticker, motivo=motivo)
     if not cik:
         return []
     form_types = form_types or ["8-K", "10-Q", "10-K", "4"]
     try:
         url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+        attendi_sec()
         r = requests.get(url, headers=_headers(), timeout=10)
         if r.status_code != 200:
             _msg = f"submissions HTTP {r.status_code} for {ticker}"
@@ -274,6 +577,7 @@ def _cik_from_exact_issuer_name(ticker, issuer_name):
     if not key:
         raise ValueError('Nome legale esatto richiesto per la ricerca documentale SEC')
     url = 'https://www.sec.gov/files/company_tickers.json'
+    attendi_sec()
     response = requests.get(url, headers=_headers(), timeout=10)
     response.raise_for_status()
     companies = response.json()
@@ -294,14 +598,17 @@ def _cik_from_exact_issuer_name(ticker, issuer_name):
         'limitation': 'SEC symbols identify issuer filings only; requested listing and quotation remain unchanged.'}
 
 
-def get_filing_catalog(ticker: str, days: int = 1100, max_pages: int = 20, *, issuer_name=None) -> dict:
+def get_filing_catalog(ticker: str, days: int = 1100, max_pages: int = 20, cik: Optional[str] = None, *,
+                       issuer_name=None) -> dict:
     """I-20: indice annuali/intermedi inclusi 20-F/6-K e archivi submissions.
 
     Non assume che un 6-K sia un bilancio: periodo/sezioni vanno verificati sul
     documento. Limiti, errori e assenze viaggiano insieme ai risultati parziali.
     Nessuna cache su disco. Il percorso storico degli altri consumer resta invariato.
+    Con `cik` esplicito (profilo gia' collegato all'emittente) il ticker non viene
+    risolto: resta quello del portafoglio e non si rifiutano i suffissi di listino.
     """
-    return _publication_catalog(ticker, days, max_pages, earnings=False, issuer_name=issuer_name)
+    return _publication_catalog(ticker, days, max_pages, earnings=False, issuer_name=issuer_name, cik=cik)
 
 
 def get_publication_catalog(ticker: str, days: int = 400, max_pages: int = 2) -> dict:
@@ -313,23 +620,30 @@ def get_publication_catalog(ticker: str, days: int = 400, max_pages: int = 2) ->
     return _publication_catalog(ticker, days, max_pages, earnings=True)
 
 
-def _publication_catalog(ticker, days, max_pages, *, earnings, issuer_name=None):
+def _publication_catalog(ticker, days, max_pages, *, earnings, issuer_name=None, cik=None):
     out = {"stato": "ok", "documenti": [], "motivi": [], "fonte": "SEC EDGAR"}
     try:
         if days <= 0 or max_pages < 1:
             raise ValueError("days e max_pages devono essere positivi")
-        ambiguo = ticker_ambiguo_per_cik(ticker)
-        if ambiguo:
-            if issuer_name is None:
-                raise ValueError(ambiguo)
-            cik, binding = _cik_from_exact_issuer_name(ticker, issuer_name)
-            out['identity_resolution'] = binding
+        if cik is not None:
+            # Explicit CIK (profile already linked to the issuer): the ticker is
+            # not resolved, listing suffixes are not rejected.
+            if not str(cik).isdigit():
+                raise ValueError("CIK esplicito non numerico")
         else:
-            cik = lookup_cik(ticker, motivo=out["motivi"])
-        if not cik:
-            raise ValueError("CIK non disponibile")
+            ambiguo = ticker_ambiguo_per_cik(ticker)
+            if ambiguo:
+                if issuer_name is None:
+                    raise ValueError(ambiguo)
+                cik, binding = _cik_from_exact_issuer_name(ticker, issuer_name)
+                out['identity_resolution'] = binding
+            else:
+                cik = lookup_cik(ticker, motivo=out["motivi"])
+            if not cik:
+                raise ValueError("CIK non disponibile")
         cik = str(int(cik)).zfill(10)
         base = "https://data.sec.gov/submissions/"
+        attendi_sec()
         response = requests.get(base + f"CIK{cik}.json", headers=_headers(), timeout=30)
         response.raise_for_status()
         data = response.json()
@@ -382,6 +696,7 @@ def _publication_catalog(ticker, days, max_pages, *, earnings, issuer_name=None)
                 continue
             try:
                 time.sleep(0.12)  # fair access anche sui piccoli archivi
+                attendi_sec()
                 response = requests.get(base + nome, headers=_headers(), timeout=30)
                 response.raise_for_status()
                 aggiungi(response.json())
@@ -545,15 +860,18 @@ def get_insider_trades(ticker: str, days: int = 30, max_items: int = 30,
             # i regex sui tag XML falliscono -> Unknown/0/$0. L'XML grezzo sta allo stesso
             # path SENZA il prefisso xsl.
             raw_url = url.replace("/xslF345X05/", "/") if "/xslF345X05/" in url else url
+            attendi_sec()
             r = requests.get(raw_url, headers=_headers(), timeout=10)
             if r.status_code != 200 or "<ownershipDocument" not in r.text:
                 # fallback: cerca il .xml nella cartella del filing via index.json
                 try:
                     folder = raw_url.rsplit("/", 1)[0]
+                    attendi_sec()
                     idx = requests.get(folder + "/index.json", headers=_headers(), timeout=10).json()
                     xmls = [it["name"] for it in idx.get("directory", {}).get("item", [])
                             if str(it.get("name", "")).lower().endswith(".xml")]
                     for name in xmls:
+                        attendi_sec()
                         r2 = requests.get(folder + "/" + name, headers=_headers(), timeout=10)
                         if r2.status_code == 200 and "<ownershipDocument" in r2.text:
                             r = r2
@@ -701,6 +1019,7 @@ def get_13f_holdings(investor: str, max_items: int = 30) -> List[Dict[str, Any]]
             % (investor, ", ".join(sorted(ist["cik"]))))
     try:
         url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+        attendi_sec()
         r = requests.get(url, headers=_headers(), timeout=10)
         if r.status_code != 200:
             return []
@@ -723,6 +1042,7 @@ def get_13f_holdings(investor: str, max_items: int = 30) -> List[Dict[str, Any]]
         base_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}"
         # Prima trova l'index per scoprire il filename dell'infotable
         index_url = f"{base_url}/index.json"
+        attendi_sec()
         idx_r = requests.get(index_url, headers=_headers(), timeout=10)
         if idx_r.status_code != 200:
             return []
@@ -742,6 +1062,7 @@ def get_13f_holdings(investor: str, max_items: int = 30) -> List[Dict[str, Any]]
             _log(f"  13F {investor}: nessun infotable/informationtable .xml nell'index "
                  f"({base_url}/index.json) — buco dichiarato")
             return []
+        attendi_sec()
         xml_r = requests.get(f"{base_url}/{info_xml_name}", headers=_headers(), timeout=15)
         if xml_r.status_code != 200:
             _log(f"  13F {investor}: HTTP {xml_r.status_code} su {info_xml_name}")

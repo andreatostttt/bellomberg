@@ -76,7 +76,7 @@ test('empty actual page renders four workspaces in IT and EN without starting re
   assert.equal(requests, 0);
 });
 
-test('actual 3D callback preserves surface geometry, holes, ATM ridge, camera and interactive config', async () => {
+test('actual 3D callback preserves geometry, holes, ATM ridge and camera across languages and themes', async () => {
   const filename = path.resolve(__dirname, '../../src/pages/VolSurfacePage.tsx');
   const code = fs.readFileSync(filename, 'utf8');
   const source = ts.createSourceFile(filename, code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -90,27 +90,76 @@ test('actual 3D callback preserves surface geometry, holes, ATM ridge, camera an
   visit(source); assert.ok(callback && percentile);
   const surface = fixture(); surface.slices[0].iv_grid = [.2, null, 2.5];
   const ref = {}, calls = [];
-  const sandbox = { exports: {}, active: true, plotRef: { current: ref }, data: surface,
+  const sandbox = { exports: {}, active: true, themeDark: false, plotRef: { current: ref },
+    plotUpdate: { current: Promise.resolve() }, data: surface,
     tr: translate.t, Math, Number, isFinite };
   vm.runInNewContext(ts.transpileModule(percentile + '\nexports.run = ' + callback, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText, sandbox);
+  const fakePlotly = {
+    newPlot: (...args) => {
+      calls.push({ method: 'newPlot', args });
+      const [, , layout] = args;
+      ref._fullLayout = { scene: { uirevision: layout.scene.uirevision, camera: layout.scene.camera } };
+      return Promise.resolve();
+    },
+    react: (...args) => {
+      calls.push({ method: 'react', args });
+      const [node, , layout] = args;
+      const priorScene = node._fullLayout?.scene;
+      if (priorScene && priorScene.uirevision === layout.scene.uirevision) layout.scene.camera = priorScene.camera;
+      node._fullLayout = { scene: { uirevision: layout.scene.uirevision, camera: layout.scene.camera } };
+      return Promise.resolve();
+    },
+  };
+  const initialCamera = { eye: { x: -1.75, y: -1.45, z: .55 } };
+  const userCamera = { eye: { x: -0.72, y: -1.9, z: 1.12 } };
+  let expectedCamera = initialCamera;
   for (const language of ['it', 'en']) {
     languages.impostaLinguaCorrente(language);
-    await sandbox.exports.run({ newPlot: (...args) => { calls.push(args); return Promise.resolve(); } });
-    const [node, traces, layout, config] = calls.at(-1);
+    await sandbox.exports.run(fakePlotly);
+    const { method, args } = calls.at(-1), [node, traces, layout, config] = args;
     assert.equal(node, ref); assert.equal(traces[0].type, 'surface');
     assert.equal(traces[0].connectgaps, false); assert.equal(traces[0].z[0][1], null);
     assert.equal(traces[0].z[0][2], 250, 'outlier geometry never clipped to the colour cap');
     assert.equal(traces[1].type, 'scatter3d'); assert.equal(traces[1].z[0], 22, 'existing ATM fallback retained');
     assert.deepEqual(JSON.parse(JSON.stringify(traces[0].y)), [10, 40, 70]);
-    assert.deepEqual(JSON.parse(JSON.stringify(layout.scene.camera)), { eye: { x: -1.75, y: -1.45, z: .55 } });
+    assert.deepEqual(JSON.parse(JSON.stringify(layout.scene.camera)), JSON.parse(JSON.stringify(expectedCamera)),
+      'uirevision should retain the live user camera instead of resetting on a palette update');
+    assert.equal(layout.scene.uirevision, 'bellomberg-vol-surface-camera');
+    assert.equal(method, calls.length === 1 ? 'newPlot' : 'react', 'the live Plotly node is updated in place');
+    if (language === 'it') {
+      ref._fullLayout.scene.camera = userCamera;
+      expectedCamera = userCamera;
+      const beforeRedraw = calls.length;
+      await sandbox.exports.run(fakePlotly);
+      const redrawn = calls.at(-1);
+      assert.equal(calls.length, beforeRedraw + 1);
+      assert.equal(redrawn.method, 'react');
+      assert.deepEqual(JSON.parse(JSON.stringify(redrawn.args[2].scene.camera)), JSON.parse(JSON.stringify(userCamera)),
+        'stable scene uirevision must keep the user-adjusted Plotly camera through a redraw');
+    }
     assert.equal(layout.height, 480); assert.equal(config.responsive, true); assert.equal(config.displayModeBar, false);
     assert.ok(traces[0].hovertemplate.includes(language === 'it' ? 'giorni' : 'days'));
     assert.ok(traces[0].hovertemplate.includes('%{y}'));
+    assert.equal(traces[0].colorbar.tickfont.size, 12, '3D ticks meet the readable type floor');
+    assert.equal(traces[0].colorbar.title.font.size, 13);
   }
-  const raw = JSON.parse(JSON.stringify(calls[0][1]));
-  const en = JSON.parse(JSON.stringify(calls[1][1]));
+  // Light -> Dark: same node via Plotly.react, camera kept, geometry unchanged, palette changed.
+  const lightModern = calls.at(-1);
+  sandbox.themeDark = true;
+  await sandbox.exports.run(fakePlotly);
+  const darkCall = calls.at(-1);
+  assert.equal(darkCall.method, 'react', 'Dark is applied in place');
+  assert.equal(darkCall.args[0], ref);
+  assert.equal(darkCall.args[2].scene.uirevision, 'bellomberg-vol-surface-camera');
+  assert.deepEqual(JSON.parse(JSON.stringify(darkCall.args[2].scene.camera)), JSON.parse(JSON.stringify(expectedCamera)),
+    'the user camera survives the Light/Dark switch');
+  assert.deepEqual(JSON.parse(JSON.stringify(darkCall.args[1][0].z)), JSON.parse(JSON.stringify(lightModern.args[1][0].z)));
+  assert.notDeepEqual(JSON.parse(JSON.stringify(darkCall.args[1][0].colorscale)), JSON.parse(JSON.stringify(lightModern.args[1][0].colorscale)));
+  sandbox.themeDark = false;
+  const raw = JSON.parse(JSON.stringify(calls[0].args[1]));
+  const en = JSON.parse(JSON.stringify(calls[2].args[1]));
   raw.forEach(trace => delete trace.hovertemplate); en.forEach(trace => delete trace.hovertemplate);
   assert.deepEqual(raw, en, 'language cannot alter any trace numeric value or interaction setting');
 });

@@ -11,6 +11,7 @@ API:
     core di IS/BS/CF + derivate (margini, payout, capex/ricavi).
 """
 import json
+import tempfile
 import os
 import time
 from datetime import datetime
@@ -82,29 +83,89 @@ def _cache_path(cik: str) -> str:
     return os.path.join(CACHE_DIR, f"CIK{cik}.json")
 
 
-def _fetch_companyfacts(cik: str) -> Optional[Dict[str, Any]]:
-    """companyfacts con cache disco 7gg (file pesante, gentilezza verso la SEC)."""
+def _superata_path(cik: str) -> str:
+    return _cache_path(cik)[:-len(".json")] + ".superata.json"
+
+
+def segna_cache_superata(cik: str, motivo: str) -> None:
+    """La cache companyfacts e' anteriore a un deposito gia' pubblicato e la rilettura e'
+    fallita (REV_G2a R-4): il DCF lo legge in `index_note` finche' una rilettura non riesce."""
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"motivo": motivo, "quando": datetime.now().isoformat(timespec="seconds")}, f)
+        os.replace(tmp, _superata_path(cik))
+    except OSError as e:
+        print(f"[sec_xbrl] segno di cache superata CIK{cik} non scritto: {type(e).__name__}: {e}")
+
+
+def cache_superata(cik: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(_superata_path(cik), "r", encoding="utf-8") as f:
+            dati = json.load(f)
+        return dati if isinstance(dati, dict) else {"motivo": "segno illeggibile"}
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {"motivo": "segno di cache superata illeggibile"}
+
+
+def _fetch_companyfacts(cik: str, *, forza: bool = False, esito: Optional[Dict[str, Any]] = None
+                        ) -> Optional[Dict[str, Any]]:
+    """companyfacts con cache disco 7gg (file pesante, gentilezza verso la SEC).
+
+    `forza`: salta la cache in lettura (filing_numeri, revisione 04/10). La cache si
+    sostituisce solo con una risposta valida (dict con `facts`), in modo atomico
+    (temporaneo + os.replace), mai cancellata: la usa anche il DCF (REV_G2a R-4).
+    `esito` (dict opzionale) riceve {"da_cache", "letto_il"}: l'eta' del dato si dichiara."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     cp = _cache_path(cik)
     try:
-        if os.path.exists(cp) and (time.time() - os.path.getmtime(cp)) < CACHE_TTL_S:
+        if not forza and os.path.exists(cp) and (time.time() - os.path.getmtime(cp)) < CACHE_TTL_S:
+            letto_il = datetime.fromtimestamp(os.path.getmtime(cp)).isoformat(timespec="seconds")
             with open(cp, "r", encoding="utf-8") as f:
-                return json.load(f)
+                dati = json.load(f)
+            if isinstance(dati, dict) and isinstance(dati.get("facts"), dict):
+                if esito is not None:
+                    esito.update(da_cache=True, letto_il=letto_il)
+                return dati
     except Exception:
         pass
     try:
         import requests
         from bellomberg.market_data.sec_edgar import _headers   # 02/09 (B2): HEADERS non esiste piu; contatto letto a chiamata
+        from bellomberg.market_data import sec_edgar
         url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+        sec_edgar.attendi_sec()  # revisione 04/10: anche companyfacts dentro il tetto totale SEC
         r = requests.get(url, headers=_headers(), timeout=30)
         if r.status_code != 200:
             return None
         data = r.json()
+        if not isinstance(data, dict) or not isinstance(data.get("facts"), dict):
+            print(f"[sec_xbrl] companyfacts CIK{cik}: risposta senza 'facts' (non usata, cache invariata)")
+            return None
+        tmp = None
         try:
-            with open(cp, "w", encoding="utf-8") as f:
+            fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f)
-        except Exception:
-            pass
+            os.replace(tmp, cp)
+            tmp = None
+            try:
+                os.remove(_superata_path(cik))  # rilettura riuscita: la cache non e' piu' anteriore
+            except FileNotFoundError:
+                pass
+        except Exception as e:
+            print(f"[sec_xbrl] cache companyfacts CIK{cik} non scritta: {type(e).__name__}: {e}")
+        finally:
+            if tmp is not None:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        if esito is not None:
+            esito.update(da_cache=False, letto_il=datetime.now().isoformat(timespec="seconds"))
         return data
     except Exception as e:
         # review 02/09: prima l'except era muto e un ImportError (HEADERS sparito)
@@ -181,14 +242,21 @@ def _annual_series(facts: Dict[str, Any], tags_gaap: List[str], tags_ifrs: List[
 def get_financial_history(ticker: str, years: int = 10) -> Dict[str, Any]:
     """Storico annuale riga-per-riga dai filing SEC (10-K/20-F). ~30 voci canoniche + derivate."""
     try:
-        from bellomberg.market_data.sec_edgar import lookup_cik
+        from bellomberg.market_data.sec_edgar import lookup_cik, ticker_ambiguo_per_cik
+        # Revisione G1 (04/10/2026): con un suffisso di listino senza alias verificato il CIK non si
+        # risolve. Prima un .MI agganciava il fondo USA con le stesse lettere e rispondeva
+        # «tassonomia atipica» (falso); chi chiama ripiega sull'ESEF dichiarandolo.
+        ambiguo = ticker_ambiguo_per_cik(ticker)
+        if ambiguo:
+            return {"error": f"{ticker}: CIK SEC non risolto: {ambiguo}"}
         cik = lookup_cik(ticker)
     except Exception as e:
         return {"error": f"lookup CIK: {type(e).__name__}: {e}"}
     if not cik:
         return {"error": f"{ticker}: nessun CIK SEC (societa' senza filing US/ADR). "
                          "Per i nomi EU senza ADR usare get_fundamentals (yfinance, 4 anni)."}
-    data = _fetch_companyfacts(cik)
+    lettura: Dict[str, Any] = {}
+    data = _fetch_companyfacts(cik, esito=lettura)
     if not data:
         return {"error": f"companyfacts non disponibile per CIK {cik}"}
     facts = data.get("facts") or {}
@@ -234,7 +302,12 @@ def get_financial_history(ticker: str, years: int = 10) -> Dict[str, Any]:
             "items": out_items, "derived": derived,
             "tags_used": tags_used, "units": unit_used,
             "_source": "SEC XBRL companyfacts (10-K/20-F/40-F, fp=FY)",
-            "_timestamp": datetime.now().isoformat(timespec="seconds")}
+            "_timestamp": datetime.now().isoformat(timespec="seconds"),
+            # REV_G2a R-4: eta' del dato (cache fino a 7 giorni) e cache nota come superata
+            "da_cache": lettura.get("da_cache"), "companyfacts_letto_il": lettura.get("letto_il"),
+            **({"index_note": "companyfacts in cache anteriore a un deposito gia' pubblicato ("
+                              + str(superata.get("motivo")) + "): possibili dati recenti mancanti"}
+               if (superata := cache_superata(cik)) and lettura.get("da_cache") else {})}
 
 
 if __name__ == "__main__":

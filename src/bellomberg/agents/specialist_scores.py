@@ -84,10 +84,21 @@ def quant_score(portfolio_data=None, risk_data=None):
 
     lines = []
     pts = []
+    unscored = []
+    from bellomberg.core.presentation import message as _message
 
-    def add(label, value, fmt, p_):
+    # fix 04/10 (A7, Opus 5.5, review RV-R): una metrica mancante NON sparisce piu' dal
+    # rubric — riga «n.d.: motivo» SENZA punti e massimo ricalcolato sulle sole misurate
+    # (dichiarato in `unscored`). Motivo dal payload se c'e', altrimenti lo si dice.
+    def add(label, value, fmt, p_, motivo=None):
         if p_ is not None:
             lines.append((label, fmt, p_)); pts.append(p_)
+        else:
+            lines.append((label, _message("n.d.: {motivo}", "n/a: {motivo}",
+                                          motivo=motivo or _message("dato non fornito dal tool",
+                                                                    "value not provided by the tool")),
+                          None))
+            unscored.append(label)
 
     # ogni metrica: soglie -> punti (0=ok .. 3=rischio alto)
     add(_t("Volatilita' annualizzata"), vol, ("{:.1f}%".format(vol) if vol is not None else "n/d"),
@@ -97,15 +108,20 @@ def quant_score(portfolio_data=None, risk_data=None):
     add(_t("Sharpe ratio (trailing 1a)"), sharpe, ("{:.2f}".format(sharpe) if sharpe is not None else "n/d"),
         _band(sharpe, [1.5, 1.0, 0.5], [0, 1, 2, 3], reverse=True))
     add(_t("Beta vs S&P 500"), beta, ("{:.2f}".format(beta) if beta is not None else "n/d"),
-        _band(beta, [0.8, 1.1, 1.4], [0, 1, 2, 3]))
+        _band(beta, [0.8, 1.1, 1.4], [0, 1, 2, 3]),
+        motivo=risk_data.get("beta_error"))   # perche' SPY manca / serie corta (portfolio_risk)
     add(_t("VaR 95% 1g"), var95, ("{:.2f}%".format(var95) if var95 is not None else "n/d"),
         _band(abs(var95) if var95 is not None else None, [2.0, 3.5, 5.0], [0, 1, 2, 3]))
     add(_t("Max Drawdown 1a"), maxdd, ("{:.1f}%".format(maxdd) if maxdd is not None else "n/d"),
         _band(abs(maxdd) if maxdd is not None else None, [8, 15, 25], [0, 1, 2, 3]))
     add(_t("Top position"), top_pct, ("{:.1f}%".format(top_pct) if top_pct is not None else "n/d"),
-        _band(top_pct, [15, 25, 35], [0, 1, 2, 3]))
+        _band(top_pct, [15, 25, 35], [0, 1, 2, 3]),
+        motivo=None if weights else _message("pesi delle posizioni non disponibili (né dal portafoglio né da per_asset)",
+                     "position weights unavailable (neither from the portfolio nor from per_asset)"))
     add(_t("Concentrazione (HHI)"), hhi, ("{:.0f}".format(hhi) if hhi is not None else "n/d"),
-        _band(hhi, [1200, 2000, 3000], [0, 1, 2, 3]))
+        _band(hhi, [1200, 2000, 3000], [0, 1, 2, 3]),
+        motivo=None if weights else _message("pesi delle posizioni non disponibili (né dal portafoglio né da per_asset)",
+                     "position weights unavailable (neither from the portfolio nor from per_asset)"))
 
     if not pts:
         return None
@@ -126,7 +142,8 @@ def quant_score(portfolio_data=None, risk_data=None):
         "score": score,
         "max_score": max_score,
         "verdict": verdict,
-        "lines": lines,  # (label, value_str, points)
+        "lines": lines,  # (label, value_str, points) — points None = n.d., fuori punteggio
+        "unscored": unscored,  # metriche n.d.: max_score = 3 x le sole misurate
         "metrics": {"vol_annual_pct": vol, "sharpe": sharpe, "beta_vs_spy": beta,
                     "var_95_1d_pct": var95, "max_dd_1y_pct": maxdd,
                     "top_position_pct": top_pct, "hhi": hhi},
@@ -879,7 +896,18 @@ def format_score_block(score: dict) -> str:
     L.append(_t("=== SCORE DETERMINISTICO ({}) — calcolato in codice, parti da QUESTO ===").format(score["domain"].upper()))
     L.append(_t("Verdetto: {} ({}/{} punti rischio; piu' alto = piu' rischio).").format(
         score["verdict"], score["score"], score["max_score"]))
+    from bellomberg.core.presentation import message as _message
+    if score.get("unscored"):  # fix 04/10 (A7): il massimo ricalcolato si DICHIARA
+        L.append(_message("Massimo ricalcolato su {n} metriche misurate: escluse perché n.d. {escluse}.",
+                          "Maximum recomputed on {n} measured metrics: excluded as n/a {escluse}.",
+                          n=len(score["lines"]) - len(score["unscored"]),
+                          escluse=", ".join(str(x) for x in score["unscored"])))
     for label, val, pt in score["lines"]:
+        if pt is None:  # fix 04/10 (A7): riga dichiarata n.d., fuori dal punteggio
+            L.append(_message("  - {label:<26} {val}  -> non punteggiata (dato mancante)",
+                              "  - {label:<26} {val}  -> not scored (missing data)",
+                              label=label, val=val))
+            continue
         flag = ["ok", _t("attenzione"), _t("alto"), _t("critico")][min(pt, 3)]
         L.append(_t("  - {:<26} {:>8}  -> {} punti ({})").format(label, val, pt, flag))
     L.append(_t("Usa questi numeri come base fattuale: spiega COSA implicano e DOVE intervenire. "

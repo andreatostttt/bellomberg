@@ -21,7 +21,10 @@ e simili sono breakdown, non il totale di bilancio).
 from bellomberg.core.paths import DATA_DIR, PROJECT_ROOT
 import json
 import os
+import re
+import threading
 import time
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -32,6 +35,12 @@ except Exception:
     pass
 
 BASE = "https://filings.xbrl.org/api"
+class EntitaEsefAssente(LookupError):
+    """filings.xbrl.org risponde 404 sull'entita': LEI assente dal repository o endpoint cambiato.
+    Revisione 04/10 (R8): prima diventava un elenco vuoto, letto come «nessun deposito» e,
+    nello storico DCF, come indice aggiornato. Chi la riceve la dichiara."""
+
+
 class ContattoMancante(RuntimeError):
     """SEC_CONTACT_EMAIL assente: filings.xbrl.org vuole un contatto nello User-Agent."""
 
@@ -126,6 +135,171 @@ def _save_cache(lei: str, cache: Dict[str, Any]) -> None:
         pass  # cache best-effort: la fonte resta l'API
 
 
+_SPA_ESTESA = re.compile(r"societ(?:a'?|à)\s+per\s+azioni", re.I)
+# Grafie della stessa forma giuridica (e solo quelle): «S.p.A.» = «SPA» = «Societa' per azioni».
+_FORME_GIURIDICHE = [(re.compile(p, re.I), f) for p, f in (
+    (r"\bsociet(?:a'?|à)\s+per\s+azioni\b", " spa "), (r"\bs\.?\s?p\.?\s?a\b\.?", " spa "),
+    (r"\baktiengesellschaft\b", " ag "), (r"\bn\.\s?v\.", " nv "), (r"\bs\.\s?a\.", " sa "),
+    (r"\bs\.\s?e\.", " se "), (r"\bp\.\s?l\.\s?c\.", " plc "), (r"\ba/s\b", " as "),
+    (r"\bs\.\s?r\.\s?l\.", " srl "))]
+
+
+def _norm_esatto(x):
+    """Nome per il collegamento automatico: si uniformano SOLO le grafie della forma giuridica;
+    «holding», «group», «the» restano (una holding e la sua controllata quotata hanno LEI diversi)."""
+    import unicodedata
+    t = unicodedata.normalize("NFKD", str(x or "")).encode("ascii", "ignore").decode().lower()
+    t = t.replace("’", "'")
+    for regola, forma in _FORME_GIURIDICHE:
+        t = regola.sub(forma, t)
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", t).split())
+
+
+def _norm_nome(x):
+    # Il repository registra anche la forma estesa («… - SOCIETA' PER AZIONI»), da
+    # normalizzare come «S.p.A.» (prova reale fase B).
+    x = _SPA_ESTESA.sub("S.p.A.", str(x or ""))
+    try:
+        from bellomberg.valuation.peer_comps import _norm_issuer
+        return _norm_issuer(x)
+    except Exception:
+        return x.lower().strip()
+
+
+_PAGINA_ENTITA = 10
+
+
+def _cerca_entita(name, ritmo=None):
+    """Ricerca progressiva per nome su /api/entities: (entita', query, usata, errore).
+
+    Audit 11/09 (Fable 5.1, run 10/09 memo #54): la sola query sulle prime tre parole del
+    nome Yahoo ("Beispiel AG") tornava 0 entita' mentre il repository registra la forma
+    giuridica lunga ("Beispiel Aktiengesellschaft"). Ricerca PROGRESSIVA: nome pieno, poi
+    il nome SENZA forma giuridica (la stessa normalizzazione del confronto esatto).
+    """
+    q_pieno = " ".join(str(name).split()[:3])
+    q_core = " ".join(_norm_nome(name).split()[:2])
+    query = []
+    for q in (q_pieno, q_core):
+        if q and q.lower() not in [x.lower() for x in query]:
+            query.append(q)
+    ritmo = attendi_esef if ritmo is None else ritmo  # REV_G2a R-3: mai una richiesta fuori ritmo
+    try:
+        import requests
+        for q in query:
+            ritmo()
+            r = requests.get(BASE + "/entities", params={
+                "page[size]": _PAGINA_ENTITA,
+                "filter": json.dumps([{"name": "name", "op": "ilike", "val": f"%{q}%"}]),
+            }, headers=_headers(), timeout=30)
+            if not r.ok:
+                return [], query, None, f"ricerca entita' ESEF fallita (HTTP {r.status_code})"
+            ents = r.json().get("data", [])
+            if ents:
+                return ents, query, q, None
+    except ContattoMancante as e:
+        return [], query, None, str(e)   # review 02/09: il nome della classe non dice cosa fare
+    except Exception as e:
+        return [], query, None, f"ricerca entita' ESEF fallita ({type(e).__name__})"
+    return [], query, None, None
+
+
+def _lei_entita(e):
+    a = e.get("attributes") or {}
+    return str(a.get("identifier") or e.get("id") or ""), str(a.get("name") or "")
+
+
+# Paesi con obbligo ESEF (SEE) piu' il Regno Unito: un LEI fuori da qui non porta pacchetti ESEF.
+# Scritti in minuscolo e portati in maiuscolo a runtime: il cancello privacy dell'export pubblico
+# cerca i ticker corti (sotto 4 lettere) in modo case-sensitive, e un codice paese di due lettere
+# maiuscole puo' coincidere con la base di un ticker vero. Il valore a runtime non cambia.
+_PAESI_ESEF = {p.upper() for p in (
+    "at", "be", "bg", "hr", "cy", "cz", "dk", "ee", "fi", "fr", "de", "gr", "hu", "ie", "it", "lv",
+    "lt", "lu", "mt", "nl", "pl", "pt", "ro", "sk", "si", "es", "se", "is", "li", "no", "gb")}
+
+
+def candidati_gleif(nome, *, cerca=None):
+    """Candidati LEI da GLEIF (fase F) per gli emittenti assenti da filings.xbrl.org: solo entita'
+    attive di paesi ESEF con nome identico (stessa normalizzazione del repository). Univoco solo
+    con un nome identico e la pagina non piena; il LEI si riverifica poi sui fatti del pacchetto."""
+    if not nome:
+        return {"stato": "nessuno", "candidati": [], "motivo": "nome dell'emittente non disponibile"}
+    try:
+        from bellomberg.market_data import esef_sito  # GLEIF: altro servizio, altro modulo
+        record = (cerca or esef_sito.gleif_lei_records)(nome)
+    except Exception as exc:
+        return {"stato": "errore", "candidati": [], "motivo": f"GLEIF non raggiungibile ({type(exc).__name__})"}
+    target, esatti = _norm_esatto(nome), {}
+    for rec in record:
+        a = (rec or {}).get("attributes") or {}
+        ent = a.get("entity") or {}
+        lei = str(a.get("lei") or rec.get("id") or "").upper()
+        legale = str((ent.get("legalName") or {}).get("name") or "")
+        paese = str((ent.get("legalAddress") or {}).get("country") or "").upper()
+        if (lei and ent.get("status") == "ACTIVE" and paese in _PAESI_ESEF
+                and _norm_esatto(legale) == target):
+            esatti.setdefault(lei, legale)
+    candidati = [{"lei": l, "nome": n, "origine": "gleif"} for l, n in esatti.items()]
+    if len(candidati) == 1 and len(record) < 20:  # pagina non piena (GLEIF_PAGINA)
+        return {"stato": "univoco", "candidati": candidati, "motivo": "nome identico su un solo LEI attivo (GLEIF)"}
+    if candidati:
+        return {"stato": "ambiguo", "candidati": candidati, "motivo": "LEI da GLEIF: conferma necessaria"}
+    return {"stato": "nessuno", "candidati": [], "motivo": "nessun LEI attivo con nome identico su GLEIF"}
+
+
+def candidati_lei(ticker, nome=None, *, ritmo=None):
+    """Candidati LEI per l'attivazione automatica: {"stato", "candidati", "motivo"}.
+
+    Piu' severo di resolve_lei (che serve lo storico DCF): univoco solo dal negozio
+    privato o con UN solo LEI a nome normalizzato identico; un risultato unico ma non
+    identico resta una proposta da confermare. Negozio illeggibile = errore (potrebbe
+    contenere un LEI diverso da quello trovato per nome).
+    """
+    from bellomberg.storage.negozi_privati import carica_lei
+    tk = (ticker or "").upper().strip()
+    negozio = carica_lei()
+    if tk in negozio["lei"]:
+        return {"stato": "univoco", "motivo": "LEI dal negozio privato lei_emittenti",
+                "candidati": [{"lei": negozio["lei"][tk], "nome": nome or tk, "origine": "negozio"}]}
+    if negozio["origine"] == "illeggibile":
+        return {"stato": "errore", "candidati": [],
+                "motivo": f"negozio lei_emittenti illeggibile ({negozio['motivo']}): correggerlo prima del collegamento"}
+    if not nome:
+        return {"stato": "nessuno", "candidati": [], "motivo": "nome dell'emittente non disponibile"}
+    ents, query, _, errore = _cerca_entita(nome, ritmo=attendi_esef if ritmo is None else ritmo)
+    if errore:
+        return {"stato": "errore", "candidati": [], "motivo": errore}
+    unici = {}
+    for e in ents:
+        lei, enome = _lei_entita(e)
+        if lei and lei not in unici:
+            unici[lei] = enome
+    target = _norm_esatto(nome)
+    esatti = [(lei, n) for lei, n in unici.items() if _norm_esatto(n) == target]
+    if len(esatti) == 1 and len(ents) >= _PAGINA_ENTITA:
+        # Pagina piena: un omonimo identico puo' stare oltre la prima pagina.
+        return {"stato": "ambiguo", "motivo": "risultati oltre la prima pagina: conferma necessaria",
+                "candidati": [{"lei": esatti[0][0], "nome": esatti[0][1], "origine": "nome"}]}
+    if len(esatti) == 1:
+        return {"stato": "univoco", "motivo": "nome identico su un solo emittente ESEF",
+                "candidati": [{"lei": esatti[0][0], "nome": esatti[0][1], "origine": "nome"}]}
+    if esatti:
+        return {"stato": "ambiguo", "motivo": f"{len(esatti)} emittenti ESEF con lo stesso nome",
+                "candidati": [{"lei": l, "nome": n, "origine": "nome"} for l, n in esatti]}
+    if not unici:
+        motivo = "nessuna entita' sul repository ESEF (cercato: " + ", ".join(query) + ")"
+        # Fase F: emittente assente dal repository -> LEI da GLEIF, pacchetti dal suo sito.
+        g = candidati_gleif(nome)
+        if g["stato"] in ("univoco", "ambiguo"):
+            return {**g, "motivo": motivo + "; " + g["motivo"]}
+        return {"stato": "nessuno", "candidati": [], "motivo": motivo + "; " + g["motivo"]}
+    if len(unici) > 5:
+        return {"stato": "nessuno", "candidati": [],
+                "motivo": f"{len(unici)} entita' ESEF simili, nessuna con nome identico: serve il LEI"}
+    return {"stato": "ambiguo", "motivo": "nome simile: conferma necessaria",
+            "candidati": [{"lei": l, "nome": n, "origine": "nome_simile"} for l, n in unici.items()]}
+
+
 def resolve_lei(ticker: str, company_name: Optional[str] = None) -> Tuple[Optional[str], str]:
     """(lei, nota). Prima il negozio privato dei LEI, poi ricerca per NOME su /api/entities
     (fallback dichiarato). Ambiguita' o zero match = errore dichiarato, mai un guess."""
@@ -152,37 +326,10 @@ def resolve_lei(ticker: str, company_name: Optional[str] = None) -> Tuple[Option
     except Exception:
         def _norm(x):
             return str(x or "").lower().strip()
-    # Audit 11/09 (Fable 5.1, run 10/09 memo #54): la sola query sulle prime tre parole del
-    # nome Yahoo ("Beispiel AG") tornava 0 entita' mentre il repository registra la forma
-    # giuridica lunga ("Beispiel Aktiengesellschaft"): storico ESEF n.d. per un emittente
-    # che c'era, e il DCF chiesto dal PM finiva in "filings: Fonte senza dati". Ricerca
-    # PROGRESSIVA: nome pieno, poi il nome SENZA forma giuridica (_norm: la stessa
-    # normalizzazione del confronto esatto qui sotto). La guardia di ambiguita' resta.
-    q_pieno = " ".join(str(name).split()[:3])
-    q_core = " ".join(_norm(name).split()[:2])
-    query = []
-    for q in (q_pieno, q_core):
-        if q and q.lower() not in [x.lower() for x in query]:
-            query.append(q)
-    ents = []
-    usata = None
-    try:
-        import requests
-        for q in query:
-            r = requests.get(BASE + "/entities", params={
-                "page[size]": 10,
-                "filter": json.dumps([{"name": "name", "op": "ilike", "val": f"%{q}%"}]),
-            }, headers=_headers(), timeout=30)
-            if not r.ok:
-                return None, f"ricerca entita' ESEF fallita (HTTP {r.status_code})"
-            ents = r.json().get("data", [])
-            if ents:
-                usata = q
-                break
-    except ContattoMancante as e:
-        return None, str(e)   # review 02/09: il nome della classe non dice cosa fare
-    except Exception as e:
-        return None, f"ricerca entita' ESEF fallita ({type(e).__name__})"
+    # Ricerca progressiva (audit 11/09): vedi _cerca_entita. La guardia di ambiguita' resta.
+    ents, query, usata, errore = _cerca_entita(name, ritmo=attendi_esef)  # revisione 04/10: ritmo anche qui
+    if errore:
+        return None, errore
     if not ents:
         return None, (f"'{name}': nessuna entita' sul repository ESEF (cercato: "
                       + ", ".join(query) + "; societa' non-UE o non quotata UE?)")
@@ -200,11 +347,91 @@ def resolve_lei(ticker: str, company_name: Optional[str] = None) -> Tuple[Option
                  f"(query '{usata}', fallback dichiarato)")
 
 
-def _list_filings(lei: str, max_pages: int = 20) -> List[Dict[str, Any]]:
+# ============================================================
+# FILING AUTOMATICI (fase B): ritmo prudente e indice con cache
+# ============================================================
+_ESEF_LOCK = threading.Lock()
+_ESEF_ULTIMA = [0.0]
+_ESEF_INTERVALLO_S = 1.0  # nessun limite pubblicato da filings.xbrl.org: una richiesta al secondo
+INDICE_TTL_S = 6 * 3600
+_LEI = re.compile(r"[A-Z0-9]{20}")
+
+
+def _ritmo_path_predefinito():
+    """File del ritmo condiviso; DATA_DIR letto a chiamata (i test lo reindirizzano)."""
+    from bellomberg.core import paths
+    return Path(paths.DATA_DIR) / ".esef_ritmo"
+
+
+_ritmo_path = _ritmo_path_predefinito
+
+
+def attendi_esef(*, percorso=None) -> None:
+    """Ritmo condiviso tra processi (lock su file) per i percorsi filing automatici."""
+    from bellomberg.market_data.sec_edgar import _attendi
+    _attendi(Path(percorso) if percorso else _ritmo_path(), _ESEF_INTERVALLO_S, _ESEF_LOCK, _ESEF_ULTIMA)
+
+
+def _cache_indice_dir():
+    from bellomberg.core import paths
+    return Path(paths.DATA_DIR) / "esef_cache"
+
+
+def indice_depositi(lei: str, *, ttl_s: int = INDICE_TTL_S, cache_dir=None, fetch=None) -> Dict[str, Any]:
+    """Depositi ESEF di un LEI: {"righe", "origine", "motivo"} con cache su disco.
+
+    Cache fresca e leggibile: nessuna rete. Cache corrotta: si rilegge subito.
+    Rete giu' con cache vecchia: si usa e lo si DICHIARA (origine cache_scaduta).
+    Senza rete e senza cache: RuntimeError, mai un elenco vuoto spacciato per vero.
+    """
+    if not isinstance(lei, str) or not _LEI.fullmatch(lei):
+        raise ValueError("LEI non valido")
+    fetch = fetch or (lambda x: _list_filings(x, ritmo=attendi_esef))
+    p = Path(cache_dir or _cache_indice_dir()) / f"indice_{lei}.json"
+    cache, motivo_cache = None, None
+    try:
+        grezzo = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(grezzo, dict) and isinstance(grezzo.get("righe"), list):
+            cache, motivo_cache = grezzo["righe"], grezzo.get("motivo")
+    except (OSError, ValueError):
+        cache = None
+    if cache is not None and time.time() - p.stat().st_mtime < ttl_s:
+        return {"righe": cache, "origine": "cache", "motivo": motivo_cache}
+    motivo = None
+    try:
+        try:
+            righe = fetch(lei)
+        except EntitaEsefAssente as exc:
+            if cache:
+                raise
+            # Nessuna copia buona: zero righe, ma col 404 DICHIARATO (resta anche in cache).
+            righe, motivo = [], str(exc)
+        if not righe and cache:
+            # 404 o elenco vuoto per un LEI che aveva depositi: probabile guasto del repository,
+            # mai cancellare la copia buona (revisione finale)
+            return {"righe": cache, "origine": "cache_scaduta",
+                    "motivo": "indice ESEF vuoto per un emittente con depositi: uso la copia precedente"}
+    except Exception as exc:
+        if cache is None:
+            raise RuntimeError(f"indice ESEF non disponibile per {lei}: {type(exc).__name__}: {exc}") from exc
+        return {"righe": cache, "origine": "cache_scaduta",
+                "motivo": f"indice ESEF non aggiornato ({type(exc).__name__}: {exc}): uso la copia precedente"}
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"lei": lei, "righe": righe, "motivo": motivo}), encoding="utf-8")
+        tmp.replace(p)
+    except OSError:
+        pass  # cache best-effort
+    return {"righe": righe, "origine": "rete", "motivo": motivo}
+
+
+def _list_filings(lei: str, max_pages: int = 20, ritmo=None) -> List[Dict[str, Any]]:
     import requests
     from urllib.parse import urljoin, urlsplit, quote
     if max_pages < 1:
         raise ValueError("max_pages deve essere positivo")
+    ritmo = attendi_esef if ritmo is None else ritmo  # REV_G2a R-3: chi non lo passa resta nel ritmo
     url = BASE + f"/entities/{quote(lei, safe='')}/filings"
     percorso = urlsplit(url).path
     visti, filings = set(), []
@@ -215,8 +442,14 @@ def _list_filings(lei: str, max_pages: int = 20) -> List[Dict[str, Any]]:
         if url in visti or len(visti) >= max_pages:
             raise ValueError("paginazione ESEF ciclica o limite pagine raggiunto: catalogo incompleto")
         visti.add(url)
+        ritmo()
         r = requests.get(url, params={"page[size]": 50} if len(visti) == 1 else None,
                          headers=_headers(), timeout=60)
+        if getattr(r, "status_code", 200) == 404 and len(visti) == 1:
+            # LEI senza entita' sul repository (prova reale fase F: LEI da GLEIF) o endpoint cambiato:
+            # non si distinguono dal 404, quindi si DICHIARA (revisione 04/10), mai un elenco vuoto muto.
+            raise EntitaEsefAssente(f"filings.xbrl.org: HTTP 404 per l'entita' {lei} (LEI assente dal "
+                                    "repository o endpoint cambiato): nessun elenco depositi")
         r.raise_for_status()
         payload = r.json()
         if not isinstance(payload.get("data"), list):
@@ -279,6 +512,7 @@ def _extract_filing_facts(json_url: str) -> Tuple[Dict[str, List[List[Any]]], Op
     Tiene SOLO i fact numerici senza assi extra. Il raw non si salva mai."""
     import requests
     try:
+        attendi_esef()  # revisione 04/10: anche lo storico DCF passa dal ritmo condiviso
         h = requests.head(json_url, headers=_headers(), timeout=30, allow_redirects=True)
         size = int(h.headers.get("Content-Length") or 0)
         if size > MAX_JSON_MB * 1e6:
@@ -286,6 +520,7 @@ def _extract_filing_facts(json_url: str) -> Tuple[Dict[str, List[List[Any]]], Op
     except Exception:
         pass  # HEAD best-effort: si tenta comunque il GET
     try:
+        attendi_esef()
         raw = requests.get(json_url, headers=_headers(), timeout=300).json()
     except ContattoMancante as e:
         return {}, str(e)
@@ -320,11 +555,11 @@ def _refresh_entity_cache(lei: str) -> Dict[str, Any]:
     if idx_age < INDEX_TTL_S and filings and not known_err:
         return cache
     try:
-        listed = _list_filings(lei)
+        listed = _list_filings(lei, ritmo=attendi_esef)
         cache["index_fetched_at"] = time.time()
         cache.pop("index_error", None)
-    except ContattoMancante as e:
-        cache["index_error"] = str(e)
+    except (ContattoMancante, EntitaEsefAssente) as e:
+        cache["index_error"] = str(e)  # 404: storico tenuto ma dichiarato non aggiornato (revisione 04/10)
         return cache
     except Exception as e:
         cache["index_error"] = f"indice filing non raggiungibile ({type(e).__name__})"

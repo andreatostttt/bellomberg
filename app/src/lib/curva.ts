@@ -272,7 +272,13 @@ export function leggiCurva(
         ignoti[f.date] = String(f.type || tr('dashboard.flow_untyped'));
         continue;
       }
-      const importo = (f.type === 'DEPOSIT' ? 1 : -1) * Number(f.amount_eur || 0);
+      // importo illeggibile: il movimento si DICHIARA non conteggiato, mai «+0 €» (revisione G9b)
+      const valore = typeof f.amount_eur === 'number' ? f.amount_eur : Number(f.amount_eur);
+      if (f.amount_eur == null || !Number.isFinite(valore)) {
+        ignoti[f.date] = `${f.type} ${tr('dashboard.flow_no_amount')}`;
+        continue;
+      }
+      const importo = (f.type === 'DEPOSIT' ? 1 : -1) * valore;
       versamenti[f.date] = (versamenti[f.date] || 0) + importo;
     }
     return {

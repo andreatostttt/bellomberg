@@ -31,6 +31,10 @@ def _chiavi_e_negozio_presenti(monkeypatch):
         monkeypatch.setattr(na, attr, "chiave-di-prova")
     monkeypatch.setattr(tiingo_news, "tiingo_available", lambda: True)
     monkeypatch.setattr(na, "PERCORSO_TERMINI", str(EXAMPLES_DIR / "news_search_terms.example.json"))
+    # 04/10 (B2): l'esito dell'ultima chiamata Tiingo/Finnhub entra in providers_blocked():
+    # uno stato lasciato da un altro test romperebbe i `== {}` qui sotto
+    tiingo_news.reset_status()
+    na.reset_esiti_fonti()
 
 
 # ---------------------------------------------------------------
@@ -52,6 +56,10 @@ def _today():
 # ---------------------------------------------------------------
 # providers_blocked: il motore riusato da entrambi gli endpoint
 # ---------------------------------------------------------------
+
+def test_newsapi_budget_interno_99_richieste_giornaliere():
+    assert na.NEWS_PROVIDER_LIMITS["newsapi"]["daily"] == 99
+
 
 def test_blocked_vuoto_a_stato_pulito(tmp_path, monkeypatch):
     _write_state(tmp_path, monkeypatch, {})

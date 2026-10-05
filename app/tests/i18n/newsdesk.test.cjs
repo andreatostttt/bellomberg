@@ -44,7 +44,6 @@ function retainedPage(seed = {}, responses = {}) {
     },
     '@/lib/api': { Bellomberg: api },
     'react-markdown': props => React.createElement('div', {}, props.children), 'remark-gfm': () => {},
-    '../lib/svg-kit': { useScalaTesto: () => 1 },
   } });
   const language = load('i18n/lingua.ts'), Component = load('pages/NewsPage.tsx').default;
   return {
@@ -59,21 +58,29 @@ function retainedPage(seed = {}, responses = {}) {
   };
 }
 
-test('news labels and retained theme memo follow IT/EN without changing original feed or filters', () => {
+// 02/10/2026: la pagina è in stile Nuova (Flusso | Agenda). Le garanzie restano quelle della
+// versione Obsidian: testi originali intatti, provenienza dichiarata, lingua che rilegge solo le
+// cache locali, codici del limiter tradotti con il suffisso del backend verbatim.
+
+test('news labels and theme names follow IT/EN without changing the original feed or filters', () => {
   const feed = [{ id: 1, title: 'Original source headline', snippet: 'Original source prose', theme: 'ukraine', ticker_mentioned: 'SYNTH.X', relevance: 9, _materiality: 12.5, published_at: new Date().toISOString() }];
   const view = retainedPage({ feed, fThemes: ['ukraine'], fTickers: ['SYNTH.X'] });
   const it = view.render('it'), en = view.render('en');
-  assert.match(it, /FILTRI/); assert.match(en, /FILTERS/);
-  assert.match(it, /UCRAINA/); assert.match(en, /UKRAINE/);
+  assert.match(it, /Flusso/); assert.match(en, /Feed/);
+  assert.match(it, /Ucraina/); assert.match(en, /Ukraine/);
   for (const html of [it, en]) { assert.match(html, /Original source headline/); assert.match(html, /Original source prose/); assert.match(html, /SYNTH.X/); }
 });
 
-test('active filter count renders zero, one and two in both languages without changing the filters', () => {
+test('the active filter count and the reset action follow the filters in both languages', () => {
+  const now = new Date().toISOString();
+  const feed = [{ id: 1, title: 'A', theme: '', ticker_mentioned: 'SYNTH.X', published_at: now }, { id: 2, title: 'B', theme: 'fed', published_at: now }];
   for (const count of [0, 1, 2]) {
-    const seed = { fPeriod: 'all', fThemes: count > 0 ? ['portfolio'] : [], fTickers: count > 1 ? ['SYNTH.X'] : [] };
+    const seed = { feed, fPeriod: 'all', fThemes: count > 0 ? ['__pf'] : [], fTickers: count > 1 ? ['SYNTH.X'] : [] };
     const before = structuredClone(seed), view = retainedPage(seed);
-    assert.match(view.render('it'), new RegExp(`${count} ${count === 1 ? 'filtro attivo' : 'filtri attivi'}`));
-    assert.match(view.render('en'), new RegExp(`${count} active ${count === 1 ? 'filter(?!s)' : 'filters'}`));
+    const it = view.render('it'), en = view.render('en');
+    const shown = count > 0 ? 1 : 2;
+    assert.match(it, new RegExp(`${shown} di 2`)); assert.match(en, new RegExp(`${shown} of 2`));
+    assert.equal(/Azzera filtri/.test(it), count > 0); assert.equal(/Clear filters/.test(en), count > 0);
     assert.deepEqual(seed, before);
   }
 });
@@ -81,11 +88,13 @@ test('active filter count renders zero, one and two in both languages without ch
 test('stored summary and briefing keep their original language and declare missing English summaries', () => {
   const feed = [{ id: 2, title: 'Titolo sintetico italiano conservato', snippet: 'Sintesi storica conservata', summary_status: 'available', summary_language: 'it' },
     { id: 3, title: 'Original provider headline', summary_status: 'unavailable', summary_language: null, summary_note: 'Original backend note: no English summary' }];
-  const wire = retainedPage({ feed }).render('en');
-  assert.match(wire, /Original summary · Italian/);
-  assert.match(wire, /Original backend note: no English summary/);
-  assert.match(wire, /Titolo sintetico italiano conservato/);
-  assert.match(wire, /Original source/);
+  const generated = retainedPage({ feed, selectedId: 2 }).render('en');
+  assert.match(generated, /Original summary · Italian/);
+  assert.match(generated, /Titolo sintetico italiano conservato/);
+  assert.match(generated, /Sintesi storica conservata/);
+  const source = retainedPage({ feed, selectedId: 3 }).render('en');
+  assert.match(source, /Original backend note: no English summary/);
+  assert.match(source, /Original source/);
   const desk = retainedPage({ view: 'desk', briefing: { briefing_md: 'Testo briefing storico invariato', language: 'it', generated_at: '2026-09-12T08:00:00' } }).render('en');
   assert.match(desk, /Original briefing · Italian/);
   assert.match(desk, /Testo briefing storico invariato/);
@@ -103,18 +112,29 @@ test('favorites and scheduler errors remain explicit; language changes reread on
   assert.match(it, /Preferiti non disponibili/); assert.match(en, /Favorites unavailable/);
   assert.deepEqual(view.requests.map(x => x.name), [...before, 'newsFeed', 'briefingCurrent']);
   assert.deepEqual(view.requests.slice(-2).map(x => x.language), ['en', 'en']);
-  assert.equal(view.requests.filter(x => /Refresh$/.test(x.name)).length, 0);
+  assert.equal(view.requests.filter(x => /Refresh$|Run$/.test(x.name)).length, 0);
+});
+
+test('opening an item reads only the saved AI summary; generating one is never automatic', async () => {
+  const feed = [{ id: 7, title: 'Synthetic headline', url: 'https://example.com/a', published_at: new Date().toISOString() }];
+  const view = retainedPage({ feed }, { newsFeed: async () => ({ items: feed }) });
+  for (const language of ['it', 'en']) {
+    const html = view.render(language); await view.effects();
+    assert.match(html, language === 'it' ? /Riassunto AI dell’articolo/ : /AI summary of the article/);
+  }
+  assert.ok(view.requests.some(x => x.name === 'newsArticleSummary' && x.args[0] === 7));
+  assert.equal(view.requests.filter(x => x.name === 'newsArticleSummaryRun').length, 0);
 });
 
 test('late Italian cache responses cannot overwrite the selected English versions', async () => {
   let releaseFeed, releaseBriefing;
   const view = retainedPage({}, {
-    newsFeed: (_args, language) => language === 'it' ? new Promise(resolve => { releaseFeed = resolve; }) : { items: [{ title: 'English cached headline', summary_status: 'available', summary_language: 'en' }] },
+    newsFeed: (_args, language) => language === 'it' ? new Promise(resolve => { releaseFeed = resolve; }) : { items: [{ id: 1, title: 'English cached headline', summary_status: 'available', summary_language: 'en' }] },
     briefingCurrent: language => language === 'it' ? new Promise(resolve => { releaseBriefing = resolve; }) : { briefing_md: 'English cached briefing', language: 'en', generated_at: '2026-09-12T08:00:00' },
   });
   view.render('it'); await view.effects();
   view.render('en'); await view.effects();
-  releaseFeed({ items: [{ title: 'Late Italian headline', summary_language: 'it' }] });
+  releaseFeed({ items: [{ id: 2, title: 'Late Italian headline', summary_language: 'it' }] });
   releaseBriefing({ briefing_md: 'Late Italian briefing', language: 'it' });
   await new Promise(resolve => setImmediate(resolve));
   const wire = view.render('en');
@@ -122,7 +142,7 @@ test('late Italian cache responses cannot overwrite the selected English version
   view.set('view', 'desk');
   const desk = view.render('en');
   assert.match(desk, /English cached briefing/); assert.doesNotMatch(desk, /Late Italian briefing/);
-  assert.equal(view.requests.filter(x => /Refresh$/.test(x.name)).length, 0);
+  assert.equal(view.requests.filter(x => /Refresh$|Run$/.test(x.name)).length, 0);
 });
 
 test('a loading calendar is not an empty calendar, and missing briefing age is not never generated', () => {
@@ -134,7 +154,7 @@ test('a loading calendar is not an empty calendar, and missing briefing age is n
 });
 
 test('summary metadata and generated SEC text are not mislabelled as original provider prose', () => {
-  const wire = retainedPage({ feed: [{ title: 'Original legacy text with unknown provenance' }] }).render('en');
+  const wire = retainedPage({ feed: [{ id: 1, title: 'Original legacy text with unknown provenance', snippet: 'Legacy prose' }] }).render('en');
   assert.match(wire, /Received content · origin and language unknown/);
   const desk = retainedPage({ view: 'desk', rawCorp: { items: [{ title: 'SYNTH: 5 azioni', source_type: 'sec', snippet: 'Mixed generated prose', published_at: new Date().toISOString() }] } }).render('en');
   assert.match(desk, /Original Bellomberg text · language unknown/);
@@ -170,7 +190,7 @@ test('cached topic labels and SEC wording change language while source excerpts 
   assert.equal(corporate.items[0].title, 'SYNTH: depositato evento');
 });
 
-test('wire colors, chronological filters, relevance ranking and radar coordinates are invariant across IT/EN', () => {
+test('radar coordinates and chronological filters are invariant across IT/EN', () => {
   const now = new Date().toISOString();
   const feed = [
     { id: 1, title: 'First synthetic source', published_at: now, relevance: 9, _materiality: 12.5, sentiment: 'bullish', theme: 'fed' },
@@ -181,24 +201,22 @@ test('wire colors, chronological filters, relevance ranking and radar coordinate
   const circles = html => [...html.matchAll(/<circle\b[^>]*>/g)].map(x => x[0]);
   assert.ok(circles(it).length > 3);
   assert.deepEqual(circles(it), circles(en));
-  const bars = html => [...html.matchAll(/<i class="(?:on|now|)"[^>]*style="([^"]*)"/g)].map(x => x[1]);
-  assert.equal(bars(it).length, 24);
-  assert.deepEqual(bars(it), bars(en));
-  assert.match(it, /class="now"/); assert.match(en, /class="now"/);
-  assert.match(it, /M12,5/); assert.match(en, /M12\.5/);
   view.set('fRel', 8); view.set('fSent', ['neg']); view.set('fThemes', ['ukraine']);
   const filtered = view.render('en');
-  assert.match(filtered, /1\/2 in wire · 3 active filters/);
+  assert.match(filtered, /1 of 2/); assert.match(filtered, /Second synthetic source/);
+  assert.match(filtered, /Clear filters/);
 });
 
 // 13/09 (Claude Opus 5): frasi attese scritte qui, non lette dai cataloghi sotto prova.
-test('the radar contact count handles zero, one and two contacts in IT/EN', () => {
+test('the radar names zero, one and two items in IT/EN', () => {
   const now = new Date().toISOString();
   for (const count of [0, 1, 2]) {
     const feed = Array.from({ length: count }, (_, id) => ({ id, title: 'Synthetic source', published_at: now }));
     const before = structuredClone(feed), view = retainedPage({ feed });
-    assert.ok(view.render('it').includes(`<span class="side num">${count} BLIP</span>`));
-    assert.ok(view.render('en').includes(`<span class="side num">${count} ${count === 1 ? 'BLIP' : 'BLIPS'}</span>`));
+    const it = view.render('it'), en = view.render('en');
+    if (count === 0) { assert.match(it, /Il radar si accende/); assert.match(en, /The radar lights up/); }
+    if (count === 1) { assert.match(it, /Radar dell’unica notizia/); assert.match(en, /Radar of the one item/); }
+    if (count === 2) { assert.match(it, /Radar delle 2 notizie/); assert.match(en, /Radar of the 2 items/); }
     assert.deepEqual(feed, before);
   }
 });
@@ -207,29 +225,25 @@ test('limiter codes of muted providers are translated, while free backend reason
   const mute = { newsapi: 'SKIP_BUDGET', gnews: 'SKIP_DISABLED', tiingo: 'SENZA_CHIAVE: TIINGO_API_KEY assente nel .env' };
   const giro = { stato: 'degradato', timestamp: new Date().toISOString(), fetched: 3, classified: 2, saved: 1, skipped_duplicates: 0,
     providers_blocked: { newsapi: 'SKIP_BUDGET', gnews: 'SKIP_DISABLED' } };
-  const view = retainedPage({ fonti: { declared: true, mute, avviso: null }, giro });
+  const view = retainedPage({ fonti: { declared: true, mute, avviso: null }, giro, sourcesOpen: true });
   const it = view.render('it'), en = view.render('en');
-  assert.match(it, /newsapi \(BUDGET ESAURITO\) · gnews \(SOSPESO\) · tiingo \(CHIAVE ASSENTE: TIINGO_API_KEY assente nel \.env\)/);
-  assert.match(en, /newsapi \(BUDGET EXHAUSTED\) · gnews \(SUSPENDED\) · tiingo \(MISSING API KEY: TIINGO_API_KEY assente nel \.env\)/);
-  assert.match(it, /<span class="mt">BUDGET ESAURITO<\/span>/); assert.match(it, /<span class="mt">SOSPESO<\/span>/);
-  assert.match(en, /<span class="mt">BUDGET EXHAUSTED<\/span>/); assert.match(en, /<span class="mt">SUSPENDED<\/span>/);
-  assert.match(it, / Bloccati: newsapi \(BUDGET ESAURITO\) · gnews \(SOSPESO\)\./);
-  assert.match(en, / Blocked: newsapi \(BUDGET EXHAUSTED\) · gnews \(SUSPENDED\)\./);
-  for (const html of [it, en]) assert.doesNotMatch(html, /\((?:BUDGET|DISABLED)\)|>(?:BUDGET|DISABLED)</);
+  assert.ok(it.includes('newsapi (Budget esaurito), gnews (Sospeso), tiingo (Chiave assente: TIINGO_API_KEY assente nel .env)'));
+  assert.ok(en.includes('newsapi (Budget exhausted), gnews (Suspended), tiingo (Missing API key: TIINGO_API_KEY assente nel .env)'));
+  assert.ok(it.includes('newsapi (Budget esaurito) · gnews (Sospeso)')); assert.ok(en.includes('newsapi (Budget exhausted) · gnews (Suspended)'));
+  for (const html of [it, en]) assert.doesNotMatch(html, /\((?:BUDGET|DISABLED)\)|>(?:BUDGET|DISABLED)<|SKIP_/);
 });
 
 test('missing key and module codes are localized at each news display while suffixes stay verbatim', () => {
   const suffix = ': Original detail SENZA_CHIAVE: nested code';
-  for (const [code, it, en] of [['SENZA_CHIAVE', 'CHIAVE ASSENTE', 'MISSING API KEY'], ['MODULO_ASSENTE', 'MODULO ASSENTE', 'MODULE UNAVAILABLE']]) {
+  for (const [code, it, en] of [['SENZA_CHIAVE', 'Chiave assente', 'Missing API key'], ['MODULO_ASSENTE', 'Modulo assente', 'Module unavailable']]) {
     for (const tail of ['', suffix]) {
       const mute = { synthetic: code + tail };
       const giro = { stato: 'degradato', timestamp: new Date().toISOString(), fetched: 0, classified: 0, saved: 0, skipped_duplicates: 0, providers_blocked: mute };
-      const before = structuredClone({ mute, giro }), view = retainedPage({ fonti: { declared: true, mute, avviso: null }, giro });
+      const before = structuredClone({ mute, giro }), view = retainedPage({ fonti: { declared: true, mute, avviso: null }, giro, sourcesOpen: true });
       for (const [language, label] of [['it', it], ['en', en]]) {
         const html = view.render(language), reason = label + tail;
-        assert.ok(html.includes(` </b>synthetic (${reason})</span>`), 'muted-source banner');
-        assert.ok(html.includes(`${language === 'it' ? ' Bloccati: ' : ' Blocked: '}synthetic (${reason}).`), 'last feed run');
-        assert.ok(html.includes(`<span class="mt">${reason}</span>`), 'source card');
+        assert.ok(html.includes(`synthetic (${reason})`), 'muted-source banner and last round');
+        assert.ok(html.includes(`>${reason}</span>`), 'provider row');
       }
       assert.deepEqual({ mute, giro }, before);
     }
@@ -242,31 +256,22 @@ test('missing key and module codes are localized at each news display while suff
 
 // 13/09 (Claude Opus 5): chiavi e codici come li scrive news_aggregator.providers_blocked (TERMINI_MUTI,
 // TEMI_TITOLI_MUTI, "NEGOZIO_{origine}: {motivo}"); le frasi attese sono scritte qui, non lette dai cataloghi.
-// In fonti_mute il motivo arriva nella lingua della richiesta; in ultimo_giro (providers_blocked scritto dal
-// giro del feed) resta nella lingua del giro che l'ha scritto. In entrambi si traduce solo il codice in testa.
 test('the two private stores among muted sources get a reader name, and only the code of their reason is translated', () => {
   const unreadable = 'JSONDecodeError: DEMO line 3 column 1';
   const expected = {
-    it: { reason: 'negozio non trovato: DEMO/termini.json (copia DEMO.example.json in data/)', blocked: ' Bloccati: ',
-      terms: 'termini di ricerca news (negozio)', topics: 'titoli per tema (negozio)',
-      missing: 'NEGOZIO ASSENTE', broken: 'NEGOZIO ILLEGGIBILE', sub: 'TITOLI PER TEMA (NEGOZIO) · TERMI…' },
-    en: { reason: 'Store not found: DEMO/termini.json (copy DEMO.example.json into data/)', blocked: ' Blocked: ',
-      terms: 'news search terms (store)', topics: 'securities by topic (store)',
-      missing: 'STORE MISSING', broken: 'STORE UNREADABLE', sub: 'SECURITIES BY TOPIC (STORE) · NEW…' },
+    it: { reason: 'negozio non trovato: DEMO/termini.json (copia DEMO.example.json in data/)',
+      terms: 'termini di ricerca news (negozio)', topics: 'titoli per tema (negozio)', missing: 'Negozio assente', broken: 'Negozio illeggibile' },
+    en: { reason: 'Store not found: DEMO/termini.json (copy DEMO.example.json into data/)',
+      terms: 'news search terms (store)', topics: 'securities by topic (store)', missing: 'Store missing', broken: 'Store unreadable' },
   };
   for (const [language, x] of Object.entries(expected)) {
     const mute = { 'termini_news (negozio)': `NEGOZIO_ASSENTE: ${x.reason}`, 'temi_titoli (negozio)': `NEGOZIO_ILLEGGIBILE: ${unreadable}` };
-    const giro = { stato: 'degradato', timestamp: new Date().toISOString(), fetched: 3, classified: 2, saved: 1, skipped_duplicates: 0,
-      providers_blocked: mute };
-    const html = retainedPage({ fonti: { declared: true, mute, avviso: null }, giro }).render(language);
+    const giro = { stato: 'degradato', timestamp: new Date().toISOString(), fetched: 3, classified: 2, saved: 1, skipped_duplicates: 0, providers_blocked: mute };
+    const html = retainedPage({ fonti: { declared: true, mute, avviso: null }, giro, sourcesOpen: true }).render(language);
     const has = text => assert.ok(html.includes(text), `${language} lacks: ${text}`);
-    const listed = `${x.terms} (${x.missing}: ${x.reason}) · ${x.topics} (${x.broken}: ${unreadable})`;
-    has(` </b>${listed}</span>`);
-    has(`${x.blocked}${listed}.`);
-    has(`>${x.sub}</div>`);
-    has(`<span class="nm">${x.terms}</span>`); has(`<span class="nm">${x.topics}</span>`);
-    has(`<span class="mt">${x.missing}: ${x.reason}</span>`); has(`<span class="mt">${x.broken}: ${unreadable}</span>`);
-    has(`title="${x.terms}: `); has(`title="${x.topics}: `);
+    has(`${x.terms} (${x.missing}: ${x.reason}), ${x.topics} (${x.broken}: ${unreadable})`);
+    has(`${x.terms} (${x.missing}: ${x.reason}) · ${x.topics} (${x.broken}: ${unreadable})`);
+    has(`>${x.missing}: ${x.reason}</span>`); has(`>${x.broken}: ${unreadable}</span>`);
     assert.doesNotMatch(html, /termini_n|temi_titoli|NEGOZIO_(?:ASSENTE|ILLEGGIBILE)/i);
   }
 });
@@ -281,6 +286,52 @@ test('an unreadable briefing cache is a fault, never first use or never generate
   for (const language of ['it', 'en']) {
     const html = retainedPage({ view: 'desk', briefing: { language, generated_at: null, stale: true, error_code: 'briefing_cache_unreadable', error: 'Original cache corruption', briefing_md: 'Original unreadable cache notice' } }).render(language);
     assert.doesNotMatch(html, />MAI<|>NEVER</);
-    assert.match(html, language === 'it' ? /CACHE ILLEGGIBILE/ : /UNREADABLE CACHE/);
+    assert.match(html, language === 'it' ? /Cache illeggibile/ : /Unreadable cache/);
+    assert.match(html, /Original cache corruption/);
   }
+});
+
+test('news refresh watcher failures reach the feed problem in the selected language', async () => {
+  // G9c (Opus 5.5): the watcher threw Italian sentences that errorDetail() showed verbatim to English users.
+  const load = creaCaricatore();
+  const language = load('i18n/lingua.ts'), watcher = load('lib/news-refresh.ts'), news = load('pages/news/calcoli.ts');
+  const cases = [
+    { start: { accepted: true, job: { id: null, status: 'running' } } },
+    { start: { accepted: true, job: { id: 'job-1', status: 'running' } }, read: { id: 'job-2', status: 'success' } },
+    { start: { accepted: true, job: { id: 'job-1', status: 'paused' } } },
+  ];
+  const problems = { it: [], en: [] };
+  for (const item of cases) {
+    const w = watcher.createNewsRefreshWatcher({ start: async () => item.start, readStatus: async () => item.read, wait: async () => {} });
+    const error = await w.run().then(() => null, e => e);
+    assert.ok(error instanceof watcher.NewsRefreshError, String(error));
+    for (const locale of ['it', 'en']) { language.impostaLinguaCorrente(locale); problems[locale].push(news.problemText({ operation: 'refresh', detail: news.errorDetail(error) })); }
+  }
+  const twice = watcher.createNewsRefreshWatcher({ start: () => new Promise(() => {}), readStatus: async () => null, wait: async () => {} });
+  twice.run();
+  const again = await twice.run().then(() => null, e => e);
+  for (const locale of ['it', 'en']) { language.impostaLinguaCorrente(locale); problems[locale].push(news.errorDetail(again)); }
+  const failed = new watcher.NewsRefreshError('failed');
+  for (const locale of ['it', 'en']) { language.impostaLinguaCorrente(locale); problems[locale].push(news.errorDetail(failed)); }
+  // REV_G9c R4: stop() durante l'attesa (unmount della pagina) -> codice `stopped`
+  let stopper;
+  stopper = watcher.createNewsRefreshWatcher({ start: async () => ({ accepted: true, job: { id: 'job-1', status: 'running' } }),
+    readStatus: async () => ({ id: 'job-1', status: 'running' }), wait: async () => { stopper.stop(); } });
+  const stopped = await stopper.run().then(() => null, e => e);
+  assert.ok(stopped instanceof watcher.NewsRefreshError && stopped.code === 'stopped', String(stopped));
+  // stop() prima del giro di attesa (dentro onStatus): esce dal ciclo, l'altro punto che lancia `stopped`
+  let early;
+  early = watcher.createNewsRefreshWatcher({ start: async () => ({ accepted: true, job: { id: 'job-1', status: 'running' } }),
+    readStatus: async () => ({ id: 'job-1', status: 'running' }), wait: async () => {}, onStatus: () => early.stop() });
+  const stoppedEarly = await early.run().then(() => null, e => e);
+  assert.ok(stoppedEarly instanceof watcher.NewsRefreshError && stoppedEarly.code === 'stopped', String(stoppedEarly));
+  for (const locale of ['it', 'en']) { language.impostaLinguaCorrente(locale); problems[locale].push(news.errorDetail(stopped)); }
+  for (const text of [...problems.it, ...problems.en]) assert.doesNotMatch(text, /⟦|\{[a-z]+\}/);
+  for (const text of problems.en) assert.doesNotMatch(text, /assente|cambiato|atteso|ricevuto|inatteso|già|arrestato|fallito|aggiornamento/i);
+  assert.match(problems.en[1], /job-1.*job-2/); assert.match(problems.it[1], /job-1.*job-2/);
+  assert.match(problems.en[2], /paused/);
+  assert.match(problems.it[0], /identificativo del job/); assert.match(problems.en[0], /no refresh job identifier/);
+  assert.match(problems.it[3], /già avviato/); assert.match(problems.en[3], /already started/);
+  assert.match(problems.it[4], /è fallito senza dettagli$/); assert.match(problems.en[4], /^the refresh job failed without details$/);
+  assert.match(problems.it[5], /attesa dell.aggiornamento interrotta/); assert.match(problems.en[5], /^waiting for the refresh was interrupted$/);
 });

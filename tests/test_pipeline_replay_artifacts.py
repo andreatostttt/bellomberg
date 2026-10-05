@@ -27,6 +27,7 @@ from test_valuation_snapshot_persistence import db
 from test_core_audit_regressions import _chat, _chunk
 
 from bellomberg.agents import chat_tools, consigliere_multi as cm, capo, red_team, agent_tools, scorekeeper
+from bellomberg.agents import action_validator as REAL_ACTION_VALIDATOR
 from bellomberg.agents.specialists import base
 from bellomberg.core import llm_client, llm_pricing
 from bellomberg.reporting import pdf_institutional, charts_institutional
@@ -53,6 +54,7 @@ def replay_loop():
 @pytest.fixture
 def replay(run_offline, db, tmp_path, monkeypatch, replay_loop):
     monkeypatch.setenv("BELLOMBERG_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("BELLOMBERG_REPORT_DIR", str(tmp_path / "report"))
     attempted_network = []
 
     def forbidden(*args, **kwargs):
@@ -66,6 +68,9 @@ def replay(run_offline, db, tmp_path, monkeypatch, replay_loop):
     monkeypatch.setattr(chat_tools, "REPORT_DIR", tmp_path / "report")
     monkeypatch.setattr(cm, "MemoryDB", lambda: db)
     monkeypatch.setattr(memory_db, "MemoryDB", lambda: db)
+    # run_offline replaces this module with shallow no-op stubs; this replay must
+    # exercise the actual local sanity reader, risk assessment and hard apply.
+    monkeypatch.setitem(sys.modules, "bellomberg.agents.action_validator", REAL_ACTION_VALIDATOR)
     monkeypatch.setattr(db, "extract_and_save_decisions", REAL_EXTRACT.__get__(db))
     # Snapshot-only DB fixture skips Chroma initialization; committee needs its
     # explicit unavailable state, while SQLite remains the real implementation.
@@ -75,7 +80,8 @@ def replay(run_offline, db, tmp_path, monkeypatch, replay_loop):
     monkeypatch.setattr(llm_pricing, "_resolve_fx_usd_to_eur", lambda: (.9, "synthetic replay FX"))
     llm_pricing.reset_fx_memo()
     state = SimpleNamespace(db=db, clients={}, news=[], prepared=[], capo_calls=[],
-                            side_calls=[], network=attempted_network, smtp=run_offline.inviati, loop=replay_loop)
+                            side_calls=[], extractor_calls=[], network=attempted_network,
+                            smtp=run_offline.inviati, loop=replay_loop)
 
     def research_block(*, sector_bundles, decision_links):
         # Actual prepare_sector_analysis via the shared fixture, on explicit synthetic
@@ -134,8 +140,14 @@ def replay(run_offline, db, tmp_path, monkeypatch, replay_loop):
             "Fair value 14.13 EUR [src: get_valuation].\n\n"
             + "La prova verifica trasporto e persistenza degli artefatti sintetici. " * 80
             + "\n\n## ACTION TABLE\n| Action | Ticker | Size EUR | Timing | Confidence |\n"
-            "|---|---|---|---|---|\n| WATCH | SYNTH-EXT | 0 | Replay only | LOW |\n")
+            "|---|---|---|---|---|\n| BUY | SYNTH-EXT | 250 | At review | HIGH |\n")
     state.memo = memo
+    (tmp_path / "report" / "VAL_SYNTH-EXT_FLAGGED.payload.json").write_text(json.dumps({
+        "_timestamp": "2026-09-21T10:41:00", "sanity": {
+            "severity": "BLOCK", "headline": "Synthetic sanity block",
+            "reason": "synthetic issuer identity mismatch",
+        },
+    }), encoding="utf-8")
 
     class CapoClient:
         def __init__(self, **kwargs): self.messages = self
@@ -152,6 +164,7 @@ def replay(run_offline, db, tmp_path, monkeypatch, replay_loop):
         def create(self, **kwargs):
             state.side_calls.append(deepcopy(kwargs))
             if kwargs.get("tool_choice", {}).get("name") == "emit_action_table":
+                state.extractor_calls.append(deepcopy(kwargs))
                 return _Resp("tool_use", [_ToolUseBlock("emit_action_table", {"table_found": True, "rows": [
                     {"action": "WATCH", "ticker": "SYNTH-EXT", "size_raw": "0",
                      "timing": "Replay only", "confidence": "LOW"}]})], _Usage())
@@ -172,7 +185,7 @@ def _assert_recovered(state, blackboard):
     assert len(client.calls) == 4
     assert client.calls[1].get("tool_choice") != {"type": "none"}
     assert client.calls[1]["thinking"] == {"type": "disabled"}
-    assert client.calls[2]["thinking"] == {"type": "adaptive"}
+    assert client.calls[2]["thinking"] == {"type": "effort", "effort": "high"}
     assert state.news and state.prepared
     serialized_results = json.dumps(client.messaggi_per_call[-1], default=str)
     assert "SYNTHETIC disclosed operating inputs" in serialized_results
@@ -242,7 +255,10 @@ def test_full_orchestrator_replay_persists_and_captures_real_pdf_and_excel(repla
     expected = {(cls.name, round_n) for cls in REAL_ROSTER for round_n in (0, 1)}
     expected |= {(name, 2) for name in cm.R2_SPECIALISTS}
     assert set(replay.clients) == expected and len(expected) == 15
-    assert len(replay.capo_calls) == 1 and len(replay.side_calls) == 2
+    assert len(replay.capo_calls) == 1
+    assert len(replay.side_calls) == 1 and replay.extractor_calls == []
+    assert all(call.get("tool_choice", {}).get("name") != "emit_action_table"
+               for call in replay.side_calls)
     assert "SYNTHETIC REPLAY CRITIQUE" in str(replay.capo_calls[0])
     assert "14.13" in str(replay.capo_calls[0])
     archive = next((tmp_path / "research_notes").glob("*_blackboard.json"))
@@ -254,19 +270,47 @@ def test_full_orchestrator_replay_persists_and_captures_real_pdf_and_excel(repla
         memo = conn.execute("SELECT id,full_markdown,pdf_path,dcf_files FROM memos").fetchone()
         usage = conn.execute("SELECT agent,api_calls FROM llm_usage WHERE memo_id=?", (memo[0],)).fetchall()
         reports = conn.execute("SELECT specialist,round_n FROM specialist_reports WHERE memo_id=?", (memo[0],)).fetchall()
-        decisions = conn.execute("SELECT id,ticker FROM decisions WHERE memo_id=?", (memo[0],)).fetchall()
+        decisions = conn.execute(
+            "SELECT id,ticker,proposal_action,proposal_ticker,proposal_ticker_cell,"
+            "assessment_status,assessment_reason,status FROM decisions WHERE memo_id=?",
+            (memo[0],)).fetchall()
+        action_usage = conn.execute(
+            "SELECT agent,api_calls FROM llm_usage WHERE memo_id=? AND agent='_action_table'",
+            (memo[0],)).fetchall()
         links = conn.execute("SELECT decision_id,generation_id FROM valuation_snapshot_links WHERE decision_id IS NOT NULL").fetchall()
-    assert memo[1].endswith(replay.memo)
-    assert len(reports) >= 6 and len(usage) == 18, (reports, usage)
-    assert len(decisions) == 1 and decisions[0][1] == "SYNTH-EXT"
+    assert "SYNTHETIC REPLAY: prova locale" in memo[1]
+    # Fifteen desk calls + Capo + red team. Deterministic ACTION TABLE parsing
+    # makes no provider call and therefore must not fabricate an extractor usage row.
+    assert len(reports) >= 6 and len(usage) == 17, (reports, usage)
+    assert action_usage == []
+    assert len(decisions) == 1
+    decision = decisions[0]
+    assert tuple(decision[1:6]) == (
+        "SYNTH-EXT", "BUY", "SYNTH-EXT", "SYNTH-EXT", "BLOCKED")
+    assert "synthetic issuer identity mismatch" in decision[6]
+    assert decision[7] == "SKIPPED"  # hard BLOCK applied after source + assessment persistence
+    raw_source = next((tmp_path / "research_notes").glob("*_capo_raw.md"))
+    raw_text = raw_source.read_text(encoding="utf-8")
+    assert raw_text.endswith(replay.memo)
+    assert "| BUY | SYNTH-EXT | 250 | At review | HIGH |" in raw_text
+    published = next(path for path in (tmp_path / "research_notes").glob("*.md")
+                     if not path.name.endswith("_capo_raw.md"))
+    assert published.read_text(encoding="utf-8") == memo[1]
+    assert "## PROPOSTE NON OPERATIVE" in memo[1]
+    assert "| BUY | SYNTH-EXT | 250 | At review | HIGH |" not in memo[1]
+    assert "synthetic issuer identity mismatch" in memo[1]
     latest = replay.db.get_latest_valuation_snapshots()["SYNTH-EXT"]["payload"]
-    assert (decisions[0][0], latest["generation_id"]) in [tuple(row) for row in links]
+    assert (decision[0], latest["generation_id"]) in [tuple(row) for row in links]
     pdf = Path(memo[2])
     assert pdf.read_bytes().startswith(b"%PDF-") and pdf.stat().st_size > 5000
     from pypdf import PdfReader
     document = PdfReader(pdf)
     assert len(document.pages) >= 2
-    assert "SYNTHETIC REPLAY" in "".join(page.extract_text() for page in document.pages)
+    pdf_text = " ".join("".join(page.extract_text() for page in document.pages).split())
+    assert "SYNTHETIC REPLAY" in pdf_text
+    assert "PROPOSTE NON OPERATIVE" in pdf_text
+    assert "BLOCKED" in pdf_text and "synthetic issuer identity mismatch" in pdf_text
+    assert "BUY" in pdf_text and "SYNTH-EXT" in pdf_text and "250.0" in pdf_text
     xlsx = Path(latest["path"])
     assert json.loads(memo[3]) == [str(xlsx)]
     assert len(replay.smtp) == 1
@@ -274,7 +318,11 @@ def test_full_orchestrator_replay_persists_and_captures_real_pdf_and_excel(repla
     mime = BytesParser(policy=policy.default).parsebytes(mime_bytes)
     attachments = {part.get_filename(): part.get_payload(decode=True) for part in mime.iter_attachments()}
     assert attachments == {pdf.name: pdf.read_bytes(), xlsx.name: xlsx.read_bytes()}
-    assert "14.13" in mime.get_body(preferencelist=("html",)).get_content()
+    email_html = mime.get_body(preferencelist=("html",)).get_content()
+    assert "14.13" in email_html
+    assert "BUY SYNTH-EXT" in email_html and "BLOCKED" in email_html
+    assert "EUR 250.0" in email_html
+    assert "synthetic issuer identity mismatch" in email_html
     assert not replay.network
     _assert_recovered(replay, replay.blackboard)
     (tmp_path / "synthetic-committee.eml").write_bytes(mime_bytes)
@@ -282,8 +330,9 @@ def test_full_orchestrator_replay_persists_and_captures_real_pdf_and_excel(repla
     (tmp_path / "synthetic-committee-receipt.json").write_text(json.dumps({
         "scope": "Full orchestrator offline replay; synthetic LLM/provider responses; no live run or delivery",
         "desk_rounds": len(replay.clients), "capo_calls": len(replay.capo_calls),
-        "red_team_and_extraction_calls": len(replay.side_calls), "usage_rows": len(usage),
-        "persisted_reports": len(reports), "memo_id": memo[0], "decision_id": decisions[0][0],
+        "red_team_calls": len(replay.side_calls), "action_table_extractor_calls": len(replay.extractor_calls),
+        "usage_rows": len(usage), "persisted_reports": len(reports),
+        "memo_id": memo[0], "decision_id": decision[0],
         "snapshot_id": latest["snapshot_id"], "generation_id": latest["generation_id"],
         "pdf": pdf.name, "workbook": xlsx.name,
         "attachment_sha256": {name: sha256(content).hexdigest() for name, content in attachments.items()},

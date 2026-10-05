@@ -55,9 +55,11 @@ class _Resp:
         self.usage = _FakeUsage()
 
 
-def _fake_client_factory(resp):
+def _fake_client_factory(resp, calls=None):
     class _Messages:
         def create(self, **kw):
+            if calls is not None:
+                calls.append(kw)
             return resp
 
     class _Client:
@@ -156,9 +158,11 @@ def test_reflection_percorso_normale_intatto(monkeypatch, tmp_path):
                         lambda *a, **k: {"overall": {"n": 74, "hit_rate_pct": 52.7}})
     monkeypatch.setattr(scorekeeper, "format_track_record_for_capo",
                         lambda sc, max_chars=2000: "TRACK RECORD: 74 call, hit 52,7%")
+    calls = []
     monkeypatch.setattr(llm_client, "OpenRouterClient",
-                        _fake_client_factory(_Resp("end_turn", [_TextBlock("1. Lezione vera.")])))
+                        _fake_client_factory(_Resp("end_turn", [_TextBlock("1. Lezione vera.")]), calls))
     u = {}
     lesson = reflection.generate_lesson("## ACTION TABLE\n| ADD | X |", memo_id=99, usage_out=u)
     assert "Lezione vera" in lesson
     assert u["status"] == "ok"
+    assert calls[0]["thinking"] == {"type": "effort", "effort": "low"}

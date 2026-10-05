@@ -1,0 +1,593 @@
+/*
+ * Shared contract for pages opting into ModernPage.
+ * Routed pages keep their own layout and page-specific styles. This file only
+ * supplies the light palette and terminal primitives; it never styles the app
+ * shell, Dashboard, Chat, or SVG/canvas internals.
+ *
+ * Keep operational hooks in the page above <ModernPage page="slug">; its
+ * boundary replaces descendants when a view fails.
+ */
+.bb-page-modern[data-page] {
+  --bb-page-bg: #f7f9fc;
+  --bb-page-panel: #fff;
+  --bb-page-line: #dfe7f3;
+  --bb-page-soft: #f7f9fc;
+  --bb-page-text: #1e293b;
+  --bb-page-muted: #64748b;
+  --bb-page-accent: #1455ff;
+  --bb-page-good: #047857;
+  --bb-page-bad: #c52943;
+  --bb-page-warn: #9a6500;
+  --bb-page-accent-soft: #eef3ff;
+  --bb-page-good-soft: #edf8f3;
+  --bb-page-bad-soft: #fff0f2;
+  --bb-page-warn-soft: #fff7df;
+  --bb-page-bar-track: #eef2f7;
+  --bb-page-bar-bad: #fff0f2;
+  --bb-page-bar-good: #edf8f3;
+  --bb-page-heat-positive: #d9f1e8;
+  --bb-page-heat-negative: #fbe1e5;
+  --bb-page-quote-shadow: none;
+  --bb-page-menu-shadow: none;
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  color: var(--bb-page-text);
+  background: var(--bb-page-bg);
+  color-scheme: light;
+  font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+.bb-page.bb-page-modern :where(*, *::before, *::after) {
+  box-sizing: border-box;
+}
+
+.bb-page.bb-page-modern h1 {
+  margin: 0 0 8px;
+  font-size: clamp(23px, 2vw, 28px);
+  font-weight: 650;
+  line-height: 1.2;
+  letter-spacing: -.025em;
+}
+
+.bb-page.bb-page-modern h2 {
+  margin: 0 0 7px;
+  font-size: 18px;
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+.bb-page.bb-page-modern h3 {
+  margin: 0 0 6px;
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.bb-page.bb-page-modern label {
+  color: var(--bb-page-muted);
+  font-size: 12px;
+}
+
+/* Shared panel and title-bar vocabulary used by the existing terminal pages. */
+.bb-page.bb-page-modern .p3 {
+  position: relative;
+  min-width: 0;
+  color: var(--bb-page-text);
+  border: 1px solid var(--bb-page-line);
+  border-radius: 8px;
+  background: var(--bb-page-panel);
+}
+
+.bb-page.bb-page-modern .p3h {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 9px;
+  height: auto;
+  min-height: 42px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--bb-page-line);
+  color: var(--bb-page-text);
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.bb-page.bb-page-modern .p3h .side {
+  margin-left: auto;
+  color: var(--bb-page-muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.bb-page.bb-page-modern .p3h .n {
+  color: var(--bb-page-muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.bb-page.bb-page-modern .tick {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  pointer-events: none;
+}
+
+.bb-page.bb-page-modern .tick.tl {
+  top: -1px;
+  left: -1px;
+  border-top: 1px solid var(--bb-page-accent);
+  border-left: 1px solid var(--bb-page-accent);
+}
+
+.bb-page.bb-page-modern .tick.tr {
+  top: -1px;
+  right: -1px;
+  border-top: 1px solid var(--bb-page-accent);
+  border-right: 1px solid var(--bb-page-accent);
+}
+
+.bb-page.bb-page-modern .tick.bl {
+  bottom: -1px;
+  left: -1px;
+  border-bottom: 1px solid var(--bb-page-accent);
+  border-left: 1px solid var(--bb-page-accent);
+}
+
+.bb-page.bb-page-modern .tick.br {
+  right: -1px;
+  bottom: -1px;
+  border-right: 1px solid var(--bb-page-accent);
+  border-bottom: 1px solid var(--bb-page-accent);
+}
+
+.bb-page.bb-page-modern .num {
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.bb-page.bb-page-modern .obsx {
+  font-family: inherit;
+}
+
+.bb-page-modern[data-page] .font-mono {
+  font-family: inherit;
+}
+
+.bb-page-modern[data-page] :is(code, pre, kbd, samp) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* Controls keep a 12px minimum while body copy remains at least 14px. */
+.bb-page.bb-page-modern button,
+.bb-page.bb-page-modern input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+.bb-page.bb-page-modern select,
+.bb-page.bb-page-modern textarea {
+  color: var(--bb-page-text);
+  border: 1px solid var(--bb-page-line);
+  border-radius: 6px;
+  background: var(--bb-page-panel);
+  font: inherit;
+  line-height: 1.4;
+}
+
+.bb-page.bb-page-modern button {
+  min-height: 34px;
+  padding: 6px 10px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.bb-page.bb-page-modern button:hover:not(:disabled) {
+  border-color: var(--bb-page-accent);
+}
+
+.bb-page.bb-page-modern button:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+.bb-page.bb-page-modern input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+.bb-page.bb-page-modern select,
+.bb-page.bb-page-modern textarea {
+  min-width: 0;
+  padding: 7px 9px;
+  font-size: 14px;
+}
+
+.bb-page.bb-page-modern input::placeholder,
+.bb-page.bb-page-modern textarea::placeholder {
+  color: var(--bb-page-muted);
+  opacity: 1;
+}
+
+.bb-page.bb-page-modern :is(button, input, select, textarea, summary, a, [tabindex]):focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--bb-page-accent) 35%, transparent);
+  outline-offset: 2px;
+}
+
+.bb-page.bb-page-modern .tb {
+  min-height: 30px;
+  padding: 4px 8px;
+  color: var(--bb-page-accent);
+  font-size: 12px;
+}
+
+/* Shared table rhythm; charts retain their own SVG/canvas rendering. */
+.bb-page.bb-page-modern table {
+  width: 100%;
+  border-collapse: collapse;
+  color: var(--bb-page-text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.bb-page.bb-page-modern :is(th, td) {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--bb-page-line);
+  vertical-align: middle;
+}
+
+.bb-page.bb-page-modern th {
+  color: var(--bb-page-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.bb-page.bb-page-modern .chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 2px 8px;
+  border: 1px solid var(--bb-page-line);
+  border-radius: 999px;
+  color: var(--bb-page-muted);
+  background: var(--bb-page-soft);
+  font-size: 12px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.bb-page.bb-page-modern .chip.g {
+  border-color: color-mix(in srgb, var(--bb-page-good) 30%, white);
+  color: var(--bb-page-good);
+  background: color-mix(in srgb, var(--bb-page-good) 7%, white);
+}
+
+.bb-page.bb-page-modern .chip.r {
+  border-color: color-mix(in srgb, var(--bb-page-bad) 30%, white);
+  color: var(--bb-page-bad);
+  background: color-mix(in srgb, var(--bb-page-bad) 6%, white);
+}
+
+.bb-page.bb-page-modern .chip.a {
+  border-color: color-mix(in srgb, var(--bb-page-warn) 28%, white);
+  color: var(--bb-page-warn);
+  background: #fff7df;
+}
+
+.bb-page.bb-page-modern .ld {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--bb-page-muted);
+}
+
+.bb-page.bb-page-modern .ld.g { background: var(--bb-page-good); }
+.bb-page.bb-page-modern .ld.r { background: var(--bb-page-bad); }
+.bb-page.bb-page-modern .ld.a { background: var(--bb-page-warn); }
+
+/* Existing terminal tone names plus explicit semantic aliases for new pages. */
+.bb-page.bb-page-modern :is(.up, .good, .pl-positive, .is-positive, .tone-green, .is-good, [data-tone="good"]) {
+  color: var(--bb-page-good);
+}
+
+.bb-page.bb-page-modern :is(.dn, .bad, .pl-negative, .is-negative, .tone-red, .is-bad, [data-tone="bad"]) {
+  color: var(--bb-page-bad);
+}
+
+.bb-page.bb-page-modern :is(.is-neutral, [data-tone="neutral"]) {
+  color: var(--bb-page-muted);
+}
+
+/* Legacy Tailwind palette aliases. Explicitly scoped so Classic, Dashboard,
+   and Chat continue to use the original dark colors. */
+.bb-page-modern[data-page] :is(.text-text, .text-white, .text-black) {
+  color: var(--bb-page-text);
+}
+
+.bb-page-modern[data-page] :is(.text-text-dim, .text-muted, .text-faint) {
+  color: var(--bb-page-muted);
+}
+
+.bb-page-modern[data-page] :is(.text-cyan, .text-cyan-bright) {
+  color: var(--bb-page-accent);
+}
+
+.bb-page-modern[data-page] :is(.text-amber, .text-amber-bright, .text-amber-deep, .text-gold, .text-gold-light, .text-gold-deep) {
+  color: var(--bb-page-warn);
+}
+
+.bb-page-modern[data-page] :is(.text-emerald, .text-emerald-deep, .text-green, .text-green-500, .text-green-600, .text-positive) {
+  color: var(--bb-page-good);
+}
+
+.bb-page-modern[data-page] :is(.text-crimson, .text-crimson-deep, .text-red, .text-red-500, .text-red-600, .text-negative) {
+  color: var(--bb-page-bad);
+}
+
+.bb-page-modern[data-page] [class~="text-cyan/80"] {
+  color: var(--bb-page-accent);
+}
+
+.bb-page-modern[data-page] :is([class~="text-amber/70"], [class~="text-amber/80"], [class~="text-gold/80"]) {
+  color: var(--bb-page-warn);
+}
+
+.bb-page-modern[data-page] :is(.bg-bg, .bg-bg-elev, .bg-panel, .bg-panel-hi, .bg-panel-lo, .bg-\[\#101010\]) {
+  background-color: var(--bb-page-soft);
+}
+
+.bb-page-modern[data-page] :is([class~="bg-bg/30"], [class~="bg-bg/50"], [class~="bg-bg-elev/30"], [class~="bg-bg-elev/50"], [class~="bg-panel/50"]) {
+  background-color: var(--bb-page-soft);
+}
+
+.bb-page-modern[data-page] :is([class~="bg-cyan/5"], [class~="bg-cyan/10"], [class~="bg-cyan/15"]) {
+  background-color: var(--bb-page-accent-soft);
+}
+
+.bb-page-modern[data-page] :is([class~="bg-amber/5"], [class~="bg-amber/10"], [class~="bg-amber/15"], [class~="bg-gold/5"], [class~="bg-gold/10"]) {
+  background-color: var(--bb-page-warn-soft);
+}
+
+.bb-page-modern[data-page] :is([class~="bg-emerald/5"], [class~="bg-emerald/10"], [class~="bg-green/10"]) {
+  background-color: var(--bb-page-good-soft);
+}
+
+.bb-page-modern[data-page] :is([class~="bg-crimson/5"], [class~="bg-crimson/10"], [class~="bg-red/10"]) {
+  background-color: var(--bb-page-bad-soft);
+}
+
+.bb-page-modern[data-page] :is(.border-border, .border-border-bright, [class~="border-border/20"], [class~="border-border/30"], [class~="border-border/40"], [class~="border-border/50"]) {
+  border-color: var(--bb-page-line);
+}
+
+.bb-page-modern[data-page] :is(.border-cyan, .border-cyan-deep, .border-cyan-bright) {
+  border-color: var(--bb-page-accent);
+}
+
+.bb-page-modern[data-page] :is(.border-amber, .border-amber-deep, .border-gold, .border-gold-deep, [class~="border-amber/40"], [class~="border-amber/50"]) {
+  border-color: var(--bb-page-warn);
+}
+
+.bb-page-modern[data-page] :is(.border-emerald, .border-emerald-deep, [class~="border-emerald/40"], [class~="border-emerald/50"]) {
+  border-color: var(--bb-page-good);
+}
+
+.bb-page-modern[data-page] :is(.border-crimson, .border-crimson-deep, [class~="border-crimson/40"], [class~="border-crimson/50"]) {
+  border-color: var(--bb-page-bad);
+}
+
+/* Old component classes retain their jobs but use the modern surface tokens. */
+.bb-page.bb-page-modern[data-page] :is(.panel, .p3) {
+  color: var(--bb-page-text);
+  border-color: var(--bb-page-line);
+  border-radius: 9px;
+  background: var(--bb-page-panel);
+  box-shadow: none;
+}
+
+.bb-page.bb-page-modern[data-page] .p3:is(.hero, .cy, .vi) {
+  border-left: 1px solid var(--bb-page-line);
+  background: var(--bb-page-panel);
+}
+
+.bb-page.bb-page-modern[data-page] .p3h {
+  height: auto;
+  min-height: 42px;
+  flex-wrap: wrap;
+  color: var(--bb-page-text);
+  font-family: inherit;
+  font-size: 14px;
+  letter-spacing: normal;
+  text-transform: none;
+  white-space: normal;
+}
+
+.bb-page.bb-page-modern[data-page] .p3h:is(.am, .cy, .vi) {
+  color: var(--bb-page-text);
+}
+
+.bb-page.bb-page-modern[data-page] .p3 .tick {
+  display: none;
+}
+
+.bb-page-modern[data-page] :is(.panel-header, .panel-header-cyan .panel-header) {
+  border-color: var(--bb-page-line);
+  background: var(--bb-page-soft);
+}
+
+.bb-page-modern[data-page] .panel-header-title {
+  color: var(--bb-page-text);
+  font-family: inherit;
+  font-size: 14px;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.bb-page-modern[data-page] :is(.input, .input-mono) {
+  color: var(--bb-page-text);
+  border-color: var(--bb-page-line);
+  background: var(--bb-page-panel);
+  font-family: inherit;
+}
+
+.bb-page-modern[data-page] :is(.btn-cyan, .btn-ghost) {
+  color: var(--bb-page-accent);
+  border-color: var(--bb-page-accent);
+  background: var(--bb-page-accent-soft);
+  box-shadow: none;
+}
+
+.bb-page-modern[data-page] :is(.btn-amber, .btn-gold) {
+  color: var(--bb-page-warn);
+  border-color: var(--bb-page-warn);
+  background: var(--bb-page-warn-soft);
+  box-shadow: none;
+}
+
+.bb-page-modern[data-page] :is(.btn-cyan, .btn-amber, .btn-gold, .btn-ghost):hover:not(:disabled) {
+  color: var(--bb-page-text);
+  border-color: var(--bb-page-accent);
+  background: var(--bb-page-accent-soft);
+  box-shadow: none;
+}
+
+.bb-page-modern[data-page] :is(.bg-bg, .bg-bg-elev, .bg-panel, .bg-panel-hi, .input-mono):focus,
+.bb-page-modern[data-page] :is(.bg-bg, .bg-bg-elev, .bg-panel, .bg-panel-hi):focus-within {
+  border-color: var(--bb-page-accent);
+  box-shadow: none;
+}
+
+.bb-page-modern[data-page] .table-bbg {
+  color: var(--bb-page-text);
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.bb-page-modern[data-page] .table-bbg thead th {
+  color: var(--bb-page-muted);
+  border-color: var(--bb-page-line);
+  background: var(--bb-page-soft);
+  font-family: inherit;
+  font-size: 12px;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.bb-page-modern[data-page] .table-bbg tbody td {
+  border-color: var(--bb-page-line);
+}
+
+.bb-page-modern[data-page] .table-bbg tbody tr:hover,
+.bb-page-modern[data-page] .table-bbg tbody tr:hover td {
+  color: var(--bb-page-text);
+  background: var(--bb-page-soft);
+}
+
+.bb-page-modern[data-page] .table-bbg :is(th, td).text-right {
+  text-align: right;
+}
+
+.bb-page-modern[data-page] .table-bbg :is(th, td):not(.text-right) {
+  text-align: left;
+}
+
+.bb-page-modern[data-page] :is(.text-2xs, .text-3xs, [class~="text-[8px]"], [class~="text-[9px]"], [class~="text-[10px]"]):not(svg):not(svg *) {
+  font-size: 12px;
+}
+
+.bb-page-modern[data-page] :where(
+  [style*="font-size: 8px"], [style*="font-size: 9px"], [style*="font-size: 10px"], [style*="font-size: 11px"]
+):not(svg):not(svg *) {
+  font-size: 12px !important;
+}
+
+.bb-page-modern[data-page] .tfg {
+  display: inline-flex;
+  overflow: hidden;
+  border: 1px solid var(--bb-page-line);
+  border-radius: 6px;
+  background: var(--bb-page-panel);
+}
+
+.bb-page-modern[data-page] .tfg .tb {
+  color: var(--bb-page-muted);
+  border: 0;
+  border-right: 1px solid var(--bb-page-line);
+  border-radius: 0;
+  background: transparent;
+}
+
+.bb-page-modern[data-page] .tfg .tb:last-child { border-right: 0; }
+
+.bb-page-modern[data-page] :is(.tb.on, button[aria-pressed="true"], [role="tab"][aria-selected="true"]) {
+  color: var(--bb-page-accent);
+  border-color: var(--bb-page-accent);
+  background: var(--bb-page-accent-soft);
+}
+
+/* Modern routed pages use the shell's former Classic-content canvas. Clear
+   that dark surface only when its direct route child opts into ModernPage. */
+.bb-modern-main-classic-content:has(> .relative > .bb-page-modern) {
+  background: #f7f9fc;
+  color: #1e293b;
+  color-scheme: light;
+}
+
+.bb-modern-main-classic-content:has(> .relative > .bb-page-modern) > .relative {
+  background: #f7f9fc;
+  color: #1e293b;
+  color-scheme: light;
+}
+
+/* ===== Dark Nuova: shared page palette =====
+   Light rules above are unchanged; the dark theme remaps the page tokens to
+   the semantic --bbt-* tokens (components/theme-tokens.css). */
+:root[data-bb-theme="dark"] .bb-page-modern[data-page] {
+  --bb-page-bg: var(--bbt-bg);
+  --bb-page-panel: var(--bbt-surface);
+  --bb-page-line: var(--bbt-line);
+  --bb-page-soft: var(--bbt-surface-2);
+  --bb-page-text: var(--bbt-text);
+  --bb-page-muted: var(--bbt-muted);
+  --bb-page-accent: var(--bbt-accent);
+  --bb-page-good: var(--bbt-good-text);
+  --bb-page-bad: var(--bbt-bad-text);
+  --bb-page-warn: var(--bbt-warn-text);
+  --bb-page-accent-soft: var(--bbt-accent-soft);
+  --bb-page-good-soft: var(--bbt-good-soft);
+  --bb-page-bad-soft: var(--bbt-bad-soft);
+  --bb-page-warn-soft: var(--bbt-warn-soft);
+  --bb-page-bar-track: var(--bbt-surface-3);
+  --bb-page-bar-bad: var(--bbt-bad-soft);
+  --bb-page-bar-good: var(--bbt-good-soft);
+  --bb-page-heat-positive: #134034;
+  --bb-page-heat-negative: #47202b;
+  color-scheme: dark;
+}
+
+:root[data-bb-theme="dark"] .bb-page.bb-page-modern .chip.g {
+  border-color: color-mix(in srgb, var(--bb-page-good) 38%, var(--bbt-surface));
+  background: color-mix(in srgb, var(--bb-page-good) 12%, var(--bbt-surface));
+}
+
+:root[data-bb-theme="dark"] .bb-page.bb-page-modern .chip.r {
+  border-color: color-mix(in srgb, var(--bb-page-bad) 38%, var(--bbt-surface));
+  background: color-mix(in srgb, var(--bb-page-bad) 12%, var(--bbt-surface));
+}
+
+:root[data-bb-theme="dark"] .bb-page.bb-page-modern .chip.a {
+  border-color: color-mix(in srgb, var(--bb-page-warn) 36%, var(--bbt-surface));
+  background: var(--bbt-warn-soft);
+}
+
+:root[data-bb-theme="dark"] .bb-modern-main-classic-content:has(> .relative > .bb-page-modern),
+:root[data-bb-theme="dark"] .bb-modern-main-classic-content:has(> .relative > .bb-page-modern) > .relative {
+  background: var(--bbt-bg);
+  color: var(--bbt-text);
+  color-scheme: dark;
+}
+
+/* Deep-amber inline labels (#B97A00: chart resample note, reconstructed-series
+   hint) are tuned for white; lift them to the dark warning ink. */
+:root[data-bb-theme="dark"] .bb-modern-shell [style*="color: rgb(185, 122, 0)"] {
+  color: var(--bbt-warn-text) !important;
+}

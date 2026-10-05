@@ -1,4 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
+import ModernPage from '@/components/ModernPage';
+import NewInterfaceBoundary from '@/components/NewInterfaceBoundary';
+import { useInterfaceTheme } from '@/components/InterfaceThemeProvider';
 import { useLingua, useT } from '@/i18n/provider';
 import { t as tr } from '@/i18n/t';
 import { linguaCorrente, localeDi } from '@/i18n/lingua';
@@ -9,6 +13,7 @@ import { volRequest } from '@/lib/vol-deck';
 import { localizePayload } from '@/lib/api-presentation';
 import './dashboard-command.css';
 import './vol-atlas.css';
+import './risk-modern.css';
 
 // #179 — F12 Volatility Surface: superficie IV da chain Polygon multi-expiry
 // v2: hover preciso, palette terminale, cresta ATM, 0DTE esclusi dal plot,
@@ -25,6 +30,15 @@ import './vol-atlas.css';
 //     buchi = gap veri). skew_note/term_slope/smoothing del payload ora RESI.
 
 declare global { interface Window { Plotly?: any } }
+
+function DeferredVolPagePresentation({ render }: { render: () => ReactNode }) { return render(); }
+
+function VolPagePresentationBoundary({ render }: { render: () => ReactNode }) {
+  const language = useLingua();
+  return <NewInterfaceBoundary language={language}>
+    <DeferredVolPagePresentation render={render} />
+  </NewInterfaceBoundary>;
+}
 
 function loadPlotly(): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -74,16 +88,25 @@ function VStat({ label, value, sub, tone, title }: {
    asse √t (il front respira), marker EARNINGS, tooltip con gli strike.
    È il prezzo DELLE OPZIONI, non una previsione: dichiarato in legenda.
    ============================================================ */
-function StrikeProjector({ spot, term, earnings }: { spot: number; term: any[]; earnings?: string | null }) {
+function StrikeProjector({ spot, term, earnings }: {
+  spot: number; term: any[]; earnings?: string | null;
+}) {
   const pts = (term || []).filter(s => s.days >= 2 && s.atm_iv != null && isFinite(s.atm_iv) && s.atm_iv > 0);
   if (!(spot > 0) || pts.length < 2) {
     return <div className="num" style={{ padding: '14px 12px', fontSize: 9, fontWeight: 600, color: '#73829F' }}>
       {tr('voldeck.ui_n_a_spot_and_at_least_2_usable_expiries_are_required_0_2')}</div>;
   }
-  const W = 332, H = 236, L = 46, R = 62, T = 12, B = 24;
+  const W = 332, H = 236, L = 46, T = 12, B = 24;
   const maxD = pts[pts.length - 1].days;
-  const sx = (d: number) => L + (W - L - R) * Math.sqrt(Math.max(0, d) / maxD);
   const sig = (s: any, k: number) => s.atm_iv * Math.sqrt(s.days / 365) * k;
+  const last = pts[pts.length - 1];
+  const upperStrikeLabel = `${px(spot * (1 + sig(last, 1)))} · +${(sig(last, 1) * 100).toFixed(0)}%`;
+  const lowerStrikeLabel = `${px(spot * (1 - sig(last, 1)))} · −${(sig(last, 1) * 100).toFixed(0)}%`;
+  // Nuova SVG labels render at 12px. Estimate their rendered width and reserve
+  // it on the right while keeping at least 120 user units for the plot itself.
+  const R = Math.max(104, Math.min(W - L - 120,
+    Math.ceil(Math.max(upperStrikeLabel.length, lowerStrikeLabel.length) * 7.2 + 14)));
+  const sx = (d: number) => L + (W - L - R) * Math.sqrt(Math.max(0, d) / maxD);
   const pad = Math.max(...pts.map(p => sig(p, 2))) * 1.08;
   const sy = (rel: number) => T + (H - T - B) * (1 - (rel + pad) / (2 * pad));
   const apex = `${sx(0).toFixed(1)},${sy(0).toFixed(1)}`;
@@ -109,7 +132,6 @@ function StrikeProjector({ spot, term, earnings }: { spot: number; term: any[]; 
     if (show) lastLx = x;
     return { x, d: p.days, show };
   });
-  const last = pts[pts.length - 1];
   return (
     <svg viewBox={`0 0 ${W} ${H}`} className="vsxsvg" role="img"
          aria-label={tr('voldeck.ui_expected_move_cone_by_expiry_spot_plus_minus_atm_iv_ti_3')}>
@@ -154,11 +176,11 @@ function StrikeProjector({ spot, term, earnings }: { spot: number; term: any[]; 
         );
       })}
       {/* strike 1σ all'ultima scadenza: il perimetro a fine finestra */}
-      <text x={W - R + 5} y={sy(sig(last, 1)) + 2.5} fontSize="9" fill="#29D3F2" fontFamily="monospace">
-        {px(spot * (1 + sig(last, 1)))} · +{(sig(last, 1) * 100).toFixed(0)}%
+      <text x={W - R + 5} y={sy(sig(last, 1)) + 2.5} fontSize="12" fill="#29D3F2" fontFamily="monospace">
+        {upperStrikeLabel}
       </text>
-      <text x={W - R + 5} y={sy(-sig(last, 1)) + 2.5} fontSize="9" fill="#29D3F2" fontFamily="monospace">
-        {px(spot * (1 - sig(last, 1)))} · −{(sig(last, 1) * 100).toFixed(0)}%
+      <text x={W - R + 5} y={sy(-sig(last, 1)) + 2.5} fontSize="12" fill="#29D3F2" fontFamily="monospace">
+        {lowerStrikeLabel}
       </text>
       <text x={W - R + 5} y={sy(0) + 3} fontSize="9" fontWeight={600} fill="#73829F" fontFamily="monospace">SPOT</text>
     </svg>
@@ -347,15 +369,20 @@ function SmileXray({ grid, slices, spot }: { grid: number[]; slices: any[]; spot
 const HEAT_STOPS: [number, [number, number, number]][] = [
   [0, [11, 37, 69]], [0.35, [27, 73, 101]], [0.62, [42, 157, 184]], [0.85, [156, 128, 48]], [1, [212, 175, 55]],
 ];
-function heatColor(t: number) {
+/* Dark Nuova: same five anchors as the dark Plotly colourscale below (deep blue
+   -> sky -> amber -> orange), so the 3D mesh and the top-down view agree. */
+const HEAT_STOPS_DARK: [number, [number, number, number]][] = [
+  [0, [30, 58, 138]], [0.35, [59, 130, 246]], [0.62, [56, 189, 248]], [0.85, [251, 191, 36]], [1, [251, 146, 60]],
+];
+function heatColor(t: number, stops = HEAT_STOPS) {
   const x = Math.max(0, Math.min(1, t));
-  for (let i = 1; i < HEAT_STOPS.length; i++) {
-    if (x <= HEAT_STOPS[i][0]) {
-      const [a, ca] = HEAT_STOPS[i - 1], [b, cb] = HEAT_STOPS[i];
+  for (let i = 1; i < stops.length; i++) {
+    if (x <= stops[i][0]) {
+      const [a, ca] = stops[i - 1], [b, cb] = stops[i];
       return mixc(ca, cb, (x - a) / ((b - a) || 1));
     }
   }
-  return mixc(HEAT_STOPS[3][1], HEAT_STOPS[4][1], 1);
+  return mixc(stops[3][1], stops[4][1], 1);
 }
 const kfmt = (n: number) => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
 
@@ -432,6 +459,8 @@ function Term2D({ term, earnings, rv30 }: { term: any[]; earnings?: string | nul
    v4-ter (feedback PM live "le scritte laterali non si leggono"): resa HTML
    con etichette a PX FISSI — la leggibilità non scala più col contenitore. */
 function HeatTopDown({ grid, slices }: { grid: number[]; slices: any[] }) {
+  const dark = useInterfaceTheme().effective === 'dark';
+  const stops = dark ? HEAT_STOPS_DARK : HEAT_STOPS;
   const use = (slices || []).filter((s: any) => s.days >= 2);
   if (!grid?.length || !use.length) return <div className="num" style={{ padding: '12px', fontSize: 10, fontWeight: 600, color: '#73829F' }}>{tr('voldeck.ui_n_a_15')}</div>;
   const vals = use.flatMap((s: any) => s.iv_grid.filter((v: any) => v != null && isFinite(v)));
@@ -453,8 +482,8 @@ function HeatTopDown({ grid, slices }: { grid: number[]; slices: any[] }) {
               return (
                 <div key={c}
                      title={`${s.expiry} · K/S ${m.toFixed(3)} · ${ok ? 'IV ' + (v * 100).toFixed(1) + '%' : tr('voldeck.ui_n_a_missing_quote_declared_gap_22')}`}
-                     style={{ flex: 1, background: ok ? heatColor((v - vmin) / ((vmax - vmin) || 1)) : '#070B16',
-                              boxShadow: c === iAtm ? 'inset 0 0 0 1px rgba(236,241,250,.45)' : 'inset 0 0 0 0.5px #0D1426' }} />
+                     style={{ flex: 1, background: ok ? heatColor((v - vmin) / ((vmax - vmin) || 1), stops) : (dark ? '#0e1522' : '#070B16'),
+                              boxShadow: c === iAtm ? 'inset 0 0 0 1px rgba(236,241,250,.45)' : (dark ? 'inset 0 0 0 0.5px #151e2d' : 'inset 0 0 0 0.5px #0D1426') }} />
               );
             })}
           </div>
@@ -475,7 +504,7 @@ function HeatTopDown({ grid, slices }: { grid: number[]; slices: any[] }) {
       </div>
       <div className="num" style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '7px 0 2px' }}>
         <span style={{ flex: `0 0 ${LBL}px`, fontSize: 10, fontWeight: 600, color: '#73829F', textAlign: 'right' }}>{tr('voldeck.ui_iv_scale_23')}</span>
-        <div style={{ flex: '0 0 190px', height: 8, background: `linear-gradient(90deg, ${heatColor(0)}, ${heatColor(0.35)}, ${heatColor(0.62)}, ${heatColor(0.85)}, ${heatColor(1)})` }} />
+        <div style={{ flex: '0 0 190px', height: 8, background: `linear-gradient(90deg, ${heatColor(0, stops)}, ${heatColor(0.35, stops)}, ${heatColor(0.62, stops)}, ${heatColor(0.85, stops)}, ${heatColor(1, stops)})` }} />
         <span style={{ fontSize: 10, color: '#8D9FC4' }}>{(vmin * 100).toFixed(0)}% → {(vmax * 100).toFixed(0)}%</span>
       </div>
     </div>
@@ -754,6 +783,7 @@ function GexProfile({ gex, spot }: { gex: any; spot?: number }) {
 
 export default function VolSurfacePage() {
   const t = useT(), language = useLingua();
+  const themeDark = useInterfaceTheme().effective === 'dark';
   const [ticker, setTicker] = useState('');
   const [input, setInput] = useState('');
   const [workspace, setWorkspace] = useState<VolWorkspace>('acquisition');
@@ -767,6 +797,7 @@ export default function VolSurfacePage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const plotRef = useRef<HTMLDivElement>(null);
+  const plotUpdate = useRef<Promise<unknown>>(Promise.resolve());
   const requestRef = useRef<AbortController | null>(null);
   const lastExpiries = useRef<string[]>([]);
 
@@ -802,7 +833,7 @@ export default function VolSurfacePage() {
     // Preserve the original 3D traces, geometry and camera in the tools workspace.
     if (workspace !== 'tools' || !data?.slices?.length || !plotRef.current) return;
     let active = true;
-    loadPlotly().then(Plotly => {
+    loadPlotly().then(async Plotly => {
       if (!active || !plotRef.current) return;
       const grid: number[] = data.moneyness_grid;
       // 0-1 DTE fuori dal plot: smile distorto dalla microstruttura
@@ -817,11 +848,23 @@ export default function VolSurfacePage() {
       const z = zraw;
       const y = use.map((s: any) => s.days);
 
+      // Colours per theme: Light keeps its original values byte for byte, Dark
+      // picks the dark-surface variants. Only
+      // these inputs change with the theme: the traces' data, camera
+      // (uirevision), node and Plotly.react path are shared by every theme.
+      const inkColor = themeDark ? '#c7d1df' : '#334155';
+      const gridColor = themeDark ? '#3a4a64' : '#dbe3ef';
+      const zeroColor = themeDark ? '#75849b' : '#94a3b8';
+      const atmColor = themeDark ? '#fde68a' : '#b45309';
+
       const surface = {
         type: 'surface', x: grid, y, z,
-        colorscale: [
-          [0, '#0B2545'], [0.35, '#1B4965'], [0.62, '#2A9DB8'],
-          [0.85, '#9C8030'], [1, '#D4AF37'],
+        colorscale: themeDark ? [
+          [0, '#1e3a8a'], [0.35, '#3b82f6'], [0.62, '#38bdf8'],
+          [0.85, '#fbbf24'], [1, '#fb923c'],
+        ] : [
+          [0, '#dbeafe'], [0.35, '#93c5fd'], [0.62, '#38bdf8'],
+          [0.85, '#fbbf24'], [1, '#b45309'],
         ],
         cmin: zlo, cmax: zhi,
         // A missing observation remains a hole in both the mesh and X-RAY.
@@ -829,8 +872,8 @@ export default function VolSurfacePage() {
         lighting: { ambient: 0.68, diffuse: 0.7, specular: 0.22, roughness: 0.7, fresnel: 0.08 },
         lightposition: { x: -60, y: -120, z: 90 },
         colorbar: {
-          tickfont: { color: '#8a8a9e', size: 9, family: 'monospace' },
-          title: { text: 'IV %', font: { color: '#8a8a9e', size: 10, family: 'monospace' } },
+          tickfont: { color: inkColor, size: 12, family: 'Inter, sans-serif'},
+          title: { text: 'IV %', font: { color: inkColor, size: 13, family: 'Inter, sans-serif'} },
           thickness: 10, len: 0.75, outlinewidth: 0,
         },
         contours: { z: { show: true, usecolormap: true, project: { z: true }, width: 1 } },
@@ -849,48 +892,63 @@ export default function VolSurfacePage() {
           const g = i1 >= 0 ? s.iv_grid?.[i1] : null;
           return (g != null ? g : s.atm_iv) * 100;
         }),
-        line: { color: '#FFD166', width: 6 },
-        marker: { size: 3.5, color: '#FFD166' },
+        line: { color: atmColor, width: 6 },
+        marker: { size: 3.5, color: atmColor },
         hovertemplate: tr('voldeck.ui_atm_y_days_br_b_iv_z_1f_b_extra_extra_52', { y: '{y}' }),
         name: 'ATM',
         showlegend: false,
       };
 
-      return Plotly.newPlot(plotRef.current, [surface, atmLine], {
+      const layout = {
         paper_bgcolor: 'rgba(0,0,0,0)',
         scene: {
           xaxis: {
-            title: { text: 'Moneyness K/S', font: { size: 10, color: '#8a8a9e', family: 'monospace' } },
-            tickfont: { size: 9, color: '#8a8a9e', family: 'monospace' },
-            gridcolor: '#1e2638', zerolinecolor: '#1e2638', showbackground: false,
+            title: { text: 'Moneyness K/S', font: { size: 13, color: inkColor, family: 'Inter, sans-serif'} },
+            tickfont: { size: 12, color: inkColor, family: 'Inter, sans-serif'},
+            gridcolor: gridColor, zerolinecolor: zeroColor, showbackground: false,
             tickformat: '.2f',
           },
           yaxis: {
-            title: { text: tr('voldeck.ui_days_to_expiry_53'), font: { size: 10, color: '#8a8a9e', family: 'monospace' } },
-            tickfont: { size: 9, color: '#8a8a9e', family: 'monospace' },
-            gridcolor: '#1e2638', zerolinecolor: '#1e2638', showbackground: false,
+            // Plotly renders 3D scene labels inside its WebGL canvas. The y
+            // title is clipped at the bottom edge on several viewport sizes,
+            // so Modern presents that one label as accessible HTML instead.
+            title: { text: '', font: { size: 13, color: inkColor, family: 'Inter, sans-serif'} },
+            tickfont: { size: 12, color: inkColor, family: 'Inter, sans-serif'},
+            gridcolor: gridColor, zerolinecolor: zeroColor, showbackground: false,
           },
           zaxis: {
-            title: { text: 'IV %', font: { size: 10, color: '#8a8a9e', family: 'monospace' } },
-            tickfont: { size: 9, color: '#8a8a9e', family: 'monospace' },
-            gridcolor: '#1e2638', zerolinecolor: '#1e2638', showbackground: false,
+            title: { text: 'IV %', font: { size: 13, color: inkColor, family: 'Inter, sans-serif'} },
+            tickfont: { size: 12, color: inkColor, family: 'Inter, sans-serif'},
+            gridcolor: gridColor, zerolinecolor: zeroColor, showbackground: false,
             ticksuffix: '%',
           },
           bgcolor: 'rgba(0,0,0,0)',
           camera: { eye: { x: -1.75, y: -1.45, z: 0.55 } },
+          uirevision: 'bellomberg-vol-surface-camera',
           aspectratio: { x: 1.25, y: 1.55, z: 0.75 },
         },
+        uirevision: 'bellomberg-vol-surface',
         hoverlabel: {
-          bgcolor: '#0e1526', bordercolor: '#B08D2E',
-          font: { family: 'monospace', size: 11, color: '#e8e8e8' },
+          bgcolor: themeDark ? '#1c2639' : '#fff', bordercolor: themeDark ? '#3a4a64' : '#cbd5e1',
+          font: { family: 'monospace', size: 11, color: themeDark ? '#e3e9f3' : '#1e293b'},
         },
-        margin: { l: 0, r: 0, t: 6, b: 0 },
+        margin: { l: 36, r: 56, t: 8, b: 36 },
         height: 480,
         showlegend: false,
-      }, { displayModeBar: false, responsive: true });
+      };
+      const config = { displayModeBar: false, responsive: true };
+      const renderPlot = plotUpdate.current.catch(() => undefined).then(() => {
+        if (!active || !plotRef.current) return;
+        const currentNode = plotRef.current as HTMLDivElement & { _fullLayout?: unknown };
+        return currentNode._fullLayout
+          ? Plotly.react(currentNode, [surface, atmLine], layout, config)
+          : Plotly.newPlot(currentNode, [surface, atmLine], layout, config);
+      });
+      plotUpdate.current = renderPlot;
+      await renderPlot;
     }).catch(e => { if (active) setError(String(e)); });
     return () => { active = false; };
-  }, [data, workspace, language]);
+  }, [data, workspace, language, themeDark]);
 
   const go = () => { const t = input.trim().toUpperCase(); if (/^[A-Z0-9][A-Z0-9.\-^]{0,24}$/.test(t)) setTicker(t); else setError(tr('voldeck.ui_enter_a_valid_ticker_before_loading_the_catalogue_54')); };
 
@@ -905,7 +963,9 @@ export default function VolSurfacePage() {
     .reduce((a: number, s: any) => a + (s.iv_grid || []).filter((v: any) => v == null).length, 0);
 
   return (
+    <ModernPage page="vol" presentationBoundary={false} render={() => (
     <div className="obsx vol-atlas" data-vol-atlas>
+      <VolPagePresentationBoundary render={() => <>
       <header className="va-heading">
         <div><p className="va-eyebrow">Vol Deck</p><h1>{t('voldeck.atlas_title')}</h1><p>{t('voldeck.atlas_intro')}</p></div>
         <form className="va-ticker" onSubmit={e => { e.preventDefault(); go(); setWorkspace('acquisition'); }}>
@@ -950,12 +1010,14 @@ export default function VolSurfacePage() {
           {!data?.slices?.length && <p role="status">{t('voldeck.no_selected')}</p>}
         </section>}
       </>}
+      </>} />
       <VolWorkbench ticker={ticker} mode={workspace} coverage={rawData?.coverage} surfaceBusy={loading}
         onSurface={(result, expiries) => {
           requestRef.current?.abort(); setLoading(false); setData(result); setError(result.error || null);
           lastExpiries.current = expiries; setWorkspace('tools'); setSelectedExpiries(null);
           setCone(null); setContextState('not_requested');
         }} onLaboratory={() => setWorkspace('chain')} onAcquisition={() => setWorkspace('acquisition')} />
+      <VolPagePresentationBoundary render={() => <>
       {workspace === 'tools' && rawData?.slices?.length > 0 && <div className="vol-workbench va-context-action"><div className="vd-actions" style={{ padding: '10px 4px' }}>
         <button className="vd-secondary" disabled={loading} onClick={() => loadSurface(lastExpiries.current, true)}>{tr('voldeck.ui_load_rv_iv_rank_gex_and_cone_context_55')}</button>
         <small>{tr('voldeck.ui_additional_provider_requests_context_is_not_loaded_aut_56')}</small>
@@ -993,10 +1055,14 @@ export default function VolSurfacePage() {
               <div className="p3h">{tr('voldeck.ui_iv_surface_3d_mesh_61')}<span className="n">{tr('voldeck.ui_gold_ridge_atm_term_structure_62')}</span>
                 <span className="side num">{nOpt > 0 ? nOpt + tr('voldeck.ui_quotes_used_63') + nIll + tr('voldeck.ui_illiquid_quotes_excluded_64') : ''}{tr('voldeck.ui_0_1_dte_excluded_from_the_plot_65')}</span>
               </div>
-              <div ref={plotRef} data-vol-3d aria-label={t('voldeck.mesh_label')} />
+              <div ref={plotRef} data-vol-3d aria-label={t('voldeck.mesh_label')}
+                aria-describedby={'vol-surface-expiry-axis-label'} />
+              {<div id="vol-surface-expiry-axis-label" data-vol-axis-title="expiry">
+                {tr('voldeck.ui_days_to_expiry_53')}
+              </div>}
               {data.slices.length < 2 && <div className="vsxleg">{tr('voldeck.ui_only_one_curve_available_the_smile_remains_usable_a_th_66')}</div>}
               <div className="vsxleg">
-                {tr('voldeck.ui_drag_rotate_hover_exact_k_s_days_and_iv_67')}<span style={{ color: '#E9BA64' }}> {nHoles} {' '}{tr('voldeck.ui_missing_cells_left_empty_no_visual_gap_filling_between_68')}</span> {tr('voldeck.ui_colour_saturated_above_the_99th_percentile_geometry_un_69')}{data._source || 'polygon chains'}]
+                {tr('voldeck.ui_drag_rotate_hover_exact_k_s_days_and_iv_67')}<span style={{ color: themeDark ? '#f0c062' : '#92400e'}}> {nHoles} {' '}{tr('voldeck.ui_missing_cells_left_empty_no_visual_gap_filling_between_68')}</span> {tr('voldeck.ui_colour_saturated_above_the_99th_percentile_geometry_un_69')}{data._source || 'polygon chains'}]
               </div>
             </div>
 
@@ -1175,6 +1241,8 @@ export default function VolSurfacePage() {
           </div>
         </div>
       )}
+      </>} />
     </div>
+    )} />
   );
 }

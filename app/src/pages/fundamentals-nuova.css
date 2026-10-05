@@ -1,0 +1,105 @@
+/* Fund (ricerca sui fondamentali) nella palette consumer --bbn-*, stesso impianto di Performance e Mercati.
+   Layout per larghezza dell'area contenuti (container `bellomberg-content`):
+     < 1180 px   una colonna: elenco delle società, poi il dettaglio;
+     ≥ 1180 px   elenco | dettaglio affiancati.
+   Il <main> di /fundamentals non dichiara il container: lo dichiara questo foglio. */
+.bb-modern-main.bb-modern-main-classic-content:has(> .relative .bbn-fund) {
+  container-type: inline-size; container-name: bellomberg-content;
+  background: var(--bbn-bg); color: var(--bbn-text); color-scheme: light;
+}
+.bb-modern-main.bb-modern-main-classic-content:has(> .relative .bbn-fund) > .relative { background: var(--bbn-bg); }
+:root[data-bb-theme="dark"] .bb-modern-main.bb-modern-main-classic-content:has(> .relative .bbn-fund),
+:root[data-bb-theme="dark"] .bb-modern-main.bb-modern-main-classic-content:has(> .relative .bbn-fund) > .relative {
+  background: var(--bbn-bg); color: var(--bbn-text); color-scheme: dark;
+}
+.bb-page.bb-page-modern[data-page="fundamentals"],
+:root[data-bb-theme="dark"] .bb-page.bb-page-modern[data-page="fundamentals"] { background: var(--bbn-bg); color: var(--bbn-text); }
+
+/* pages-modern.css veste ogni bottone e titolo delle pagine moderne: qui valgono i componenti della Nuova. */
+.bb-page.bb-page-modern[data-page] .bbn-fund button {
+  min-height: 0; padding: 0; border: 0; border-radius: 0; background: none; color: inherit; font: inherit; line-height: inherit; box-shadow: none;
+}
+.bb-page.bb-page-modern[data-page] .bbn-fund :is(h1, h2, h3, h4) { color: var(--bbn-text); letter-spacing: normal; text-transform: none; font-family: inherit; }
+.bb-page.bb-page-modern[data-page] .bbn-fund button.bbn-btn {
+  display: inline-flex; align-items: center; gap: 7px; min-height: 38px; padding: 0 16px; border-radius: 999px; background: var(--bbn-card);
+  color: var(--bbn-text); font-weight: 700; font-size: 13px; line-height: 1; box-shadow: var(--bbn-shadow); white-space: nowrap; cursor: pointer;
+}
+:root[data-bb-theme="dark"] .bb-page.bb-page-modern[data-page] .bbn-fund button.bbn-btn { background: var(--bbn-raised); }
+.bb-page.bb-page-modern[data-page] .bbn-fund button.bbn-btn[aria-expanded="true"] { background: var(--bbn-accent-soft); color: var(--bbn-accent); box-shadow: none; }
+.bb-page.bb-page-modern[data-page] .bbn-fund button.bbn-btn:hover:not(:disabled) { filter: brightness(1.06); }
+.bb-page.bb-page-modern[data-page] .bbn-fund button.bbn-btn:disabled { opacity: .6; cursor: default; }
+.bbn-fund :where(button, a):focus-visible { outline: 2px solid var(--bbn-accent); outline-offset: 2px; }
+
+.bbn-fund { color: var(--bbn-text); font-size: 14px; line-height: 1.45; }
+.bbn-fund *, .bbn-fund *::before, .bbn-fund *::after { box-sizing: border-box; }
+.fr-root { display: grid; gap: 12px; }
+
+/* intestazione */
+.fr-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.fr-title h1 { margin: 0; font-size: 20px; font-weight: 700; letter-spacing: -.01em; }
+.fr-title p { margin: 4px 0 0; color: var(--bbn-muted); font-size: 13px; font-weight: 600; }
+.fr-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* note e avvisi */
+.fr-note { margin: 0; color: var(--bbn-muted); font-size: 12px; font-weight: 600; line-height: 1.45; }
+.fr-note.is-warn, .fr-cell-note.is-warn { color: var(--bbn-warn); }
+.fr-callout { margin: 0; padding: 12px 16px; border-radius: 16px; font-size: 13px; font-weight: 600; line-height: 1.45; }
+.fr-callout.is-bad { background: var(--bbn-bad-soft); color: var(--bbn-bad); }
+.fr-callout.is-warn { background: var(--bbn-warn-soft); color: var(--bbn-text); }
+
+/* elenco | dettaglio */
+.fr-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }
+@container bellomberg-content (min-width: 1180px) {
+  .fr-grid { grid-template-columns: minmax(420px, .95fr) minmax(0, 1.35fr); }
+  .fr-detail-card { position: sticky; top: 0; max-height: calc(100vh - 160px); overflow: auto; overscroll-behavior: contain; }
+}
+.fr-list-card { overflow: hidden; }
+.fr-table-wrap { overflow-x: auto; padding: 8px 12px 12px; }
+.fr-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.fr-table th { padding: 10px; color: var(--bbn-muted); font-size: 12px; font-weight: 600; text-align: right; white-space: nowrap; }
+.fr-table td { padding: 10px; border-top: 1px solid var(--bbn-line); text-align: right; vertical-align: top; white-space: nowrap; }
+.fr-table :is(th, td):first-child { text-align: left; }
+.fr-table tbody tr.is-on { background: var(--bbn-accent-soft); }
+.fr-table tbody tr:hover:not(.is-on) { background: var(--bbn-raised); }
+.fr-table td.is-up { color: var(--bbn-good); font-weight: 700; }
+.fr-table td.is-down { color: var(--bbn-bad); font-weight: 700; }
+.bb-page.bb-page-modern[data-page] .bbn-fund button.fr-ticker { color: var(--bbn-accent); font-weight: 800; font-size: 14px; cursor: pointer; text-align: left; }
+.bb-page.bb-page-modern[data-page] .bbn-fund button.fr-ticker:hover { text-decoration: underline; }
+.fr-name { max-width: 180px; margin-top: 2px; overflow: hidden; color: var(--bbn-muted); font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.fr-ccy { color: var(--bbn-muted); font-size: 11px; font-weight: 600; }
+.fr-cell-note { margin-top: 2px; color: var(--bbn-muted); font-size: 11px; font-weight: 600; white-space: normal; }
+
+/* dettaglio */
+.fr-detail-card { min-width: 0; padding: 18px 20px 20px; }
+.fr-detail { display: grid; gap: 18px; }
+.fr-detail-head { display: grid; gap: 4px; padding-bottom: 12px; border-bottom: 1px solid var(--bbn-line); }
+.fr-detail-head h2 { margin: 0; font-size: 18px; font-weight: 800; }
+.fr-detail-head h2 span { color: var(--bbn-muted); font-weight: 600; }
+.fr-sec { display: grid; gap: 8px; min-width: 0; }
+.fr-h { margin: 0; color: var(--bbn-text); font-size: 15px; font-weight: 700; }
+.fr-facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 16px; font-size: 13px; }
+.fr-facts > span { font-weight: 700; overflow-wrap: anywhere; }
+.fr-facts > span.fr-k { color: var(--bbn-muted); font-weight: 600; }
+.fr-judgment { justify-self: start; padding: 4px 10px; border-radius: 999px; background: var(--bbn-accent-soft); color: var(--bbn-accent); font-size: 12px; font-weight: 700; }
+.fr-prose { font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
+.fr-prose :is(p, ul, ol) { margin: 0 0 8px; }
+.fr-prose ul { padding-left: 18px; list-style: disc; }
+.fr-prose ol { padding-left: 18px; list-style: decimal; }
+.fr-prose :is(h1, h2, h3, h4) { margin: 14px 0 6px; font-size: 14px; font-weight: 700; }
+.fr-link { display: inline-flex; align-items: center; gap: 4px; color: var(--bbn-accent); font-weight: 700; text-decoration: none; }
+.fr-link:hover { text-decoration: underline; }
+.fr-text { margin: 0; font-size: 13px; }
+.fr-source { display: grid; gap: 4px; padding-top: 8px; border-top: 1px solid var(--bbn-line); font-size: 13px; overflow-wrap: anywhere; }
+.fr-scenario h4 { margin: 0 0 4px; font-size: 13px; font-weight: 700; }
+.fr-list { margin: 0; padding-left: 18px; list-style: disc; display: grid; gap: 4px; font-size: 13px; }
+.fr-dossier-table { display: grid; gap: 6px; overflow-x: auto; }
+.fr-mini-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.fr-mini-table th { padding: 6px 8px; color: var(--bbn-muted); font-weight: 600; text-align: left; border-bottom: 1px solid var(--bbn-line); }
+.fr-mini-table td { padding: 6px 8px; border-bottom: 1px solid var(--bbn-line); }
+.fr-extra:not(:empty) { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--bbn-line); }
+
+/* archivio Excel (sola lettura) */
+.fr-archive-body { display: grid; gap: 8px; padding: 0 20px 18px; }
+.fr-archive-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-top: 1px solid var(--bbn-line); font-size: 13px; }
+.fr-archive-file { min-width: 0; overflow-wrap: anywhere; }
+.fr-archive-file b { font-weight: 800; }

@@ -7,6 +7,7 @@ Pulla news multi-fonte per ticker singolo, lista ticker portfolio, o query liber
 - TheNewsAPI (thenewsapi.com)
 - GNews (gnews.io)
 - yfinance news (per ticker)
+- Finnhub company news (per simbolo fonte risolto)
 - RSS feeds (Bloomberg, FT, Reuters, WSJ)
 
 PRINCIPI:
@@ -23,17 +24,21 @@ API:
 
 TERMINI DI RICERCA (04/09, criterio (1)): vivono nel negozio PRIVATO
 data/news_search_terms.json (v. carica_termini); lo schema tracciato e'
-news_search_terms.example.json. Nessun simbolo del book vive in questo sorgente.
+news_search_terms.example.json. Una voce assente usa il nome emittente Yahoo; per i
+provider a simbolo un alias Finnhub esplicito vince sulla scoperta USA univoca per nome.
+Nessun simbolo del book vive in questo sorgente.
 """
 from bellomberg.core.paths import DATA_DIR, PROJECT_ROOT
 from bellomberg.core.language import capture_language, scoped_language, text as _lt
 from bellomberg.core.presentation import error_text, message, render_payload
 from pathlib import Path
 import tempfile
+import threading
 import time
 import re
 import hashlib
-from datetime import datetime, timedelta
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
 import os
 import json
@@ -60,6 +65,9 @@ from bellomberg.storage.memory_db import MemoryDB, connect_sqlite, DB_DIR
 
 CACHE_TTL_SEC = 900  # 15 min
 _CACHE: Dict[str, Any] = {}
+# Errori dei provider non gestiti dal limiter giornaliero, per provider e simbolo:
+# {provider: {target: (timestamp, motivo)}}. Scadono insieme alla cache delle news.
+_RUNTIME_PROVIDER_FAILURES: Dict[str, Dict[str, tuple[float, str]]] = {}
 
 # 202-A: il modulo congela le chiavi all'import -> garantisci il .env caricato QUI,
 # qualunque sia l'ordine di import del processo (API, .bat, script standalone).
@@ -104,12 +112,85 @@ RSS_FEEDS = {
 }
 
 
+def _eccezione_sicura(exc: BaseException) -> str:
+    """G3 (04/10): nei log e negli stati via API solo tipo + stato HTTP. Il messaggio grezzo
+    di requests contiene l'URL con la querystring, cioe' la chiave API (apiKey/api_token/token)."""
+    from bellomberg.core.errori_sicuri import descrivi_eccezione
+    return descrivi_eccezione(exc)
+
+
 def _log(msg: str):
     # pipe stdout morta (backend zombie, autopsia (40)): log perso, mai eccezione
     try:
         print(f"[NEWS] {msg}", flush=True)
     except OSError:
         pass
+
+
+# --- deduplica per TITOLO (04/10, B2 — rilievo RV-N P2-2, via libera main) ---
+# _dedupe usa l'url: gli url Finnhub sono redirect finnhub.io (misura M1: 3.466/3.466),
+# quindi lo stesso articolo da Tiingo/yfinance (url diretto) e da Finnhub passava due
+# volte -> doppia classificazione Haiku e doppia notifica desktop (M1: 165/333 notifiche
+# Tiingo per-ticker con un gemello Finnhub). Titolo normalizzato = minuscole, punteggiatura
+# tolta, spazi compressi; stesso titolo entro FINESTRA_DOPPIONI_S = doppione. Si tiene
+# l'item con l'URL DIRETTO. Data illeggibile: il confronto vale sul solo titolo (dichiarato).
+FINESTRA_DOPPIONI_S = 24 * 3600
+_RE_NON_ALFANUM = re.compile(r"[\W_]+", re.UNICODE)
+_DOPPIONI_GIRO: Dict[str, int] = {"titolo": 0, "titolo_db": 0}
+
+
+def _titolo_norm(titolo: str) -> str:
+    return " ".join(_RE_NON_ALFANUM.sub(" ", (titolo or "").lower()).split())
+
+
+def _url_redirect(url: str) -> bool:
+    """URL che non identificano l'articolo (redirect del fornitore): la dedupe per url li manca."""
+    return "finnhub.io" in (url or "").lower()
+
+
+def _dedupe_titoli(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Toglie i doppioni per titolo normalizzato entro FINESTRA_DOPPIONI_S, tenendo l'item con
+    URL diretto (a parita', il primo). L'ordine degli item tenuti resta quello d'ingresso.
+    Gli scarti si contano in _DOPPIONI_GIRO["titolo"]."""
+    gruppi: Dict[str, List[int]] = {}
+    for i, it in enumerate(items):
+        t = _titolo_norm(it.get("title", ""))
+        if t:
+            gruppi.setdefault(t, []).append(i)
+    via = set()
+    for idx in gruppi.values():
+        if len(idx) < 2:
+            continue
+        # i diretti prima: ognuno «assorbe» i doppioni nella finestra
+        ordine = sorted(idx, key=lambda i: (_url_redirect(items[i].get("url", "")), i))
+        tenuti: List[int] = []
+        for i in ordine:
+            ts_i = _parse_date_ts(items[i].get("published_at", ""))
+            gemello = False
+            for k in tenuti:
+                ts_k = _parse_date_ts(items[k].get("published_at", ""))
+                if not ts_i or not ts_k or abs(ts_i - ts_k) <= FINESTRA_DOPPIONI_S:
+                    gemello = True
+                    break
+            if gemello:
+                via.add(i)
+            else:
+                tenuti.append(i)
+    if via:
+        with _ESITI_LOCK:
+            _DOPPIONI_GIRO["titolo"] += len(via)
+    return [it for i, it in enumerate(items) if i not in via]
+
+
+def _azzera_doppioni_giro() -> None:
+    with _ESITI_LOCK:
+        _DOPPIONI_GIRO["titolo"] = 0
+        _DOPPIONI_GIRO["titolo_db"] = 0
+
+
+def _doppioni_giro() -> Dict[str, int]:
+    with _ESITI_LOCK:
+        return dict(_DOPPIONI_GIRO)
 
 
 def _dedupe(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -130,14 +211,19 @@ def _dedupe(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # giornaliero, cooldown per query, auto-disable su quota esaurita.
 # Stato su file: gli scheduler sono processi separati ogni 15 minuti.
 _NEWS_RATE_PATH = str(DATA_DIR / "news_rate_state.json")
+# 02/10/2026 (dosaggio): con i giri ogni 15 minuti NewsAPI e TheNewsAPI finivano il budget
+# in serata e restavano mute fino a mezzanotte. "pace" = finestra oraria locale (inizio, fine)
+# in cui il budget si sblocca a rate: una piccola scorta all'inizio, poi cresce lineare fino
+# al tetto alla fine della finestra. Oltre la quota del momento: SKIP_PACING (rimandata).
+NEWS_PACE_BURST = 0.12   # quota disponibile subito all'inizio della finestra (12% del tetto)
 NEWS_PROVIDER_LIMITS = {
-    "newsapi":    {"daily": 80, "cooldown": 6 * 3600, "disable": 12 * 3600},
-    "thenewsapi": {"daily": 80, "cooldown": 6 * 3600, "disable": 12 * 3600},
+    "newsapi":    {"daily": 99, "cooldown": 6 * 3600, "disable": 12 * 3600, "pace": (6, 23)},
+    "thenewsapi": {"daily": 80, "cooldown": 6 * 3600, "disable": 12 * 3600, "pace": (6, 23)},
     # Opus 4.8 16/07: GNews su piano ESSENTIAL (verificato live: max=25 ok, news di 12
     # min fa, storico attivo, stessa key). Tetto 80->800 (20% sotto il cap di piano 1000):
     # GNews non si spegne piu' a meta' mattina. Cooldown 6h->2h per SFRUTTARE il real-time:
     # ogni query si aggiorna ogni 2h invece di 6h (~360 chiamate/g stimate, sotto 800).
-    # newsapi/thenewsapi restano a 80 (piano free): l'upgrade copre 1 fonte su 3.
+    # NewsAPI sale a 99 (margine di 1 sul piano Developer da 100); TheNewsAPI resta a 80.
     "gnews":      {"daily": 800, "cooldown": 2 * 3600, "disable": 12 * 3600},
 }
 
@@ -167,6 +253,46 @@ def _news_rate_save(st: Dict[str, Any]) -> None:
         pass
 
 
+def _adesso() -> datetime:
+    """Ora locale del limiter (punto unico, cosi' le prove possono fissarla)."""
+    return datetime.now()
+
+
+def _pace_bounds(lim: Dict[str, Any], when: datetime):
+    start_h, end_h = lim["pace"]
+    start = when.replace(hour=start_h, minute=0, second=0, microsecond=0)
+    end = when.replace(hour=end_h, minute=0, second=0, microsecond=0) if end_h < 24 else \
+        when.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    return start, end
+
+
+def pacing_allowance(lim: Dict[str, Any], when: datetime) -> Optional[int]:
+    """Chiamate consentite DA INIZIO GIORNATA fino a `when`, per un provider con "pace";
+    None se il provider non e' dosato. Prima della finestra vale la sola scorta iniziale,
+    dopo la fine il tetto giornaliero."""
+    if not lim.get("pace"):
+        return None
+    daily = int(lim["daily"])
+    burst = max(1, int(round(daily * NEWS_PACE_BURST)))
+    start, end = _pace_bounds(lim, when)
+    frac = (when - start).total_seconds() / max(1.0, (end - start).total_seconds())
+    frac = min(1.0, max(0.0, frac))
+    return min(daily, int(burst + (daily - burst) * frac))
+
+
+def pacing_next_slot(lim: Dict[str, Any], used: int, when: datetime) -> Optional[datetime]:
+    """Quando la quota del momento supera `used` (la prossima chiamata possibile), oppure
+    None se e' gia' possibile o se il tetto giornaliero e' raggiunto."""
+    allowed = pacing_allowance(lim, when)
+    daily = int(lim["daily"])
+    if allowed is None or used < allowed or used >= daily:
+        return None
+    burst = max(1, int(round(daily * NEWS_PACE_BURST)))
+    start, end = _pace_bounds(lim, when)
+    frac = (used + 1 - burst) / max(1, daily - burst)
+    return start + (end - start) * min(1.0, max(0.0, frac))
+
+
 def provider_status(provider: str, query: str) -> Optional[str]:
     """Opus 4.8 15/07 (P0 skip dichiarato): il MOTIVO per cui il provider e' bloccato,
     o None se la chiamata puo' partire. Il bool di _provider_allowed collassava 3 cause
@@ -174,7 +300,9 @@ def provider_status(provider: str, query: str) -> Optional[str]:
     cieco' erano lo stesso valore. Vocabolario CHIUSO (come llm_pricing 'live|fallback|
     n.d.'), niente 'ok' inventato: qui si dichiara solo cio' che il limiter SA.
       SKIP_DISABLED — auto-disable dopo un 429/402/403 (:175-177), scade da solo
-      SKIP_BUDGET   — budget giornaliero esaurito (il ramo che scatta oggi: 80/80)
+      SKIP_BUDGET   — budget giornaliero esaurito (il ramo che scatta oggi: 99/99)
+      SKIP_PACING   — quota del momento esaurita (dosaggio 02/10/2026): il budget si sblocca
+                      a rate nella finestra "pace"; riparte da solo, non spegne il provider
       SKIP_COOLDOWN — questa QUERY e' gia' stata fatta da meno di `cooldown` (per-query,
                       non per-provider: per questo la firma prende anche `query`)
     None NON significa "andra' bene": significa solo "il limiter non blocca". L'esito vero
@@ -192,16 +320,66 @@ def provider_status(provider: str, query: str) -> Optional[str]:
         return "SKIP_DISABLED"
     if st.get("day") == today and int(st.get("count", 0)) >= lim["daily"]:
         return "SKIP_BUDGET"
+    allowed = pacing_allowance(lim, _adesso())
+    if allowed is not None and st.get("day") == today and int(st.get("count", 0)) >= allowed:
+        return "SKIP_PACING"
     q_ts = float(st.get("per_query", {}).get(query.lower().strip()[:80], 0))
     if now - q_ts < lim["cooldown"]:
         return "SKIP_COOLDOWN"
     return None
 
 
+def providers_budget() -> Dict[str, Dict[str, Any]]:
+    """Consumo del budget per i provider contingentati, solo dallo stato su file (zero rete):
+    usate oggi, tetto, quota del momento se dosato, e quando si libera la prossima chiamata."""
+    state = _news_rate_state()
+    now = _adesso()
+    today = now.strftime("%Y-%m-%d")
+    out: Dict[str, Dict[str, Any]] = {}
+    for p, lim in NEWS_PROVIDER_LIMITS.items():
+        st = state.get(p, {})
+        used = int(st.get("count", 0)) if st.get("day") == today else 0
+        allowed = pacing_allowance(lim, now)
+        nxt = pacing_next_slot(lim, used, now) if allowed is not None else None
+        out[p] = {"used": used, "daily": int(lim["daily"]), "allowed_now": allowed,
+                  "pace": list(lim["pace"]) if lim.get("pace") else None,
+                  "next_call_at": nxt.isoformat(timespec="minutes") if nxt else None}
+    return out
+
+
 def _provider_allowed(provider: str, query: str) -> bool:
     # Firma invariata di proposito: 5 call site vivi la usano come bool (:185, :315,
     # :347 + news_sources via _rate_limiter). Il motivo si chiede a provider_status().
     return provider_status(provider, query) is None
+
+
+def _runtime_failure_record(provider: str, target: str, motivo: str) -> None:
+    _RUNTIME_PROVIDER_FAILURES.setdefault(provider, {})[target] = (time.time(), motivo)
+
+
+def _runtime_failure_clear(provider: str, target: str) -> None:
+    per_target = _RUNTIME_PROVIDER_FAILURES.get(provider)
+    if not per_target:
+        return
+    per_target.pop(target, None)
+    if not per_target:
+        _RUNTIME_PROVIDER_FAILURES.pop(provider, None)
+
+
+def _runtime_failures_correnti() -> Dict[str, str]:
+    """Guasti recenti aggregati senza far cancellare un ticker dal successo di un altro."""
+    now = time.time()
+    fuori: Dict[str, str] = {}
+    for provider, per_target in list(_RUNTIME_PROVIDER_FAILURES.items()):
+        for target, (ts, _motivo) in list(per_target.items()):
+            if now - ts > CACHE_TTL_SEC:
+                per_target.pop(target, None)
+        if not per_target:
+            _RUNTIME_PROVIDER_FAILURES.pop(provider, None)
+            continue
+        fuori[provider] = "; ".join(
+            f"{target}: {motivo}" for target, (_ts, motivo) in sorted(per_target.items()))
+    return fuori
 
 
 def providers_blocked() -> Dict[str, str]:
@@ -230,15 +408,29 @@ def providers_blocked() -> Dict[str, str]:
         st = provider_status(p, _probe)
         if st in ("SKIP_BUDGET", "SKIP_DISABLED"):
             fuori[p] = st
+    fuori.update(_runtime_failures_correnti())
     # Tiingo: chiave dedicata, fuori dai limiti giornalieri (tiingo_news.tiingo_available)
+    # 04/10 (B2, Opus 5.5): con la chiave presente si guarda anche l'ESITO dell'ultima
+    # chiamata (tiingo_news.last_status): un 401 di abbonamento scaduto era invisibile
+    # (la parola «tiingo» compariva 0 volte nel news_feed.log). «Mai interrogata» = nessuna voce.
+    tiingo_ultimo = None
     try:
-        from bellomberg.market_data.tiingo_news import tiingo_available
+        from bellomberg.market_data.tiingo_news import tiingo_available, last_status
         if not tiingo_available():
             fuori["tiingo"] = message("SENZA_CHIAVE: TIINGO_API_KEY assente nel .env (o requests non importabile)",
                                       "SENZA_CHIAVE: TIINGO_API_KEY missing from .env (or requests cannot be imported)")
+        else:
+            tiingo_ultimo = last_status()
     except Exception as e:
         fuori["tiingo"] = message("MODULO_ASSENTE: tiingo_news non importabile ({kind})",
                                   "MODULO_ASSENTE: tiingo_news cannot be imported ({kind})", kind=type(e).__name__)
+    if "tiingo" not in fuori:
+        muta = _esito_muto_recente("tiingo", "Tiingo", tiingo_ultimo)
+        if muta:
+            fuori["tiingo"] = muta
+    muta = _esito_muto_recente("finnhub", "Finnhub")
+    if muta:
+        fuori["finnhub"] = muta
     # il negozio dei termini: senza, i nomi europei si cercano col ticker nudo (dichiarato nel
     # log, ma il payload diceva solo «0 news»): e' una fonte muta del giro, e qui lo dice.
     # 13/09: niente % — riduceva a str il motivo (e con lui le sue due lingue)
@@ -264,6 +456,135 @@ def providers_blocked() -> Dict[str, str]:
                                           "MODULO_ASSENTE: negozi_privati cannot be imported ({kind}: {cause})",
                                           kind=type(e).__name__, cause=error_text(e))
     return fuori
+
+
+# ── Esiti delle fonti NON contingentate (04/10, B2 — Opus 5.5) ──────────────────
+# Tiingo e Finnhub non passano dal rate-limiter su file: il loro guasto (401, 429,
+# timeout) era inghiottito da `except Exception: pass`. Qui si tiene l'esito
+# dell'ULTIMA chiamata per fonte, in QUESTO processo (il feed gira dentro il backend:
+# POST /news/feed/refresh, quindi le rotte vedono lo stesso stato). L'eta' si misura su
+# time.monotonic (immune ai salti NTP); `quando` e' solo un'etichetta. Un esito non-live
+# piu' vecchio di TTL_ESITO_FONTE_S non spegne piu' la fonte: nessuno l'ha riprovata, e
+# dichiararla muta per sempre sarebbe un'altra bugia. Limite: un processo nuovo parte
+# da «mai interrogata» (nessuna voce) fino alla prima chiamata.
+TTL_ESITO_FONTE_S = 3600
+_ESITI_LOCK = threading.Lock()
+_ESITI_FONTI: Dict[str, Dict[str, Any]] = {}
+# la chiave di quasi tutti i provider viaggia in querystring: mai nei log ne' nei payload.
+# Integrazione 04/10: UN solo ripulitore, core/errori_sicuri.senza_segreti (G3): toglie la
+# querystring degli URL, ogni parametro-chiave (token/apikey/api_key/api_token/key/...) e i
+# valori delle chiavi presenti nell'ambiente.
+def _maschera_chiavi(testo: str) -> str:
+    from bellomberg.core.errori_sicuri import senza_segreti
+    return senza_segreti(testo or "")
+
+
+# 04/10 (B2, rilievo RV-N P2-1): l'ultimo esito da solo NASCONDE il guasto parziale (429 su
+# 2 ticker su 3, poi un 200: «live»). Nel giro si contano TUTTE le chiamate per fonte.
+# Azzerato a inizio auto_pull_feed; limite: conta anche le chiamate di altre rotte dello
+# stesso processo che cadono durante il giro (non distinguibili senza un id di giro).
+_ESITI_GIRO: Dict[str, Counter] = {}
+
+
+def _conta_nel_giro(provider: str, stato: str) -> None:
+    with _ESITI_LOCK:
+        _ESITI_GIRO.setdefault(provider, Counter())[stato] += 1
+
+
+def _azzera_esiti_giro() -> None:
+    with _ESITI_LOCK:
+        _ESITI_GIRO.clear()
+
+
+def _registra_esito(provider: str, stato: str, motivo: str = "") -> None:
+    """Esito dell'ultima chiamata a `provider` (anche `live`: un 200 dopo un 401 guarisce),
+    e conteggio della chiamata nel giro corrente."""
+    voce = {"stato": stato, "motivo": _maschera_chiavi(motivo)[:200],
+            "quando": datetime.now().isoformat(timespec="seconds"), "mono": time.monotonic()}
+    with _ESITI_LOCK:
+        _ESITI_FONTI[provider] = voce
+    _conta_nel_giro(provider, stato)
+
+
+def esiti_fonti() -> Dict[str, Dict[str, Any]]:
+    """{provider: {stato, motivo, quando, mono}} — COPIA; provider assente = mai interrogato."""
+    with _ESITI_LOCK:
+        return {p: dict(v) for p, v in _ESITI_FONTI.items()}
+
+
+def reset_esiti_fonti() -> None:
+    """Riporta tutte le fonti a «mai interrogata» (per i test)."""
+    with _ESITI_LOCK:
+        _ESITI_FONTI.clear()
+
+
+def fonti_spente() -> Dict[str, str]:
+    """Fonti tolte PER DECISIONE (non guaste): {fonte: motivo}, codice SPENTA in testa.
+    Il codice non le interroga piu' in nessun punto; si dichiarano perche' chi legge il
+    giro o le rotte non scambi la loro assenza per «zero notizie»."""
+    return {"reddit": message("SPENTA: Reddit tolto dalle fonti (decisione PM 04/10)",
+                              "SPENTA: Reddit removed from sources (PM decision 04/10)")}
+
+
+def _esito_piu_recente(provider: str, esterno: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """Il piu' recente fra l'esito del modulo della fonte (es. tiingo_news.last_status) e
+    quello registrato qui dal wrapper (guasti che il modulo non vede: import, eccezioni)."""
+    voci = [v for v in (esterno, esiti_fonti().get(provider))
+            if isinstance(v, dict) and isinstance(v.get("mono"), (int, float))]
+    return max(voci, key=lambda v: v["mono"]) if voci else None
+
+
+def _esito_muto_recente(provider: str, nome: str, esterno: Optional[Dict[str, Any]] = None,
+                        ora_mono: Optional[float] = None) -> Optional[str]:
+    """Motivo (codice IN TESTA: i lettori fanno startswith) se l'ultimo esito e' non-live e
+    piu' giovane di TTL_ESITO_FONTE_S; None se mai interrogata, live, o esito scaduto."""
+    v = _esito_piu_recente(provider, esterno)
+    if v is None or v.get("stato") == "live":
+        return None
+    eta = (time.monotonic() if ora_mono is None else ora_mono) - float(v["mono"])
+    if eta >= TTL_ESITO_FONTE_S:
+        return None
+    dettaglio = v.get("motivo") or ""
+    if not dettaglio and v.get("http") and str(v.get("stato") or "").startswith("HTTP_"):
+        dettaglio = "HTTP %s on %s" % (v.get("http"), v.get("path") or "")
+    ora = str(v.get("quando") or "n.d.")
+    ora = ora[11:16] if len(ora) >= 16 else ora
+    if v.get("stato") == "VUOTO_SOSPETTO":
+        # tiingo_news (B1): N chiamate generali consecutive a 200 con 0 articoli — risposta
+        # riuscita ma sospetta (abbonamento/piano scaduto?), non un errore di rete
+        return message("VUOTO_SOSPETTO: {nome} risponde 200 ma senza articoli sul feed generale "
+                       "(ultima alle {ora}, {min} min fa): abbonamento/piano da verificare",
+                       "VUOTO_SOSPETTO: {nome} answers 200 but with no articles on the general feed "
+                       "(last at {ora}, {min} min ago): check the subscription/plan",
+                       nome=nome, ora=ora, min=int(max(eta, 0) // 60))
+    return message("{stato}: ultima chiamata {nome} non riuscita alle {ora} ({min} min fa){det}",
+                   "{stato}: last {nome} call failed at {ora} ({min} min ago){det}",
+                   stato=str(v.get("stato") or "ERRORE"), nome=nome, ora=ora,
+                   min=int(max(eta, 0) // 60), det=(": " + dettaglio) if dettaglio else "")
+
+
+def _esito_nel_giro(provider: str) -> str:
+    """Stato della fonte in QUESTO giro, su TUTTE le sue chiamate (contatore azzerato a inizio
+    giro): nessuna -> non_interrogata; tutte uguali -> quello stato; miste -> «PARZIALE: live
+    1/3, HTTP_429 2/3» (codice in testa, conta come guasto per `degraded`)."""
+    with _ESITI_LOCK:
+        c = Counter(_ESITI_GIRO.get(provider) or {})
+    tot = sum(c.values())
+    if not tot:
+        return "non_interrogata"
+    if len(c) == 1:
+        return next(iter(c))
+    return "PARZIALE: " + ", ".join("%s %d/%d" % (st, n, tot)
+                                    for st, n in sorted(c.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def _tiingo_ultimo_stato():
+    """(last_status() | None, stato di guasto dell'import | None) — mai un'eccezione."""
+    try:
+        from bellomberg.market_data.tiingo_news import last_status
+        return last_status(), None
+    except Exception as e:
+        return None, "MODULO_ASSENTE_" + type(e).__name__
 
 
 def _chiavi_provider() -> Dict[str, tuple]:
@@ -327,7 +648,7 @@ def _fetch_newsapi(query: str, days: int = 3, max_results: int = 10) -> List[Dic
             "provider": "newsapi",
         } for a in data.get("articles", [])[:max_results]]
     except Exception as e:
-        _log(f"newsapi failed: {e}")
+        _log(f"newsapi failed: {_eccezione_sicura(e)}")
         return []
 
 
@@ -423,7 +744,7 @@ def _fetch_marketaux(query: str, days: int = 3, max_results: int = 10) -> List[D
             "provider": "marketaux",
         } for a in data.get("data", [])[:max_results]]
     except Exception as e:
-        _log(f"marketaux failed: {e}")
+        _log(f"marketaux failed: {_eccezione_sicura(e)}")
         return []
 
 
@@ -455,15 +776,75 @@ def _fetch_thenewsapi(query: str, days: int = 3, max_results: int = 10) -> List[
             "provider": "thenewsapi",
         } for a in data.get("data", [])[:max_results]]
     except Exception as e:
-        _log(f"thenewsapi failed: {e}")
+        _log(f"thenewsapi failed: {_eccezione_sicura(e)}")
         return []
+
+
+def _chiave_limiter_gnews(query: str, lang: str = "en") -> str:
+    """Chiave di cooldown/record GNews. 04/10 (B2): senza la lingua, la chiamata `it` per i
+    .MI usava la chiave della `en` appena registrata -> SKIP_COOLDOWN sempre: la stampa
+    italiana via GNews non partiva MAI. La lingua va IN TESTA: provider_status taglia la
+    query a 80 caratteri e in coda sparirebbe. `en` resta la query nuda (stessa chiave di
+    news_sources, che chiama solo in inglese)."""
+    return query if lang == "en" else f"[lang={lang}] {query}"
+
+
+def _mappa_gnews(articoli: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [{
+        "title": a.get("title", ""),
+        "source": (a.get("source") or {}).get("name", "GNews"),
+        "url": a.get("url", ""),
+        "published_at": a.get("publishedAt", ""),
+        "snippet": a.get("description", ""),
+        "provider": "gnews",
+    } for a in articoli]
+
+
+def _gnews_da_cache(query: str, days: int, max_results: int, lang: str) -> List[Dict[str, Any]]:
+    """Query in cooldown: gli articoli dell'ultima risposta vera (gnews_cache, condivisa con
+    news_sources) invece di un [] muto. Cache assente/scaduta/illeggibile: dichiarato nel log."""
+    try:
+        from bellomberg.market_data import gnews_cache
+        voce = gnews_cache.leggi(query, lang)
+    except Exception as e:
+        _log(f"gnews SKIP_COOLDOWN e cache MODULO_ASSENTE ({type(e).__name__}): 0 articoli GNews per questa query")
+        return []
+    if not voce:
+        err = None
+        try:
+            err = gnews_cache.stato_ultimo_errore()
+        except Exception:
+            err = "stato_ultimo_errore non leggibile"
+        _log("gnews SKIP_COOLDOWN e nessuna cache valida%s: 0 articoli GNews per questa query"
+             % (f" (cache: {err})" if err else ""))
+        return []
+    soglia = datetime.now(timezone.utc) - timedelta(days=days)
+    tenuti = []
+    for a in voce.get("articles") or []:
+        try:
+            pub = datetime.fromisoformat(str(a.get("publishedAt") or "").replace("Z", "+00:00"))
+            if pub.tzinfo is None:
+                pub = pub.replace(tzinfo=timezone.utc)
+            if pub < soglia:
+                continue
+        except ValueError:
+            pass  # data illeggibile: l'articolo resta, il taglio per data non si puo' misurare
+        tenuti.append(a)
+    out = _mappa_gnews(tenuti[:max_results])
+    for it in out:
+        it["_gnews_cache_eta_s"] = voce.get("eta_s")
+    return out
 
 
 def _fetch_gnews(query: str, days: int = 3, max_results: int = 10, lang: str = "en") -> List[Dict[str, Any]]:
     if not (REQ_OK and GNEWS_KEY):
         return []
-    if not _provider_allowed("gnews", query):
-        return []
+    q_lim = _chiave_limiter_gnews(query, lang)
+    blocco = provider_status("gnews", q_lim)
+    if blocco == "SKIP_COOLDOWN":
+        return _gnews_da_cache(query, days, max_results, lang)
+    if blocco is not None:
+        return []  # SKIP_BUDGET/SKIP_DISABLED: globali, dichiarati da providers_blocked()
     try:
         from bellomberg.market_data.news_sources import gnews_safe_query  # quotatura token con -/$/. (400 syntax, diagnosi 15/07)
         url = "https://gnews.io/api/v4/search"
@@ -475,22 +856,171 @@ def _fetch_gnews(query: str, days: int = 3, max_results: int = 10, lang: str = "
             "apikey": GNEWS_KEY,
         }
         r = requests.get(url, params=params, timeout=10)
-        _provider_record("gnews", query, got_429=r.status_code in (403, 429))
+        _provider_record("gnews", q_lim, got_429=r.status_code in (403, 429))
         if r.status_code != 200:
-            _log(f"gnews HTTP {r.status_code}: {r.text[:200]}")
+            _log(f"gnews HTTP {r.status_code}: {_maschera_chiavi(r.text[:200])}")
             return []
         data = r.json()
-        return [{
-            "title": a.get("title", ""),
-            "source": a.get("source", {}).get("name", "GNews"),
-            "url": a.get("url", ""),
-            "published_at": a.get("publishedAt", ""),
-            "snippet": a.get("description", ""),
-            "provider": "gnews",
-        } for a in data.get("articles", [])[:max_results]]
+        articoli = data.get("articles", []) or []
+        try:
+            from bellomberg.market_data import gnews_cache
+            gnews_cache.scrivi(query, lang, articoli)
+        except Exception as e:
+            _log(f"gnews cache NON scritta (MODULO_ASSENTE o guasto: {type(e).__name__}): "
+                 f"il prossimo cooldown di questa query restera' senza articoli")
+        return _mappa_gnews(articoli[:max_results])
     except Exception as e:
-        _log(f"gnews failed: {e}")
+        _log(f"gnews failed: {_eccezione_sicura(e)}")
         return []
+
+
+def _simbolo_usa(ticker: str) -> bool:
+    """Tiingo e Finnhub company-news taggano bene solo i simboli US: niente suffisso di
+    borsa («.MI», «.DE») ne' indici («^N225», che prima arrivava a Tiingo come `^n225`);
+    niente coppie/futures/crypto (`-USD`, `=F`, `/USDT`, rilievo RV-N P3): un 200 vuoto «live»
+    su un simbolo che il fornitore non conosce coprirebbe un guasto vero."""
+    t = (ticker or "").strip()
+    return bool(t) and not any(c in t for c in ".^-=/")
+
+
+def _fetch_tiingo(tickers: Optional[List[str]], days: int, limit: int) -> List[Dict[str, Any]]:
+    """Wrapper stubbabile di tiingo_news.fetch_tiingo_news (04/10, B2): prima stava in due
+    `try: ... except Exception: pass`. Il guasto HTTP lo registra tiingo_news.last_status
+    (riga [TIINGO] nel log); qui si DICHIARANO i guasti che il modulo non puo' vedere."""
+    try:
+        from bellomberg.market_data.tiingo_news import fetch_tiingo_news, tiingo_available
+    except Exception as e:
+        _log(f"tiingo MODULO_ASSENTE ({type(e).__name__}): 0 articoli Tiingo")
+        _registra_esito("tiingo", "MODULO_ASSENTE", type(e).__name__)
+        return []
+    try:
+        if not tiingo_available():
+            return []  # chiave assente: dichiarata da providers_blocked() (SENZA_CHIAVE)
+        out = list(fetch_tiingo_news(tickers, days=days, limit=limit) or [])
+    except Exception as e:
+        _log(f"tiingo failed: {type(e).__name__}")
+        _registra_esito("tiingo", "ERRORE_" + type(e).__name__, type(e).__name__)
+        return []
+    # l'esito HTTP lo sa tiingo_news: si CONTA nel giro (P2-1), senza duplicarlo negli esiti
+    st, guasto = _tiingo_ultimo_stato()
+    _conta_nel_giro("tiingo", guasto or (st or {}).get("stato") or "ignoto")
+    return out
+
+
+def _stato_finnhub(testo: str) -> str:
+    """Codice dal motivo di finnhub_news._muto (vocabolario allineato a tiingo_news)."""
+    t = testo or ""
+    m = re.match(r"(\d{3})\b", t) or re.search(r"\bHTTP (\d{3})\b", t)
+    if m:
+        return "HTTP_" + m.group(1)
+    if "FINNHUB_API_KEY" in t:
+        return "SENZA_CHIAVE"
+    if t.startswith("fuori piano"):
+        return "FUORI_PIANO"
+    if "requests" in t and "non disponibile" in t:
+        return "ERRORE_ImportError"
+    if "risposta inattesa" in t:
+        return "RISPOSTA_INATTESA"
+    return "ERRORE"
+
+
+def _utc_z(valore: str) -> str:
+    """published_at in UTC con Z, come Tiingo/GNews: il sort per stringa di
+    search_news_for_ticker mescolava male l'ora LOCALE senza fuso di Finnhub."""
+    if not valore:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(valore).replace("Z", "+00:00"))
+    except ValueError:
+        return str(valore)
+    if dt.tzinfo is None:
+        dt = dt.astimezone()  # naive = ora locale (fetch_company_news usa fromtimestamp)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Misure M1 (04/10): Finnhub taglia a 250 item per chiamata (sui nomi grandi 50-220
+# articoli/giorno: 7 gg sono poche ore) -> il taglio si DICHIARA. E un tetto NOSTRO per
+# ticker per chiamata: senza, ~2.440 articoli nuovi in 10 gg gonfierebbero le notifiche.
+FINNHUB_TETTO_FORNITORE = 250
+FINNHUB_MAX_PER_TICKER = 30
+# tagli accumulati nel giro corrente di auto_pull_feed (azzerati a inizio giro)
+_FINNHUB_TAGLI_GIRO: Dict[str, Any] = {"scartati": 0, "troncati_dal_fornitore": []}
+
+
+def _azzera_tagli_finnhub() -> None:
+    with _ESITI_LOCK:
+        _FINNHUB_TAGLI_GIRO["scartati"] = 0
+        _FINNHUB_TAGLI_GIRO["troncati_dal_fornitore"] = []
+
+
+def _tagli_finnhub() -> Dict[str, Any]:
+    with _ESITI_LOCK:
+        return {"scartati": _FINNHUB_TAGLI_GIRO["scartati"],
+                "troncati_dal_fornitore": list(_FINNHUB_TAGLI_GIRO["troncati_dal_fornitore"])}
+
+
+def _fetch_finnhub_news(ticker: str, days: int, max_results: int) -> List[Dict[str, Any]]:
+    """Finnhub company-news nell'aggregatore (04/10, B2). Wrapper stubbabile: senza, un test
+    che arriva qui con la chiave vera del .env farebbe rete vera. Normalizza QUI (non in
+    fetch_company_news, che chat_tools usa con la sua forma): provider «finnhub» minuscolo,
+    published_at UTC con Z. Ogni esito (anche live) va in esiti_fonti()."""
+    motivo: List[str] = []
+    try:
+        from bellomberg.market_data.finnhub_news import fetch_company_news
+    except Exception as e:
+        _log(f"finnhub MODULO_ASSENTE ({type(e).__name__}): 0 articoli Finnhub")
+        _registra_esito("finnhub", "MODULO_ASSENTE", type(e).__name__)
+        return []
+    try:
+        # si chiede TUTTO cio' che Finnhub manda (max_items alto) per poter MISURARE il
+        # taglio del fornitore; il tetto nostro si applica dopo, sui piu' recenti
+        grezzi = fetch_company_news(ticker, days=days, max_items=10 * FINNHUB_TETTO_FORNITORE,
+                                    motivo=motivo) or []
+    except Exception as e:
+        _log(f"finnhub company news {ticker} failed: {_eccezione_sicura(e)}")
+        _registra_esito("finnhub", "ERRORE_" + type(e).__name__, _eccezione_sicura(e))
+        return []
+    if motivo:
+        _registra_esito("finnhub", _stato_finnhub(motivo[0]), motivo[0])
+    else:
+        _registra_esito("finnhub", "live")
+    out = []
+    senza_epoch = riconvertiti = 0
+    for a in grezzi:
+        it = {k: a.get(k) for k in ("title", "snippet", "url", "source")}
+        it["provider"] = "finnhub"
+        # 04/10 (B3, rilievo RV-N P3): l'epoch UTC originale di Finnhub, quando c'e'. La
+        # riconversione dell'ora locale e' ambigua nell'ora ripetuta del cambio d'ora.
+        ep = a.get("published_epoch")
+        if isinstance(ep, (int, float)) and not isinstance(ep, bool):
+            it["published_at"] = datetime.fromtimestamp(ep, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        elif "published_epoch" in a:
+            senza_epoch += 1          # Finnhub non ha dato la data: resta vuota, dichiarato
+            it["published_at"] = ""
+        else:
+            riconvertiti += 1         # finnhub_news senza il campo: PROXY dall'ora locale
+            it["published_at"] = _utc_z(a.get("published_at") or "")
+        out.append(it)
+    if senza_epoch:
+        _log(f"finnhub {ticker}: {senza_epoch} articoli senza data da Finnhub (published_at vuoto)")
+    if riconvertiti:
+        _log(f"finnhub {ticker}: {riconvertiti} date PROXY (ora locale riconvertita in UTC, "
+             f"ambigua nell'ora del cambio d'ora): published_epoch assente")
+    # tutti in UTC con Z: l'ordine per stringa e' l'ordine per tempo
+    out.sort(key=lambda x: x.get("published_at") or "", reverse=True)
+    tetto = max(0, min(int(max_results), FINNHUB_MAX_PER_TICKER))
+    tenuti, scartati = out[:tetto], len(out) - min(len(out), tetto)
+    troncato = len(grezzi) >= FINNHUB_TETTO_FORNITORE
+    with _ESITI_LOCK:
+        _FINNHUB_TAGLI_GIRO["scartati"] += scartati
+        if troncato:
+            _FINNHUB_TAGLI_GIRO["troncati_dal_fornitore"].append(ticker)
+    if troncato:
+        _log(f"finnhub {ticker}: {len(grezzi)} item = tetto del fornitore ({FINNHUB_TETTO_FORNITORE}): "
+             f"risposta TRONCATA dal fornitore, la finestra di {days} gg non e' coperta per intero")
+    if scartati:
+        _log(f"finnhub {ticker}: tenuti i {len(tenuti)} piu' recenti, scartati {scartati} (tetto per ticker)")
+    return tenuti
 
 
 def _fetch_yfinance_news(ticker: str, max_results: int = 10) -> List[Dict[str, Any]]:
@@ -564,7 +1094,8 @@ def _fetch_rss(feed_name: str, feed_url: str, max_results: int = 10) -> List[Dic
 # per questo simbolo», esclusione DICHIARATA (prima era un set letterale col simbolo
 # scritto nel codice, ripetuto quattro volte). Le chiavi che iniziano con `_` sono note.
 # Regola PM 14/07: negozio assente/illeggibile = mappa VUOTA con origine e motivo
-# scritti; voce assente = ticker nudo, DICHIARATO nel log; mai un ripiego muto.
+# scritti; voce assente = nome Yahoo e poi ticker nudo, DICHIARATI nel log; mai un
+# ripiego muto.
 
 PERCORSO_TERMINI = os.path.join(DB_DIR, "news_search_terms.json")
 _ESEMPIO_TERMINI = "news_search_terms.example.json"
@@ -695,7 +1226,8 @@ def _voce_termini(ticker: str):
 
 def escluso_dalle_news(ticker: str, termini: Optional[Dict[str, Any]] = None) -> bool:
     """True SOLO per la voce `null` del negozio: un simbolo assente NON e' escluso,
-    si cerca col ticker nudo (dichiarato). `termini` gia' caricati = una lettura sola."""
+    si cerca per nome Yahoo e infine col ticker nudo (dichiarato). `termini` gia'
+    caricati = una lettura sola."""
     if termini is None:
         termini = termini_correnti()
     return termini.get((ticker or "").upper(), _VOCE_ASSENTE) is None
@@ -728,13 +1260,109 @@ def _filter_items_by_terms(items: List[Dict[str, Any]],
     pats = [re.compile(r"\b" + re.escape(t) + r"\b", re.IGNORECASE) for t in terms]
     out = []
     for it in items:
-        if (it.get("provider") or "") in ("yfinance", "tiingo"):
+        if (it.get("provider") or "").lower() in ("yfinance", "tiingo", "finnhub"):
             out.append(it)  # fonti symbol-based/taggate: fidate
             continue
         text = (it.get("title", "") or "") + " " + (it.get("snippet", "") or "")
         if any(p.search(text) for p in pats):
             out.append(it)
     return out
+
+
+def _nome_emittente_yahoo(ticker: str) -> str:
+    """Nome dell'emittente della quotazione, usato solo come termine news.
+
+    Il ticker del portafoglio resta quello del listino posseduto.  Per una quotazione
+    europea senza voce nel negozio dei termini, il nome Yahoo e' un fallback piu'
+    affidabile del ticker nudo; un errore di metadata lascia decidere al chiamante il
+    fallback dichiarato precedente.
+    """
+    if not YF_OK:
+        return ""
+    try:
+        info = yf.Ticker((ticker or "").upper().strip()).get_info() or {}
+        return str(info.get("longName") or info.get("shortName") or "").strip()
+    except Exception as exc:
+        _log(f"identita' Yahoo {ticker} non disponibile: {type(exc).__name__}: {exc}")
+        return ""
+
+
+_SUFFISSI_LEGALI_NOME = {
+    "ag", "corp", "corporation", "inc", "incorporated", "limited", "ltd", "nv",
+    "plc", "sa", "se", "spa",
+}
+_YAHOO_EXCHANGE_US = {
+    "ASE", "BTS", "NCM", "NGM", "NMS", "NYQ", "OQB", "OQX", "PCX", "PNK",
+    "NASDAQ", "NASDAQCM", "NASDAQGM", "NASDAQGS", "NYSE", "NYSEARCA",
+    "NYSEAMERICAN", "OTC MARKETS", "OTCQB", "OTCQX",
+}
+
+
+def _nome_emittente_normalizzato(nome: str) -> str:
+    """Forma prudente per confrontare lo stesso emittente fra due quotazioni Yahoo."""
+    parole = re.findall(r"[a-z0-9]+", (nome or "").lower())
+    while parole and parole[-1] in _SUFFISSI_LEGALI_NOME:
+        parole.pop()
+    return " ".join(parole)
+
+
+def _ticker_us_yahoo_univoco(ticker: str, nome: str) -> Optional[str]:
+    """Ticker US plain dello stesso emittente, solo se il match per nome e' univoco.
+
+    Nessuna regola sintattica `.DE -> base`: i codici Xetra non codificano il simbolo USA.
+    Ambiguita' (per esempio due classi azionarie) o rete assente restituiscono ``None``.
+    """
+    t = (ticker or "").upper().strip()
+    nome_norm = _nome_emittente_normalizzato(nome)
+    if not REQ_OK or "." not in t or not nome_norm:
+        return None
+    try:
+        r = requests.get(
+            "https://query2.finance.yahoo.com/v1/finance/search",
+            params={"q": nome, "quotesCount": 20, "newsCount": 0},
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=8,
+        )
+        r.raise_for_status()
+        candidati = set()
+        for voce in (r.json().get("quotes") or []):
+            simbolo = str(voce.get("symbol") or "").upper().strip()
+            tipo = str(voce.get("quoteType") or "").upper().strip()
+            exchange = str(voce.get("exchange") or "").upper().strip()
+            exchange_esteso = str(voce.get("exchDisp") or "").upper().strip()
+            nome_voce = voce.get("longname") or voce.get("shortname") or ""
+            if (simbolo and "." not in simbolo and tipo == "EQUITY"
+                    and (exchange in _YAHOO_EXCHANGE_US
+                         or exchange_esteso in _YAHOO_EXCHANGE_US)
+                    and _nome_emittente_normalizzato(nome_voce) == nome_norm):
+                candidati.add(simbolo)
+        return next(iter(candidati)) if len(candidati) == 1 else None
+    except Exception as exc:
+        _log(f"ricerca alias USA Yahoo per {t} non disponibile: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _simbolo_news(ticker: str, nome: str) -> tuple[str, str]:
+    """Simbolo per provider news symbol-based; torna anche la provenienza."""
+    t = (ticker or "").upper().strip()
+    if not t or "." not in t:
+        return t, "ticker_portafoglio"
+    try:
+        from bellomberg.storage.negozi_privati import carica_alias
+        alias = carica_alias()
+        if alias["origine"] not in ("assente", "illeggibile"):
+            esplicito = alias["alias"]["finnhub"].get(t)
+            if esplicito:
+                return esplicito, "alias_fonti:finnhub"
+        else:
+            _log(f"{t}: alias_fonti {alias['origine']}: "
+                 f"{alias.get('motivo') or 'causa non dichiarata'}; provo la scoperta Yahoo")
+    except Exception as exc:
+        _log(f"{t}: alias_fonti illeggibile: {type(exc).__name__}: {exc}; "
+             "provo la scoperta Yahoo")
+    automatico = _ticker_us_yahoo_univoco(t, nome)
+    if automatico:
+        return automatico, "yahoo:nome_univoco"
+    return t, "ticker_portafoglio"
 
 
 # --- 199e: filtro qualita' - fonti clickbait/SEO fuori dal feed (e quindi dal briefing) ---
@@ -775,9 +1403,9 @@ def _all_rss_cached(max_per_feed: int = 10) -> List[Dict[str, Any]]:
 def search_news_for_ticker(ticker: str, days: int = 3, max_per_source: int = 5) -> List[Dict[str, Any]]:
     """Cerca news per un ticker specifico aggregando tutte le fonti.
     Usa i termini del negozio (nomi azienda) al posto del bare ticker (#160/#171).
-    Voce assente = ticker nudo, dichiarato nel log. Voce null = fuori dal GIRO automatico
-    (search_portfolio_news, eventi SEC, auto_pull_feed), ma la ricerca DIRETTA procede col
-    ticker nudo come a HEAD: un [] muto qui sarebbe identico a «zero notizie» per chi
+    Voce assente = nome Yahoo, con ticker nudo come ultimo fallback dichiarato. Voce null
+    = fuori dal GIRO automatico (search_portfolio_news, eventi SEC, auto_pull_feed), ma la
+    ricerca DIRETTA procede: un [] muto qui sarebbe identico a «zero notizie» per chi
     chiama (review 04/09)."""
     cache_key = f"ticker:{ticker}:{days}:{max_per_source}"
     if cache_key in _CACHE:
@@ -792,13 +1420,24 @@ def search_news_for_ticker(ticker: str, days: int = 3, max_per_source: int = 5) 
         terms = [ticker]
     elif stato == "assente":
         motivo = f"; motivo: {caricato['motivo']}" if caricato["motivo"] else ""
-        _log(f"{ticker}: voce assente nel negozio dei termini (origine: "
-             f"{caricato['origine']}{motivo}): cerco il ticker nudo, che per i "
-             f"simboli europei le API non trovano")
-        terms = [ticker]  # il ticker nudo, dichiarato sopra
+        nome = _nome_emittente_yahoo(ticker)
+        if nome:
+            _log(f"{ticker}: voce assente nel negozio dei termini (origine: "
+                 f"{caricato['origine']}{motivo}): cerco il nome emittente Yahoo {nome!r}")
+            terms = [nome]
+        else:
+            _log(f"{ticker}: voce assente nel negozio dei termini (origine: "
+                 f"{caricato['origine']}{motivo}): identita' Yahoo non disponibile, cerco "
+                 f"il ticker nudo, che per i simboli europei le API non trovano")
+            terms = [ticker]  # ultimo fallback, dichiarato sopra
     else:
         terms = voce
     query = " OR ".join(f'"{t}"' if " " in t else t for t in terms)
+    nome_identita = terms[0] if terms and terms[0] != ticker else ""
+    simbolo_news, origine_simbolo = _simbolo_news(ticker, nome_identita)
+    if simbolo_news != ticker:
+        _log(f"{ticker}: provider news a simbolo risolti su {simbolo_news} "
+             f"({origine_simbolo}); gli item restano attribuiti a {ticker}")
 
     items: List[Dict[str, Any]] = []
     items.extend(_fetch_newsapi(query, days, max_per_source))
@@ -807,21 +1446,31 @@ def search_news_for_ticker(ticker: str, days: int = 3, max_per_source: int = 5) 
     items.extend(_fetch_gnews(query, days, GNEWS_MAX_ART))  # Essential: bacino ampio, i freschi vincono il sort :599
     if ticker.upper().endswith(".MI"):  # 199e: stampa italiana per i nomi italiani
         items.extend(_fetch_gnews(query, days, GNEWS_MAX_ART, lang="it"))
-    items.extend(_fetch_yfinance_news(ticker, max_per_source))
-    if "." not in ticker:  # Tiingo (#173): tagging affidabile per simboli US
-        try:
-            from bellomberg.market_data.tiingo_news import fetch_tiingo_news, tiingo_available
-            if tiingo_available():
-                items.extend(fetch_tiingo_news([ticker], days=days, limit=max_per_source))
-        except Exception:
-            pass
+    items.extend(_fetch_yfinance_news(simbolo_news, max_per_source))
+    # Tiingo (#173) e Finnhub (04/10): tagging affidabile per simboli US. Integrazione: sul
+    # simbolo RISOLTO da G3 (ADR/ricerca Yahoo), coi wrapper stubbabili dell'altra sessione.
+    if _simbolo_usa(simbolo_news):
+        items.extend(_fetch_tiingo([simbolo_news], days, max_per_source))
+        with _ESITI_LOCK:
+            esito_prima = _ESITI_FONTI.get("finnhub")
+        items.extend(_fetch_finnhub_news(simbolo_news, days, max_per_source))
+        with _ESITI_LOCK:
+            esito_dopo = _ESITI_FONTI.get("finnhub")
+        # G3: il guasto resta PER TICKER (un successo su un altro titolo non lo cancella) e
+        # scade con la cache 15 min di questa ricerca; l'esito lo scrive il wrapper (nuova voce).
+        if esito_dopo is not None and esito_dopo is not esito_prima:
+            if esito_dopo.get("stato") == "live":
+                _runtime_failure_clear("finnhub", simbolo_news)
+            else:
+                _runtime_failure_record("finnhub", simbolo_news,
+                                        f"{esito_dopo.get('stato')}: {esito_dopo.get('motivo') or ''}")
 
     items.extend(_all_rss_cached())  # 199e: copertura EU - gli RSS vengono filtrati dai terms qui sotto
     items = _drop_junk(items)
     items = _filter_items_by_terms(items, terms)
     for it in items:
         it["ticker_mentioned"] = ticker
-    items = _dedupe(items)
+    items = _dedupe_titoli(_dedupe(items))  # P2-2: anche i redirect Finnhub
     items.sort(key=lambda x: x.get("published_at", ""), reverse=True)
 
     _CACHE[cache_key] = {"ts": time.time(), "data": items}
@@ -981,25 +1630,11 @@ def fetch_macro_news(categories: Optional[List[str]] = None,
                 items.append(r_it)
                 break
 
-    # Reddit (top of the day, filtered by topic keywords)
+    # Reddit: TOLTO dalle fonti (decisione PM 04/10; misura F7: HTTP 403 su 5/5 subreddit).
+    # Non si interroga piu'; `include_reddit` resta nella firma per i chiamanti (chat_tools,
+    # /news/macro) e la richiesta si DICHIARA invece di produrre zero post in silenzio.
     if include_reddit:
-        try:
-            from bellomberg.market_data.reddit_news import fetch_reddit_top
-            reddit_posts = fetch_reddit_top(listing="top", t="day")
-            for r in reddit_posts[:25]:
-                # Match topic if title/snippet contains keyword
-                text_low = (r.get("title", "") + " " + r.get("snippet", "")).lower()
-                for kw, topic in all_keywords:
-                    if kw in text_low:
-                        r["topic_id"] = topic["id"]
-                        r["topic_label"] = topic["label"]
-                        r["topic_category"] = topic["category"]
-                        r["topic_importance"] = topic.get("importance", 3)
-                        r["tickers_affected"] = list(titoli.get(topic["id"], ()))
-                        items.append(r)
-                        break
-        except Exception as e:
-            _log(f"reddit aggregation failed: {e}")
+        _log("reddit " + str(fonti_spente()["reddit"]) + ": nessuna chiamata")
 
     items = _dedupe(items)
     # Sort: importance desc, then recency desc
@@ -1026,14 +1661,17 @@ def fetch_corporate_events(days: int = 14, max_items: int = 30) -> List[Dict[str
 
     # 1. SEC EDGAR per ticker US del portfolio
     try:
-        from bellomberg.market_data.sec_edgar import get_corporate_events_for_portfolio
+        from bellomberg.market_data.sec_edgar import (get_corporate_events_for_portfolio,
+                                                      ticker_ambiguo_per_cik)
         db = MemoryDB()
         snap = db.get_portfolio_summary()
         positions = snap.get("positions", [])
-        # Solo ticker US (no suffix .MI, .L, .DE)
+        # Ticker US diretti + quotazioni estere con alias SEC verificato. Passare una base
+        # ricavata togliendo il suffisso puo' agganciare un omonimo americano; la guardia
+        # di sec_edgar ammette il suffisso solo quando alias_fonti lo rende non ambiguo.
         termini = _termini_del_giro("fetch_corporate_events")
         us_tickers = [p["ticker"] for p in positions
-                      if p.get("ticker") and "." not in p.get("ticker", "")
+                      if p.get("ticker") and ticker_ambiguo_per_cik(p["ticker"]) is None
                       and not escluso_dalle_news(p["ticker"], termini)]  # voce null = fuori dal giro
         sec_events = get_corporate_events_for_portfolio(us_tickers, days=days)
         for e in sec_events:
@@ -1123,8 +1761,11 @@ def get_top_global(limit: int = 15) -> List[Dict[str, Any]]:
                         "source": a.get("source", {}).get("name", ""),
                         "published_at": a.get("publishedAt", ""),
                     })
+            else:
+                # 04/10 (B2, rilievo RV-N): il non-200 scartava in silenzio
+                _log(f"top_global newsapi HTTP {r.status_code}: 0 articoli NewsAPI nel top globale")
     except Exception as e:
-        _log(f"top_global newsapi failed: {e}")
+        _log(f"top_global newsapi failed: {_eccezione_sicura(e)}")
 
     items = _drop_junk(_dedupe(items))
     items.sort(key=lambda x: x.get("published_at", ""), reverse=True)
@@ -1289,7 +1930,9 @@ def get_feed(limit: int = 50, min_relevance: int = 0,
         where = ["1=1"]
         params: List[Any] = []
         if min_relevance > 0:
-            where.append("COALESCE(relevance, 0) >= ?")
+            # Decisione PM (04/10): le non classificate (relevance NULL) restano nel filtro,
+            # marcate da classification_status, senza una rilevanza inventata.
+            where.append("(relevance >= ? OR relevance IS NULL)")
             params.append(min_relevance)
         if ticker:
             where.append("ticker_mentioned = ?")
@@ -1297,7 +1940,7 @@ def get_feed(limit: int = 50, min_relevance: int = 0,
         if sentiment:
             where.append("sentiment = ?")
             params.append(sentiment.lower())
-        extra_cols = ", headline_it, why_matters"
+        extra_cols = ", headline_it, why_matters, classified"
         sql = f"""
             SELECT id, title, snippet, source, url, published_at, pulled_at,
                    ticker_mentioned, theme, provider, sentiment, sentiment_score, relevance{extra_cols}
@@ -1310,9 +1953,11 @@ def get_feed(limit: int = 50, min_relevance: int = 0,
         try:
             cur.execute(sql, params)
         except sqlite3.OperationalError:
-            # pre-migrazione (colonne 201 assenti): query legacy
-            sql = sql.replace(extra_cols, "")
-            cur.execute(sql, params)
+            # pre-migrazione: prima senza `classified` (G3, righe «unknown»), poi legacy 201
+            try:
+                cur.execute(sql.replace(extra_cols, ", headline_it, why_matters"), params)
+            except sqlite3.OperationalError:
+                cur.execute(sql.replace(extra_cols, ""), params)
         rows = [dict(r) for r in cur.fetchall()]
         conn.close()
 
@@ -1321,7 +1966,12 @@ def get_feed(limit: int = 50, min_relevance: int = 0,
         favs = _favorites_tickers()  # T4-3: boost preferiti nel ranking (non nasconde il resto)
         now_ts = _dt.now().timestamp()
         for r in rows:
-            rel = float(r.get("relevance") or 5)
+            # G3 (04/10): classified 1/0 dichiarato; NULL = riga di prima, quando un
+            # fallimento entrava come neutral/5 indistinguibile (stato «unknown»).
+            r["classification_status"] = {1: "classified", 0: "not_classified"}.get(
+                r.pop("classified", None), "unknown")
+            # non classificata = nessun punteggio di rilevanza (non un 5 finto)
+            rel = float(r["relevance"]) if r.get("relevance") is not None else 0.0
             w = float(weights.get((r.get("ticker_mentioned") or "").upper(), 0.0))
             age_h = max(0.0, (now_ts - _parse_date_ts(r.get("pulled_at") or "")) / 3600.0) if r.get("pulled_at") else 48.0
             fresh = 6.0 if age_h <= 6 else (3.0 if age_h <= 24 else 0.0)
@@ -1337,6 +1987,7 @@ def get_feed(limit: int = 50, min_relevance: int = 0,
 
 def invalidate_cache():
     _CACHE.clear()
+    _RUNTIME_PROVIDER_FAILURES.clear()
 
 
 # ============================================================
@@ -1369,13 +2020,63 @@ NEWS_SENTIMENT_PROMPT = (
 )
 
 
+_CLASSIFICATION_DEFAULT = {
+    "sentiment": "neutral", "sentiment_score": 0.0, "relevance": 5,
+    "headline_it": "", "why_matters": "",
+}
+
+
+CLASSIFIER_TIMEOUT_S = 60.0   # per tentativo (REV_G3 R3): non i 600 s di default ritentati
+
+
+def _classification_result(status: str, error: Optional[str] = None) -> Dict[str, Any]:
+    result = dict(_CLASSIFICATION_DEFAULT)
+    result["_classification_status"] = status
+    if error:
+        result["_classification_error"] = error[:240]
+    return result
+
+
+def _textual_llm_content(message: Any) -> str:
+    """Return only text blocks; reasoning/tool blocks never enter JSON parsing."""
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, (list, tuple)):
+        return ""
+    parts = []
+    for block in content:
+        if isinstance(block, dict):
+            kind = block.get("type")
+            text = block.get("text")
+        else:
+            kind = getattr(block, "type", "text")
+            text = getattr(block, "text", None)
+        if kind in (None, "text", "output_text") and isinstance(text, str):
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _extract_first_json_value(text: str) -> Any:
+    """Extract the first valid JSON object or array from text without ``eval``."""
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text or ""):
+        if char not in "[{":
+            continue
+        try:
+            value, _end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, (dict, list)):
+            return value
+    raise ValueError("nessun oggetto o array JSON valido nella risposta testuale")
+
+
 @scoped_language
 def _classify_with_haiku(item: Dict[str, Any], context_tickers: List[str]) -> Dict[str, Any]:
     """Classifica con Haiku: sentiment + relevance score 1-10.
-    Retry policy: 3 retries con backoff esponenziale per 529/429/5xx.
+    Retry: SOLO quelli del client OpenRouter (REV_G3 R3); campi assenti = fallita (R5).
     """
-    import time as _time
-    import random
     try:
         # 05/09 (ordine PM): OpenRouter, modello dal .env (NEWS_CLASSIFIER_MODEL). Chiave o
         # variabile assente: la causa va nel log col NOME e la notizia resta "neutral"
@@ -1383,10 +2084,10 @@ def _classify_with_haiku(item: Dict[str, Any], context_tickers: List[str]) -> Di
         from bellomberg.core.llm_client import OpenRouterClient, modello as _modello_llm, ConfigurazioneLLMMancante
         try:
             _modello_classificatore = _modello_llm("news_classifier")
-            client = OpenRouterClient()
+            client = OpenRouterClient(timeout=CLASSIFIER_TIMEOUT_S)
         except ConfigurazioneLLMMancante as e:
             _log(f"classify SKIPPED ({e}) - news defaults to neutral")
-            return {"sentiment": "neutral", "sentiment_score": 0.0, "relevance": 5, "headline_it": "", "why_matters": ""}
+            return _classification_result("failed", str(e))
         title = item.get("title", "")[:200]
         snippet = item.get("snippet", "")[:300]
         # Fix 7 §9-quattuortrigies (ok PM 03/08): NIENTE [:20] — su un book piu' lungo
@@ -1404,59 +2105,49 @@ def _classify_with_haiku(item: Dict[str, Any], context_tickers: List[str]) -> Di
         prompt = template.format(title=title, snippet=snippet, tk_tag=tk_tag,
                                               theme_tag=theme_tag, tickers_str=tickers_str)
 
-        MAX_RETRIES = 3
-        BASE_DELAY = 2.0
-        last_err = None
-        msg = None
-        for attempt in range(MAX_RETRIES + 1):
-            try:
-                msg = client.messages.create(
-                    model=_modello_classificatore,
-                    max_tokens=320,
-                    # 05/09 (sonda): senza questo il classificatore spende ~250 dei 320 token a
-                    # ragionare e il JSON esce troncato (-> neutral zitto); «spento» su un
-                    # modello che lo rifiuta diventa effort minimal, dichiarato da llm_client.
-                    thinking={"type": "disabled"},
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                break
-            except Exception as e:
-                last_err = e
-                err_str = str(e)
-                status = getattr(e, "status_code", None)
-                if status is None:
-                    if "529" in err_str or "overloaded" in err_str.lower():
-                        status = 529
-                    elif "429" in err_str or "rate_limit" in err_str.lower():
-                        status = 429
-                retriable = status in (429, 529) or (status is not None and 500 <= status < 600)
-                if not retriable or attempt == MAX_RETRIES:
-                    raise
-                delay = BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
-                _log(f"haiku classify {status} - retry {attempt+1}/{MAX_RETRIES} in {delay:.1f}s")
-                _time.sleep(delay)
+        # REV_G3 R3: un solo livello di retry, quello del client (max_retries su 408/409/429/
+        # 5xx e rete, timeout CLASSIFIER_TIMEOUT_S): prima un ciclo qui sopra = fino a 12 POST.
+        msg = client.messages.create(
+            model=_modello_classificatore,
+            max_tokens=1200,
+            # 05/09 (sonda): senza questo il classificatore spende ~250 dei 320 token a
+            # ragionare e il JSON esce troncato (-> neutral zitto); «spento» su un
+            # modello che lo rifiuta diventa effort minimal, dichiarato da llm_client.
+            thinking={"type": "disabled"},
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}],
+        )
 
-        if msg is None:
-            if last_err:
-                raise last_err
-            return {"sentiment": "neutral", "sentiment_score": 0.0, "relevance": 5, "headline_it": "", "why_matters": ""}
-
-        txt = "\n".join(block.text for block in msg.content
-                        if getattr(block, "type", "text") == "text").strip()
-        if txt.startswith("```"):
-            txt = txt.split("```")[1]
-            if txt.startswith("json"):
-                txt = txt[4:]
-        import json as _json
-        data = _json.loads(txt.strip())
+        data = _extract_first_json_value(_textual_llm_content(msg))
+        if isinstance(data, list):
+            data = next((entry for entry in data if isinstance(entry, dict)), None)
+        if not isinstance(data, dict):
+            raise ValueError("JSON classificatore non e' un oggetto")
+        # REV_G3 R5: campi assenti o fuori dominio = classificazione FALLITA, mai neutral/5
+        sentiment = str(data.get("sentiment") or "").strip().lower()
+        if sentiment not in ("bullish", "bearish", "neutral"):
+            return _classification_result("failed", "campo sentiment assente o non valido: %r"
+                                          % (data.get("sentiment"),))
+        try:
+            relevance = int(data.get("relevance"))
+        except (TypeError, ValueError):
+            relevance = None
+        if relevance is None or not 1 <= relevance <= 10:
+            return _classification_result("failed", "campo relevance assente o non valido: %r"
+                                          % (data.get("relevance"),))
+        try:
+            sentiment_score = float(data["sentiment_score"]) if data.get("sentiment_score") is not None else None
+        except (TypeError, ValueError):
+            sentiment_score = None   # punteggio illeggibile = assente (None), non uno 0 inventato
         return {
-            "sentiment": str(data.get("sentiment", "neutral"))[:16],
-            "sentiment_score": float(data.get("sentiment_score", 0)),
-            "relevance": int(data.get("relevance", 5)),
+            "sentiment": sentiment,
+            "sentiment_score": sentiment_score,
+            "relevance": relevance,
             "language": capture_language(),
             "headline": str(data.get("headline_it", "") or "")[:120],
             "headline_it": str(data.get("headline_it", "") or "")[:120] if capture_language() == "it" else "",
             "why_matters": str(data.get("why_matters", "") or "")[:180],
+            "_classification_status": "classified",
         }
     except Exception as e:
         err_str = str(e)
@@ -1464,7 +2155,7 @@ def _classify_with_haiku(item: Dict[str, Any], context_tickers: List[str]) -> Di
             _log(f"haiku classify SKIPPED (Anthropic overloaded after retries) - news defaults to neutral")
         else:
             _log(f"haiku classify failed: {e}")
-        return {"sentiment": "neutral", "sentiment_score": 0.0, "relevance": 5, "headline_it": "", "why_matters": ""}
+        return _classification_result("failed", err_str)
 
 
 NEWS_FEED_STATUS_PATH = os.path.join(DB_DIR, "news_feed_status.json")   # B4 (02/09): era relativo alla cwd
@@ -1484,9 +2175,18 @@ def _scrivi_stato_giro(out: Dict[str, Any], path: Optional[str] = None) -> None:
         "esito": "degradato" if out.get("degraded") else "ok",
         "fetched": out.get("fetched"),
         "classified": out.get("classified"),
+        "classification_attempted": out.get("classification_attempted"),
+        "classification_failed": out.get("classification_failed"),
         "saved": out.get("saved"),
+        "not_classified": out.get("not_classified"),
+        "interrupted": out.get("interrupted"),
         "skipped_duplicates": out.get("skipped_duplicates"),
         "providers_blocked": out.get("providers_blocked") or {},
+        # 04/10 (B2): chiavi additive; un giro che non le ha misurate scrive n.d., non {}
+        "provenienza": out.get("provenienza", "n.d."),
+        "fonti_esito": out.get("fonti_esito", "n.d."),
+        "finnhub_tagli": out.get("finnhub_tagli", "n.d."),
+        "doppioni_titolo": out.get("doppioni_titolo", "n.d."),
     }
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -1521,16 +2221,26 @@ def stato_ultimo_giro(path: Optional[str] = None,
                 "age_minutes": age_min,
                 "fetched": raw.get("fetched"),
                 "classified": raw.get("classified"),
+                "classification_attempted": raw.get("classification_attempted"),
+                "classification_failed": raw.get("classification_failed"),
                 "saved": raw.get("saved"),
+                "not_classified": raw.get("not_classified"),
+                "interrupted": raw.get("interrupted"),
                 "skipped_duplicates": raw.get("skipped_duplicates"),
-                "providers_blocked": raw.get("providers_blocked") or {}}
+                "providers_blocked": raw.get("providers_blocked") or {},
+                # 04/10 (B2): file scritti prima di oggi non hanno le chiavi -> n.d. dichiarato
+                "provenienza": raw.get("provenienza", "n.d."),
+                "fonti_esito": raw.get("fonti_esito", "n.d."),
+                "finnhub_tagli": raw.get("finnhub_tagli", "n.d."),
+                "doppioni_titolo": raw.get("doppioni_titolo", "n.d.")}
     except Exception as e:
         return {"stato": "illeggibile", "motivo": f"{type(e).__name__}: {e}"}
 
 
 @scoped_language
 def auto_pull_feed(days: int = 1, classify: bool = True,
-                    max_per_ticker: int = 5, max_per_theme: int = 5) -> Dict[str, Any]:
+                    max_per_ticker: int = 5, max_per_theme: int = 5,
+                    should_stop=None) -> Dict[str, Any]:
     # Opus 4.8 16/07: 3->5 (feed tiene i top max_per_ticker*2 = 10/ticker per data, era 6),
     # cosi' piu' news fresche di GNews Essential raggiungono il DB. tiingo sale solo 3->5
     # (bacino ampio 25 e' SOLO per gnews), quindi il rumore cresce poco; tunabile nel trial.
@@ -1542,6 +2252,9 @@ def auto_pull_feed(days: int = 1, classify: bool = True,
     Returns dict con counts: {fetched, classified, saved, skipped_duplicates}.
     """
     import sqlite3
+    _azzera_tagli_finnhub()
+    _azzera_esiti_giro()
+    _azzera_doppioni_giro()
     db = MemoryDB()
     snap = db.get_portfolio_summary()
     positions = snap.get("positions", [])
@@ -1557,9 +2270,19 @@ def auto_pull_feed(days: int = 1, classify: bool = True,
         _log(f"auto_pull_feed: +{len(fav_extra)} favorites nel giro news: {fav_extra}")
 
     all_items: List[Dict[str, Any]] = []
+    # G3 (04/10): arresto del backend -> il giro si ferma al prossimo passo e lo dichiara
+    interrotto: List[bool] = []
+
+    def fermato() -> bool:
+        if should_stop is not None and should_stop():
+            interrotto.append(True)
+            return True
+        return False
 
     # 1) Per ogni ticker portfolio
     for tk in tickers:
+        if fermato():
+            break
         items = search_news_for_ticker(tk, days=days, max_per_source=max_per_ticker)
         for it in items[:max_per_ticker * 2]:
             it["ticker_mentioned"] = tk
@@ -1578,34 +2301,48 @@ def auto_pull_feed(days: int = 1, classify: bool = True,
         ("italy", "Italy budget OR BTP spread OR Meloni"),
     ]
     for theme_id, q in macro_themes:
+        if fermato():
+            break
         items = search_news_global(q, days=days, max_per_source=max_per_theme)
         for it in items[:max_per_theme]:
             it["ticker_mentioned"] = ""
             it["theme"] = theme_id
             all_items.append(it)
 
-    # 2.5) Feed generale Tiingo (#173) — fonte premium, top news mercato
-    try:
-        from bellomberg.market_data.tiingo_news import fetch_tiingo_news, tiingo_available
-        if tiingo_available():
-            for it in fetch_tiingo_news(None, days=days, limit=10):
-                it.setdefault("ticker_mentioned", "")
-                it.setdefault("theme", "")
-                all_items.append(it)
-    except Exception:
-        pass
+    # 2.5) Feed generale Tiingo (#173) — fonte premium, top news mercato.
+    # 04/10 (B2): era `except Exception: pass`; ora il guasto e' dichiarato (_fetch_tiingo)
+    for it in _fetch_tiingo(None, days, 10):
+        it.setdefault("ticker_mentioned", "")
+        it.setdefault("theme", "")
+        all_items.append(it)
 
     # 3) Deduplica + filtro qualita' (199e)
-    all_items = _drop_junk(_dedupe(all_items))
+    all_items = _drop_junk(_dedupe_titoli(_dedupe(all_items)))
 
     # 4) Classifica + salva
     conn = connect_sqlite(db.db_path)  # hardening #32: WAL + busy_timeout
     cur = conn.cursor()
+    # P2-2: un item con URL-redirect (Finnhub) il cui titolo e' gia' nel feed delle ultime 48h
+    # e' lo stesso articolo arrivato in un giro precedente da un'altra fonte: il controllo per
+    # url non lo vede. Titoli letti UNA volta per giro.
+    titoli_recenti = set()
+    if any(_url_redirect(it.get("url", "")) for it in all_items):
+        try:
+            cur.execute("SELECT title FROM news_feed WHERE pulled_at >= datetime('now', '-2 days')")
+            titoli_recenti = {_titolo_norm(r[0]) for r in cur.fetchall() if r[0]}
+        except Exception as e:
+            _log(f"doppioni per titolo contro il feed NON controllati ({type(e).__name__}): "
+                 f"possibili doppie notifiche Finnhub in questo giro")
     saved = 0
     classified = 0
+    classification_attempted = 0
+    classification_failed = 0
     skipped = 0
+    not_classified = 0
     summary_errors = []
     for it in all_items:
+        if fermato():
+            break
         url = (it.get("url") or "").strip()
         if not url:
             # genera fake url-key da hash title
@@ -1615,19 +2352,32 @@ def auto_pull_feed(days: int = 1, classify: bool = True,
         if cur.fetchone():
             skipped += 1
             continue
-        cls = {"sentiment": "neutral", "sentiment_score": 0.0, "relevance": 5, "headline_it": "", "why_matters": ""}
+        if _url_redirect(url) and _titolo_norm(it.get("title", "")) in titoli_recenti:
+            skipped += 1
+            with _ESITI_LOCK:
+                _DOPPIONI_GIRO["titolo_db"] += 1
+            continue
+        # G3 (04/10): senza classificazione riuscita la riga entra con classified=0 e
+        # sentiment/score/relevance NULL, mai il «neutral/5» finto di prima.
+        cls = {"sentiment": None, "sentiment_score": None, "relevance": None, "headline_it": "", "why_matters": ""}
         if classify:
+            classification_attempted += 1
             try:
                 cls = _classify_with_haiku(it, ctx_weighted or tickers)
-                classified += 1
+                if cls.get("_classification_status") == "classified":
+                    classified += 1
+                else:
+                    classification_failed += 1
             except Exception:
-                pass
+                classification_failed += 1
+        ok_cls = cls.get("_classification_status") == "classified"
         try:
             cur.execute("""
                 INSERT INTO news_feed
                   (title, snippet, source, url, published_at, ticker_mentioned, theme,
-                   provider, sentiment, sentiment_score, relevance, headline_it, why_matters)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   provider, sentiment, sentiment_score, relevance, headline_it, why_matters,
+                   classified)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 (it.get("title") or "")[:500],
                 (it.get("snippet") or "")[:1000],
@@ -1637,13 +2387,16 @@ def auto_pull_feed(days: int = 1, classify: bool = True,
                 (it.get("ticker_mentioned") or "")[:30],
                 (it.get("theme") or "")[:30],
                 (it.get("provider") or "")[:50],
-                cls.get("sentiment", "neutral")[:16],
-                float(cls.get("sentiment_score", 0)),
-                int(cls.get("relevance", 5)),
+                str(cls.get("sentiment") or "")[:16] if ok_cls else None,
+                cls.get("sentiment_score") if ok_cls else None,
+                int(cls["relevance"]) if ok_cls else None,
                 (cls.get("headline_it") or "")[:120] if capture_language() == "it" else "",
                 (cls.get("why_matters") or "")[:180] if capture_language() == "it" else "",
+                1 if ok_cls else 0,
             ))
             saved += 1
+            if not ok_cls:
+                not_classified += 1
             # audit/11 §2: commit per-INSERT — prima la transazione di scrittura restava
             # aperta per TUTTE le chiamate Haiku successive (1-15s l'una): ogni altro
             # writer (price updater, /trade, heartbeat) andava in database-is-locked.
@@ -1667,30 +2420,52 @@ def auto_pull_feed(days: int = 1, classify: bool = True,
     # muti da ore e i 76 item venivano tutti da RSS/yfinance/tiingo: un log che dichiara
     # OK su un giro cieco e' peggio di un log assente.
     fuori = providers_blocked()
+    # 04/10 (B2): la provenienza ora si MISURA (ogni item porta `provider`); gli articoli
+    # GNews serviti dalla cache del cooldown si contano a parte, non come chiamate vere
+    provenienza = dict(Counter(
+        ((it.get("provider") or "ignoto") + (" (cache)" if "_gnews_cache_eta_s" in it else ""))
+        for it in all_items))
+    fonti_esito = {"tiingo": _esito_nel_giro("tiingo"), "finnhub": _esito_nel_giro("finnhub")}
+    # fonti tolte per decisione: nel giro col loro codice (SPENTA), ma non «guaste»
+    for p, motivo in fonti_spente().items():
+        fonti_esito[p] = str(motivo).split(":", 1)[0]
+    esiti_muti = {p: s for p, s in fonti_esito.items() if s not in ("live", "non_interrogata", "SPENTA")}
     out = {
         "fetched": len(all_items),
         "classified": classified,
+        "classification_attempted": classification_attempted,
+        "classification_failed": classification_failed,
         "saved": saved,
+        "not_classified": not_classified,
         "skipped_duplicates": skipped,
+        "interrupted": bool(interrotto),
         "language": capture_language(),
         "summary_errors": summary_errors,
         "providers_blocked": fuori,
-        "degraded": bool(fuori or summary_errors),
+        "provenienza": provenienza,
+        "fonti_esito": fonti_esito,
+        # M1 (04/10): articoli Finnhub scartati dal tetto per ticker e ticker troncati dal
+        # fornitore (250). Conta solo le chiamate vere: un ticker servito dalla cache 15 min
+        # di search_news_for_ticker non richiama Finnhub e non si ri-conta.
+        "finnhub_tagli": _tagli_finnhub(),
+        # P2-2: doppioni tolti per titolo nel giro (fra fonti) e contro il feed delle 48h
+        "doppioni_titolo": _doppioni_giro(),
+        "degraded": bool(fuori or summary_errors or interrotto or esiti_muti) or classification_failed > 0
+                    or not_classified > 0,
     }
-    if fuori:
-        # NB: gli item NON sono taggati per provenienza (search_news_for_ticker mescola
-        # provider contingentati e non in un'unica lista), quindi "da dove vengono i 76"
-        # il codice NON lo sa. Si dichiara solo il fatto misurato: chi era muto. Con un
-        # blocco PARZIALE gli altri provider hanno contribuito e dire "vengono tutti da
-        # rss/yfinance" sarebbe inventare uno stato — cioe' il bug che questa voce chiude.
-        tutti = len(fuori) == len(NEWS_PROVIDER_LIMITS)
-        _log("DEGRADATO: %d/%d provider contingentati muti (%s). %s"
-             % (len(fuori), len(NEWS_PROVIDER_LIMITS),
-                ", ".join("%s=%s" % kv for kv in sorted(fuori.items())),
-                ("Nessuno dei %d item puo' venire da loro: restano le sole fonti non "
-                 "contingentate (rss/yfinance/tiingo)." % len(all_items)) if tutti else
-                ("I %d item sono un PARZIALE: provenienza per-fonte non misurata."
-                 % len(all_items))))
+    if out["finnhub_tagli"]["scartati"] or out["finnhub_tagli"]["troncati_dal_fornitore"]:
+        _log("finnhub nel giro: scartati %d articoli (tetto %d per ticker); troncati dal fornitore: %s"
+             % (out["finnhub_tagli"]["scartati"], FINNHUB_MAX_PER_TICKER,
+                ", ".join(out["finnhub_tagli"]["troncati_dal_fornitore"]) or "nessuno"))
+    if fuori or esiti_muti:
+        contingentati_muti = [p for p in NEWS_PROVIDER_LIMITS if p in fuori]
+        _log("DEGRADATO: %d/%d provider contingentati muti; fonti mute: %s; esiti del giro: %s. "
+             "Provenienza dei %d item (misurata): %s"
+             % (len(contingentati_muti), len(NEWS_PROVIDER_LIMITS),
+                ", ".join("%s=%s" % kv for kv in sorted(fuori.items())) or "nessuna",
+                ", ".join("%s=%s" % kv for kv in sorted(fonti_esito.items())),
+                len(all_items),
+                ", ".join("%s=%d" % kv for kv in sorted(provenienza.items())) or "nessun item"))
     # P2 (12/08): ora+esito del giro diventano un fatto leggibile da
     # GET /news/providers — un feed fermo non ha piu' la stessa faccia di
     # un feed sano. Il fallimento della scrittura NON uccide il giro

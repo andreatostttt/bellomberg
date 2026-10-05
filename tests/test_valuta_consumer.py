@@ -81,13 +81,23 @@ def test_price_updater_non_sovrascrive_il_db_con_la_valuta_del_provider(monkeypa
         'bellomberg.portfolio.twr_engine',
         types.SimpleNamespace(record_nav_snapshot=lambda _db: None),
     )
+    # 05/10 (import Andrea, cintura R-5 di G4): _fetch_ibkr chiede un contratto in USD,
+    # quindi quel prezzo E' in USD. Prima veniva scritto con l'etichetta GBX della
+    # posizione (il difetto che questo test fissava); ora non entra e lo dichiara.
     db = _db_senza_connessione([{"ticker": "FONDO", "valuta": "GBX", "prezzo_medio": 40}])
 
     out = price_updater.update_all_prices(db, source_order=("ibkr",), verbose=False)
 
-    assert out["updated"] == 1 and out["failed"] == 0
-    assert db.scritture == [("FONDO", 42.0, "GBX", "ibkr")]
-    assert out["details"][0]["currency_label"]["fonte"] == "misura_dato"
+    assert out["updated"] == 0 and out["failed"] == 1
+    assert db.scritture == []
+    assert "USD" in out["details"][0]["error"] and "GBX" in out["details"][0]["error"]
+
+    # Stessa fonte, posizione in USD: il prezzo entra con la sua etichetta.
+    db_usd = _db_senza_connessione([{"ticker": "FONDO", "valuta": "USD", "prezzo_medio": 40}])
+    out_usd = price_updater.update_all_prices(db_usd, source_order=("ibkr",), verbose=False)
+    assert out_usd["updated"] == 1 and out_usd["failed"] == 0
+    assert db_usd.scritture == [("FONDO", 42.0, "USD", "ibkr")]
+    assert out_usd["details"][0]["currency_label"]["fonte"] == "misura_dato"
 
 
 def test_price_updater_non_scrive_se_la_valuta_e_ignota(monkeypatch, tmp_path):

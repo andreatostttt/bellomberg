@@ -78,8 +78,12 @@ class _MockSpecialist(Specialist):
     tools_used = []
 
 
-@pytest.mark.parametrize("round_n", [0, 1, 2])
-def test_muse_specialist_sends_explicit_max_for_every_round(bb, monkeypatch, round_n):
+@pytest.mark.parametrize(("round_n", "expected_effort"), [
+    (0, {"effort": "low"}),
+    (1, {"effort": "high"}),
+    (2, {"effort": "high"}),
+])
+def test_muse_specialist_uses_effort_by_round(bb, monkeypatch, round_n, expected_effort):
     from bellomberg.core.llm_client import costruisci_corpo
     monkeypatch.setenv("CONSIGLIERE_R0_MODEL", "meta/muse-spark-1.3")
     monkeypatch.setenv("CONSIGLIERE_QUANT_MODEL", "meta/muse-spark-1.3")
@@ -87,7 +91,7 @@ def test_muse_specialist_sends_explicit_max_for_every_round(bb, monkeypatch, rou
     _MockSpecialist(bb, client=client).run(round_n)
     assert client.calls
     for call in client.calls:
-        assert costruisci_corpo(**call)["reasoning"] == {"effort": "max"}
+        assert costruisci_corpo(**call)["reasoning"] == expected_effort
 
 
 @pytest.fixture

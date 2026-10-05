@@ -21,13 +21,28 @@
    pannello vuoto che sembra "nessun dato" quando invece e' un errore.
    ============================================================ */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { AlertCircle, CheckCircle, HardDrive, Trash2, X } from 'lucide-react';
 import { Bellomberg } from '@/lib/api';
 import SceltaLingua from './SceltaLingua';
+import ModernPage from './ModernPage';
+import NewInterfaceBoundary from './NewInterfaceBoundary';
 import { useLingua, useT } from '../i18n/provider';
 import { localeDi } from '../i18n/lingua';
 import { t as tr, type Chiave } from '../i18n/t';
 import '../pages/settings-veglia.css';
+import '../pages/operations-modern.css';
+
+function DeferredSettingsView({ render }: { render: () => ReactNode }) {
+  return render();
+}
+
+function SettingsViewBoundary({ render }: { render: () => ReactNode }) {
+  const language = useLingua();
+  return <NewInterfaceBoundary language={language}>
+    <DeferredSettingsView render={render} />
+  </NewInterfaceBoundary>;
+}
 
 type Backup = { filename: string; path: string; size_mb: number; created: string };
 type Numero = (value: number, digits?: number) => string;
@@ -70,6 +85,7 @@ export default function SettingsPanel({ open, onClose }: { open: boolean; onClos
   const [health, setHealth] = useState<any>(null);
   const [fx, setFx] = useState<Record<string, number> | null>(null);
   const [engines, setEngines] = useState<Record<string, string> | null>(null);
+  const [loadingReads, setLoadingReads] = useState({ tasks: true, backups: true, health: true, fx: true, engines: true });
   // regola 14/07: i fetch falliti si DICHIARANO per nome, mai pannelli vuoti muti
   const missingLabels = { backups: 'settings.missing_backups', tasks: 'settings.missing_tasks', health: 'settings.missing_health', fx: 'settings.missing_fx', engines: 'settings.missing_engines' } as const;
   type MissingData = keyof typeof missingLabels;
@@ -80,12 +96,31 @@ export default function SettingsPanel({ open, onClose }: { open: boolean; onClos
 
   const box = useRef<HTMLDivElement>(null);
   const tornaA = useRef<HTMLElement | null>(null);
+  const triggerCancellazione = useRef<HTMLElement | null>(null);
+  const daCancellareRef = useRef<Backup | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  const mostraConfermaCancellazione = (backup: Backup | null) => {
+    daCancellareRef.current = backup;
+    setDaCancellare(backup);
+  };
+
+  const chiudiConfermaCancellazione = () => {
+    mostraConfermaCancellazione(null);
+    const restoreTriggerFocus = () => {
+      if (open) triggerCancellazione.current?.focus();
+    };
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(restoreTriggerFocus);
+    else queueMicrotask(restoreTriggerFocus);
+  };
 
   const segnala = useCallback((nome: MissingData) => {
     setBuchi(prev => (prev.includes(nome) ? prev : [...prev, nome]));
   }, []);
 
   const caricaBackups = useCallback(async () => {
+    setLoadingReads(current => ({ ...current, backups: true }));
     try {
       const r = await Bellomberg.dbBackupsList();
       setBackups(r.backups || []);
@@ -94,6 +129,8 @@ export default function SettingsPanel({ open, onClose }: { open: boolean; onClos
     } catch {
       setBackups(null);
       segnala('backups');
+    } finally {
+      setLoadingReads(current => ({ ...current, backups: false }));
     }
   }, [segnala]);
 
@@ -101,18 +138,22 @@ export default function SettingsPanel({ open, onClose }: { open: boolean; onClos
     if (!open) return;
     setBuchi([]);
     setTaskDiagnostic(null);
+    setLoadingReads({ tasks: true, backups: true, health: true, fx: true, engines: true });
     Bellomberg.scheduledTasks().then(r => {
       if ('error' in r && r.error) throw new Error(String(r.error));
       setTasks(r.tasks || []);
     }).catch((e: unknown) => {
       setTasks(null); segnala('tasks');
       setTaskDiagnostic(e instanceof Error ? e.message : String(e));
-    });
-    Bellomberg.health().then(setHealth).catch(() => { setHealth(null); segnala('health'); });
-    Bellomberg.fx().then(r => setFx(r.rates || {})).catch(() => { setFx(null); segnala('fx'); });
+    }).finally(() => setLoadingReads(current => ({ ...current, tasks: false })));
+    Bellomberg.health().then(setHealth).catch(() => { setHealth(null); segnala('health'); })
+      .finally(() => setLoadingReads(current => ({ ...current, health: false })));
+    Bellomberg.fx().then(r => setFx(r.rates || {})).catch(() => { setFx(null); segnala('fx'); })
+      .finally(() => setLoadingReads(current => ({ ...current, fx: false })));
     Bellomberg.agentsList()
       .then(r => setEngines((r.engines as unknown as Record<string, string>) || null))
-      .catch(() => { setEngines(null); segnala('engines'); });
+      .catch(() => { setEngines(null); segnala('engines'); })
+      .finally(() => setLoadingReads(current => ({ ...current, engines: false })));
     caricaBackups();
   }, [open, caricaBackups, segnala]);
 
@@ -126,8 +167,8 @@ export default function SettingsPanel({ open, onClose }: { open: boolean; onClos
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault();
-        if (daCancellare) setDaCancellare(null);
-        else onClose();
+        if (daCancellareRef.current) chiudiConfermaCancellazione();
+        else onCloseRef.current();
       }
     };
     window.addEventListener('keydown', onKey);
@@ -135,7 +176,7 @@ export default function SettingsPanel({ open, onClose }: { open: boolean; onClos
       window.removeEventListener('keydown', onKey);
       try { tornaA.current?.focus(); } catch { /* il nodo puo' non esistere piu' */ }
     };
-  }, [open, onClose, daCancellare]);
+  }, [open]);
 
   /* ── i lavori: spento di proposito NON e' un guasto ────────
      Il Consigliere e' disattivato dal 03/07 per scelta del PM e porta
@@ -217,7 +258,7 @@ export default function SettingsPanel({ open, onClose }: { open: boolean; onClos
   };
 
   const cancella = async (b: Backup) => {
-    setDaCancellare(null); setEsito(null);
+    mostraConfermaCancellazione(null); setEsito(null);
     try {
       await Bellomberg.dbBackupDelete(b.filename);
       setEsito({ ok: true, text: (tr, num) => tr('settings.deleted', {a: b.filename, b: num(b.size_mb)}) });
@@ -232,7 +273,7 @@ export default function SettingsPanel({ open, onClose }: { open: boolean; onClos
   const ordinati = (backups || []).slice().sort((a, b) => String(b.created).localeCompare(String(a.created)));
   const ultimo = ordinati[0] ? parseIso(ordinati[0].created) : null;
 
-  return (
+  return <ModernPage page="settings" className="bb-page-settings" render={() => <SettingsViewBoundary render={() => (
     <>
       <div className="f11-scrim" onClick={onClose} />
       <div className="f11v" role="dialog" aria-modal="true" aria-label={tr('settings.title')} tabIndex={-1} ref={box}>
@@ -267,7 +308,9 @@ export default function SettingsPanel({ open, onClose }: { open: boolean; onClos
               <span className="side">{tr('settings.result_nonzero')}</span>
             </div>
             <div className="pb nopad">
-              {tasks === null ? (
+              {tasks === null && loadingReads.tasks ? (
+                <div style={{ padding: '9px 10px' }} className="nota" role="status" aria-busy="true">{tr('ui.loading')}</div>
+              ) : tasks === null ? (
                 <div style={{ padding: '9px 10px' }} className="nota">
                   <b className="ko">{tr('settings.jobs_unreadable')}</b>{tr('settings.backend_error')}
                   {taskDiagnostic && <div>{taskDiagnostic}</div>}
@@ -343,9 +386,12 @@ export default function SettingsPanel({ open, onClose }: { open: boolean; onClos
             </div>
             <div className="pb" style={{ padding: '14px 12px 26px' }}>
               {calendario.length === 0 ? (
-                <div className="nota">
+                <div className="nota" role={backups === null && loadingReads.backups ? 'status' : undefined}
+                     aria-busy={backups === null && loadingReads.backups ? 'true' : undefined}>
+                  {backups === null && loadingReads.backups ? tr('ui.loading') : <>
                   <b className="ko">{tr('settings.no_backups_chart')}</b>
                   {backups === null ? tr('settings.list_error') : tr('settings.folder_empty')}
+                  </>}
                 </div>
               ) : (
                 <>
@@ -464,7 +510,9 @@ export default function SettingsPanel({ open, onClose }: { open: boolean; onClos
               </div>
             </div>
             <div className="pb scroll nopad">
-              {backups === null ? (
+              {backups === null && loadingReads.backups ? (
+                <div style={{ padding: '9px 10px' }} className="nota" role="status" aria-busy="true">{tr('ui.loading')}</div>
+              ) : backups === null ? (
                 <div style={{ padding: '9px 10px' }} className="nota">
                   <b className="ko">{tr('settings.list_unreadable')}</b>{tr('settings.backend_error')}
                 </div>
@@ -481,7 +529,10 @@ export default function SettingsPanel({ open, onClose }: { open: boolean; onClos
                     <span className="mb num">{num(b.size_mb, 2)} MB</span>
                     <span className="dt num">{ggmm(d)} {hhmm(d)}</span>
                     <span className="rm">
-                      <button onClick={() => setDaCancellare(b)} title={tr('settings.delete_prefix') + b.filename}
+                      <button onClick={(event) => {
+                        triggerCancellazione.current = event.currentTarget;
+                        mostraConfermaCancellazione(b);
+                      }} title={tr('settings.delete_prefix') + b.filename}
                               aria-label={tr('settings.delete_prefix') + b.filename}>
                         <Trash2 size={11} />
                       </button>
@@ -498,9 +549,10 @@ export default function SettingsPanel({ open, onClose }: { open: boolean; onClos
               <div className="ph">{tr('settings.machine')}</div>
               <div className="pb">
                 <div className="kv"><span className="k">{tr('settings.status')}</span>
-                  <span className="v">{health ? String(health.status || tr('settings.nd')).toUpperCase() : tr('settings.nd_upper')}</span></div>
+                  <span className="v">{health ? String(health.status || tr('settings.nd')).toUpperCase()
+                    : loadingReads.health ? tr('ui.loading') : tr('settings.nd_upper')}</span></div>
                 <div className="kv"><span className="k">{tr('settings.backend_version')}</span>
-                  <span className="v num">{health?.version || tr('settings.nd')}</span></div>
+                  <span className="v num">{health?.version || (loadingReads.health ? tr('ui.loading') : tr('settings.nd'))}</span></div>
                 {/* (B10, 02/09) attribuzione che la licenza di Lightweight Charts
                     richiede (Apache-2.0 con avviso TradingView): il grafico non
                     mostra il logo (`attributionLogo: false` in TerminalChart),
@@ -523,7 +575,9 @@ export default function SettingsPanel({ open, onClose }: { open: boolean; onClos
             <div className="p">
               <div className="ph">{tr('settings.fx')}</div>
               <div className="pb">
-                {fx === null ? <div className="nota"><b className="ko">{tr('settings.fx_unreadable')}</b>{tr('settings.backend_error_short')}</div>
+                {fx === null && loadingReads.fx
+                  ? <div className="nota" role="status" aria-busy="true">{tr('ui.loading')}</div>
+                  : fx === null ? <div className="nota"><b className="ko">{tr('settings.fx_unreadable')}</b>{tr('settings.backend_error_short')}</div>
                   : Object.keys(fx).length === 0 ? <div className="nota">{tr('settings.no_fx')}</div>
                   : Object.entries(fx).map(([c, v]) => (
                     <div className="kv" key={c}>
@@ -539,7 +593,9 @@ export default function SettingsPanel({ open, onClose }: { open: boolean; onClos
             <div className="p">
               <div className="ph">{tr('settings.engines')}</div>
               <div className="pb">
-                {engines === null ? (
+                {engines === null && loadingReads.engines ? (
+                  <div className="nota" role="status" aria-busy="true">{tr('ui.loading')}</div>
+                ) : engines === null ? (
                   <div className="nota">
                     {tr('settings.field')} <b>engines</b> {tr('settings.engines_absent')}
                   </div>
@@ -582,12 +638,12 @@ export default function SettingsPanel({ open, onClose }: { open: boolean; onClos
               </div>
             </div>
             <div className="bf">
-              <button className="btn" onClick={() => setDaCancellare(null)} autoFocus>{tr('settings.cancel')}</button>
+              <button className="btn" onClick={chiudiConfermaCancellazione} autoFocus>{tr('settings.cancel')}</button>
               <button className="btn ko" onClick={() => cancella(daCancellare)}>{tr('settings.delete_forever')}</button>
             </div>
           </div>
         </div>
       )}
     </>
-  );
+  )} />} />;
 }

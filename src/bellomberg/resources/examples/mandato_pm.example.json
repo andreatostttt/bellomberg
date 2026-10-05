@@ -33,7 +33,8 @@
     "posizione_minima_pct": null,
     "size_nuova_posizione_pct": null,
     "max_posizioni": null,
-    "top3_max_pct": null
+    "top3_max_pct": null,
+    "tolleranza_sforo_sizing_pct": null
   },
   "cassa": {
     "cassa_tipica_pct": null,
@@ -398,6 +399,19 @@
       "scelte": null,
       "massimo_char": null
     },
+    "tolleranza_sforo_sizing_pct": {
+      "blocco": "sizing",
+      "tipo": "pct",
+      "obbligatorio": false,
+      "descrizione": "Sotto questo sforo un acquisto (BUY/ADD) oltre la policy di sizing non genera avviso nel memo; sopra, l'avviso c'e' (mai un blocco). Obbligatorio per il comitato settimanale: senza, il comitato non parte.",
+      "unita": "% dell'investito",
+      "intervallo": [
+        0,
+        5
+      ],
+      "scelte": null,
+      "massimo_char": null
+    },
     "cassa_tipica_pct": {
       "blocco": "cassa",
       "tipo": "intervallo_pct",
@@ -693,7 +707,8 @@
         2
       ],
       "max_posizioni": 25,
-      "top3_max_pct": 40
+      "top3_max_pct": 40,
+      "tolleranza_sforo_sizing_pct": 0.5
     },
     "cassa": {
       "cassa_tipica_pct": [

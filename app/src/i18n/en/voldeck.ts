@@ -341,4 +341,5 @@ export const voldeck = {
   ui_calendar_spread: "Calendar spread",
   ui_iv_shock: "IV shock",
   ui_scenario_p_l: "Scenario P&L",
+  chainDownloadedAt: "Downloaded at {time}",
 };

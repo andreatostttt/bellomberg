@@ -182,7 +182,7 @@ test('fixture scenes open only navigation destinations and a request is answered
   // Independent reading of the registry, with the row pattern docs/guide/verify_docs.py applies.
   const registry = fs.readFileSync(path.join(root, 'app/src/lib/navigation.ts'), 'utf8');
   const destinations = [...registry.matchAll(/^\s*\['[^']+',\s*'([^']+)',/gm)].map(m => m[1]);
-  assert.equal(destinations.length, 19);
+  assert.equal(destinations.length, 20);
   assert.deepEqual(capture.navigationDestinations(root), destinations);
   assert.ok(fixture.scenes.every(s => destinations.includes(s.route)), JSON.stringify(fixture.scenes.map(s => s.route)));
   assert.equal(new Set(fixture.scenes.map(s => s.id)).size, fixture.scenes.length);
