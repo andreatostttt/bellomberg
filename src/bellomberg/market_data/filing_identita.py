@@ -165,6 +165,10 @@ def preferita(proposta):
 
 
 MAX_SONDATI = 3  # candidati SEC di un listino estero di cui si legge il catalogo (rete)
+# Frase unica per la SEC non configurata: proposta, attivazione e card di Agents Live (Opus 5.5, 05/10).
+SEC_NON_CONFIGURATA = "SEC non configurata: imposta SEC_CONTACT_EMAIL nel .env"
+# filings.xbrl.org vuole lo stesso contatto nello User-Agent (esef._headers): stessa causa, detta per ESEF.
+ESEF_NON_CONFIGURATO = "ESEF non configurato: imposta SEC_CONTACT_EMAIL nel .env (filings.xbrl.org vuole un contatto)"
 
 
 def _forme_utili(ticker, cik, catalogo_fn):
@@ -201,7 +205,17 @@ def proponi(ticker, nome=None, *, rifiutati=frozenset(), rifiutati_lei=frozenset
     nome = nome or nome_emittente(ticker)
     try:
         elenco = sec_edgar.elenco_emittenti_sec()
-    except Exception as exc:  # ContattoMancante, oppure rete e cache assenti
+    except sec_edgar.ContattoMancante:
+        # Installazione senza SEC_CONTACT_EMAIL (Opus 5.5, 05/10): la SEC non e' in errore, non e'
+        # CONFIGURATA. Si dichiara e, per i listini esteri, si prova lo stesso l'ESEF; i titoli
+        # USA non interrogano mai filings.xbrl.org (stessa regola sotto).
+        out = {"ticker": ticker, "nome": nome, "origine_elenco": None, "motivo_elenco": None,
+               "sec": {"stato": "non_configurata", "candidati": [], "motivo": SEC_NON_CONFIGURATA}}
+        if "." in ticker:
+            out["esef"] = proponi_esef(ticker, nome, rifiutati=rifiutati, rifiutati_lei=rifiutati_lei)
+        out["preferita"] = preferita(out)
+        return out
+    except Exception as exc:  # rete e cache assenti
         return {"ticker": ticker, "nome": nome, "origine_elenco": None, "motivo_elenco": None,
                 "sec": {"stato": "errore", "candidati": [], "motivo": f"{type(exc).__name__}: {exc}"}}
     tipo = tipo_registro(ticker)
@@ -237,6 +251,8 @@ def proponi_esef(ticker, nome, *, rifiutati=frozenset(), rifiutati_lei=frozenset
     from bellomberg.market_data import esef
     try:
         esito = esef.candidati_lei(ticker, nome)
+    except esef.ContattoMancante:
+        return {"stato": "errore", "candidati": [], "motivo": ESEF_NON_CONFIGURATO}
     except Exception as exc:
         return {"stato": "errore", "candidati": [], "motivo": f"{type(exc).__name__}: {exc}"}
     candidati = [c for c in esito["candidati"] if c["lei"] not in rifiutati]

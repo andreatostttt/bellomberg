@@ -70,8 +70,13 @@ def test_proponi_errore_di_configurazione_non_e_nessuna_fonte(monkeypatch):
         raise sec_edgar.ContattoMancante("SEC_CONTACT_EMAIL assente nel .env")
 
     monkeypatch.setattr(sec_edgar, "elenco_emittenti_sec", manca)
+    # RUN-ANDREA (Opus 5.5, 05/10): contatto assente = SEC NON CONFIGURATA, dichiarata (mai «nessuna
+    # fonte»); il listino estero prova lo stesso l'ESEF (qui finto, nessuna rete).
+    monkeypatch.setattr(filing_identita, "proponi_esef",
+                        lambda t, n, rifiutati=frozenset(), rifiutati_lei=frozenset():
+                        {"stato": "nessuno", "candidati": [], "motivo": "finto"})
     r = proponi("NOVA.DE", "Nova Semiconductors Inc.")
-    assert r["sec"]["stato"] == "errore" and "SEC_CONTACT_EMAIL" in r["sec"]["motivo"]
+    assert r["sec"]["stato"] == "non_configurata" and "SEC_CONTACT_EMAIL" in r["sec"]["motivo"]
 
 
 def test_proponi_usa_elenco_alias_e_nome(monkeypatch):

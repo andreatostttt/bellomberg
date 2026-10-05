@@ -26,9 +26,12 @@ import { dashboardPage } from './dashboardPage.js';
 import { filingPage } from './filingPage.js';
 import { marketsPage } from './marketsPage.js';
 import { movementsPage } from './movementsPage.js';
+import { favoritesPage } from './favoritesPage.js';
 import { newsPage } from './newsPage.js';
 import { performancePage } from './performancePage.js';
+import { factorsPage } from './factorsPage.js';
 import { tradePage } from './tradePage.js';
+import { settingsPage } from './settingsPage.js';
 
 export const it = {
   ui,
@@ -59,9 +62,12 @@ export const it = {
   filingPage,
   marketsPage,
   movementsPage,
+  favoritesPage,
   newsPage,
   performancePage,
+  factorsPage,
   tradePage,
+  settingsPage,
   lingua: {
     italiano: 'ITALIANO', inglese: 'INGLESE', titolo: 'Scegli la lingua',
     descrizione: 'Interfaccia e nuovi contenuti seguiranno la lingua scelta. Puoi cambiarla nelle impostazioni. I documenti esistenti restano nella lingua originale.',

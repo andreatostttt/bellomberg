@@ -3277,6 +3277,26 @@ def pm_constraints_gaps(blackboard):
     return gaps
 
 
+def official_documents_gaps(blackboard):
+    """Il buco «nessun bilancio» dichiarato dal SERVER, non lasciato al testo del Capo.
+
+    Una Trade Idea di ricerca parte anche senza filing (preflight e ricerca R0 li
+    cercano, ma possono non trovarne): se il dossier sigillato del titolo non ha
+    alcun documento ufficiale ammesso, il risultato lo dice sempre. [] altrimenti.
+    """
+    if not is_research_mode(blackboard):
+        return []
+    ticker = getattr(blackboard, "target_ticker", None)
+    sealed = (getattr(blackboard, "data", None) or {}).get("_research_thesis")
+    dossier = ((sealed.get("dossiers") or {}).get(ticker) if isinstance(sealed, dict) else None)
+    if not isinstance(dossier, dict):
+        return ["copertura documentale non verificabile: dossier del titolo assente dal sigillo della ricerca"]
+    if dossier.get("documents"):
+        return []
+    return ["nessun bilancio o documento ufficiale dell'emittente ammesso alla ricerca "
+            "(verifica fonti e ricerca R0 senza esito): l'analisi non poggia su filing primari verificati"]
+
+
 def _run_research_red_team(blackboard, portfolio, runner):
     from bellomberg.agents.red_team import motivo_critica_non_utilizzabile
     reference = research_reference(blackboard)
@@ -6115,6 +6135,9 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                 for pm_gap in pm_constraints_gaps(blackboard):  # E7: vincoli/mandato PM mancanti
                     if pm_gap not in result["data_gaps"] and len(result["data_gaps"]) < 80:
                         result["data_gaps"].append(pm_gap)
+                for doc_gap in official_documents_gaps(blackboard):  # PM 05/10: run senza filing, buco dichiarato
+                    if doc_gap not in result["data_gaps"]:  # in testa: col tetto 80 non e' lui a cadere
+                        result["data_gaps"] = [doc_gap, *result["data_gaps"]][:80]
                 if numeric_gaps and result["judgment"] == "favorable" and result.get("proposal"):
                     failures.append("claim quantitativi senza binding alle ricevute dei tool")
                 try:

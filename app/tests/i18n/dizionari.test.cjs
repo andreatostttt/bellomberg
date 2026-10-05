@@ -15,14 +15,16 @@ const NEUTRE_PER_CHIAVE = { 'mandate.no': 'No', 'mandate.sum_profilo': '{a} · {
   'voldeck.spot': 'Spot', 'voldeck.expected_move': 'Expected move 1σ',
   'newsdesk.blipCountOne': '{a} BLIP', 'progress.callsCountOne': '{a} call',
   'dashboardPage.heroNav': 'NAV',
-  'performancePage.unitPct': '%', 'performancePage.unitEur': '€' };
+  'performancePage.unitPct': '%', 'performancePage.unitEur': '€',
+  'factorsPage.colDelta': 'Δ', 'factorsPage.regDatasetOne': '1 dataset', 'factorsPage.sharpeTitle': 'Sharpe ratio',
+  'factorsPage.gapPp': '{v} pp' };
 // Nuova pages: shared domain terms, tickers, metric names and pure layouts of placeholders.
 Object.assign(NEUTRE_PER_CHIAVE, {
   'agentsPage.descDone_desk_one': '1 desk', 'agentsPage.descDone_round_one': '1 round', 'agentsPage.runSpan': '{giorno} · {da} → {a}',
   'agentsPage.sTickers_one': '1 ticker', 'agentsPage.memo': 'Memo #{id}', 'agentsPage.stepRound': 'Round {r}', 'agentsPage.stepMemo': 'Memo',
   'agentsPage.rounds_one': '1 round', 'agentsPage.capo': 'Capo', 'agentsPage.stageRedTeam': 'Red team',
   'agentsPage.lookedCount': '{tools} · {tickers}', 'agentsPage.lookedCount_ticker_one': '1 ticker', 'agentsPage.allN': '{n}',
-  'agentsPage.fx': 'FX USD/EUR', 'agentsPage.filingCount': '{con}/{tot}',
+  'agentsPage.fx': 'FX USD/EUR', 'agentsPage.lanesReport': 'Report', 'agentsPage.reportsN_one': '1 report', 'agentsPage.lanesMemo': 'Memo', 'agentsPage.filingCount': '{con}/{tot}',
   'chatPage.you': 'PM',
   'dashboardPage.title': 'Dashboard', 'dashboardPage.regime': 'Regime', 'dashboardPage.dayPnlWindow': 'P&L {finestra}',
   'dashboardPage.spy': 'SPY', 'dashboardPage.colPlEur': 'P&L €', 'dashboardPage.colPlPct': 'P&L %', 'dashboardPage.heatmap': 'Heatmap',
@@ -53,6 +55,9 @@ Object.assign(NEUTRE_PER_CHIAVE, {
   'dashboardPage.dt_pe': 'P/E (ttm)', 'dashboardPage.dt_eps': 'EPS (ttm)', 'dashboardPage.dt_beta': 'Beta',
   'dashboardPage.dt_evEbitda': 'EV/EBITDA', 'dashboardPage.dt_volume': 'Vol.',
   'newsPage.theme_fed': 'Fed / FOMC', 'newsPage.theme_btc_etf': 'BTC / ETF',
+  'settingsPage.chipBackend': 'Backend',
+  // Monte Carlo (05/10): sigle d'orizzonte identiche nelle due lingue
+  'montecarlo.h21': '1M', 'montecarlo.h63': '3M', 'montecarlo.h126': '6M',
   'tradeidea.pdfSectionPage': 'p. {page}', 'tradeidea.pdfSection_business': 'Business', 'tradeidea.pdfSection_red_team': 'Red team',
   // archivio memo Nuova (05/10): tasti, sigle e nomi propri identici nelle due lingue
   'memoarchive.nSearchKbd': 'Ctrl ⇧ F', 'memoarchive.nDist': 'dist. {d}', 'memoarchive.nKeyArrows': '↑↓', 'memoarchive.nKeyEsc': 'Esc',
@@ -157,22 +162,25 @@ test('nessun valore dei cataloghi ha un «?» al posto di un accento, di un apos
 
 test('le etichette ricostruite dicono il testo scritto dagli autori', () => {
   // Fonte primaria: i log delle sessioni che le hanno scritte (09/09 e 12/09), prima del canale
-  // che le ha corrotte. Frasi congelate qui.
+  // che le ha corrotte. Frasi congelate qui. Le frasi del pannello Impostazioni sono passate in
+  // settingsPage col restyle Nuova (05/10): gli stessi glifi (—, è) dentro le frasi intere.
   const atteso = {
-    it: { but_folder: "— quella stessa data nell'elenco ricevuto compare",
-      inconsistent: '. Il legame con questo lavoro non è attestato.',
-      run_confirm_hint: 'analisi multi-agente — conferma prima del lancio',
-      run_started: 'ANALISI AVVIATA — apri Agenti in diretta',
-      path_not_declared: 'n.d. — percorso non dichiarato dal payload',
-      palette_keys: 'CTRL+K APRI/CHIUDI  ·  ↑↓ NAVIGA  ·  INVIO ESEGUI  ·  ESC CHIUDI' },
-    en: { but_folder: '— on the same date, the returned list contains',
-      run_confirm_hint: 'multi-agent analysis — confirmation before launch',
-      run_started: 'ANALYSIS STARTED — open Agents Live',
-      path_not_declared: 'n/a — path not declared in the payload',
-      palette_keys: 'CTRL+K OPEN/CLOSE  ·  ↑↓ NAVIGATE  ·  ENTER EXECUTE  ·  ESC CLOSE' },
+    it: { 'settingsPage.phraseKoFiles': "Dichiara esito {r}, ma quella notte nell'elenco ricevuto ci sono {n} backup da {mb} MB. Il legame con questo lavoro non è attestato.",
+      'settings.run_confirm_hint': 'analisi multi-agente — conferma prima del lancio',
+      'settings.run_started': 'ANALISI AVVIATA — apri Agenti in diretta',
+      'settingsPage.pathNotDeclared': 'n.d. — percorso non dichiarato dal payload',
+      'settings.palette_keys': 'CTRL+K APRI/CHIUDI \u00a0·\u00a0 ↑↓ NAVIGA \u00a0·\u00a0 INVIO ESEGUI \u00a0·\u00a0 ESC CHIUDI' },
+    en: { 'settingsPage.phraseKoFiles': 'Reports result {r}, but on that night the returned list contains {n} backup(s) totalling {mb} MB. A connection to this job is not established.',
+      'settings.run_confirm_hint': 'multi-agent analysis — confirmation before launch',
+      'settings.run_started': 'ANALYSIS STARTED — open Agents Live',
+      'settingsPage.pathNotDeclared': 'n/a — path not declared in the payload',
+      'settings.palette_keys': 'CTRL+K OPEN/CLOSE \u00a0·\u00a0 ↑↓ NAVIGATE \u00a0·\u00a0 ENTER EXECUTE \u00a0·\u00a0 ESC CLOSE' },
   };
   for (const [lingua, voci] of Object.entries(atteso)) {
     const catalogo = lingua === 'it' ? it : en;
-    for (const [k, v] of Object.entries(voci)) assert.equal(catalogo.settings[k], v, `${lingua}.settings.${k}`);
+    for (const [k, v] of Object.entries(voci)) {
+      const [ns, key] = k.split('.');
+      assert.equal(catalogo[ns][key], v, `${lingua}.${k}`);
+    }
   }
 });

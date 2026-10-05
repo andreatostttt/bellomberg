@@ -61,6 +61,9 @@ export default function RunConfirmDialog({ open, onConfirm, onCancel, pagePresen
     { k: running ? tr('communications.costRunning') : tr('communications.costLast'), v: costText, tone: costTone },
     { k: tr('communications.costMagnitude'), v: tr('communications.costEstimate') },
     { k: tr('communications.duration'), v: tr('communications.runDuration') },
+    // RUN-ANDREA (Opus 5.5, 05/10): il filing mancante non e' un cancello della run, lo si dice qui
+    // (chiavi di agentsPage: communications.ts IT e' fissato da un pin sha256 ratificato dal PM)
+    { k: tr('agentsPage.tabFiling'), v: tr('agentsPage.filingNotBlocking') },
   ];
 
   return (

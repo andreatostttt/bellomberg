@@ -85,9 +85,9 @@ test('dataset and skipped-security captions handle zero, one and two without cha
     render('it'); await render.effects();
     const it = render('it'), en = render('en');
     if (datasets) {
-      assert.match(en, new RegExp(`${datasets} ${datasets === 1 ? 'DATASET' : 'DATASETS'} · ${skipped} ${skipped === 1 ? 'SECURITY' : 'SECURITIES'} SKIPPED`));
-      assert.match(it, new RegExp(`${datasets} DATASET · ${skipped} ${skipped === 1 ? 'TITOLO SCARTATO' : 'TITOLI SCARTATI'}`));
-    } else { assert.doesNotMatch(en, /0 DATASETS/); assert.doesNotMatch(it, /0 DATASET/); }
+      assert.match(en, new RegExp(`${datasets} ${datasets === 1 ? 'dataset' : 'datasets'} · ${skipped} ${skipped === 1 ? 'security' : 'securities'} skipped`));
+      assert.match(it, new RegExp(`${datasets} dataset · ${skipped} ${skipped === 1 ? 'titolo scartato' : 'titoli scartati'}`));
+    } else { assert.doesNotMatch(en, /0 datasets/); assert.doesNotMatch(it, /0 dataset/); }
     assert.deepEqual(data, before);
   }
 });
@@ -96,7 +96,7 @@ test('Factors updates labels and authored backend variants without repeating its
   const data = fixtures(), before = structuredClone(data), { render, calls } = retained(data);
   render('it'); await render.effects(); const it = render('it'); await render.effects();
   const en = render('en'); await render.effects();
-  assert.match(it, /RICONCILIAZIONE MISURE/); assert.match(en, /MEASURE RECONCILIATION/);
+  assert.match(it, /Fattori di rischio/); assert.match(en, /Risk factors/);
   assert.match(it, /Nota dichiarata/); assert.match(en, /Declared note/); assert.match(en, /Declared definition/);
   for (const html of [it, en]) { assert.match(html, /Original unmarked definition/); assert.match(html, /Original missing history/); assert.match(html, /Original unmarked caveat/); assert.match(html, /RECONCILED/); }
   assert.deepEqual(calls.filter(c => !['portfolio', 'advanced', 'risk'].includes(c)), ['factors-1y', 'beta_reconcile', 'factors-3y', 'riscalda-1y']);
@@ -111,7 +111,7 @@ for (const mode of ['throw', 'error']) test(`cache restoration ${mode} is explic
   const { render, calls } = retained(fixtures(), mode);
   render('it'); await render.effects();
   for (const lang of ['it', 'en']) { const html = render(lang); await render.effects();
-    assert.match(html, lang === 'it' ? /RIPRISTINO CACHE NON CONFERMATO/ : /CACHE RESTORATION NOT CONFIRMED/);
+    assert.match(html, lang === 'it' ? /Ripristino della cache non confermato/ : /Cache restoration not confirmed/);
     assert.match(html, /Original warm failure/);
   }
   assert.equal(calls.filter(x => x === 'riscalda-1y').length, 1);
@@ -122,27 +122,25 @@ test('an error without detail cannot turn a failed 3Y request into an endless lo
   render('it'); await render.effects();
   for (const lang of ['it', 'en']) {
     const html = render(lang);
-    assert.match(html, lang === 'it' ? /FINESTRA 3Y NON DISPONIBILE/ : /3Y WINDOW UNAVAILABLE/);
+    assert.match(html, lang === 'it' ? /Finestra a 3 anni non disponibile/ : /3-year window unavailable/);
     assert.match(html, lang === 'it' ? /Dettaglio dell’errore non fornito/ : /Error detail not provided/);
-    assert.doesNotMatch(html, /FINESTRA 3Y IN ARRIVO|3Y WINDOW LOADING/);
+    assert.doesNotMatch(html, /Finestra a 3 anni in arrivo|3-year window loading/);
   }
 });
 
-test('Sharpe sources are real backend routes and a missing spread is named like the SPREAD beside it', async () => {
-  const fs = require('node:fs'), path = require('node:path');
-  const routes = fs.readFileSync(path.resolve(__dirname, '../../../src/bellomberg/api/bellomberg_api.py'), 'utf8');
+test('alpha and Sharpe name their sources and a missing spread is declared, not drawn as zero', async () => {
   const data = fixtures(); delete data.adv.sharpe;
   const { render } = retained(data);
   render('it'); await render.effects();
-  // Frasi attese scritte qui: il riquadro del Duello dice SPREAD quando il numero c'e'.
-  const expected = { it: '<span class="muto">spread non calcolabile</span>', en: '<span class="muto">spread cannot be calculated</span>' };
+  const expected = {
+    it: { missing: 'scarto non calcolabile', spread: /scarto 5,3 pp/, sources: ['Rischio di portafoglio', 'Metriche avanzate', 'Modello fattoriale', 'Benchmark ufficiale'] },
+    en: { missing: 'spread cannot be calculated', spread: /spread 5\.3 pp/, sources: ['Portfolio risk', 'Advanced metrics', 'Factor model', 'Official benchmark'] },
+  };
   for (const language of ['it', 'en']) {
     const html = render(language); await render.effects();
-    assert.ok(html.includes(expected[language]), `${language}: ${expected[language]}`);
-    assert.match(html, /<div class="sc num">SPREAD 5[.,]30 PP<\/div>/);
-    const shown = [...html.matchAll(/<div class="fonte">(\/[^<]+)<\/div>/g)].map(m => m[1]);
-    assert.deepEqual(shown, ['/PORTFOLIO/RISK', '/PORTFOLIO/METRICS/ADVANCED']);
-    for (const route of shown) assert.ok(routes.includes(`@app.get("${route.toLowerCase()}")`), `route ${route} exists`);
+    assert.ok(html.includes(expected[language].missing), `${language}: ${expected[language].missing}`);
+    assert.match(html, expected[language].spread);
+    for (const source of expected[language].sources) assert.ok(html.includes(source), `${language}: ${source}`);
   }
 });
 
@@ -154,4 +152,50 @@ test('Factors rejects malformed backend presentation explicitly and keeps raw me
   assert.throws(() => render('en'), /Invalid presentation metadata/);
   assert.equal(data.rec.betas.portfolio_risk_spy, before.rec.betas.portfolio_risk_spy);
   assert.equal(calls.length, 7);
+});
+
+// Review PR #10: the backend sends three verdicts (advanced_metrics.py reconcile_betas). With fewer
+// than two engines it is INSUFFICIENT_SOURCES: nothing was compared, so the page must not say the
+// estimates disagree or that the spread exceeds the threshold.
+test('INSUFFICIENT_SOURCES is not shown as diverging sources beyond the threshold', async () => {
+  const data = fixtures();
+  data.rec = { betas: { portfolio_risk_spy: 0.8 }, definitions: { portfolio_risk_spy: 'Original book definition' },
+    sources_failed: { factor_model_mkt: 'Original engine failure', advanced_metrics_twr: 'Original twr failure' },
+    threshold: 0.25, verdict: 'INSUFFICIENT_SOURCES', note: 'Original insufficient note' };
+  const { render } = retained(data);
+  render('it'); await render.effects();
+  const expected = {
+    it: { no: [/Fonti discordanti/, /supera la soglia/], yes: /Fonti insufficienti/ },
+    en: { no: [/Sources disagree/, /exceeds the threshold/], yes: /Not enough sources/ },
+  };
+  for (const lang of ['it', 'en']) {
+    const html = render(lang); await render.effects();
+    for (const wrong of expected[lang].no) assert.doesNotMatch(html, wrong, `${lang}: ${wrong}`);
+    assert.match(html, expected[lang].yes);
+    assert.match(html, /Original insufficient note/);
+    assert.match(html, /Original engine failure/);
+  }
+});
+
+test('a beta estimate without a backend definition declares the gap instead of a generic gloss', async () => {
+  const data = fixtures(); delete data.rec.definitions.advanced_metrics_twr;
+  const { render } = retained(data);
+  render('it'); await render.effects();
+  for (const lang of ['it', 'en']) {
+    const html = render(lang); await render.effects();
+    assert.doesNotMatch(html, lang === 'it' ? /Stima dichiarata dal controllo/ : /Estimate declared by the check/);
+  }
+});
+
+test('an alpha without t-statistic declares the missing interval instead of an empty whisker', async () => {
+  const data = fixtures(); delete data.fac.per_holding['SYNTH.X'].alpha_tstat;
+  const { render } = retained(data);
+  render('it'); await render.effects();
+  for (const lang of ['it', 'en']) {
+    const html = render(lang); await render.effects();
+    const cell = html.match(/<td class="fat-whisk-cell">(.*?)<\/td>/);
+    assert.ok(cell, 'alpha whisker cell rendered');
+    assert.match(cell[1], /n\.d\.|n\/a/, `${lang}: the missing interval is declared`);
+    assert.match(cell[1], /aria-label="[^"]+"/, `${lang}: the reason is reachable`);
+  }
 });

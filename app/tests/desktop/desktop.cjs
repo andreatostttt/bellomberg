@@ -83,7 +83,7 @@ async function main() {
       await evaluate('window.dispatchEvent(new Event("bb:settings"))');
       await waitFor('!!document.querySelector("input[name=language][value=en]:checked") && document.querySelector("fieldset")?.disabled === false', 'saved preference in settings');
       await evaluate('document.querySelector("input[name=language][value=it]").click()');
-      await evaluate('Array.from(document.querySelectorAll("button")).find(b=>b.textContent.includes("SAVE LANGUAGE")).click()');
+      await evaluate('Array.from(document.querySelectorAll("button")).find(b=>b.closest("section[aria-labelledby=language-title]")&&b.textContent.trim()==="Save language").click()');
       await waitFor('document.documentElement.lang === "it" && localStorage.getItem("bellomberg.lingua") === "it"', 'Italian preference verified');
       if (await evaluate('document.querySelector("textarea")?.value') !== draft) throw new Error('language switch discarded the unsent chat draft');
       await evaluate('window.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true}))');

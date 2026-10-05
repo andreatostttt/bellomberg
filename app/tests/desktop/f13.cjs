@@ -87,7 +87,7 @@ async function renderer(config){
     assert.equal(await js(()=>document.querySelector('.ap-lesson-text').scrollHeight>document.querySelector('.ap-lesson-text').clientHeight),true);
     const before=(await control()).requests.filter(r=>r.route==='/agents/progress').length;
     await js(()=>window.dispatchEvent(new KeyboardEvent('keydown',{key:'F19',bubbles:true})));await wait(()=>document.querySelector('#language-title')&&document.querySelector('input[name=language][value=en]:not(:disabled)'));
-    await click('input[name=language][value=en]');await js(()=>[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='SALVA LINGUA').click());
+    await click('input[name=language][value=en]');await js(()=>[...document.querySelectorAll('button')].find(b=>b.closest('section[aria-labelledby=language-title]')&&b.textContent.trim()==='Salva lingua').click());
     await wait(()=>document.documentElement.lang==='en');await js(()=>window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})));
     await wait(()=>document.querySelector('.ap-header h1')?.textContent==='Results with evidence');
     assert.equal((await control()).requests.filter(r=>r.route==='/agents/progress').length,before);

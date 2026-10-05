@@ -31,6 +31,7 @@ function retained(data = fixture(), failure = null) {
       useState(initial) { const at = state++; if (!(at in values)) values[at] = typeof initial === 'function' ? initial() : initial;
         return [values[at], value => { values[at] = typeof value === 'function' ? value(values[at]) : value; }]; } },
     '@/lib/api': { API_BASE: 'http://synthetic.invalid', requestHeaders: () => ({ 'X-BB-Language': load('i18n/lingua.ts').linguaCorrente(), 'X-Synthetic-Test': 'yes' }) },
+    '@/lib/loghi-remoti': { caricaLoghi: async () => {}, useLogoRemoto: () => ({}) },
     axios: { get: async (url, options) => { calls.push({ url, options }); if (failure) throw failure; return { data }; } },
   } });
   const language = load('i18n/lingua.ts'), Page = load('pages/EdgeScannerPage.tsx').default;
@@ -48,10 +49,10 @@ test('Edge updates authored variants and labels locally, preserving strength, so
   const data = fixture(), before = structuredClone(data), { render, calls } = retained(data);
   render('en'); await render.effects(); const en = render('en'); await render.effects();
   const it = render('it'); await render.effects();
-  assert.match(en, /Strength threshold/); assert.match(it, /Soglia forza/);
+  assert.match(en, /Minimum strength/); assert.match(it, /Forza minima/);
   assert.match(en, /Declared reading/); assert.match(en, /Declared note/); assert.match(it, /Lettura dichiarata/);
   assert.match(en, /1,234\.567/); assert.match(it, /1\.234,567/);
-  for (const html of [it, en]) { assert.match(html, /Original unmarked context/); assert.match(html, /SYNTH.X/); assert.match(html, /#7a4f00/i); }
+  for (const html of [it, en]) { assert.match(html, /Original unmarked context/); assert.match(html, /SYNTH.X/); assert.match(html, /<b>77<\/b>/); }
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].options, { params: { min_strength: 45 }, timeout: 420000, headers: { 'X-BB-Language': 'en', 'X-Synthetic-Test': 'yes' } });
   assert.deepEqual(data, before);
@@ -68,9 +69,9 @@ test('the positioning category is named in the UI language in filters, summary a
   for (const language of ['it', 'en']) {
     const html = render(language);
     const label = expected[language];
-    assert.ok(html.includes(`>${label}</button>`), `${language} filter`);
-    assert.ok(html.includes(`>${label}: <span class="text-white">1</span>`), `${language} summary`);
-    assert.match(html, new RegExp(`rounded-sm">${label}</span>`), `${language} signal tag`);
+    assert.match(html, new RegExp(`data-cat="positioning"[^>]*>${label}(<!-- -->)? <b>1</b></button>`), `${language} filter`);
+    assert.ok(html.includes(`<span class="ro-lane-l">${label}<small>`), `${language} strength map lane`);
+    assert.ok(html.includes(`ro-cat is-positioning">${label}</span>`), `${language} signal tag`);
     if (language === 'it') assert.doesNotMatch(html, /Positioning/);
   }
 });
@@ -116,4 +117,75 @@ test('the scanner footer describes supplied data without asserting a completed b
   assert.match(it, /Segnali calcolati sui dati forniti dagli strumenti/);
   assert.match(en, /Signals calculated from data supplied by the tools/);
   for (const html of [it, en]) assert.doesNotMatch(html, /#148|actual market data|dati di mercato reali|Formal validation through backtesting|Validazione formale via backtest/);
+});
+
+// ── review della PR #13 (Opus 5.5): la vista Nuova non trasforma un buco in una misura ──
+
+function vista(lang, { diagnosi = null, data = fixture(), copertura = false } = {}) {
+  const load = creaCaricatore({ stub: { '@/lib/loghi-remoti': { caricaLoghi: async () => {}, useLogoRemoto: () => ({}) } } });
+  const language = load('i18n/lingua.ts'), edge = load('lib/edge.ts');
+  language.impostaLinguaCorrente(lang);
+  const Vista = load('pages/ricerca/VistaRicerca.tsx').default;
+  const esito = edge.leggiScan(data, idle);
+  const tutti = esito.segnali.map((s, i) => ({ s, k: `k${i}` }));
+  const eta = edge.etaScan(esito.eta, 1000, 11000);
+  const d = { esito, viva: esito, errore: null, loading: false, forzata: false, attesaS: 0, timeoutMs: 420000,
+    minStrength: 45, sogliaResa: 45, cat: '', tutti, righe: tutti, sel: tutti[0] || null, vuoto: null, eta,
+    oraScan: '10:00', copertura, diagnosi };
+  const noop = () => {};
+  const a = { soglia: noop, categoria: noop, scegli: noop, rifai: noop, riprova: noop, copertura: noop, diagnosi: noop, apriMercati: noop };
+  return { html: renderToStaticMarkup(React.createElement(Vista, { d, a })), load };
+}
+
+test('a position check with zero signals is declared as not a measurement, never drawn as a HOLD gauge', () => {
+  for (const lang of ['it', 'en']) {
+    const diagnosi = { ticker: 'SYNTH.X', stato: 'ok', score: 0, verdetto: 'HOLD — synthetic', nota: '', nSegnali: 0, alle: '10:00' };
+    const { html } = vista(lang, { diagnosi });
+    assert.match(html, /data-avviso="diagnosi-zero"/, `${lang}: zero-signal warning`);
+    assert.doesNotMatch(html, /ro-gauge"/, `${lang}: no gauge on a zero-signal check`);
+    const undeclared = vista(lang, { diagnosi: { ...diagnosi, nSegnali: null } }).html;
+    assert.match(undeclared, /data-avviso="diagnosi-zero"/, `${lang}: undeclared count is not a measurement either`);
+    const measured = vista(lang, { diagnosi: { ...diagnosi, score: 1.2, nSegnali: 2 } }).html;
+    assert.match(measured, /ro-gauge"/); assert.doesNotMatch(measured, /data-avviso="diagnosi-zero"/);
+  }
+});
+
+test('the position check names its scope: per-ticker detectors only, factors excluded', () => {
+  const it = vista('it').html, en = vista('en').html;
+  assert.match(it, /fattoriali esclusi/); assert.match(en, /factors excluded/);
+});
+
+test('position-check payloads: a backend error is reported verbatim and a missing verdict is declared n/a', () => {
+  const load = creaCaricatore(), language = load('i18n/lingua.ts'), calcoli = load('pages/ricerca/calcoli.ts');
+  for (const lang of ['it', 'en']) {
+    language.impostaLinguaCorrente(lang);
+    const ko = calcoli.leggiDiagnosi({ error: 'Synthetic provider failure' }, 'SYNTH.X');
+    assert.equal(ko.stato, 'errore'); assert.match(ko.motivo, /Synthetic provider failure/);
+    const shape = calcoli.leggiDiagnosi({ verdict: 'HOLD' }, 'SYNTH.X');
+    assert.equal(shape.stato, 'errore'); assert.match(shape.motivo, /net_score/);
+    const noVerdict = calcoli.leggiDiagnosi({ net_score: 0.5, n_signals: 1 }, 'SYNTH.X');
+    assert.equal(noVerdict.stato, 'ok'); assert.match(noVerdict.verdetto, lang === 'it' ? /n\.d\./ : /n\/a/);
+    const nan = calcoli.leggiDiagnosi({ net_score: 1, verdict: 'X', n_signals: 'tre' }, 'SYNTH.X');
+    assert.equal(nan.nSegnali, null);
+  }
+});
+
+test('an undeclared cache TTL is said in the visible register, not only in a tooltip', async () => {
+  const data = fixture(); delete data.cache.ttl_s;
+  const { render } = retained(data);
+  render('it'); await render.effects();
+  for (const [lang, rx] of [['it', /TTL non dichiarato/], ['en', /TTL not declared/]]) {
+    const html = render(lang);
+    const chip = html.match(/<span class="ro-chip-t">([\s\S]*?)<\/span><\/span>/);
+    assert.ok(chip, `${lang}: register chip`);
+    assert.match(chip[1], rx, `${lang}: visible TTL declaration`);
+  }
+});
+
+test('the degraded-coverage bucket does not claim exactly one silent detector', () => {
+  const data = fixture();
+  data.copertura.scansione_piena = []; data.copertura.scansione_degradata = { 'SYNTH.X': 'vol risk premium down; dealer gamma down' };
+  const it = vista('it', { data }).html, en = vista('en', { data }).html;
+  assert.doesNotMatch(it, /Un rilevatore muto/); assert.doesNotMatch(en, /One silent detector/);
+  assert.match(it, /Almeno un rilevatore muto/); assert.match(en, /At least one silent detector/);
 });

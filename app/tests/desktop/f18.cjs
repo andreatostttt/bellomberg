@@ -100,7 +100,7 @@ async function renderer(config){
     await new Promise(r=>setTimeout(r,150));await js(async()=>{await document.fonts.ready;await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));});fs.writeFileSync(path.join(config.temporary,'f18-diario-it.png'),(await w.capturePage(undefined,{stayHidden:true})).toPNG());
     scenarios.push('journal create/revision, 409 keeps original draft, comparison, reversible archive and immutable history');
     await js(()=>window.dispatchEvent(new KeyboardEvent('keydown',{key:'F19',bubbles:true})));await wait(()=>document.querySelector('#language-title')&&document.querySelector('input[name=language][value=en]:not(:disabled)'));
-    await click('input[name=language][value=en]');await button('SALVA LINGUA');await wait(()=>document.documentElement.lang==='en');await js(()=>window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})));
+    await click('input[name=language][value=en]');await button('Salva lingua');await wait(()=>document.documentElement.lang==='en');await js(()=>window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})));
     await wait(()=>document.querySelector('.journal-library h2')?.textContent==='Your notes');assert.equal(await js(()=>document.querySelector('.journal-title-input').value),'Originale α 1,25');
     await new Promise(r=>setTimeout(r,150));await js(async()=>{await document.fonts.ready;await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));});fs.writeFileSync(path.join(config.temporary,'f18-diario-en.png'),(await w.capturePage(undefined,{stayHidden:true})).toPNG());
     scenarios.push('saved language changes controls while original note remains unchanged');

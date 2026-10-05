@@ -435,3 +435,65 @@ test('agent cost missing is n/a in the KO share and the agent sum, never counted
   assert.match(html, /1 senza costo dichiarato \(n\.d\., non contati come 0\)/);
   assert.doesNotMatch(html, /Somma degli agenti 10,00\s€ uguale|coincide/);
 });
+
+// Revisione PR #16 (05/10/2026, Claude Opus 5.5): il tavolo e i cassetti non affermano piu' di quanto
+// il payload sa. Fixture sintetiche; le frasi attese sono scritte qui, non lette dai cataloghi.
+const tavoloRoster = [{ id: 'quant', name: 'QUANT', role: 'Original role', color: '#29D3F2' }];
+const tavoloFinita = { running: false, start_time: '2026-09-12T10:00:00', completed_at: '2026-09-12T10:05:00', expected_reports: 4,
+  reports_by_specialist: { quant: { '0': 'Synthetic opening sentence for the desk.' } }, specialist_status: { quant: 'done' },
+  tool_log: [{ time: '10:00:05', specialist: 'quant', round: 0, tool: 'get_synthetic_data', input: 'Synthetic input' }] };
+
+test('the table never quotes a run length that no tool measured', () => {
+  const live = { ...tavoloFinita, running: true, completed_at: null, updated_at: new Date().toISOString(), specialist_status: { quant: 'running' } };
+  for (const selected of ['it', 'en']) {
+    const html = pageInLanguage(selected, { 0: tavoloRoster, 3: live });
+    assert.match(html, /class="ag-angolo is-sx"/);
+    assert.doesNotMatch(html, /25[–-]40|di solito|usually/);
+  }
+});
+
+test('an ended run fills the progress bar only with the reports actually delivered', () => {
+  for (const selected of ['it', 'en']) {
+    const html = pageInLanguage(selected, { 0: tavoloRoster, 3: tavoloFinita, 16: true });
+    assert.match(html, /data-vista="finita"/);
+    assert.match(html, /class="ag-avanz"><u style="width:25%"/);
+    assert.doesNotMatch(html, /class="ag-avanz"><u style="width:100%"/);
+  }
+});
+
+test('a desk frozen by a stale heartbeat is not counted as working in the table legend', () => {
+  const ferma = { ...tavoloFinita, running: true, completed_at: null, updated_at: '2026-09-12T10:01:00', stale_warning: true, specialist_status: { quant: 'running' } };
+  for (const selected of ['it', 'en']) {
+    const html = pageInLanguage(selected, { 0: tavoloRoster, 3: ferma });
+    assert.match(html, /data-agente="quant"[^>]*data-stato="stale"/);
+    assert.match(html, /<li class="is-lav">[^<]*<b class="num">0<\/b>/);
+    assert.match(html, /<li class="is-ko">[^<]*<b class="num">1<\/b>/);
+  }
+});
+
+test('the report drawer of an ended run does not promise a report that will never arrive', () => {
+  const it = pageInLanguage('it', { 0: tavoloRoster, 3: tavoloFinita, 16: true, 21: { id: 'quant', r: 1, aperto: true } });
+  const en = pageInLanguage('en', { 0: tavoloRoster, 3: tavoloFinita, 16: true, 21: { id: 'quant', r: 1, aperto: true } });
+  assert.doesNotMatch(it, /arriva quando/); assert.doesNotMatch(en, /arrives when/);
+  assert.match(it, /Nessun report del Round 1 di Quant in questa run/);
+  assert.match(en, /No Round 1 report from Quant in this run/);
+});
+
+test('the report preview does not claim the full desk report is inside the memo', () => {
+  for (const selected of ['it', 'en']) {
+    const html = pageInLanguage(selected, { 0: tavoloRoster, 3: tavoloFinita, 16: true, 21: { id: 'quant', r: 0, aperto: true } });
+    assert.match(html, /Synthetic opening sentence for the desk\./);
+    assert.match(html, /500/);
+    assert.doesNotMatch(html, /intero è nel memo|full text is in the memo/);
+  }
+});
+
+test('the insider tool phrase does not narrow insider trades to purchases', () => {
+  const p = load('pages/agents/parole.ts');
+  for (const selected of ['it', 'en']) {
+    language.impostaLinguaCorrente(selected);
+    const w = p.parole();
+    for (const f of [w.faccio('get_insider_trades', null), w.faccio('get_insider_trades', 'ACME')]) assert.doesNotMatch(f, /acquist|buying/);
+  }
+  language.impostaLinguaCorrente('it');
+});

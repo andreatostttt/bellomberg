@@ -105,14 +105,19 @@ export default function CoperturaFiling({ dati, errore, occupato, bloccato, esit
         {onApri && <button type="button" className="bbn-link" data-filing-pagina="1" onClick={() => onApri()}>{w.filingOpenPage}</button>}
       </div>
       {corre && <p className="ag-filing-run"><RefreshCw size={14} />{w.filingRefreshing}</p>}
+      {/* RUN-ANDREA (Opus 5.5, 05/10): copertura incompleta o archivio giu' non sono un cancello della run */}
+      {(errore || (c && c.con_confronto < c.totale)) && <p className="ag-foot" data-filing-non-blocca="1">{w.filingNotBlocking}</p>}
 
       {esito && <div className="ag-filing-esito" role="status" data-filing-esito="1">
+        {esito.avviso_configurazione && <div className="ag-ban is-warn" data-filing-configurazione="sec">
+          <CircleAlert size={18} /><span><b>{w.filingSecNotConfigured}</b></span></div>}
         <b>{w.filingResult(esito.attivati.length, esito.da_confermare.length, esito.senza_fonte.length)}</b>
         {esito.da_confermare.length > 0 && <div className="ag-filing-grp"><span className="ag-sub">{w.filingToConfirm}</span>
           <span className="ag-filing-tks">{esito.da_confermare.map(t => <span key={t} className="ag-tk" data-filing-confirm={t}>{t}</span>)}</span>
           <span className="ag-foot">{w.filingToConfirmHelp}</span></div>}
         {esito.senza_fonte.length > 0 && <div className="ag-filing-grp"><span className="ag-sub">{w.filingNoSource}</span>
-          <span className="ag-filing-tks">{esito.senza_fonte.map(t => <span key={t} className="ag-tk">{t}</span>)}</span></div>}
+          <span className="ag-filing-tks">{esito.senza_fonte.map(t => <span key={t} className="ag-tk">{t}</span>)}</span>
+          {esito.senza_fonte.filter(t => esito.motivi?.[t]).map(t => <span key={t} className="ag-foot" data-filing-motivo={t}><b>{t}</b> · {esito.motivi?.[t]}</span>)}</div>}
         {esito.errori.length > 0 && <div className="ag-filing-grp"><span className="ag-sub">{w.filingErrors}</span>
           {esito.errori.map(e => <span key={e.ticker} className="ag-foot"><b>{e.ticker}</b> · {e.motivo}</span>)}</div>}
         {esito.attivati.length > 0 && <span className="ag-foot">{esito.aggiornamento ? w.filingQueued : w.filingStarted}</span>}

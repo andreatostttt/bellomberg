@@ -679,10 +679,11 @@ def create_filing_router(require_session, service_factory=default_service, *, at
         service = _service(service_factory)
         _preferenze()
         riepilogo = attivazione.attiva_mancanti(service.store, tickers_portafoglio())
+        motivi = riepilogo.get("motivi") or {}  # Opus 5.5, 05/10: prima l'esito si salvava con motivo=null
         for lista, esito in (("attivati", "attivato"), ("da_confermare", "da_confermare"),
                              ("senza_fonte", "senza_fonte"), ("esclusi", "escluso")):
             for t in riepilogo.get(lista) or []:
-                _registra_esito_sicuro(t, esito)
+                _registra_esito_sicuro(t, esito, motivo=motivi.get(t))
         for e in riepilogo.get("errori") or []:
             _registra_esito_sicuro(e["ticker"], "errore", motivo=e.get("motivo"))
         if riepilogo["attivati"]:

@@ -38,6 +38,28 @@ from bellomberg.core.trade_idea_policy import role_thinking
 TRADE_IDEA_RED_MAX_TOKENS = 128000
 WEEKLY_RED_MAX_TOKENS = 128000
 
+
+def _cap_del_provider(richiesti, model, metadata_fn=None):
+    """Run 05/10 21:00: 128000 > 65536 di google/gemini-3.8-flash e il controllo prezzi fermava
+    la run PRIMA di spendere. Si chiede il tetto del provider (Models API, gratuita), DICHIARATO;
+    se il catalogo non risponde resta il valore richiesto (il controllo prezzi decide, come prima)."""
+    try:
+        meta = (metadata_fn or _live_metadata)(model)
+        cap = (meta.get("top_provider") or {}).get("max_completion_tokens")
+    except Exception as exc:
+        print("[RED_TEAM] tetto del provider non letto (" + type(exc).__name__ + "): resta " + str(richiesti))
+        return richiesti
+    if type(cap) is int and 0 < cap < richiesti:
+        print("[RED_TEAM] max_tokens " + str(richiesti) + " -> " + str(cap) + " (tetto del provider "
+              + str(model) + ", dichiarato)")
+        return cap
+    return richiesti
+
+
+def _live_metadata(model):
+    from bellomberg.valuation.preparation_ai import live_metadata
+    return live_metadata(model)
+
 RED_TEAM_PROMPT = """Sei il RISK MANAGER SCETTICO di Bellomberg, l'avvocato del diavolo del team. Gli specialisti hanno prodotto le loro tesi. Il tuo compito NON e' proporre trade, ma ATTACCARE le tesi prima che il Capo decida, in italiano professionale e diretto.
 
 Per ogni tesi o proposta rilevante degli specialisti, chiediti e scrivi:
@@ -448,7 +470,7 @@ def _run_red_team_loop(blackboard, trade_idea, MODEL_SYNTHESIZER, user_msg,
                     'conditions. Missing consensus/documents must be declared. No workbook or AI '
                     'fair value is required; do not request compiler inputs or workbook repairs. '
                     'Mandate, prices, risk and sizing controls remain binding.')
-        max_tokens = TRADE_IDEA_RED_MAX_TOKENS if trade_idea else WEEKLY_RED_MAX_TOKENS
+        max_tokens = TRADE_IDEA_RED_MAX_TOKENS if trade_idea else _cap_del_provider(WEEKLY_RED_MAX_TOKENS, MODEL_SYNTHESIZER)
         # Weekly: effort dal .env (RED_TEAM_EFFORT, default high), via llm_client.
         red_thinking = (role_thinking(blackboard, 'red_team') if trade_idea
                         else thinking_fase("red_team"))
@@ -479,6 +501,18 @@ def _run_red_team_loop(blackboard, trade_idea, MODEL_SYNTHESIZER, user_msg,
                 systems = [None] + ([base_system] if trade_idea else [])
                 match = next(((system, cap, thinking) for system in systems for cap, thinking in candidates
                               if saved_checkpoint["contract"] == contract_for(cap, thinking, system)), None)
+                if (match is None and not trade_idea and max_tokens < WEEKLY_RED_MAX_TOKENS
+                        and saved_checkpoint.get("iteration") == 0 and not saved_checkpoint.get("calls")
+                        and any(saved_checkpoint["contract"] == contract_for(WEEKLY_RED_MAX_TOKENS, th)
+                                for th in (red_thinking, {"type": "adaptive"}))):
+                    # Run 05/10 21:00: checkpoint al cap 128000 oltre il tetto del provider; il controllo
+                    # prezzi rifiuta PRIMA dell'invio, quindi nessun corpo di quel contratto e' mai stato
+                    # pagato (iterazione 0, nessuna chiamata): si riparte col tetto del provider, dichiarato.
+                    print("[RED_TEAM] checkpoint al cap " + str(WEEKLY_RED_MAX_TOKENS) + " mai inviato "
+                          "(oltre il tetto del provider): ripreso col cap " + str(max_tokens) + " (dichiarato)")
+                    saved_checkpoint = {**saved_checkpoint, "contract": contract,
+                                        **({"max_tokens": max_tokens} if "max_tokens" in saved_checkpoint else {})}
+                    match = (None, max_tokens, red_thinking)
                 if match is None:
                     raise ValueError("Red Team checkpoint contract changed"
                         + (" (system diverso da quello attuale e da quello precedente all'ingresso "

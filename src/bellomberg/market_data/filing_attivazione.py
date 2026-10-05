@@ -129,6 +129,9 @@ def _attiva(store, ticker, *, cik, lei, proponi_fn, catalogo_fn, pref_path, indi
                             "LEI confermato dall'utente", indice_fn)
     if sec["stato"] == "errore":
         return {"ticker": ticker, "esito": "errore", "proposta": proposta, "motivo": sec["motivo"]}
+    if sec["stato"] == "non_configurata" and (cik is not None or "esef" not in proposta):
+        # CIK scelto o titolo USA (ESEF mai interrogato): senza contatto non c'e' nulla da provare.
+        return {"ticker": ticker, "esito": "errore", "proposta": proposta, "motivo": sec["motivo"]}
     if cik is not None:
         scelto = next((c for c in sec["candidati"] if c["cik"] == str(cik).zfill(10)), None)
         if scelto is None:
@@ -148,9 +151,15 @@ def _attiva(store, ticker, *, cik, lei, proponi_fn, catalogo_fn, pref_path, indi
         return {"ticker": ticker, "esito": "da_confermare", "proposta": proposta, "motivo": sec["motivo"]}
     elif esef_p["stato"] == "univoco" and esef_p["candidati"]:
         c = esef_p["candidati"][0]
-        return _attiva_esef(store, ticker, c, c["origine"], proposta.get("nome"), proposta, esef_p["motivo"], indice_fn)
+        motivo_esef = esef_p["motivo"] + (f" ({sec['motivo']}: SEC non consultata)"
+                                          if sec["stato"] == "non_configurata" else "")
+        return _attiva_esef(store, ticker, c, c["origine"], proposta.get("nome"), proposta, motivo_esef, indice_fn)
     elif esef_p["stato"] == "ambiguo":
         return {"ticker": ticker, "esito": "da_confermare", "proposta": proposta, "motivo": "ESEF: " + esef_p["motivo"]}
+    elif sec["stato"] == "non_configurata":
+        # SEC mai consultata: «senza fonte» sarebbe falso; e' un errore di configurazione dichiarato.
+        return {"ticker": ticker, "esito": "errore", "proposta": proposta,
+                "motivo": f"{sec['motivo']}; ESEF: {esef_p['motivo']}"}
     elif esef_p["stato"] == "errore":
         return {"ticker": ticker, "esito": "errore", "proposta": proposta, "motivo": "ESEF: " + esef_p["motivo"]}
     else:
@@ -187,9 +196,17 @@ def _attiva(store, ticker, *, cik, lei, proponi_fn, catalogo_fn, pref_path, indi
 
 
 def attiva_mancanti(store, tickers, **kw):
-    """Attivazione in blocco dei titoli senza profilo: riepilogo per esito."""
+    """Attivazione in blocco dei titoli senza profilo: riepilogo per esito.
+
+    Le liste restano di ticker (chiamanti e frontend invariati); `motivi` {ticker: motivo} porta
+    il motivo di OGNI esito non in errore, cosi' le preferenze lo salvano (prima: null).
+    `avviso_configurazione`: la frase SEC_NON_CONFIGURATA se manca il contatto SEC/ESEF, misurato
+    sulla causa (variabile d'ambiente), non dedotto dagli errori; altrimenti None. (Opus 5.5, 05/10)"""
+    from bellomberg.market_data.sec_edgar import _contatto
     out = {k: [] for k in ("attivati", "da_confermare", "senza_fonte", "esclusi", "gia_attivi", "scollegati",
                            "errori")}
+    out["motivi"] = {}
+    out["avviso_configurazione"] = None if _contatto() else filing_identita.SEC_NON_CONFIGURATA
     chiave = {"attivato": "attivati", "da_confermare": "da_confermare", "senza_fonte": "senza_fonte",
               "escluso": "esclusi", "gia_attivo": "gia_attivi", "scollegato": "scollegati"}
     for ticker in dict.fromkeys(tickers):
@@ -201,6 +218,7 @@ def attiva_mancanti(store, tickers, **kw):
             out["errori"].append({"ticker": ticker, "motivo": r["motivo"]})
         else:
             out[chiave[r["esito"]]].append(ticker)
+            out["motivi"][ticker] = r.get("motivo")
     return out
 
 

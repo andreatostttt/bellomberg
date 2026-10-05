@@ -33,7 +33,7 @@ def _book(n=28):
         "positions": [{
             "ticker": f"TCK{i}.MI", "nome": f"Societa Numero {i} SpA",
             "quantita": 100.0 + i, "prezzo_medio": 12.34 + i, "prezzo_live": 13.98 + i,
-            "valuta": "EUR", "valore_mercato": 1398.76 + i, "pl_eur": 165.43 + i,
+            "valuta": "EUR", "valore_mercato": 1398.76 + i, "pl_eur": 171.29 + i,
             "pl_pct": 13.40 + i, "prev_close": 13.5, "prev_close_ts": "2026-08-19T17:30:00",
             "price_stale": False, "price_source": "snapshot", "data_apertura": "2026-02-01",
             "fx_to_eur": 1.0, "peso_pct": 3.70 + i,
