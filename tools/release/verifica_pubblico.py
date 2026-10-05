@@ -56,6 +56,23 @@ GITLEAKS_EXIT_HIT = 7   # il codice che gitleaks usa per «leak trovati» SOLO s
 GITLEAKS_SCOPERTI = ("app/package-lock.json",)   # l'allowlist globale del config di default 8.30.1
                         # salta i lockfile: il MOTORE non li legge (li leggono i
                         # controlli in memoria). Ogni altro salto e' un KO, non una nota.
+# PM 05/10 (Opus 5.5): i PDF sintetici dei test che l'allowlist globale del motore 8.30.1 salta
+# (estensione .pdf). Fuori raggio SOLO se il motore dichiara il salto E lo SHA-256 dei byte
+# esportati coincide col pin: un byte cambiato o un PDF non pinnato resta un KO di copertura.
+# Prima del pin il testo estratto (pagine, metadati, stream decompressi) e' passato da gitleaks e
+# dai controlli in memoria del cancello: 0 riscontri. Ri-pinnare = rifare quella prova.
+GITLEAKS_FUORI_RAGGIO_PIN = {
+    "tests/fixtures/fonti_it/dep_generico_2025.pdf": "004f660763c0640cf327c366d5a0abda020f3cc0a395d486b0d7a4600c0a4a39",
+    "tests/fixtures/fonti_it/dep_generico_en.pdf": "9ba62b31d00be39249b1652b4199ea13594f38e532a247cef0442357ed28d8d3",
+    "tests/fixtures/fonti_it/dep_generico_it.pdf": "de5cb7006009fdcbea33e4c50c98d47bc1cd16e63356a0036b98627524333b5d",
+    "tests/fixtures/fonti_it/dep_generico_lontano.pdf": "3a202c501352a46dc7f2b18ed24d5d3e637936f98dec61d8a0505a10900501c0",
+    "tests/fixtures/fonti_it/id_multipla.pdf": "c01eb5197733dac66b5946dc921c7583ea91615cfb728527edcf79cf0dba9b73",
+    "tests/fixtures/fonti_it/id_senza_etichette.pdf": "434cd9d61f6ae5c5b77741fee5ec2256ef3ebd9a6fe2058fa3d8b9d6a3e06a62",
+    "tests/fixtures/fonti_it/id_singola.pdf": "3bdfcbbdc4436116f89c4f7f6d42831996f310cb0f6f7f77c7d96f02b8939bbd",
+    "tests/fixtures/fonti_it/oi_id_ambiguo.pdf": "14ea20e63973e1310f1b60345c03e8d2500d843c7391a95f99b3962d25d4f7ce",
+    "tests/fixtures/fonti_it/oi_id_iso.pdf": "31cf814fe0c251863cbe757ab9e73429caddf413239a61a4775658b4d4d7c2a5",
+    "tests/fixtures/fonti_it/oi_id_usa.pdf": "9a3cf8a0b6dc880a20954b25163b354465535f14156c328062255674abb77f6d",
+}
 MAX_TREE = 32 * 1024 * 1024  # PM 03/10: 32 MiB ordinary release files; other guards unchanged.
 MAX_FILE = 2 * 1024 * 1024
 BUDGET_SCREENSHOTS = "BUDGET_SCREENSHOTS_APPROVATO.json"
@@ -2012,7 +2029,26 @@ def _saltati_gitleaks(tree_dir, stderr):
     return skipped
 
 
-def _copertura(tree_dir, stderr, stdin_letti=None, raster_pins=None):
+def _fuori_raggio_pinnati(tree_dir, saltati, pin):
+    """(dichiarati, errori): i file del pin che il motore DICE di aver saltato e i cui byte
+    esportati hanno lo SHA-256 pinnato. Uno saltato con hash diverso e' un errore che lo nomina e
+    i suoi byte restano fra i non scansionati; uno che il motore ha letto non riceve credito."""
+    dichiarati, errori = [], []
+    for rel, atteso in sorted(pin.items()):
+        path = os.path.join(tree_dir, rel.replace("/", os.sep))
+        if rel not in saltati or not os.path.isfile(path):
+            continue
+        with open(path, "rb") as fh:
+            visto = hashlib.sha256(fh.read()).hexdigest()
+        if visto == atteso:
+            dichiarati.append(rel)
+        else:
+            errori.append("%s fuori dal raggio del motore con SHA-256 %s diverso dal pin %s"
+                          % (rel, visto[:12], atteso[:12]))
+    return dichiarati, errori
+
+
+def _copertura(tree_dir, stderr, stdin_letti=None, raster_pins=None, pin_fuori_raggio=None):
     """Quanto ha letto DAVVERO il motore: la riga «scanned ~N bytes» (esatta al byte, misurata
     sul tree vero) confrontata coi byte del tree, meno i file che il config di default salta per
     disegno suo (GITLEAKS_SCOPERTI). Torna (errore, nota). Senza questa misura ogni salto del
@@ -2049,8 +2085,17 @@ def _copertura(tree_dir, stderr, stdin_letti=None, raster_pins=None):
     fuori = [rel for rel in GITLEAKS_SCOPERTI
              if os.path.isfile(os.path.join(tree_dir, rel.replace("/", os.sep)))]
     scoperti = sum(os.path.getsize(os.path.join(tree_dir, rel.replace("/", os.sep))) for rel in fuori)
+    pinnati, pin_ko = _fuori_raggio_pinnati(
+        tree_dir, _saltati_gitleaks(tree_dir, stderr) - set(stdin_letti) - set(raster) - set(fuori),
+        GITLEAKS_FUORI_RAGGIO_PIN if pin_fuori_raggio is None else pin_fuori_raggio)
+    errori.extend(pin_ko)
+    byte_pinnati = sum(os.path.getsize(os.path.join(tree_dir, rel.replace("/", os.sep))) for rel in pinnati)
+    scoperti += byte_pinnati
     nota = "%d/%d byte letti%s" % (letti, attesi,
                                    (" (%s fuori dal raggio del motore)" % ", ".join(fuori)) if fuori else "")
+    if pinnati:
+        nota += "; %d file fuori dal raggio del motore pinnati per SHA-256 (%d byte, GITLEAKS_FUORI_RAGGIO_PIN)" % (
+            len(pinnati), byte_pinnati)
     if stdin_letti:
         svg = sum(rel.lower().endswith('.svg') for rel in stdin_letti)
         js = sum(rel.lower().endswith('.min.js') for rel in stdin_letti)
@@ -2061,7 +2106,7 @@ def _copertura(tree_dir, stderr, stdin_letti=None, raster_pins=None):
     if letti > attesi - scoperti - raster_bytes:
         errori.append("conteggio del motore superiore ai byte attribuibili a dir/stdin: copertura incoerente")
     elif letti != attesi - scoperti - raster_bytes:
-        nomi = sorted(_saltati_gitleaks(tree_dir, stderr) - set(stdin_letti) - set(raster))
+        nomi = sorted(_saltati_gitleaks(tree_dir, stderr) - set(stdin_letti) - set(raster) - set(pinnati))
         errori.append("letti %d byte su %d attesi (%d dichiarati fuori dal raggio, %d raster certificati separatamente): %d byte NON scansionati%s"
                       % (letti, attesi, scoperti, raster_bytes, attesi - scoperti - raster_bytes - letti,
                          (": " + ", ".join(nomi)) if nomi else ""))
@@ -2129,7 +2174,7 @@ def _scansiona_asset_gitleaks(tree_dir, exe, esegui, ambiente, temporaneo, stder
     return letti, finding
 
 
-def controllo_gitleaks(tree_dir, exe=GITLEAKS_EXE, esegui=None, raster_pins=None):
+def controllo_gitleaks(tree_dir, exe=GITLEAKS_EXE, esegui=None, raster_pins=None, pin_fuori_raggio=None):
     """Il motore di terzi sulla CARTELLA esportata (gitleaks legge file, non il dict in
     memoria degli altri controlli). Ogni esito ambiguo e' un KO dichiarato, mai un «0 hit»:
       · gitleaks esce 1 sia per «leak trovati» sia per QUALUNQUE guasto (cmd/root.go v8.30.1:
@@ -2138,7 +2183,8 @@ def controllo_gitleaks(tree_dir, exe=GITLEAKS_EXE, esegui=None, raster_pins=None
       · il report lo scrive prima di uscire: se manca o non e' una lista JSON, KO;
       · la COPERTURA e' una misura, non una deduzione: `_copertura` confronta i byte che il motore
         dichiara di aver letto con quelli del tree (i file che salta per disegno suo sono elencati
-        in GITLEAKS_SCOPERTI e finiscono nella nota); ogni altro salto e' un KO col numero e i nomi;
+        in GITLEAKS_SCOPERTI e finiscono nella nota; i PDF di GITLEAKS_FUORI_RAGGIO_PIN solo se il
+        motore ne dichiara il salto e lo SHA-256 coincide col pin); ogni altro salto e' un KO col numero e i nomi;
       · la versione la legge dall'EXE (`gitleaks version`), non dalla costante: un binario di
         un'altra versione, troncato o di un'altra architettura e' un KO, non una nota;
       · le regole sono le nostre: `gitleaks:allow` ignorato, `--gitleaks-ignore-path` tolto dal
@@ -2191,7 +2237,7 @@ def controllo_gitleaks(tree_dir, exe=GITLEAKS_EXE, esegui=None, raster_pins=None
             stdin_letti, stdin_finding = _scansiona_asset_gitleaks(tree_dir, exe, esegui, ambiente, td, r.stderr or "")
         except (OSError, ValueError) as e:
             return Esito('gitleaks', errore='Scansione SVG/min.js non conclusa: %s' % e)
-        buco, quanto = _copertura(tree_dir, r.stderr or "", stdin_letti, raster_pins)
+        buco, quanto = _copertura(tree_dir, r.stderr or "", stdin_letti, raster_pins, pin_fuori_raggio)
         if buco:
             return Esito("gitleaks", errore=buco)
         finding.extend(stdin_finding)

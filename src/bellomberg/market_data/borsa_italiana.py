@@ -49,6 +49,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 from datetime import date, datetime, timezone
 from html import unescape
@@ -207,9 +208,9 @@ def _valida_isin_it(grezzo: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     def _voce(k, v):
         if not isinstance(v, dict):
             raise ValueError("voce %r: serve un oggetto {isin, emarket}" % k)
-        fuori = sorted(set(v) - {"isin", "emarket"})
+        fuori = sorted(set(v) - {"isin", "emarket", "oneinfo"})
         if fuori:
-            raise ValueError("voce %r: campo %r sconosciuto (ammessi isin, emarket)" % (k, fuori[0]))
+            raise ValueError("voce %r: campo %r sconosciuto (ammessi isin, emarket, oneinfo)" % (k, fuori[0]))
         isin = _np.stringa_piena("%s.isin" % k, v.get("isin"))
         if not isin_valido(isin):
             raise ValueError("voce %r: %r non e' un ISIN valido (forma o cifra di controllo)" % (k, isin))
@@ -221,7 +222,16 @@ def _valida_isin_it(grezzo: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         em = v["emarket"]
         if em is not None and (isinstance(em, bool) or not isinstance(em, int) or em <= 0):
             raise ValueError("voce %r: 'emarket' dev'essere un intero positivo o null, non %r" % (k, em))
-        return {"isin": isin, "emarket": em}
+        voce = {"isin": isin, "emarket": em}
+        # 'oneinfo' FACOLTATIVO (handoff-3, richiesta di oneinfo_sdir): ndg dell'emittente su
+        # 1INFO-SDIR (intero) | null = DICHIARATO non su 1INFO | chiave ASSENTE = non dichiarato,
+        # lo misura chi legge. Assente e null sono due cose diverse: la chiave si copia solo se c'e'.
+        if "oneinfo" in v:
+            oi = v["oneinfo"]
+            if oi is not None and (isinstance(oi, bool) or not isinstance(oi, int) or oi <= 0):
+                raise ValueError("voce %r: 'oneinfo' dev'essere un intero positivo o null, non %r" % (k, oi))
+            voce["oneinfo"] = oi
+        return voce
     return _np.mappa_canonica(grezzo, _voce, "simbolo")
 
 
@@ -253,7 +263,7 @@ def voce_ticker(ticker: str) -> Tuple[Optional[Dict[str, Any]], Optional[str], O
 PERCORSO_ISIN_AUTO = str(DATA_DIR / "isin_it_auto.json")
 ORIGINE_AUTO = "verificato automaticamente su Borsa Italiana il %s"
 _CAMPI_AUTO = ("isin", "emarket", "emarket_motivo", "origine", "verificato_il", "nome_cercato",
-               "riga_listino", "scheda_url", "scheda_sha256")
+               "riga_listino", "scheda_url", "scheda_sha256", "oneinfo", "mic")
 
 
 def _valida_isin_auto(grezzo: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -263,10 +273,17 @@ def _valida_isin_auto(grezzo: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         fuori = sorted(set(v) - set(_CAMPI_AUTO))
         if fuori:
             raise ValueError("voce automatica %r: campo %r sconosciuto" % (k, fuori[0]))
-        base = _valida_isin_it({k: {"isin": v.get("isin"), "emarket": v.get("emarket")}})[k]
+        base = _valida_isin_it({k: {c: v.get(c) for c in ("isin", "emarket", "oneinfo")
+                                    if c in v or c != "oneinfo"}})[k]
         origine = _np.stringa_piena("%s.origine" % k, v.get("origine"))
         if not origine.startswith("verificato automaticamente su Borsa Italiana il "):
             raise ValueError("voce automatica %r: origine %r non riconosciuta" % (k, origine))
+        if "riga_listino" in v:   # facoltativo (voci vecchie senza): se c'e', testo pieno
+            _np.stringa_piena("%s.riga_listino" % k, v["riga_listino"])
+        if "mic" in v:            # facoltativo: mercato della riga del listino (MTAA, EXGM, BGEM...)
+            if not isinstance(v["mic"], str) or not re.fullmatch(r"[A-Z0-9]{2,10}", v["mic"]):
+                raise ValueError("voce automatica %r: 'mic' dev'essere una sigla maiuscola alfanumerica, "
+                                 "non %r" % (k, v["mic"]))
         return dict(v, **base)
     return _np.mappa_canonica(grezzo, _voce, "simbolo")
 
@@ -276,28 +293,159 @@ def carica_isin_auto(path: Optional[str] = None) -> Dict[str, Any]:
                       _valida_isin_auto, "voci")
 
 
-def _scrivi_voce_auto(simbolo: str, voce: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
-    """Legge-modifica-riscrive il negozio automatico in modo atomico (tmp + os.replace).
-    Un negozio automatico ILLEGGIBILE non si sovrascrive (si perderebbero le altre voci):
-    si rifiuta e si dichiara."""
-    neg = carica_isin_auto(PERCORSO_ISIN_AUTO)
-    if neg["origine"] == "illeggibile":
-        return False, "negozio automatico illeggibile, non sovrascritto: %s" % neg["motivo"]
-    grezzo: Dict[str, Any] = {}
-    if neg["origine"] != "assente":
-        with open(PERCORSO_ISIN_AUTO, encoding="utf-8") as fh:
-            grezzo = json.load(fh)
-    grezzo[simbolo] = {k: voce[k] for k in _CAMPI_AUTO if k in voce}
+# ------------------------------------------------------------
+# SCRITTURA CONCORRENTE (rilievo R3 di RV-W1, 05/10): due risoluzioni in parallelo (thread
+# dell'API, run, scheduler: anche PROCESSI diversi) facevano leggi-modifica-scrivi senza
+# lock -> una voce «ok, salvato» spariva, o os.replace falliva con PermissionError su Windows.
+# Cura: lock DI FILE fra processi (<percorso>.lock, primo byte bloccato con msvcrt/fcntl: il
+# sistema lo rilascia da solo se il processo muore, niente lock orfani) + lock di processo per
+# percorso (fcntl non esclude i thread dello stesso processo); dentro il lock si RILEGGE il
+# file dal disco, si unisce, si scrive temporaneo + os.replace con nuovi tentativi brevi.
+# ------------------------------------------------------------
+ATTESA_LOCK_S = 10.0
+_LOCK_PROCESSO: Dict[str, Any] = {}
+_LOCK_MAPPA = threading.Lock()
+
+
+class RifiutoModifica(Exception):
+    """La `modifica` passata ad aggiorna_json_bloccato rifiuta di scrivere: `motivo` va al
+    chiamante cosi' com'e' (testo nostro, mai il testo di un'eccezione esterna)."""
+
+    def __init__(self, motivo: str):
+        super().__init__(motivo)
+        self.motivo = motivo
+
+
+def _blocca_byte(fd: int) -> bool:
+    """Un tentativo NON bloccante sul primo byte del file di lock. True = preso."""
     try:
-        cartella = os.path.dirname(os.path.abspath(PERCORSO_ISIN_AUTO))
-        os.makedirs(cartella, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=cartella, suffix=".tmp")
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(grezzo, fh, ensure_ascii=False, indent=2)
-        os.replace(tmp, PERCORSO_ISIN_AUTO)
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _sblocca_byte(fd: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.lockf(fd, fcntl.LOCK_UN, 1, 0)
+
+
+def _replace_con_tentativi(tmp: str, percorso: str, attesa_s: float = 2.0) -> None:
+    """os.replace; su Windows un LETTORE che ha il file aperto lo fa fallire con
+    PermissionError: si riprova per al massimo `attesa_s`, poi l'errore sale."""
+    fine = time.monotonic() + attesa_s
+    while True:
+        try:
+            os.replace(tmp, percorso)
+            return
+        except PermissionError:
+            if time.monotonic() >= fine:
+                raise
+            time.sleep(0.02)
+
+
+def aggiorna_json_bloccato(percorso: str, modifica: Callable[[Dict[str, Any]], Dict[str, Any]], *,
+                           attesa_s: float = ATTESA_LOCK_S,
+                           illeggibile_si_riscrive: bool = False) -> Tuple[bool, Optional[str]]:
+    """Leggi-modifica-scrivi di un file JSON (oggetto) sotto lock fra thread E processi.
+    - lock: `<percorso>.lock` accanto al file; attesa al massimo `attesa_s` (orologio monotonico),
+      poi (False, motivo) dichiarato: nessuna scrittura senza lock.
+    - dentro il lock il file si RILEGGE dal disco: assente = {}; illeggibile (JSON rotto o non
+      oggetto) = (False, motivo) e NON si sovrascrive, salvo `illeggibile_si_riscrive=True`
+      (solo per file che sono cache, es. i tentativi di isin_automatico).
+    - `modifica(dati) -> nuovi dati` (puo' sollevare RifiutoModifica(motivo) per non scrivere);
+    - scrittura: temporaneo nella stessa cartella + os.replace con tentativi su PermissionError.
+    Ritorna (True, None) | (False, motivo); gli errori portano solo il TIPO dell'eccezione."""
+    assoluto = os.path.abspath(percorso)
+    nome = os.path.basename(assoluto)
+    with _LOCK_MAPPA:
+        lock_proc = _LOCK_PROCESSO.setdefault(os.path.normcase(assoluto), threading.Lock())
+    fine = time.monotonic() + attesa_s
+    if not lock_proc.acquire(timeout=max(attesa_s, 0.0)):
+        return False, "lock di %s non ottenuto in %.1f s (altra scrittura in corso): non scritto" % (nome, attesa_s)
+    try:
+        try:
+            os.makedirs(os.path.dirname(assoluto), exist_ok=True)
+            fd = os.open(assoluto + ".lock", os.O_CREAT | os.O_RDWR)
+        except OSError as e:
+            return False, "file di lock di %s non aperto: %s" % (nome, type(e).__name__)
+        try:
+            while not _blocca_byte(fd):
+                if time.monotonic() >= fine:
+                    return False, ("lock di %s non ottenuto in %.1f s (un altro processo sta scrivendo): "
+                                   "non scritto" % (nome, attesa_s))
+                time.sleep(0.02)
+            try:
+                return _leggi_modifica_scrivi(assoluto, nome, modifica, illeggibile_si_riscrive)
+            finally:
+                _sblocca_byte(fd)
+        finally:
+            os.close(fd)
+    finally:
+        lock_proc.release()
+
+
+def _leggi_modifica_scrivi(assoluto: str, nome: str, modifica: Callable[[Dict[str, Any]], Dict[str, Any]],
+                           illeggibile_si_riscrive: bool) -> Tuple[bool, Optional[str]]:
+    """Il corpo di aggiorna_json_bloccato: va chiamato SOLO col lock preso."""
+    dati: Dict[str, Any] = {}
+    if os.path.exists(assoluto):
+        try:
+            with open(assoluto, encoding="utf-8") as fh:
+                letto = json.load(fh)
+            if not isinstance(letto, dict):
+                raise ValueError("non oggetto")
+            dati = letto
+        except (OSError, ValueError) as e:
+            if not illeggibile_si_riscrive:
+                return False, "%s illeggibile (%s): non sovrascritto" % (nome, type(e).__name__)
+    try:
+        nuovi = modifica(dati)
+    except RifiutoModifica as r:
+        return False, r.motivo
+    fdt, tmp = tempfile.mkstemp(dir=os.path.dirname(assoluto), suffix=".tmp")
+    try:
+        with os.fdopen(fdt, "w", encoding="utf-8") as fh:
+            json.dump(nuovi, fh, ensure_ascii=False, indent=2)
+        _replace_con_tentativi(tmp, assoluto)
     except OSError as e:
-        return False, "scrittura del negozio automatico fallita: %s" % type(e).__name__
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False, "scrittura di %s fallita: %s" % (nome, type(e).__name__)
     return True, None
+
+
+def _scrivi_voce_auto(simbolo: str, voce: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """Aggiunge/aggiorna UNA voce del negozio automatico sotto lock (aggiorna_json_bloccato):
+    il negozio si rilegge dal disco DENTRO il lock, quindi le voci scritte nel frattempo da
+    altri thread o processi restano. Un negozio automatico ILLEGGIBILE (JSON rotto o voce
+    malformata) non si sovrascrive (si perderebbero le altre voci): si rifiuta e si dichiara."""
+    def _modifica(grezzo: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            _valida_isin_auto({k: v for k, v in grezzo.items() if not str(k).startswith("_")})
+        except ValueError as e:
+            raise RifiutoModifica("voce malformata (%s)" % type(e).__name__)
+        grezzo[simbolo] = {k: voce[k] for k in _CAMPI_AUTO if k in voce}
+        return grezzo
+    ok, motivo = aggiorna_json_bloccato(PERCORSO_ISIN_AUTO, _modifica)
+    if ok:
+        return True, None
+    if "illeggibile" in (motivo or "") or "malformata" in (motivo or ""):
+        return False, "negozio automatico illeggibile, non sovrascritto: %s" % motivo
+    return False, "negozio automatico non scritto: %s" % motivo
 
 
 def voce_ticker_o_auto(ticker: str) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
@@ -322,6 +470,38 @@ def voce_ticker_o_auto(ticker: str) -> Tuple[Optional[Dict[str, Any]], Optional[
     return None, "ticker_non_mappato", ("ticker %r assente dal negozio confermato (%s) e da quello "
                                         "automatico (%s): risolvi_isin(ticker, nome=...) lo verifica "
                                         "su Borsa Italiana" % (chiave, PERCORSO_ISIN, PERCORSO_ISIN_AUTO))
+
+
+def _campo_automatico(ticker: str, campo: str) -> Optional[str]:
+    """Un campo della voce AUTOMATICA del ticker, senza rete. Per un ticker del negozio
+    CONFERMATO solo se la voce automatica ha lo STESSO ISIN (il confermato ha la precedenza e
+    non porta questi campi). None se manca, se il negozio e' illeggibile o il ticker non c'e'."""
+    voce, _err, _mot = voce_ticker_o_auto(ticker)
+    if voce is None:
+        return None
+    if voce["negozio"] == "automatico":
+        return voce.get(campo)
+    auto = carica_isin_auto(PERCORSO_ISIN_AUTO)
+    va = auto["voci"].get((ticker or "").strip().upper())
+    if va and va.get("isin") == voce.get("isin"):
+        return va.get(campo)
+    return None
+
+
+def nome_listino(ticker: str) -> Optional[str]:
+    """Nome della RIGA del Listino A-Z di Borsa Italiana con cui risolvi_isin ha verificato il
+    titolo (campo `riga_listino` del negozio AUTOMATICO), SENZA rete. Serve a chi cerca
+    l'emittente altrove col nome ufficiale del listino (sdir/1INFO: nome storico diverso dal
+    nome societario). None: v. _campo_automatico (anche voce vecchia senza il campo)."""
+    return _campo_automatico(ticker, "riga_listino")
+
+
+def mercato_listino(ticker: str) -> Optional[str]:
+    """Mercato (MIC) della riga del Listino A-Z verificata da risolvi_isin: 'MTAA' Euronext
+    Milan, 'EXGM' Euronext Growth Milan, 'BGEM' Global Equity Market (azione ESTERA quotata
+    in Italia). SENZA rete. None per le voci scritte prima del 05/10 (campo assente: non
+    dedotto dall'URL della scheda) e nei casi di _campo_automatico."""
+    return _campo_automatico(ticker, "mic")
 
 
 # ============================================================
@@ -512,8 +692,9 @@ def _leggi_eventi(ticker: str, isin: str) -> Dict[str, Any]:
     out = _base(ticker, isin)
     try:
         http, corpo, _finale = _scarica(out["url"])
-    except URLVietato as e:
-        out.update(errore="url_vietato", motivo=str(e))
+    except URLVietato as e:  # testo controllato: il messaggio puo' contenere l'URL del redirect (regola 16)
+        out.update(errore="url_vietato", motivo="URL rifiutato prima della rete (%s: robots.txt o host non "
+                                                "previsto)" % type(e).__name__)
         return out
     except Exception as e:  # rete: solo il TIPO (regola: niente testo con URL nei log)
         out.update(errore="rete", motivo="richiesta fallita: %s" % type(e).__name__)
@@ -592,12 +773,30 @@ URL_LISTINO = BASE + "/borsa/azioni/listino-a-z.html?initial={iniziale}&lang=it"
 URL_MENU_EMARKET = "https://www.emarketstorage.it/it/comunicati-finanziari?categoria=110"
 MAX_PAGINE_LISTINO = 10
 MAX_SCHEDE = 6
+MAX_LETTERE = 3     # lettere del listino provate: una per parola significativa del nome (v. sotto)
 PAUSA_S = 1.0
+# MISURA 05/10 (IT1b, 8 richieste): il Listino A-Z mescola Euronext Milan (MTAA), Euronext
+# Growth Milan (EXGM) e il Global Equity Market (BGEM, azioni ESTERE), ordinato per nome;
+# ~20 righe a pagina, le lettere piu' lunghe misurate (C, S) hanno 6 pagine. La classe
+# dell'azione sta nel NOME della riga («... Ord», «... Rsp», «... Pref»). Gli ETF NON ci
+# sono (stanno sotto /borsa/etf/): un nome da ETF si dichiara subito, senza rete.
+# Il nome del fornitore puo' iniziare con un'altra parola rispetto alla riga del listino
+# (nome lungo «Assicurazioni X» -> riga «X» sotto un'altra lettera): se la prima lettera non
+# da' righe che combaciano si provano le iniziali delle altre parole significative (al
+# massimo MAX_LETTERE, ognuna DICHIARATA in verifica.iniziali_lette).
 
 _FORME_GIURIDICHE = re.compile(
     r"\b(?:S\.?\s?P\.?\s?A|S\.?\s?A\.?\s?P\.?\s?A|S\.?\s?R\.?\s?L|N\.?\s?V|S\.?\s?E|S\.?\s?A|A\.?\s?G|PLC|INC|CORP|"
     r"SOCIETA'?\s+PER\s+AZIONI)\.?(?=\s|$)", re.I)
+# forme che non sono MAI un nome da sole (una riga «Plc» invece e' un emittente)
+_SOLO_FORMA_GENERICA = re.compile(r"(?:S\.?\s?P\.?\s?A|S\.?\s?A\.?\s?P\.?\s?A|S\.?\s?R\.?\s?L|"
+                                  r"SOCIETA'?\s+PER\s+AZIONI)\.?", re.I)
 _PAROLE_VUOTE = {"DI", "DEI", "DEL", "DELLA", "DELLE", "DEGLI", "E", "THE", "OF", "GRUPPO", "GROUP"}
+# classe dell'azione nel nome della riga: non distingue l'EMITTENTE (lo fa la scheda col
+# Codice Alfanumerico), quindi non conta nell'abbinamento per parole
+_CLASSI_AZIONE = {"ORD", "ORDINARIA", "ORDINARIE", "RSP", "RISP", "RISPARMIO", "PRIV", "PRIVILEGIATA",
+                  "PRIVILEGIATE", "PREF", "AZ", "AZIONI"}
+_PAROLE_FONDO = {"ETF", "ETC", "ETN", "UCITS"}
 
 
 def normalizza_nome(nome: Any) -> str:
@@ -608,26 +807,98 @@ def normalizza_nome(nome: Any) -> str:
         return ""
     s = unicodedata.normalize("NFKD", nome)
     s = "".join(c for c in s if not unicodedata.combining(c)).upper()
+    # forma giuridica PRIMA di '&' -> 'E': 'S&P' diventerebbe 'S E P' e la regola 'S.E.'
+    # (Societas Europaea) gli mangerebbe le prime due lettere
+    senza_forma = _FORME_GIURIDICHE.sub(" ", s)
+    if not re.sub(r"[^A-Z0-9]+", "", senza_forma):
+        # il nome E' una sigla da forma giuridica («PLC S.p.A.», rilievo P3 RV-IT1): si toglie
+        # solo l'ULTIMA forma; se resta vuoto (solo «S.p.A.») il nome e' vuoto davvero
+        ultime = list(_FORME_GIURIDICHE.finditer(s))
+        senza_forma = s[:ultime[-1].start()] + " " + s[ultime[-1].end():] if ultime else s
+        if not re.sub(r"[^A-Z0-9]+", "", senza_forma) and not _SOLO_FORMA_GENERICA.fullmatch(s.strip()):
+            senza_forma = s   # riga del listino «Plc»: il nome e' la sigla, resta
+    s = senza_forma
     s = s.replace("&", " E ")
-    s = _FORME_GIURIDICHE.sub(" ", s)
     s = re.sub(r"[^A-Z0-9]+", " ", s)
     return " ".join(s.split())
 
 
+def _significative(n: str) -> List[str]:
+    """Parole del nome senza parole vuote e classi dell'azione (ORD, RSP...). Le lettere di
+    classe A/B NON si tolgono qui: v. _nomi_di_confronto (servono le righe sorelle)."""
+    return [p for p in n.split() if p not in _PAROLE_VUOTE and p not in _CLASSI_AZIONE]
+
+
+def _nomi_di_confronto(righe: List[Dict[str, Any]]) -> None:
+    """Aggiunge a ogni riga `nome_confronto`: il nome normalizzato, senza la LETTERA finale A/B
+    solo se nel listino c'e' la riga SORELLA con l'altra lettera (misura M1b 05/10 su un emittente
+    vero; qui sintetico: «Mfx A» e «Mfx B», menu eMarket «MFX-MEDIAFINTA»). Senza sorella la
+    lettera e' parte del nome (rilievo RV-IT1: un nome vero che finisce con «B»)."""
+    nomi = {r["nome_normalizzato"] for r in righe}
+    for r in righe:
+        n = r["nome_normalizzato"]
+        parti = n.split()
+        r["nome_confronto"] = n
+        if len(parti) > 1 and parti[-1] in ("A", "B"):
+            sorella = " ".join(parti[:-1] + ["B" if parti[-1] == "A" else "A"])
+            if sorella in nomi:
+                r["nome_confronto"] = " ".join(parti[:-1])
+
+
 def _parole(n: str) -> set:
-    return {p for p in n.split() if p not in _PAROLE_VUOTE}
+    return set(_significative(n))
+
+
+def _compatto(n: str) -> str:
+    """Le parole significative attaccate, nell'ordine: 'ZETAFIN BANK' e 'ZETAFINBANK' (o 'ZU VE'
+    e 'ZUVE', trattino del menu eMarket) si equivalgono."""
+    return "".join(_significative(n))
+
+
+_RANGO_COMBACIA = {"esatto": 0, "compatto": 1, "parole": 2, "abbreviato": 3}
 
 
 def _combacia(cercato: str, riga: str) -> Optional[str]:
-    """'esatto' | 'parole' (le parole significative di uno stanno tutte nell'altro) | None."""
+    """'esatto' | 'compatto' (stesse parole significative, spazi a parte) | 'parole' (le parole
+    significative di uno stanno tutte nell'altro) | None."""
     if not cercato or not riga:
         return None
     if cercato == riga:
         return "esatto"
+    ca = _compatto(cercato)
+    if ca and ca == _compatto(riga):
+        return "compatto"
     a, b = _parole(cercato), _parole(riga)
     if a and b and (a <= b or b <= a):
         return "parole"
     return None
+
+
+def _ordine_corrispondenza(cercato: str, riga: str, combacia: str) -> Tuple[int, int]:
+    """Prima le esatte, poi le compatte, poi per parole con meno parole di scarto: con piu' di
+    MAX_SCHEDE righe le schede controllate sono le piu' vicine al nome, non le prime a caso."""
+    return _RANGO_COMBACIA[combacia], len(_parole(cercato) ^ _parole(riga))
+
+
+def _lettere_da_provare(n: str) -> List[Tuple[str, str]]:
+    """[(iniziale, parola_di_arresto)] nell'ordine: la prima parola del nome (anche se generica:
+    «Gruppo X» sta sotto la G), poi le iniziali delle altre parole significative. Per lettera
+    la parola di arresto e' la piu' alta in ordine alfabetico: il listino si legge finche' le
+    righe non la superano. Le parole che non iniziano con una lettera si saltano."""
+    parole = n.split()
+    candidate = parole[:1] + [p for p in parole[1:] if p not in _PAROLE_VUOTE and p not in _CLASSI_AZIONE]
+    lettere: Dict[str, str] = {}
+    for p in candidate:
+        if p[:1].isalpha() and p > lettere.get(p[0], ""):
+            lettere[p[0]] = p
+    return list(lettere.items())[:MAX_LETTERE]
+
+
+def _oltre(nome_norm_riga: str, parola: str) -> bool:
+    """La riga sta DOPO `parola` nell'ordine del listino. Confronto sul prefisso lungo quanto
+    la parola: una riga che INIZIA con la parola ('ZETAFINBANK' per 'ZETAFIN') non e' mai oltre."""
+    primo = (nome_norm_riga.split() or [""])[0]
+    return primo[:len(parola)] > parola
 
 
 _RIGA_LISTINO = re.compile(
@@ -635,10 +906,13 @@ _RIGA_LISTINO = re.compile(
     r'\s+title="Accedi alla scheda strumento&nbsp;([^"]+)"')
 
 
-def parse_listino(html: str, iniziale: str) -> Dict[str, Any]:
+def parse_listino(html: str, iniziale: str, pagina: int = 1) -> Dict[str, Any]:
     """{"stato": ok|KO, "righe": [{nome, nome_normalizzato, isin, mic, scheda_url}],
     "pagina_successiva": bool, "motivo"}. Nessuna riga sulla pagina = KO layout (una lettera
-    del listino non e' mai vuota: e' la pagina che e' cambiata)."""
+    del listino non e' mai vuota: e' la pagina che e' cambiata).
+    MISURA 05/10 (bug trovato dalla copertura FTSE MIB): ogni pagina linka SE STESSA (anche in
+    inglese) e oltre l'ultima pagina il sito RISERVE l'ultima. `pagina_successiva` e' quindi il
+    link alla pagina `pagina+1`, non un qualunque `page=`."""
     righe, viste = [], set()
     for href, isin, mic, nome in _RIGA_LISTINO.findall(html or ""):
         if href in viste:
@@ -650,7 +924,8 @@ def parse_listino(html: str, iniziale: str) -> Dict[str, Any]:
     if not righe:
         return {"stato": "KO", "righe": [], "pagina_successiva": False,
                 "motivo": "listino A-Z senza righe riconoscibili (link alla scheda con ISIN): layout cambiato"}
-    succ = re.search(r'listino-a-z\.html\?initial=%s[^"]*page=\d' % re.escape(iniziale), html) is not None
+    succ = re.search(r'listino-a-z\.html\?initial=%s(?:&amp;|&)[^"]*page=%d(?!\d)' % (re.escape(iniziale), pagina + 1),
+                     html) is not None
     return {"stato": "ok", "righe": righe, "pagina_successiva": succ, "motivo": None}
 
 
@@ -675,8 +950,21 @@ def verifica_scheda(html: str, isin: str, simbolo: str) -> Tuple[bool, str, Dict
     return True, "", letti
 
 
-def _cerca_emarket(nome_norm: str) -> Tuple[Optional[int], str, Optional[str]]:
-    """(id, esito 'ok'|'non_trovato'|'ambiguo'|'KO', motivo) dal menu emittenti di eMarket."""
+def _cerca_emarket(nome_norm: str, altro_nome: Optional[str] = None) -> Tuple[Optional[int], str, Optional[str]]:
+    """(id, esito 'ok'|'non_trovato'|'ambiguo'|'da_confermare'|'KO', motivo) dal menu emittenti
+    di eMarket. `nome_norm` e' il nome della RIGA del listino (la scheda l'ha verificata),
+    `altro_nome` quello cercato (fornitore/DB, a volte piu' lungo: «Assicurazioni X»).
+    Regola (rilievi P1 di RV-IT1: un candidato unico «per parole» dava l'id di un ALTRO
+    emittente, es. sintetici dei casi veri: riga «Qqal Verde Potenza» -> GRUPPO VERDE POTENZA, «Res» -> ZZCOR RES):
+    una voce del menu e' ACCETTABILE solo se contiene tutte le parole significative della riga.
+    Gradini, ciascuno solo se UNIVOCO (un id):
+      1. esatta/compatta sul nome della riga;
+      2. esatta/compatta sul nome cercato, fra le accettabili (il nome cercato non scavalca la
+         riga: «Calta» non porta a CALTA se la riga e' «Calta Edit»);
+      3. per parole fra le accettabili con la STESSA prima parola significativa (sigla + classe:
+         riga «Mfx A» -> «MFX-MEDIAFINTA»), ristrette col nome cercato se piu' d'una.
+    Altrimenti: voci simili ma non accettabili -> 'da_confermare' (una) / 'ambiguo' (piu'),
+    id None e la lista nel motivo; nessuna -> 'non_trovato'. Mai il primo a caso."""
     try:
         http, corpo, _ = _scarica(URL_MENU_EMARKET)
     except Exception as e:
@@ -689,14 +977,96 @@ def _cerca_emarket(nome_norm: str) -> Tuple[Optional[int], str, Optional[str]]:
         return None, "KO", "menu emittenti di eMarket non trovato (layout cambiato)"
     opzioni = [(int(v), unescape(t).strip()) for v, t in
                re.findall(r'<option\s+value="(\d+)"[^>]*>([^<]*)</option>', menu.group(1))]
-    esatti = [(i, t) for i, t in opzioni if normalizza_nome(t) == nome_norm]
-    simili = esatti or [(i, t) for i, t in opzioni if _combacia(nome_norm, normalizza_nome(t))]
-    if len(simili) == 1:
-        return simili[0][0], "ok", "menu eMarket: %r (id %d)" % (simili[0][1], simili[0][0])
+    if not opzioni:
+        return None, "KO", "menu emittenti di eMarket senza voci (layout cambiato)"
+    cercato = normalizza_nome(altro_nome)
+    norm = [(i, t, normalizza_nome(t)) for i, t in opzioni]
+    riga_p = _parole(nome_norm)
+    # accettabile = contiene tutte le parole della riga, o la riga ne e' l'abbreviazione
+    # («Calta Edit» -> CALTA EDITORE)
+    accettabili = [o for o in norm if riga_p and (riga_p <= _parole(o[2]) or _abbreviato(o[2], nome_norm))]
+
+    def _uno(lista: List[Tuple[int, str, str]], come: str) -> Optional[Tuple[Optional[int], str, Optional[str]]]:
+        ids = sorted({o[0] for o in lista})
+        if len(ids) == 1:
+            return lista[0][0], "ok", "menu eMarket: %r (id %d), %s" % (lista[0][1], lista[0][0], come)
+        if len(ids) > 1:
+            return None, "ambiguo", "piu' emittenti nel menu eMarket per %r (%s): %s" % (
+                nome_norm, come, ", ".join("%s (%d)" % (o[1], o[0]) for o in lista[:6]))
+        return None
+    for gradino in ("esatto", "compatto"):
+        esito = _uno([o for o in norm if _combacia(nome_norm, o[2]) == gradino], gradino + " sul nome della riga")
+        if esito:
+            return esito
+    if cercato:
+        for gradino in ("esatto", "compatto"):
+            esito = _uno([o for o in accettabili if _combacia(cercato, o[2]) == gradino],
+                         gradino + " sul nome cercato")
+            if esito:
+                return esito
+    prima = (_significative(nome_norm) or [""])[0]
+    stessi = [o for o in accettabili if (_significative(o[2]) or [""])[0] == prima]
+    if len({o[0] for o in stessi}) > 1 and cercato:
+        stessi = [o for o in stessi if _combacia(cercato, o[2])] or stessi
+    esito = _uno(stessi, "per parole")
+    if esito:
+        return esito
+    simili = [o for o in norm if _combacia(nome_norm, o[2])]
     if not simili:
         return None, "non_trovato", "nessun emittente %r nel menu eMarket (forse su un altro SDIR)" % nome_norm
-    return None, "ambiguo", "piu' emittenti nel menu eMarket per %r: %s" % (
-        nome_norm, ", ".join("%s (%d)" % (t, i) for i, t in simili[:6]))
+    elenco = ", ".join("%s (%d)" % (o[1], o[0]) for o in simili[:6])
+    if len({o[0] for o in simili}) > 1:
+        return None, "ambiguo", "piu' emittenti simili a %r nel menu eMarket, nessuno sicuro: %s" % (nome_norm, elenco)
+    return None, "da_confermare", ("voce del menu eMarket solo SIMILE a %r (non contiene tutte le parole della "
+                                   "riga o inizia con un'altra parola): %s; id non salvato" % (nome_norm, elenco))
+
+
+def _abbreviato(cercato: str, riga: str) -> Optional[str]:
+    """'abbreviato' se la riga del listino abbrevia il nome (rilievo P2 di RV-IT1, qui sintetico: «Calta
+    Edit» per «Calta Editore»): stessa prima parola e ogni altra parola della riga uguale
+    o PREFISSO (almeno 3 lettere) della parola del nome nella stessa posizione. Solo per trovare
+    i candidati del listino: la scheda resta la prova."""
+    a, b = _significative(cercato), _significative(riga)
+    if len(b) < 2 or len(b) > len(a) or a[0] != b[0]:
+        return None
+    for pa, pb in zip(a[1:], b[1:]):
+        if not (pa == pb or (len(pb) >= 3 and pa.startswith(pb))):
+            return None
+    return "abbreviato"
+
+
+def _controlla_schede(corr: List[Dict[str, Any]], simbolo: str, out: Dict[str, Any]
+                      ) -> Tuple[List[Tuple[Dict[str, Any], Dict[str, Any]]], Optional[Tuple[str, str]]]:
+    """Legge le schede dei candidati: (accettate, errore). Errore = una scheda non letta (rete,
+    429, 5xx): poteva essere quella giusta, quindi niente verdetto parziale."""
+    import hashlib
+    accettate = []
+    for r in corr:
+        time.sleep(PAUSA_S)
+        voce_sch = {"scheda_url": r["scheda_url"], "nome": r["nome"], "isin": r["isin"]}
+        try:
+            http, corpo, finale = _scarica(r["scheda_url"])
+        except Exception as e:
+            voce_sch.update(esito="KO", motivo="scheda non letta: %s" % type(e).__name__)
+            out["verifica"]["schede_controllate"].append(voce_sch)
+            return accettate, ("rete", "scheda %s non letta: verdetto sospeso" % r["isin"])
+        voce_sch["http"] = http
+        if http == 429 or http >= 500:
+            # guasto del sito, non «scheda inesistente»: come una scheda non letta
+            voce_sch.update(esito="KO", motivo="HTTP %s" % http)
+            out["verifica"]["schede_controllate"].append(voce_sch)
+            return accettate, ("http", "scheda %s: HTTP %s, verdetto sospeso" % (r["isin"], http))
+        if http != 200:
+            voce_sch.update(esito="scartata", motivo="HTTP %s" % http)
+            out["verifica"]["schede_controllate"].append(voce_sch)
+            continue
+        ok, motivo, letti = verifica_scheda(corpo.decode("utf-8", errors="replace"), r["isin"], simbolo)
+        voce_sch.update(letti, esito="accettata" if ok else "scartata", motivo=motivo or None,
+                        sha256=hashlib.sha256(corpo).hexdigest(), url_finale=finale)
+        out["verifica"]["schede_controllate"].append(voce_sch)
+        if ok:
+            accettate.append((r, voce_sch))
+    return accettate, None
 
 
 def _esito_risolvi(ticker: str, nome: Any) -> Dict[str, Any]:
@@ -704,8 +1074,48 @@ def _esito_risolvi(ticker: str, nome: Any) -> Dict[str, Any]:
             "isin": None, "emarket": None, "emarket_motivo": None, "fonte_url": None,
             "letto_il": None, "negozio": None, "salvato": False,
             "verifica": {"nome_cercato": nome, "nome_normalizzato": None, "iniziale": None,
-                         "pagine_listino": [], "righe_corrispondenti": [], "riga_usata": None,
+                         "iniziali_lette": [], "pagine_listino": [], "righe_corrispondenti": [], "riga_usata": None,
                          "schede_controllate": [], "scheda_sha256": None, "limiti": []}}
+
+
+def _leggi_lettera(iniziale: str, parola: str, out: Dict[str, Any]
+                   ) -> Tuple[List[Dict[str, Any]], bool, Optional[Tuple[str, str]]]:
+    """Righe del Listino A-Z di una lettera, lette pagina dopo pagina finche' le righe non
+    superano `parola` (ordine alfabetico del listino). Ritorna (righe, troncato, errore):
+    errore = (codice, motivo) se una pagina non e' leggibile (niente verdetto su meta' lettera),
+    troncato = lette MAX_PAGINE_LISTINO pagine senza superare la parola.
+    Fine del listino: la pagina non linka la successiva, OPPURE il sito riserve una pagina gia'
+    letta (oltre l'ultima pagina risponde con l'ultima): nessuna riga nuova = fine."""
+    righe: List[Dict[str, Any]] = []
+    viste = set()
+    for pagina in range(1, MAX_PAGINE_LISTINO + 1):
+        url = URL_LISTINO.format(iniziale=iniziale) + ("&page=%d" % pagina if pagina > 1 else "")
+        if out["verifica"]["pagine_listino"]:
+            time.sleep(PAUSA_S)   # anche fra due lettere: e' lo stesso host
+        try:
+            http, corpo, _ = _scarica(url)
+        except URLVietato:
+            return righe, False, ("url_vietato", "listino %s pagina %d: %s" % (iniziale, pagina, url_consentito(url)[1]))
+        except Exception as e:
+            return righe, False, ("rete", "listino %s pagina %d: %s" % (iniziale, pagina, type(e).__name__))
+        if http != 200:
+            return righe, False, ("http", "listino %s pagina %d: HTTP %s" % (iniziale, pagina, http))
+        out["verifica"]["pagine_listino"].append(url)
+        p = parse_listino(corpo.decode("utf-8", errors="replace"), iniziale, pagina)
+        if p["stato"] != "ok":
+            return righe, False, ("layout_cambiato", "listino %s pagina %d: %s" % (iniziale, pagina, p["motivo"]))
+        # chiave = link alla scheda (ISIN-MIC): lo stesso ISIN su due mercati sono due righe
+        nuove = [r for r in p["righe"] if r["scheda_url"] not in viste]
+        if not nuove:
+            out["verifica"]["limiti"].append("listino %s pagina %d senza righe nuove: fine" % (iniziale, pagina))
+            return righe, False, None
+        viste.update(r["scheda_url"] for r in nuove)
+        righe.extend(nuove)
+        if _oltre(p["righe"][-1]["nome_normalizzato"], parola) or not p["pagina_successiva"]:
+            return righe, False, None
+    out["verifica"]["limiti"].append("lette %d pagine del listino %s senza superare il nome"
+                                     % (MAX_PAGINE_LISTINO, iniziale))
+    return righe, True, None
 
 
 def risolvi_isin(ticker: str, *, nome: Optional[str] = None) -> Dict[str, Any]:
@@ -715,8 +1125,11 @@ def risolvi_isin(ticker: str, *, nome: Optional[str] = None) -> Dict[str, Any]:
       senza rete, con `negozio` che lo dice.
     - Altrimenti: il NOME trova i candidati nel Listino A-Z (lettera iniziale), la SCHEDA
       decide (criterio IT2). Una sola scheda valida = ok, salvata in data/isin_it_auto.json.
-    - Nome assente = non_trovato «serve il nome dell'emittente»: mai un ISIN a memoria."""
-    import hashlib
+    - Nome assente = non_trovato «serve il nome dell'emittente»: mai un ISIN a memoria.
+    - Verdetto SOSPESO (KO) quando non si e' guardato tutto: pagina del listino o scheda non
+      lette (rete/http/5xx), listino oltre MAX_PAGINE_LISTINO (`listino_troncato`), piu' di
+      MAX_SCHEDE righe candidate senza una scheda valida (`schede_troncate`).
+    - Nome da ETF/ETC = non_trovato `non_azione` senza rete (il listino e' solo azioni)."""
     out = _esito_risolvi(ticker, nome)
     t = out["ticker"]
     m = re.fullmatch(r"([A-Z0-9]+)\.MI", t)
@@ -740,82 +1153,81 @@ def risolvi_isin(ticker: str, *, nome: Optional[str] = None) -> Dict[str, Any]:
                    motivo="serve il nome dell'emittente: senza nome non c'e' una ricerca permessa "
                           "su Borsa Italiana (il simbolo non e' cercabile)")
         return out
-    iniziale = n[0]
-    out["verifica"]["iniziale"] = iniziale
-    if not iniziale.isalpha():
+    out["verifica"]["iniziale"] = n[0]
+    if _PAROLE_FONDO & set(n.split()):
+        out.update(stato="non_trovato", errore="non_azione",
+                   motivo="nome %r da ETF/ETC/ETN: il Listino A-Z di Borsa Italiana copre solo le azioni "
+                          "(gli ETF stanno sotto /borsa/etf/, non cercati qui): ISIN non risolto" % n)
+        return out
+    lettere = _lettere_da_provare(n)
+    if not lettere:
         out.update(stato="non_trovato", errore="iniziale_non_alfabetica",
-                   motivo="nome %r: il Listino A-Z e' indicizzato per lettera" % n)
+                   motivo="nome %r: il Listino A-Z e' indicizzato per lettera e nessuna parola del "
+                          "nome inizia con una lettera" % n)
         return out
-    # 1. listino A-Z della lettera, finche' le righe non superano il nome cercato
-    righe: List[Dict[str, Any]] = []
-    prima_parola = n.split()[0]
-    for pagina in range(1, MAX_PAGINE_LISTINO + 1):
-        url = URL_LISTINO.format(iniziale=iniziale) + ("&page=%d" % pagina if pagina > 1 else "")
-        if pagina > 1:
-            time.sleep(PAUSA_S)
-        try:
-            http, corpo, _ = _scarica(url)
-        except URLVietato as e:
-            out.update(errore="url_vietato", motivo=str(e))
+    # 1. listino A-Z: la lettera della prima parola; se nessuna riga combacia, OPPURE combaciano
+    #    ma nessuna scheda e' valida (rilievo P2 di RV-IT1), le iniziali delle altre parole
+    #    significative (dichiarate in iniziali_lette). Il verdetto arriva dopo TUTTE le lettere.
+    tutte_corr: List[Dict[str, Any]] = []
+    troncate: List[str] = []
+    schede_tagliate = 0
+    accettate: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for iniziale, parola in lettere:
+        righe, troncato, errore = _leggi_lettera(iniziale, parola, out)
+        if errore is not None:
+            out.update(errore=errore[0], motivo=errore[1])
             return out
-        except Exception as e:
-            out.update(errore="rete", motivo="listino pagina %d: %s" % (pagina, type(e).__name__))
-            return out
-        if http != 200:
-            out.update(errore="http", motivo="listino pagina %d: HTTP %s" % (pagina, http))
-            return out
-        out["verifica"]["pagine_listino"].append(url)
-        p = parse_listino(corpo.decode("utf-8", errors="replace"), iniziale)
-        if p["stato"] != "ok":
-            out.update(errore="layout_cambiato", motivo="listino pagina %d: %s" % (pagina, p["motivo"]))
-            return out
-        righe.extend(p["righe"])
-        primo = (p["righe"][0]["nome_normalizzato"].split() or [""])[0]
-        if primo > prima_parola or not p["pagina_successiva"]:
-            break
-        if pagina == MAX_PAGINE_LISTINO:
-            out["verifica"]["limiti"].append("lette %d pagine del listino %s senza superare il nome"
-                                             % (MAX_PAGINE_LISTINO, iniziale))
-    # 2. corrispondenze per nome: prima le esatte, poi per parole
-    corr = [dict(r, combacia=_combacia(n, r["nome_normalizzato"])) for r in righe]
-    corr = [r for r in corr if r["combacia"]]
-    corr.sort(key=lambda r: r["combacia"] != "esatto")
-    out["verifica"]["righe_corrispondenti"] = [{k: r[k] for k in ("nome", "isin", "mic", "scheda_url", "combacia")}
-                                               for r in corr]
-    if not corr:
-        out.update(stato="non_trovato", errore="nome_non_nel_listino",
-                   motivo="nessuna riga del Listino A-Z (lettera %s) combacia col nome %r" % (iniziale, n))
-        return out
-    if len(corr) > MAX_SCHEDE:
-        out["verifica"]["limiti"].append("%d righe combaciano col nome: controllate le prime %d"
-                                         % (len(corr), MAX_SCHEDE))
-    # 3. la scheda decide
-    accettate = []
-    for r in corr[:MAX_SCHEDE]:
-        time.sleep(PAUSA_S)
-        voce_sch = {"scheda_url": r["scheda_url"], "nome": r["nome"], "isin": r["isin"]}
-        try:
-            http, corpo, finale = _scarica(r["scheda_url"])
-        except Exception as e:
-            voce_sch.update(esito="KO", motivo="scheda non letta: %s" % type(e).__name__)
-            out["verifica"]["schede_controllate"].append(voce_sch)
-            out.update(errore="rete", motivo="scheda %s non letta: verdetto sospeso" % r["isin"])
-            return out   # una scheda non letta poteva essere quella giusta: niente verdetto parziale
-        voce_sch["http"] = http
-        if http != 200:
-            voce_sch.update(esito="scartata", motivo="HTTP %s" % http)
-            out["verifica"]["schede_controllate"].append(voce_sch)
+        out["verifica"]["iniziali_lette"].append(iniziale)
+        if troncato:
+            troncate.append(iniziale)
+        # 2. corrispondenze per nome: esatte, compatte, per parole, abbreviate (le piu' vicine prima)
+        _nomi_di_confronto(righe)
+        corr = []
+        for r in righe:
+            c = (_combacia(n, r["nome_normalizzato"]) or _combacia(n, r["nome_confronto"])
+                 or _abbreviato(n, r["nome_confronto"]))
+            if c:
+                corr.append(dict(r, combacia=c))
+        corr.sort(key=lambda r: _ordine_corrispondenza(n, r["nome_confronto"], r["combacia"]))
+        tutte_corr.extend(corr)
+        if not corr:
             continue
-        ok, motivo, letti = verifica_scheda(corpo.decode("utf-8", errors="replace"), r["isin"], simbolo)
-        voce_sch.update(letti, esito="accettata" if ok else "scartata", motivo=motivo or None,
-                        sha256=hashlib.sha256(corpo).hexdigest(), url_finale=finale)
-        out["verifica"]["schede_controllate"].append(voce_sch)
-        if ok:
-            accettate.append((r, voce_sch))
+        if len(corr) > MAX_SCHEDE:
+            schede_tagliate += len(corr) - MAX_SCHEDE
+            out["verifica"]["limiti"].append("lettera %s: %d righe combaciano col nome, controllate le %d "
+                                             "piu' vicine" % (iniziale, len(corr), MAX_SCHEDE))
+        # 3. la scheda decide
+        accettate, errore = _controlla_schede(corr[:MAX_SCHEDE], simbolo, out)
+        if errore is not None:
+            out.update(errore=errore[0], motivo=errore[1])
+            return out
+        if accettate:
+            break
+    out["verifica"]["righe_corrispondenti"] = [{k: r[k] for k in ("nome", "isin", "mic", "scheda_url", "combacia")}
+                                               for r in tutte_corr]
+    lette = "/".join(out["verifica"]["iniziali_lette"])
+    if not accettate and troncate:
+        # non tutte le righe utili sono state lette: «non c'e'» non e' una misura
+        out.update(errore="listino_troncato",
+                   motivo="nessuna scheda valida per %r fra le righe lette, ma il Listino A-Z (lettera %s) e' "
+                          "stato letto solo per %d pagine: verdetto sospeso" % (n, "/".join(troncate),
+                                                                                MAX_PAGINE_LISTINO))
+        return out
+    if not accettate and schede_tagliate:
+        out.update(errore="schede_troncate",
+                   motivo="%d righe combaciano col nome %r, %d schede NON lette (tetto %d per lettera) e nessuna "
+                          "delle lette ha il Codice Alfanumerico %r: verdetto sospeso"
+                          % (len(tutte_corr), n, schede_tagliate, MAX_SCHEDE, simbolo))
+        return out
+    if not tutte_corr:
+        out.update(stato="non_trovato", errore="nome_non_nel_listino",
+                   motivo="nessuna riga del Listino A-Z (lettere %s) combacia col nome %r (abbreviazioni del "
+                          "listino riconosciute solo come prefisso di almeno 3 lettere della parola)" % (lette, n))
+        return out
     if not accettate:
         out.update(stato="non_trovato", errore="nessuna_scheda_valida",
-                   motivo="%d schede controllate, nessuna con Codice Alfanumerico %r e ISIN coerente"
-                          % (len(out["verifica"]["schede_controllate"]), simbolo))
+                   motivo="lettere %s: %d schede controllate, nessuna con Codice Alfanumerico %r e ISIN coerente"
+                          % (lette, len(out["verifica"]["schede_controllate"]), simbolo))
         return out
     if len(accettate) > 1:
         out.update(stato="ambiguo", errore="piu_schede_valide",
@@ -826,9 +1238,15 @@ def risolvi_isin(ticker: str, *, nome: Optional[str] = None) -> Dict[str, Any]:
     adesso = adesso_utc().isoformat(timespec="seconds")
     out["verifica"]["riga_usata"] = {k: r[k] for k in ("nome", "isin", "mic", "scheda_url", "combacia")}
     out["verifica"]["scheda_sha256"] = sch["sha256"]
-    # 4. id eMarket per nome (della RIGA del listino: e' il nome ufficiale), solo se univoco
-    time.sleep(PAUSA_S)
-    id_em, esito_em, motivo_em = _cerca_emarket(r["nome_normalizzato"])
+    # 4. id eMarket per nome (della RIGA del listino: e' il nome ufficiale), solo se univoco.
+    #    Riga del Global Equity Market (BGEM) = azione ESTERA: non sta su eMarket, non si cerca
+    #    (rilievo RV-IT1, casi veri; qui sintetici: «Zeta» -> ZETA MEDIA GROUP, «Acme Energy» -> ENERGY).
+    if r["mic"] == "BGEM":
+        id_em, esito_em, motivo_em = (None, "non_cercato", "riga del Global Equity Market (azione estera, "
+                                      "mic BGEM): emittente estero, eMarket non cercato")
+    else:
+        time.sleep(PAUSA_S)
+        id_em, esito_em, motivo_em = _cerca_emarket(r["nome_confronto"], nome)
     out.update(stato="ok", isin=r["isin"], emarket=id_em, fonte_url=sch["url_finale"], letto_il=adesso,
                negozio="automatico", emarket_motivo=None if esito_em == "ok" else
                "id eMarket non risolto (%s): %s" % (esito_em, motivo_em))
@@ -836,7 +1254,8 @@ def risolvi_isin(ticker: str, *, nome: Optional[str] = None) -> Dict[str, Any]:
     salvato, motivo_salv = _scrivi_voce_auto(t, {
         "isin": r["isin"], "emarket": id_em, "emarket_motivo": out["emarket_motivo"],
         "origine": ORIGINE_AUTO % adesso, "verificato_il": adesso, "nome_cercato": nome,
-        "riga_listino": r["nome"], "scheda_url": sch["url_finale"], "scheda_sha256": sch["sha256"]})
+        "riga_listino": r["nome"], "mic": r["mic"], "scheda_url": sch["url_finale"],
+        "scheda_sha256": sch["sha256"]})
     out["salvato"] = salvato
     if not salvato:
         out["motivo"] = motivo_salv

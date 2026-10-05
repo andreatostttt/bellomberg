@@ -1,0 +1,40 @@
+{
+  "resultCount": 2,
+  "storiResultItems": [
+    {
+      "requiredReportingTopicId": "00000000-0000-4000-8000-000000000011",
+      "companyName": "ACME SINTETICA",
+      "companyNumber": "0000000001",
+      "nationality": "BE",
+      "reportingTopicName": "Annual announcement",
+      "datePublication": "2026-02-11T07:00:00",
+      "dateReceived": "2026-02-11T07:20:00",
+      "lei": "ZZTEST00000000ACME38",
+      "mainDocuments": [
+        {"fileDataId": "00000000-0000-4000-8000-0000000001a1", "language": "en", "title": "FY25_ACME_Press Release_English.pdf", "originalFileName": "FY25_ACME_Press Release_English.pdf", "size": 10, "fileType": "pdf"}
+      ],
+      "attachments": [],
+      "isinCodes": [{"code": "BE00ZZSYNT07", "startDate": "2020-01-01T00:00:00", "isinType": "Shares", "market": "Euronext Brussels"}],
+      "documentTitle": ""
+    },
+    {
+      "requiredReportingTopicId": "00000000-0000-4000-8000-000000000012",
+      "companyName": "ACME SINTETICA",
+      "companyNumber": "0000000001",
+      "nationality": "BE",
+      "reportingTopicName": "Annual financial report",
+      "datePublication": "2026-03-20T07:30:00",
+      "dateReceived": "2026-03-27T10:44:19.58",
+      "lei": "ZZTEST00000000ACME38",
+      "mainDocuments": [
+        {"fileDataId": "00000000-0000-4000-8000-0000000001b1", "language": "nl", "title": "ZZTEST00000000ACME38-2025-12-31-0-nl.zip", "originalFileName": "ZZTEST00000000ACME38-2025-12-31-0-nl.zip", "size": 10, "fileType": "zip"},
+        {"fileDataId": "00000000-0000-4000-8000-0000000001b2", "language": "en", "title": "ZZTEST00000000ACME38-2025-12-31-0-en.xhtml", "originalFileName": "ZZTEST00000000ACME38-2025-12-31-0-en.xhtml", "size": 10, "fileType": "xhtml"}
+      ],
+      "attachments": [
+        {"fileDataId": "00000000-0000-4000-8000-0000000001b3", "language": "en", "title": null, "originalFileName": "ACME FY25 Annual report.pdf", "size": 10, "fileType": "pdf"}
+      ],
+      "isinCodes": [{"code": "BE00ZZSYNT07", "startDate": "2020-01-01T00:00:00", "isinType": "Shares", "market": "Euronext Brussels"}],
+      "documentTitle": ""
+    }
+  ]
+}

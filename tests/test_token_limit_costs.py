@@ -420,12 +420,19 @@ def test_remaining_floor_does_not_replace_a_native_ready_legacy_contract(
 
     # Isolate the summary branch where the sole remaining contract is saved.
     # These status flags are a view fixture, not an executed committee order.
+    # ZR 05/10 (Z4): la vista gira in modalita' RESEARCH, l'unica che una run Trade Idea puo' avere
+    # dal 03/10 (1326312: nuove run solo research, prosecuzione legacy 409). In legacy la tappa
+    # model_authoring (workbook verificato) resta aperta per sempre: e' codice dietro excel_archived.
+    # La garanzia provata qui (il contratto SALVATO non prende il floor della nuova policy) e'
+    # indipendente dalla modalita'.
+    from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE
     progress = {**deepcopy(bb.data), "_completed_stages": {
         f"{desk}:{round_n}": {"status": "complete"}
         for round_n in range(3) for desk in trade_idea.TRADE_IDEA_DESKS
         if (desk, round_n) != ("quant", 1)},
-        "_red_model_review": {"status": "complete"}, "_capo_completed": True}
-    only_saved = SimpleNamespace(**{**vars(bb), "data": progress})
+        "_research_thesis": {"status": "sealed"},
+        "_red_research_review": {"status": "complete"}, "_capo_completed": True}
+    only_saved = SimpleNamespace(**{**vars(bb), "data": progress, "analysis_mode": RESEARCH_ANALYSIS_MODE})
     saved_summary = trade_idea._remaining_work(only_saved)
     assert saved_summary["remaining"] == ["quant:R1"]
     assert saved_summary["largest_output_reservation_floor_usd"] is None

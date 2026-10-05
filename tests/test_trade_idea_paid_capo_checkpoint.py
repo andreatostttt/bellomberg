@@ -15,10 +15,10 @@ DESKS = ('macro', 'eventdesk', 'crypto', 'fundamentals', 'quant', 'options')
 
 
 def v2_request():
-    payload = request()
+    # Z3b 05/10: qualificazione di ricerca VERA (research_required), non piu' il finto 'qualified'.
+    from _trade_idea_research_request import research_request
+    payload = research_request(request())
     payload['execution_policy'] = POLICY
-    payload['analysis_mode'] = payload['source_qualification']['analysis_mode'] = 'fundamentals_research_v1'
-    payload['authorization'].update(activities=['committee'], max_revision_rounds=0)
     for role, selected in payload['models'].items():
         selected['reasoning_effort'] = 'low' if role == 'capo' else 'medium'
     return payload

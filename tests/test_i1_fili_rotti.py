@@ -170,15 +170,37 @@ def test_nessun_prompt_ordina_un_tool_che_il_desk_non_ha():
     TOOL_DEFINITIONS *e* dal subset macro — cioe' ricreando il bug originale — questo
     test FALLISCE. Con l'universo sbagliato della prima stesura restava verde.
     """
+    from types import SimpleNamespace
     from bellomberg.agents.specialists import ALL_SPECIALISTS
+    from bellomberg.agents.specialists.base import RESEARCH_UNAVAILABLE_TOOLS
+    from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE
 
+    # ZR 05/10: si misura il prompt che il desk RICEVE nella modalita' VIVA, non
+    # l'attributo di classe. Dal 03/10 (consegna "Fundamentals research", Excel
+    # archiviato) ogni run nuova nasce in fundamentals_research_v1: Fundamentals
+    # sostituisce sull'istanza il prompt di classe con RESEARCH_SYSTEM_PROMPT, e il
+    # prompt di classe resta come ARCHIVIO del percorso legacy, che non arriva piu' a
+    # un modello (weekly legacy = solo delivery_only; la Trade Idea sostituisce il
+    # prompt per intero). Leggere la classe faceva cadere questa guardia su un ordine
+    # get_valuation che nessun desk vivo riceve. Il testo misurato e' quello completo
+    # di _request_system (prompt + SPECIALIST_STYLE_RULES, con lo strip research di
+    # get_valuation), e il set di tool e' quello che il desk ha DAVVERO in research
+    # (subset meno RESEARCH_UNAVAILABLE_TOOLS, v. base._build_tools_schema).
+    board = SimpleNamespace(run_scope="weekly", analysis_mode=RESEARCH_ANALYSIS_MODE)
     universo = _universo_dei_nomi_di_tool()
     rotti = []
     for spec in ALL_SPECIALISTS:
-        prompt = getattr(spec, "system_prompt", "") or ""
-        if not isinstance(prompt, str):
-            continue
-        suoi = _nomi(chat_tools.get_tools_for_agent(spec.name)) | _META_TOOLS
+        desk = spec(board, client=object())
+        prompt = desk.system_prompt
+        assert isinstance(prompt, str) and prompt.strip(), spec.name
+        # Le style rules sono comuni a tutti i desk ma la sezione ARSENALE e' una
+        # rubrica per desk ("  * QUANT: ...", "  * FUNDAMENTALS: ..."): a ogni desk
+        # si applica SOLO la sua riga, le righe degli altri non sono ordini per lui.
+        prompt = "\n".join(
+            riga for riga in desk._request_system(prompt).splitlines()
+            if not (m := re.match(r"\s*\*\s*([A-Z]+):", riga)) or m.group(1) == spec.name.upper())
+        suoi =((_nomi(chat_tools.get_tools_for_agent(spec.name)) - RESEARCH_UNAVAILABLE_TOOLS)
+                | _META_TOOLS)
         for nome in sorted(_tool_ordinati_nel_prompt(prompt, universo)):
             if nome not in suoi:
                 rotti.append(f"{spec.name}: il prompt chiama {nome}() ma non e' nel suo subset")

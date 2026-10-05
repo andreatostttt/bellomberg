@@ -60,6 +60,9 @@ def fetch_generation(generation_id, *, api_key=None, opener=urlopen, timeout=15)
 
 def _same_model(requested, observed):
     # OpenRouter reports the dated variant: "anthropic/claude-opus-5.5-20260921".
+    base, _, variant = str(requested).partition(":")
+    if variant in ("exacto", "nitro", "floor"):   # variante di instradamento: risponde col nome base
+        requested = base
     return isinstance(observed, str) and (observed == requested or observed.startswith(str(requested) + "-"))
 
 

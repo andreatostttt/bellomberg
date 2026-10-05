@@ -3510,15 +3510,31 @@ if FASTAPI_OK:
         04/10 (W2, Opus 5.5): Form 4 copre solo emittenti USA. `.MI` -> internal dealing
         eMarket SDIR con lo stato della fonte (KO/STALE/non_coperto dichiarati); altri
         mercati, crypto o copertura indeterminata -> errore dichiarato in 200, nessuna
-        chiamata (mai il suffisso tolto: aggancerebbe un omonimo USA)."""
+        chiamata (mai il suffisso tolto: aggancerebbe un omonimo USA).
+        handoff-3 (W1): `.MI` -> SDIR scelto da sdir.py (eMarket o 1INFO); ISIN assente dalle
+        tabelle = risolto su Borsa Italiana (`risoluzione_isin`). LATENZA DICHIARATA: la PRIMA
+        richiesta per un .MI senza voce puo' fare fino a ~30 richieste HTTP verso Borsa (pausa
+        1 s, timeout 25 s: tetto teorico ~13 min) + yfinance senza timeout, poi la rete dello
+        SDIR; dalla seconda niente (negozio automatico o memoria negativa). `def`: threadpool."""
         try:
             from bellomberg.market_data.copertura import copertura_usa, risposta_non_coperta
             if str(ticker or "").strip().upper().endswith(".MI"):
-                from bellomberg.market_data.emarket_sdir import get_internal_dealing
-                idl = get_internal_dealing(ticker, giorni=days)
-                return {"ticker": idl.get("ticker"), "source": "emarket_sdir", "stato": idl.get("stato"),
-                        "error": None if idl.get("stato") in ("ok", "vuoto_misurato") else (idl.get("motivo") or idl.get("errore") or idl.get("stato")),
-                        "count": len(idl.get("comunicazioni") or []), "internal_dealing": idl}
+                # W1 handoff-3 (05/10): voce ISIN mancante -> risolta su Borsa Italiana col nome
+                # della posizione (DB di questa API) o del fornitore prezzi, dichiarata; poi lo
+                # SDIR giusto (instradatore sdir.py: eMarket SDIR o 1INFO-SDIR, `sdir` lo dice)
+                from bellomberg.market_data import sdir as _sdir
+                from bellomberg.market_data.isin_automatico import assicura_isin_it, con_risoluzione, nome_noto
+                _dbp = get_db().db_path
+                from bellomberg.market_data.isin_automatico import giorni_validi
+                # days non valido = lo sdir lo respinge per parametro: niente rete di risoluzione
+                ris = assicura_isin_it(ticker, db_path=_dbp) if giorni_validi(days) else None
+                idl = _sdir.get_internal_dealing(ticker, giorni=days, nome=nome_noto(ticker, ris, db_path=_dbp))
+                return con_risoluzione(
+                    {"ticker": idl.get("ticker"), "source": "sdir", "sdir": idl.get("sdir"),
+                     "instradamento": idl.get("instradamento"),
+                     "stato": idl.get("stato"),
+                     "error": None if idl.get("stato") in ("ok", "vuoto_misurato") else (idl.get("motivo") or idl.get("errore") or idl.get("stato")),
+                     "count": len(idl.get("comunicazioni") or []), "internal_dealing": idl}, ris)
             # senza ?valuta= la valuta e' quella della posizione nel book (sola lettura);
             # fuori dal book la presunzione USA dal simbolo e' DICHIARATA in copertura_nota
             _nota = None

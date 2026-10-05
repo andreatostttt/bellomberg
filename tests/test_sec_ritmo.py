@@ -36,12 +36,18 @@ def test_ritmo_condiviso_tra_due_processi(tmp_path):
     assert min(gap) >= sec_edgar._SEC_INTERVALLO_S - 0.001
 
 
-def test_file_ritmo_corrotto_non_blocca(tmp_path):
+def test_file_ritmo_corrotto_non_blocca(tmp_path, monkeypatch):
     percorso = tmp_path / ".sec_ritmo"
+    # Cantiere zero rossi 05/10 (TIMING): prima `< 0.5 s` cronometrati; ora si REGISTRANO le attese
+    # chieste dal ritmo (orologi veri, sleep finto solo nel modulo): file illeggibile = nessuna.
+    import types
     percorso.write_text("non-un-numero")
-    t0 = time.monotonic()
+    sonni = []
+    monkeypatch.setattr(sec_edgar, "time", types.SimpleNamespace(
+        time=time.time, monotonic=time.monotonic, sleep=sonni.append))
     sec_edgar.attendi_sec(percorso=percorso)
-    assert time.monotonic() - t0 < 0.5
+    assert sonni == []
+    assert float(percorso.read_bytes()[:32].decode("ascii").strip()) > 0   # istante riscritto valido
 
 
 def test_percorso_non_scrivibile_ripiega_sul_ritmo_locale(tmp_path):

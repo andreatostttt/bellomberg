@@ -613,32 +613,281 @@ _DEPOSIT_BASIS = "emarket_sdir_deposit_receipt"
 _PUBLICATION_AMBIGUOUS = ('Publication requires one unambiguous primary header or cover date; optional claims cannot '
                           'resolve contradictory publication facts')
 _DEPOSIT_PM_HINT = "data di pubblicazione da fornire dal PM"
-# Nome del documento nella copertina -> tipo di relazione cercato su eMarket SDIR.
-_DEPOSIT_DOCUMENT_TYPES = {
-    "semestrale": (r"relazione\s+finanziaria\s+semestrale", r"half[\s-]*year(?:ly)?\s+financial\s+report"),
-    "annuale": (r"relazione\s+finanziaria\s+annuale", r"annual\s+financial\s+report"),
-    "trimestrale": (r"resoconto\s+intermedio\s+di\s+gestione",
-                    r"interim\s+(?:financial|management)\s+(?:report|statement)"),
-}
+
+
+def _deposit_document_types():
+    """Nomi dei documenti per tipo: UNICA fonte = `emarket_sdir.DOCUMENTI_DEPOSITO` (stesse regole della
+    ricerca del deposito; accordo D4/IT1/IT2 05/10). Copertina e deposito leggono gli stessi nomi."""
+    from bellomberg.market_data.emarket_sdir import DOCUMENTI_DEPOSITO
+    return DOCUMENTI_DEPOSITO
+
+
 _DEPOSIT_FIELDS = ("ticker", "isin", "emarket_id", "tipo", "periodo_fine", "stato", "stato_originale",
                    "data_deposito", "ora_deposito",
                    "titolo", "url", "protocollo", "categoria", "lingua", "fonte", "categorie_cercate", "url_liste",
                    "sha256_liste", "letto_il", "limiti", "prova", "sha256_pdf", "voce_da", "isin_resolution")
 _ISIN_RESOLUTION_FIELDS = ("stato", "isin", "emarket", "negozio", "fonte_url", "letto_il")
+# Ricevute dal router sdir.get_data_deposito (accordo D4b/ON 05/10): quale SDIR ha dato la data e i campi
+# 1INFO. Le ricevute vecchie (solo eMarket) non hanno «sdir» e restano valide byte per byte (il sigillo e'
+# confrontato chiave per chiave con l'archivio). Dell'instradamento si sigilla la parte deterministica.
+_SDIR_EMARKET, _SDIR_1INFO = "eMarket SDIR", "1INFO-SDIR"
+_DEPOSIT_SDIR_FIELDS = ("sdir", "oneinfo_ndg", "esef", "consolidato", "tipo_data", "instradamento")
+_ROUTING_FIELDS = ("regola", "scelta", "emarket_id", "oneinfo_ndg")
+# eMarket Storage, sezione DOCUMENTI (IT2/IT3 05/10, ancora primaria): data di STOCCAGGIO del documento.
+# Campi sigillati SOLO quando prova == 'documento' (le ricevute da comunicato restano identiche).
+_DEPOSIT_DOCUMENT_FIELDS = ("prova_documento", "documento", "comunicato_conferma", "url_liste_documenti",
+                            "sha256_liste_documenti", "stato_documenti", "tipo_data", "natura")
+# Ambiguo UE (regola di main 05/10, caso reale DEU vs comptes consolides): si sceglie l'UNICO candidato il cui
+# titolo porta un nome del documento uguale a uno di quelli letti in copertina legati al periodo.
+_COVER_NAME_CHOICE = "cover_document_name/1"
+# Scelta dell'instradamento ammessa per lo SDIR che ha dato la data (ON 05/10: con 'entrambi' la data servita
+# puo' venire da UNA sola fonte; «eMarket SDIR + 1INFO-SDIR» non arriva mai con stato ok).
+_SDIR_ROUTING_CHOICES = {_SDIR_EMARKET: ("emarket", "entrambi"), _SDIR_1INFO: ("oneinfo", "entrambi")}
+# Listini UE non italiani (decisione PM 05/10, contratto scratchpad/INTERFACCIA_UE.md): instradatore
+# market_data/depositi_ue.py di EU-R; la ricevuta si sigilla INTERA (risposte_salvate comprese) e si riverifica
+# senza rete con depositi_ue.riverifica_ricevuta. natura_data (dal RITORNO, non dal registro) va nel testo al PM.
+_EU_DEPOSIT_CONTRACT = "trade-idea-eu-deposit-receipt/1"
+_EU_DEPOSIT_BASIS = "eu_official_deposit_receipt"
+_EU_LOCAL_KEYS = ("contract", "scelta_copertina", "esito_sdir", "identita_ue")    # chiavi nostre, non del modulo
+_EU_NATURE_LABELS = {"diffusione": "data di diffusione %s",
+                     "deposito_autorita": "data di deposito %s, non di diffusione,",
+                     "pubblicazione_dichiarata": "data di pubblicazione dichiarata da %s"}
 
 
-def _deposit_document_type(text):
-    """Tipo della relazione dalla copertina (primi 2.000 caratteri); None se assente o non univoco."""
+# Finestra nome -> periodo (D4 05/10): fra il nome e la data in copertina stanno al massimo qualificatori
+# e locuzioni («consolidata», «abbreviato», « - », «for the six months ended», «as at»: <= 30 caratteri);
+# 60 li copre con margine e resta piu' corta di una riga di indice o di una frase che cita un ALTRO
+# documento. Stessa ampiezza della conferma nel PDF di eMarket (`emarket_sdir._lingua_doc`, vicini=True).
+_DOCUMENT_PERIOD_WINDOW = 60
+# «Interim financial report» (IAS 34 = anche la SEMESTRALE): lo decide la regola di IT2 in DOCUMENTI_DEPOSITO
+# (lookahead sul mese: giugno -> semestrale, marzo/settembre -> trimestrale, altri mesi -> nessun tipo).
+# Annuale col SOLO anno («Annual Report 2025», «Relazione finanziaria annuale 2025»): ammesso soltanto se il
+# periodo e' il 31/12 di quell'anno. Esercizi non solari («2024/2025», chiusura al 30/06) -> tipo non deciso.
+_ANNUAL_BARE_YEAR = re.compile(r"\s*(?:(?:dell'|per\s+l')?esercizio\s+|for\s+(?:the\s+)?(?:financial\s+|fiscal\s+)?"
+                               r"year\s+)?(?P<year>\d{4})\b(?!\s*[/-]\s*\d)", re.I)
+_DOCUMENT_TYPE_RULE = ("name followed within %d characters by the period date; annual: year alone only for a "
+                       "31 Dec year end; 'interim financial report': June = half-year, Mar/Sep = quarterly, else none"
+                       % _DOCUMENT_PERIOD_WINDOW)
+
+
+def _cover_bound_names(text, report_date, extra_names=None):
+    """{(tipo, nome normalizzato)} dei nomi di documento in copertina (primi 2.000 caratteri) seguiti ENTRO
+    `_DOCUMENT_PERIOD_WINDOW` caratteri da una data uguale al periodo (o, per l'annuale, dal solo anno con
+    periodo al 31/12). Nomi = DOCUMENTI_DEPOSITO (IT/EN) + `extra_names` {tipo: [regex]} (nomi locali UE)."""
     header = " ".join(text[:2000].split())
-    kinds = [kind for kind, patterns in _DEPOSIT_DOCUMENT_TYPES.items()
-             if any(re.search(pattern, header, re.I) for pattern in patterns)]
-    return kinds[0] if len(kinds) == 1 else None
+    date_pattern = re.compile(_DATE_PATTERN, re.I)
+    period = date.fromisoformat(report_date)
+    found_names = set()
+    for kind, patterns in _deposit_document_types().items():
+        for pattern in list(patterns) + list((extra_names or {}).get(kind) or ()):
+            for name in re.finditer(pattern, header, re.I):
+                if not _normalized(name.group(0)):
+                    continue
+                window = header[name.end():name.end() + _DOCUMENT_PERIOD_WINDOW + 30]
+                bound = False
+                for found in date_pattern.finditer(window):
+                    if found.start() > _DOCUMENT_PERIOD_WINDOW:
+                        break
+                    try:
+                        if _parse_date_token(" ".join(found.group(0).split())) == report_date:
+                            bound = True
+                            break
+                    except (ValueError, KeyError):
+                        continue
+                if not bound and kind == "annuale" and (period.month, period.day) == (12, 31):
+                    year = _ANNUAL_BARE_YEAR.match(window)
+                    bound = year is not None and int(year.group("year")) == period.year
+                if bound:
+                    found_names.add((kind, _normalized(name.group(0))))
+    return found_names
+
+
+def _deposit_document_type(text, report_date, extra_names=None):
+    """Tipo della relazione dalla copertina: il tipo dei nomi legati al periodo (`_cover_bound_names`). None se
+    nessun tipo, piu' tipi, o un «interim financial report» di un mese non deciso: il tipo sceglie quale deposito
+    ufficiale cercare, quindi nel dubbio non si cerca."""
+    kinds = {kind for kind, _name in _cover_bound_names(text, report_date, extra_names)}
+    return kinds.pop() if len(kinds) == 1 else None
+
+
+def _eu_document_names(country):
+    """{tipo: [regex]} dei nomi locali del paese di instradamento (depositi_ue.nomi_documento, AGGIUNTA 2);
+    tipi senza nomi esclusi. None se nessun paese."""
+    if not country:
+        return None
+    from bellomberg.market_data.depositi_ue import nomi_documento
+    names = {}
+    for kind in ("annuale", "semestrale", "trimestrale"):
+        found, _reason = nomi_documento(country, kind)
+        if found:
+            names[kind] = list(found)
+    return names
+
+
+def _deposit_type_names(value):
+    """Nomi locali con cui ricalcolare il tipo per una ricevuta sigillata (UE: paese sigillato)."""
+    return _eu_document_names(value.get("paese")) if value.get("contract") == _EU_DEPOSIT_CONTRACT else None
+
+
+def _cover_named_candidate(text, report_date, tipo, candidates, extra_names=None):
+    """Scelta PURA fra i candidati di un 'ambiguo': l'unico il cui titolo contiene un nome del documento uguale
+    (normalizzato) a uno dei nomi di tipo `tipo` legati al periodo in copertina. None se nessuno o piu' d'uno."""
+    cover = sorted(name for kind, name in _cover_bound_names(text, report_date, extra_names) if kind == tipo)
+    if not cover or not isinstance(candidates, list) or not candidates:
+        return None
+    patterns = list(_deposit_document_types()[tipo]) + list((extra_names or {}).get(tipo) or ())
+    matching = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or not isinstance(candidate.get("titolo"), str):
+            return None
+        names = {_normalized(found.group(0)) for pattern in patterns
+                 for found in re.finditer(pattern, candidate["titolo"], re.I)}
+        if names & set(cover):
+            matching.append(candidate)
+    if len(matching) != 1:
+        return None
+    return {"regola": _COVER_NAME_CHOICE, "nomi_copertina": cover, "candidato": deepcopy(matching[0])}
+
+
+def _deposit_effective(value):
+    """La ricevuta vista col deposito che conta: per un 'ambiguo' UE scelto col nome in copertina, i campi del
+    candidato scelto (data, ora, titolo, url, protocollo); altrimenti la ricevuta com'e'."""
+    choice = value.get("scelta_copertina") if isinstance(value, dict) else None
+    if not isinstance(choice, dict) or not isinstance(choice.get("candidato"), dict):
+        return value
+    chosen = choice["candidato"]
+    effective = {**value, "data_deposito": chosen.get("data"), "ora_deposito": chosen.get("ora"),
+                 "titolo": chosen.get("titolo"), "url": chosen.get("url"), "protocollo": chosen.get("protocollo")}
+    if value.get("contract") == _EU_DEPOSIT_CONTRACT:
+        # Rilievo RV-D4 P1/P2: l'ora del candidato vale SOLO col fuso dichiarato dal candidato stesso (AMF/Nasdaq:
+        # ore UTC con fuso del ritorno None; AFM: ora del registro senza fuso). Senza: ora ignorata = fine del
+        # giorno nel fuso del RITORNO; se anche quello manca la scelta e' rifiutata (mai il fuso del listino).
+        zone = chosen.get("fuso")
+        effective.update(fuso=zone or value.get("fuso"), ora_deposito=chosen.get("ora") if zone else None,
+                         protocollo=chosen.get("protocollo") or chosen.get("id"))
+    if value.get("contract") == _DEPOSIT_CONTRACT:
+        # SDIR italiani: la riga scelta e' quella che ripassa la regola della fonte (righe eMarket/1INFO con
+        # url_pdf; righe della sezione Documenti con url e prova del documento).
+        effective.update(url=chosen.get("url") or chosen.get("url_pdf"), categoria=chosen.get("categoria"))
+        if value.get("prova") == "documento":
+            # forma vera dell'ambiguo (emarket_sdir): tipo_data None; la riga scelta E' un documento stoccato
+            effective.update(documento={key: item for key, item in chosen.items() if key != "prova"},
+                             prova_documento=chosen.get("prova"), tipo_data="stoccaggio_documento")
+        else:
+            effective.update(prova=chosen.get("prova"))
+        if _deposit_sdir(value) == _SDIR_1INFO:
+            effective.update(esef=chosen.get("esef"), consolidato=chosen.get("consolidato"))
+    return effective
+
+
+# AGGIUNTA 3 di INTERFACCIA_UE (main 05/10, rilievo RV-UE1 AMF-5): si confrontano ISTANTI, non date.
+# Istante del deposito = data + ora nel fuso della fonte; ora mancante = FINE del giorno locale (prudente).
+# Cutoff = FINE del giorno as_of nel fuso del PM (Europe/Rome). SDIR italiani: ore di Roma (anche 1INFO, la cui
+# ora e' gia' di Roma benche' marcata come UTC: misura S1). Fonti UE: il fuso dichiarato nel ritorno; senza fuso
+# quello del listino (mercati.MERCATI); senza nessuno dei due la ricevuta e' rifiutata.
+_PM_TIMEZONE = "Europe/Rome"
+
+
+def _zone(name):
+    from zoneinfo import ZoneInfo
+    try:
+        return ZoneInfo(name)
+    except Exception as exc:
+        raise ValueError("Deposit timezone %r cannot be resolved (%s); %s"
+                         % (str(name)[:40], type(exc).__name__, _DEPOSIT_PM_HINT)) from exc
+
+
+def _listing_timezone(ticker):
+    from bellomberg.market_data.mercati import MERCATI
+    market = MERCATI.get(_listing_suffix(ticker) or "")
+    return market[1] if market else None
+
+
+def _deposit_timezone(value):
+    if value.get("contract") != _EU_DEPOSIT_CONTRACT:
+        return _PM_TIMEZONE
+    if value.get("scelta_copertina") is not None:
+        return value.get("fuso")        # scelta fra candidati: solo il fuso dichiarato dalla fonte (RV-D4 P1)
+    return value.get("fuso") or _listing_timezone(value.get("ticker"))
+
+
+def _deposit_instant(value):
+    """Istante del deposito (datetime con fuso). Ora mancante = 23:59:59 locale della fonte."""
+    value = _deposit_effective(value)
+    zone_name = _deposit_timezone(value)
+    if not zone_name:
+        raise ValueError("Deposit time zone is unknown (no source time zone and no listing time zone); "
+                         + _DEPOSIT_PM_HINT)
+    day = date.fromisoformat(value["data_deposito"])
+    clock = value.get("ora_deposito")
+    if clock is None:
+        hour, minute, second = 23, 59, 59
+    elif isinstance(clock, str) and re.fullmatch(r"\d{2}:\d{2}", clock):
+        hour, minute, second = int(clock[:2]), int(clock[3:]), 0
+    else:
+        raise ValueError("Deposit time is malformed; " + _DEPOSIT_PM_HINT)
+    return datetime(day.year, day.month, day.day, hour, minute, second, tzinfo=_zone(zone_name))
+
+
+def _cutoff_instant(as_of):
+    day = date.fromisoformat(as_of)
+    return datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=_zone(_PM_TIMEZONE))
+
+
+def _deposit_public_date(value):
+    """Data di pubblicazione dichiarata = giorno dell'istante del deposito nel fuso del PM (come il cutoff)."""
+    return _deposit_instant(value).astimezone(_zone(_PM_TIMEZONE)).date().isoformat()
+
+
+def _deposit_sdir(value):
+    """Quale SDIR ha dato la data. Ricevuta senza \u00absdir\u00bb (prima del router, solo eMarket) = eMarket."""
+    return value.get("sdir") if "sdir" in value else _SDIR_EMARKET
+
+
+def _deposit_basis(value):
+    """Base della data di pubblicazione dichiarata nella ricevuta, dal contratto del deposito sigillato."""
+    return _EU_DEPOSIT_BASIS if value.get("contract") == _EU_DEPOSIT_CONTRACT else _DEPOSIT_BASIS
 
 
 def _deposit_declaration(value):
+    value = _deposit_effective(value)
     day = date.fromisoformat(value["data_deposito"])
-    text = ("data di deposito eMarket SDIR del %s, documento \u00ab%s\u00bb (protocollo %s)"
-            % (day.strftime("%d/%m/%Y"), " ".join(str(value["titolo"]).split()), value["protocollo"]))
+    if value.get("contract") == _EU_DEPOSIT_CONTRACT:
+        # UE: l'etichetta dice la NATURA della data (diffusione / deposito presso l'autorita' / dichiarata).
+        local_zone = _listing_timezone(value.get("ticker")) or _deposit_timezone(value)
+        if value.get("ora_deposito") is None:
+            moment = "%s (ora non indicata dalla fonte: fine del giorno)" % day.strftime("%d/%m/%Y")
+            rome = date.fromisoformat(_deposit_public_date(value))
+            if rome != day:
+                moment += ", cio\u00e8 il %s a Roma" % rome.strftime("%d/%m/%Y")
+        else:
+            local = _deposit_instant(value).astimezone(_zone(local_zone))
+            moment = "%s alle %s ora di %s" % (local.strftime("%d/%m/%Y"), local.strftime("%H:%M"), local_zone)
+        text = ("%s del %s, documento «%s»" % (_EU_NATURE_LABELS[value["natura_data"]] % value["fonte"],
+                moment, " ".join(str(value["titolo"]).split())))
+        if value.get("esito_sdir") is not None:
+            text = ("non trovato sugli SDIR italiani; data dallo Stato d'origine (%s, ISIN %s): %s"
+                    % (value.get("paese"), value.get("isin_instradamento"), text))
+        if value.get("protocollo"):
+            text += " (protocollo %s)" % value["protocollo"]
+        if (value.get("instradamento") or {}).get("canale") == "borsa":
+            text += "; canale di borsa, non l'OAM nazionale"
+        if value.get("scelta_copertina"):
+            text += ("; fonte ambigua fra %d documenti: scelto quello col nome della copertina"
+                     % len(value.get("candidati") or ()))
+        identity_eu = value.get("identita_ue") or {}
+        if identity_eu.get("stato") == "ok":
+            text += "; emittente verificato su GLEIF (LEI %s)" % identity_eu.get("lei")
+        elif identity_eu:
+            text += ("; identità dell'emittente non confermata su GLEIF (%s): ISIN e LEI non usati"
+                     % identity_eu.get("stato"))
+        return text
+    # 1INFO: la data e' quella di STOCCAGGIO del documento (definizione diversa dal comunicato eMarket).
+    label = ("data di stoccaggio 1INFO-SDIR" if _deposit_sdir(value) == _SDIR_1INFO
+             else "data di stoccaggio eMarket Storage (sezione Documenti)" if value.get("prova") == "documento"
+             else "data di deposito eMarket SDIR")
+    text = ("%s del %s, documento \u00ab%s\u00bb (protocollo %s)"
+            % (label, day.strftime("%d/%m/%Y"), " ".join(str(value["titolo"]).split()), value["protocollo"]))
     if value.get("stato") == "STALE":
         read = datetime.fromisoformat(str(value["letto_il"]))
         text += "; data di deposito letta il %s, fonte ora non raggiungibile" % read.strftime("%d/%m")
@@ -646,6 +895,14 @@ def _deposit_declaration(value):
         text += "; nome e periodo del documento letti nel PDF del comunicato (titolo generico di deposito)"
     if value.get("voce_da") == "automatico":
         text += "; ISIN %s risolto automaticamente su Borsa Italiana" % value.get("isin")
+    if value.get("scelta_copertina"):
+        text += ("; fonte ambigua fra %d documenti: scelto quello col nome della copertina"
+                 % len(value.get("candidati") or ()))
+    if isinstance(value.get("fine_esercizio"), dict):
+        fiscal = value["fine_esercizio"]
+        text += "; esercizio non solare che chiude il %s (fonte: %s)" % (
+            "/".join(reversed(str(fiscal.get("valore")).split("-"))),
+            _FISCAL_LABELS.get(fiscal.get("fonte"), fiscal.get("fonte")))
     return text
 
 
@@ -668,10 +925,58 @@ def _deposit_pdf_text(root, sha):
         raise ValueError("Archived eMarket SDIR deposit PDF cannot be read (" + type(exc).__name__ + ")") from exc
 
 
-def _check_deposit_value(value, ticker, tipo, report_date, as_of, root):
+def _check_full_sdir_receipt(value, ticker, tipo, report_date):
+    """AGGIUNTA 5: la ricevuta INTERA della fonte si riverifica senza rete (sdir.riverifica_deposito rifa' la scelta
+    dalle risposte salvate) e ogni campo sigillato a parte deve essere quello della ricevuta riverificata."""
+    from bellomberg.market_data.sdir import riverifica_deposito
+    source = value["ricevuta_fonte"]
+    fiscal = value.get("fine_esercizio")
+    if not isinstance(source, dict):
+        raise ValueError("SDIR source receipt is malformed; " + _DEPOSIT_PM_HINT)
+    try:
+        ok, reason = riverifica_deposito(source, ticker=(ticker or "").strip().upper(), tipo=tipo,
+                                         periodo_fine=report_date,
+                                         fine_esercizio=fiscal.get("valore") if isinstance(fiscal, dict) else None)
+    except Exception as exc:
+        ok, reason = False, "riverifica sollevata (%s)" % type(exc).__name__
+    if ok is not True:
+        raise ValueError("SDIR source receipt failed the offline re-verification (%s); %s"
+                         % (str(reason)[:200], _DEPOSIT_PM_HINT))
+    keys = [key for key in _DEPOSIT_FIELDS if key != "isin_resolution"]
+    if value.get("prova") == "documento":
+        keys += list(_DEPOSIT_DOCUMENT_FIELDS)
+    if "sdir" in value:
+        keys += [key for key in _DEPOSIT_SDIR_FIELDS if key != "instradamento"]
+    if value.get("scelta_copertina") is not None:
+        keys.append("candidati")
+    routing = source.get("instradamento")
+    bound = ({key: routing.get(key) for key in _ROUTING_FIELDS} if isinstance(routing, dict) else routing)
+    if (any(not same_exact_value(value.get(key), source.get(key)) for key in keys)
+            or ("sdir" in value and not same_exact_value(value.get("instradamento"), bound))):
+        raise ValueError("Sealed SDIR deposit fields differ from the re-verified source receipt; " + _DEPOSIT_PM_HINT)
+
+
+def _check_deposit_value(value, ticker, tipo, report_date, as_of, root, text=None):
     """Riverifica PURA del deposito sigillato: stesso emittente, tipo e periodo; deposito dopo la fine
-    del periodo e non dopo il cutoff; il titolo passa ancora la regola di eMarket (nome + periodo)."""
+    del periodo e non dopo il cutoff; il titolo passa ancora la regola di eMarket (nome + periodo).
+    Un 'ambiguo' vale solo con la scelta col nome in copertina, RIFATTA sul testo del documento archiviato;
+    poi la riga scelta ripassa DA SOLA la regola della fonte (come un ok)."""
     from bellomberg.market_data.emarket_sdir import candidati_deposito
+    if not isinstance(value, dict) or value.get("ricevuta_fonte") is None:
+        raise ValueError("SDIR deposit receipt lacks the full source receipt (saved responses); " + _DEPOSIT_PM_HINT)
+    _check_full_sdir_receipt(value, ticker, tipo, report_date)
+    choice = value.get("scelta_copertina") if isinstance(value, dict) else None
+    if choice is not None:
+        if value.get("stato") != "ambiguo" or text is None:
+            raise ValueError("SDIR deposit choice by cover name needs an ambiguous source and the document text; "
+                             + _DEPOSIT_PM_HINT)
+        again = _cover_named_candidate(text, report_date, tipo, value.get("candidati"))
+        if not same_exact_value(again, choice):
+            raise ValueError("SDIR deposit choice by cover name differs from the document cover; " + _DEPOSIT_PM_HINT)
+        value = {**_deposit_effective(value), "stato": "ok"}
+        if value.get("prova") == "testo_pdf":
+            raise ValueError("SDIR deposit choice among generic deposit notices (PDF text) is not supported; "
+                             + _DEPOSIT_PM_HINT)
     stale = isinstance(value, dict) and value.get("stato") == "STALE" and value.get("stato_originale") == "ok"
     if stale:
         try:
@@ -684,29 +989,188 @@ def _check_deposit_value(value, ticker, tipo, report_date, as_of, root):
             or value.get("periodo_fine") != report_date
             or any(not isinstance(value.get(key), str) or not value[key].strip()
                    for key in ("data_deposito", "titolo", "url", "protocollo"))
-            or not isinstance(value.get("url_liste"), list) or not value["url_liste"]
+            or not isinstance(value.get("url_liste"), list)
+            or not (value["url_liste"] or value.get("prova") == "documento")
             or not isinstance(value.get("sha256_liste"), dict)
             or set(value["sha256_liste"]) != set(value["url_liste"])):
         raise ValueError("eMarket SDIR deposit receipt conflicts with the document issuer, type or period; "
                          + _DEPOSIT_PM_HINT)
-    if not date.fromisoformat(report_date) < date.fromisoformat(value["data_deposito"]) <= date.fromisoformat(as_of):
+    if not (date.fromisoformat(report_date) < date.fromisoformat(value["data_deposito"])
+            and _deposit_instant(value) <= _cutoff_instant(as_of)):
         raise ValueError("eMarket SDIR deposit date is not after the reporting period or is after the cutoff; "
                          + _DEPOSIT_PM_HINT)
     row = {"data": value["data_deposito"], "ora": value.get("ora_deposito"), "titolo": value["titolo"],
            "url_pdf": value["url"], "protocollo": value["protocollo"], "categoria": value.get("categoria")}
+    _check_fiscal_seal(value, tipo, report_date, text)
+    isin = value.get("isin_resolution")
+    if isin is not None and (not isinstance(isin, dict) or isin.get("stato") != "ok" or isin.get("isin") != value.get("isin")):
+        raise ValueError("Automatic ISIN resolution differs from the eMarket SDIR deposit issuer; " + _DEPOSIT_PM_HINT)
+    sdir = _deposit_sdir(value)
+    routing = value.get("instradamento")
+    if routing is not None and (not isinstance(routing, dict)
+                                or routing.get("scelta") not in _SDIR_ROUTING_CHOICES.get(sdir, ())):
+        raise ValueError("SDIR routing of the deposit receipt differs from the SDIR that gave the date; "
+                         + _DEPOSIT_PM_HINT)
+    if sdir == _SDIR_1INFO:
+        # Regola PURA di 1INFO (ON): categoria del tipo, finestra dopo il periodo, ancora ESEF o nome + periodo.
+        from bellomberg.market_data.oneinfo_sdir import candidati_deposito as oneinfo_candidates
+        verdict = oneinfo_candidates([{**row, "esef": value.get("esef"), "consolidato": value.get("consolidato")}],
+                                     tipo, date.fromisoformat(report_date))
+        if (value.get("tipo_data") != "stoccaggio_documento" or value.get("prova") not in ("titolo", "esef")
+                or verdict["stato"] != "ok" or verdict["scelto"]["protocollo"] != value["protocollo"]
+                or verdict.get("prova") != value["prova"]):
+            raise ValueError("1INFO-SDIR deposit does not name this document and period; " + _DEPOSIT_PM_HINT)
+        return
+    if sdir != _SDIR_EMARKET:
+        raise ValueError("Deposit receipt SDIR is unknown (%s); %s" % (str(sdir)[:60], _DEPOSIT_PM_HINT))
+    if value.get("prova") == "documento":
+        _check_storage_document(value, tipo, report_date)
+        return
     texts = None
     if value.get("prova") == "testo_pdf":
         # Titolo generico: nome + periodo si ricontrollano nel PDF del comunicato archiviato.
         texts = {value["url"]: _deposit_pdf_text(root, (value.get("sha256_pdf") or {}).get(value["url"]))}
     elif value.get("prova") not in ("titolo", None):
         raise ValueError("eMarket SDIR deposit evidence kind is unknown; " + _DEPOSIT_PM_HINT)
-    isin = value.get("isin_resolution")
-    if isin is not None and (not isinstance(isin, dict) or isin.get("stato") != "ok" or isin.get("isin") != value.get("isin")):
-        raise ValueError("Automatic ISIN resolution differs from the eMarket SDIR deposit issuer; " + _DEPOSIT_PM_HINT)
     verdict = candidati_deposito([row], tipo, date.fromisoformat(report_date), testi_pdf=texts)
     if (verdict["stato"] != "ok" or verdict["scelto"]["protocollo"] != value["protocollo"]
             or verdict.get("prova") != (value.get("prova") or "titolo")):
         raise ValueError("eMarket SDIR deposit does not name this document and period; " + _DEPOSIT_PM_HINT)
+
+
+def _fiscal_year_end(tipo, report_date):
+    """'MM-GG' della fine dell'esercizio quando il periodo NON e' solare e la si DEDUCE dal tipo: annuale = il
+    periodo stesso; semestrale = sei mesi dopo (fine mese). Trimestrale non solare: non deducibile -> None (la
+    fonte risponde KO 'parametro', rifiuto dichiarato). Periodo solare -> None (default delle fonti)."""
+    period = date.fromisoformat(report_date)
+    if tipo == "annuale" and (period.month, period.day) != (12, 31):
+        return period.strftime("%m-%d")
+    if tipo == "semestrale" and (period.month, period.day) != (6, 30):
+        month = (period.month + 5) % 12 + 1
+        year = period.year + (1 if month < period.month else 0)
+        last = (date(year + (month == 12), month % 12 + 1, 1) - date.resolution).day
+        return "%02d-%02d" % (month, last)
+    return None
+
+
+# Fine esercizio di una TRIMESTRALE non solare (main 05/10): non si deduce dal periodo (31/07 puo' essere il Q1 di
+# un esercizio al 30/04 o il Q3 di uno al 31/10). Fonti DICHIARATE, in quest'ordine: (a) l'ultima relazione
+# ANNUALE dello stesso emittente gia' ammessa (in questa richiesta o passata dal chiamante); (b) la copertina
+# stessa se cita l'esercizio; (c) il fornitore prezzi passato dal chiamante, dichiarato come tale. Nessuna fonte =
+# limite dichiarato (la fonte del deposito risponde KO 'parametro'). Valore + fonte si sigillano nella ricevuta.
+_FISCAL_DEDUCED = "dedotta dal tipo e dal periodo"
+_FISCAL_KINDS = ("relazione_annuale", "copertina", "fornitore_prezzi")
+_FISCAL_LABELS = {"relazione_annuale": "relazione annuale ammessa", "copertina": "esercizio citato in copertina",
+                  "fornitore_prezzi": "fornitore prezzi, PROXY non ufficiale",
+                  "dedotta dal tipo e dal periodo": "dedotta dal tipo e dal periodo"}
+_FISCAL_COVER = re.compile(r"(?:esercizio\s+(?:sociale\s+)?(?:che\s+)?(?:si\s+)?(?:chiude|chiuder\u00e0|chiudera')\s+al|"
+                           r"(?:financial|fiscal)\s+year\s+(?:ending|ended|ends)(?:\s+on)?)\s+(?P<date>"
+                           + _DATE_PATTERN + r")", re.I)
+
+
+def _fiscal_entry_ok(entry, tipo, report_date):
+    """Una voce {valore 'MM-GG', fonte, dettaglio} e' coerente con una trimestrale al `report_date`?"""
+    if (not isinstance(entry, dict) or entry.get("fonte") not in _FISCAL_KINDS
+            or not isinstance(entry.get("valore"), str) or not re.fullmatch(r"\d{2}-\d{2}", entry["valore"])):
+        return False
+    try:
+        end = date.fromisoformat("2000-" + entry["valore"])     # 2000 bisestile: '02-29' si legge
+    except ValueError:
+        return False
+    period = date.fromisoformat(report_date)
+    last_day = (date(period.year + (period.month == 12), period.month % 12 + 1, 1) - date.resolution).day
+    # fine mese: in un anno NON bisestile (2001), piu' il 29/02 (RV-D4 P3-1: '02-28' dei retail era rifiutato)
+    month_end = (end.day == (date(2001 + (end.month == 12), end.month % 12 + 1, 1) - date.resolution).day
+                 or (end.month, end.day) == (2, 29))
+    return (tipo == "trimestrale" and period.day == last_day
+            and (period.month - end.month) % 12 in (3, 6, 9) and month_end)
+
+
+def _fiscal_year_end_declared(tipo, report_date, text=None, declared=()):
+    """{valore, fonte, dettaglio} della fine esercizio da passare alla fonte del deposito, o None (periodo solare,
+    o trimestrale non solare senza fonte dichiarata coerente)."""
+    deduced = _fiscal_year_end(tipo, report_date)
+    if deduced:
+        return {"valore": deduced, "fonte": _FISCAL_DEDUCED, "dettaglio": None}
+    period = date.fromisoformat(report_date)
+    if tipo != "trimestrale" or (period.month, period.day) in ((3, 31), (9, 30)):
+        return None
+    entries = [entry for entry in declared or () if isinstance(entry, dict)]
+    cover = set()
+    for match in _FISCAL_COVER.finditer(" ".join((text or "")[:2000].split())):
+        try:
+            cover.add(_parse_date_token(" ".join(match.group("date").split()))[5:])
+        except (ValueError, KeyError):
+            continue
+    ordered = ([entry for entry in entries if entry.get("fonte") == "relazione_annuale"]
+               + ([{"valore": cover.pop(), "fonte": "copertina", "dettaglio": "esercizio citato in copertina"}]
+                  if len(cover) == 1 else [])
+               + [entry for entry in entries if entry.get("fonte") == "fornitore_prezzi"])
+    for entry in ordered:
+        if _fiscal_entry_ok(entry, tipo, report_date):
+            return {"valore": entry["valore"], "fonte": entry["fonte"], "dettaglio": entry.get("dettaglio")}
+    return None
+
+
+def fiscal_year_end_from_provider(info, source_id="yahoo public issuer profile"):
+    """Voce (c) per `fiscal_year_end_sources`: la fine esercizio del FORNITORE PREZZI (profilo Yahoo,
+    `lastFiscalYearEnd` = epoch in secondi), DICHIARATA come PROXY. [] se il campo manca o non e' leggibile:
+    nessun valore inventato, la trimestrale non solare resta senza fonte (limite dichiarato)."""
+    raw = (info or {}).get("lastFiscalYearEnd") if isinstance(info, dict) else None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
+        return []
+    try:
+        from datetime import timezone
+        end = datetime.fromtimestamp(raw, tz=timezone.utc).date()
+    except (OverflowError, OSError, ValueError):
+        return []
+    return [{"valore": end.strftime("%m-%d"), "fonte": "fornitore_prezzi",
+             "dettaglio": "PROXY: lastFiscalYearEnd %s del fornitore prezzi (%s), non una fonte ufficiale"
+                          % (end.isoformat(), source_id)}]
+
+
+def _check_fiscal_seal(value, tipo, report_date, text=None, *, cover_check=True):
+    """La fine esercizio sigillata (se c'e') e' coerente: dedotta = ricalcolata; dichiarata = coerente col trimestre;
+    letta in copertina = RILETTA dal testo archiviato (senza testo: rifiuto). Ritorna il valore 'MM-GG'."""
+    sealed = value.get("fine_esercizio")
+    if sealed is None:
+        return _fiscal_year_end(tipo, report_date)
+    if not isinstance(sealed, dict) or (
+            sealed.get("valore") != _fiscal_year_end(tipo, report_date) if sealed.get("fonte") == _FISCAL_DEDUCED
+            else not _fiscal_entry_ok(sealed, tipo, report_date)):
+        raise ValueError("Sealed fiscal year end is malformed or incoherent with the reporting period; "
+                         + _DEPOSIT_PM_HINT)
+    if cover_check and sealed.get("fonte") == "copertina" and (
+            text is None or _fiscal_year_end_declared(tipo, report_date, text, ()) != sealed):
+        raise ValueError("Sealed fiscal year end read on the cover differs from the document cover; "
+                         + _DEPOSIT_PM_HINT)
+    return sealed["valore"]
+
+
+def _check_storage_document(value, tipo, report_date):
+    """eMarket Storage, sezione DOCUMENTI: la riga sigillata e' quella della ricevuta (data, ora, titolo, url,
+    protocollo), le liste dei documenti hanno i loro sha, e la regola PURA di IT3 (candidati_documento) ripassa
+    sulla riga con lo stesso protocollo e la stessa prova. Le pagine HTML non sono sigillate (solo gli sha)."""
+    from bellomberg.market_data.emarket_documenti import candidati_documento
+    row = value.get("documento")
+    pages = value.get("url_liste_documenti")
+    digests = value.get("sha256_liste_documenti")
+    if (not isinstance(row, dict) or value.get("tipo_data") != "stoccaggio_documento"
+            or row.get("data") != value["data_deposito"] or row.get("ora") != value.get("ora_deposito")
+            or row.get("titolo") != value["titolo"] or row.get("url") != value["url"]
+            or row.get("protocollo") != value["protocollo"]
+            or not isinstance(pages, list) or not pages or not isinstance(digests, dict) or set(digests) != set(pages)):
+        raise ValueError("eMarket Storage document receipt is incomplete or differs from the deposit; "
+                         + _DEPOSIT_PM_HINT)
+    try:
+        verdict = candidati_documento([deepcopy(row)], tipo, report_date,
+                                      fine_esercizio=_check_fiscal_seal(value, tipo, report_date, cover_check=False))
+    except Exception as exc:
+        raise ValueError("eMarket Storage document rule cannot be re-applied (%s); %s"
+                         % (type(exc).__name__, _DEPOSIT_PM_HINT)) from exc
+    if (verdict.get("stato") != "ok" or (verdict.get("scelto") or {}).get("protocollo") != value["protocollo"]
+            or verdict.get("prova") != value.get("prova_documento")):
+        raise ValueError("eMarket Storage document does not name this report and period; " + _DEPOSIT_PM_HINT)
 
 
 def _fetch_deposit_pdf(url):
@@ -717,46 +1181,157 @@ def _fetch_deposit_pdf(url):
     return raw
 
 
+# RIPIEGO .MI -> STATO D'ORIGINE (main 05/10; es. emittenti olandesi quotati a Milano): se gli SDIR italiani
+# rispondono non_coperto o KO 'instradamento_nome_non_trovato' e l'ISIN (identita' confermata, o risolto e
+# sigillato) e' di un altro paese, la data viene da depositi_ue con dopo_sdir_italiano=True. Si sigillano
+# ENTRAMBI gli esiti; la riverifica rifa' senza rete la scelta del ripiego e quella della fonte UE.
+_SDIR_FALLBACK_STATES = (("non_coperto", None), ("KO", "instradamento_nome_non_trovato"))
+_SDIR_OUTCOME_FIELDS = ("stato", "errore", "motivo", "sdir")
+
+
+def _sdir_allows_origin_fallback(outcome):
+    return (isinstance(outcome, dict) and (outcome.get("stato"), None if outcome.get("stato") == "non_coperto"
+            else outcome.get("errore")) in _SDIR_FALLBACK_STATES)
+
+
+def _sdir_fallback_reason(outcome):
+    return "sdir: %s %s (%s)" % (outcome.get("stato"), outcome.get("errore") or "", str(outcome.get("motivo"))[:200])
+
+
+def _check_origin_fallback(value):
+    """Riverifica PURA della scelta del ripiego: esito SDIR ammesso, motivo passato alla fonte UE identico,
+    ISIN di instradamento non italiano, chiave dopo_sdir_italiano sigillata."""
+    outcome = value.get("esito_sdir")
+    routing = value.get("instradamento") if isinstance(value.get("instradamento"), dict) else {}
+    isin = value.get("isin_instradamento")
+    if (not _sdir_allows_origin_fallback(outcome) or value.get("dopo_sdir_italiano") is not True
+            or routing.get("motivo_sdir") != _sdir_fallback_reason(outcome)
+            or not isinstance(isin, str) or isin[:2] == "IT" or _listing_suffix(value.get("ticker")) != ".MI"):
+        raise ValueError("Origin-state fallback after the Italian SDIRs is incoherent with the sealed SDIR outcome; "
+                         + _DEPOSIT_PM_HINT)
+
+
+def _acquire_origin_fallback(ticker, tipo, report_date, as_of, root, outcome, isin, *, issuer_name=None,
+                             text=None, eu_lookup=None):
+    """None se il ripiego non si applica; altrimenti la ricevuta UE sigillata con l'esito SDIR (o ValueError)."""
+    if not _sdir_allows_origin_fallback(outcome) or not isinstance(isin, str) or not isin or isin[:2] == "IT":
+        return None
+    if eu_lookup is None:
+        from bellomberg.market_data.depositi_ue import get_data_deposito as eu_lookup
+    reason = _sdir_fallback_reason(outcome)
+
+    def lookup(ticker, *, tipo, periodo_fine, isin=None, lei=None, nome=None):
+        return eu_lookup(ticker, tipo=tipo, periodo_fine=periodo_fine, isin=isin, lei=lei, nome=nome,
+                         dopo_sdir_italiano=True, motivo_sdir=reason)
+    # Il contesto del ripiego entra nel motivo come PREFISSO costruito qui (testo controllato, mai il testo
+    # di un'eccezione): i rifiuti successivi del controllo della ricevuta restano i loro, specifici.
+    return _acquire_eu_deposit(ticker, tipo, report_date, as_of, root, lookup, issuer_name=issuer_name,
+                               isin=isin, text=text,
+                               sdir_outcome={key: deepcopy(outcome.get(key)) for key in _SDIR_OUTCOME_FIELDS},
+                               reason_prefix="not found on the Italian SDIRs (%s); origin-state source: " % reason)
+
+
 def _acquire_deposit_companion(ticker, tipo, report_date, as_of, root, lookup=None, *, issuer_name=None,
-                               isin_lookup=None, pdf_fetch=None):
+                               isin_lookup=None, pdf_fetch=None, text=None, fiscal_sources=(),
+                               identity_isin=None, eu_lookup=None):
     """Una lettura della fonte ufficiale; solo l'esito ok viene sigillato in archivio.
 
     In produzione (nessuno strumento iniettato) prima risolve l'ISIN (negozio confermato ->
     automatico -> Borsa Italiana col nome dell'emittente), poi legge il deposito."""
     resolution = None
-    if isin_lookup is None and lookup is None:
+    fiscal = _fiscal_year_end_declared(tipo, report_date, text, fiscal_sources)
+    production = isin_lookup is None and lookup is None
+    if production:
         from bellomberg.market_data.borsa_italiana import risolvi_isin as isin_lookup
     if isin_lookup is not None:
+        # Il nome viene SOLO dall'identita' confermata (ingest_document_sources: status confirmed, nome del
+        # chart esatto); un nome uguale al simbolo non e' un nome: la ricerca per nome non parte (D4 05/10).
+        symbol = str(ticker or "").strip().upper().rsplit(".", 1)[0]
+        if not isinstance(issuer_name, str) or _normalized(issuer_name) in ("", _normalized(symbol)):
+            raise ValueError("%s; ISIN resolution not attempted: the confirmed issuer name is missing or equals the "
+                             "ticker symbol; %s" % (_PUBLICATION_AMBIGUOUS, _DEPOSIT_PM_HINT))
+        if production:
+            # Memoria dei tentativi falliti (W1 05/10: 72 h non_trovato/ambiguo, 6 h KO) e negozio confermato con
+            # precedenza: un .MI non risolvibile non rifa' la rete a ogni run. Poi risolvi_isin rilegge la voce
+            # dal negozio, senza rete, coi campi da sigillare.
+            from bellomberg.market_data.isin_automatico import assicura_isin_it
+            ensured = assicura_isin_it(ticker, nome=issuer_name, fonte_nome=_ISSUER_NAME_ORIGIN)
+            if isinstance(ensured, dict) and ensured.get("stato") != "ok":
+                raise ValueError("%s; ISIN resolution %s (%s): %s; %s" % (_PUBLICATION_AMBIGUOUS,
+                    ensured.get("stato"), ensured.get("errore"), str(ensured.get("motivo"))[:300], _DEPOSIT_PM_HINT))
         found = isin_lookup(ticker, nome=issuer_name)
         if not isinstance(found, dict) or found.get("stato") != "ok":
             detail = found if isinstance(found, dict) else {}
             raise ValueError("%s; ISIN resolution %s (%s): %s; %s" % (_PUBLICATION_AMBIGUOUS,
                 detail.get("stato", "malformed"), detail.get("errore"), str(detail.get("motivo"))[:300], _DEPOSIT_PM_HINT))
         resolution = {key: deepcopy(found.get(key)) for key in _ISIN_RESOLUTION_FIELDS}
+        resolution["nome_cercato"] = issuer_name    # sigillato: con quale nome confermato si e' cercato
     if lookup is None:
-        from bellomberg.market_data.emarket_sdir import get_data_deposito as lookup
+        # Router SDIR (ON 05/10): eMarket o 1INFO secondo l'instradamento; il nome e' quello confermato.
+        from bellomberg.market_data.sdir import get_data_deposito as _sdir_lookup
+        def lookup(ticker, *, tipo, periodo_fine):
+            # fine_esercizio solo per i periodi non solari, dedotta dal tipo (ON 05/10: kwarg facoltativo)
+            return _sdir_lookup(ticker, tipo=tipo, periodo_fine=periodo_fine, nome=issuer_name,
+                                fine_esercizio=fiscal["valore"] if fiscal else None)
     result = lookup(ticker, tipo=tipo, periodo_fine=report_date)
-    if not isinstance(result, dict) or not (result.get("stato") == "ok"
+    choice = None
+    if (isinstance(result, dict) and result.get("stato") == "ambiguo" and text is not None
+            and result.get("sdir") in (None, _SDIR_EMARKET, _SDIR_1INFO)):
+        # Documenti DIVERSI per lo stesso periodo (stessa regola dell'UE, main 05/10): conta quello col nome
+        # della copertina. Date discordi FRA i due SDIR («eMarket SDIR + 1INFO-SDIR») non si scelgono mai.
+        choice = _cover_named_candidate(text, report_date, tipo, result.get("candidati"))
+    if not isinstance(result, dict) or not (result.get("stato") == "ok" or choice is not None
             or (result.get("stato") == "STALE" and result.get("stato_originale") == "ok")):
         detail = result if isinstance(result, dict) else {}
-        raise ValueError("%s; eMarket SDIR deposit %s (%s): %s; %s" % (_PUBLICATION_AMBIGUOUS,
-            detail.get("stato", "malformed"), detail.get("errore"), str(detail.get("motivo"))[:300], _DEPOSIT_PM_HINT))
+        origin_isin = identity_isin or (resolution or {}).get("isin")
+        fallback = _acquire_origin_fallback(ticker, tipo, report_date, as_of, root, detail, origin_isin,
+                                            issuer_name=issuer_name, text=text, eu_lookup=eu_lookup)
+        if fallback is not None:
+            return fallback
+        label = (detail.get("sdir") or "SDIR") if "sdir" in detail else _SDIR_EMARKET
+        extra = ("; no single candidate carries the document name read on the cover"
+                 if detail.get("stato") == "ambiguo" else "")
+        raise ValueError("%s; %s deposit %s (%s): %s%s; %s" % (_PUBLICATION_AMBIGUOUS, label,
+            detail.get("stato", "malformed"), detail.get("errore"), str(detail.get("motivo"))[:300], extra,
+            _DEPOSIT_PM_HINT))
     value = {"contract": _DEPOSIT_CONTRACT, **{key: deepcopy(result.get(key)) for key in _DEPOSIT_FIELDS}}
+    if result.get("prova") == "documento":
+        value.update({key: deepcopy(result.get(key)) for key in _DEPOSIT_DOCUMENT_FIELDS})
+    if "sdir" in result:
+        value.update({key: deepcopy(result.get(key)) for key in _DEPOSIT_SDIR_FIELDS})
+        routing = result.get("instradamento")
+        value["instradamento"] = ({key: deepcopy(routing.get(key)) for key in _ROUTING_FIELDS}
+                                  if isinstance(routing, dict) else routing)
     value["isin_resolution"] = resolution
-    if value.get("prova") == "testo_pdf":
+    if fiscal is not None:
+        value["fine_esercizio"] = fiscal        # solo esercizi non solari: le ricevute solari restano identiche
+    if choice is not None:
+        value["candidati"] = deepcopy(result.get("candidati"))
+        value["scelta_copertina"] = choice
+    if not result.get("risposte_salvate"):
+        # RV-D4 P1: senza risposte salvate la scelta non si rifa' senza rete -> nessuna ricevuta (rifiuto dichiarato).
+        raise ValueError("%s; SDIR deposit receipt without saved source responses cannot be re-verified offline; %s"
+                         % (_PUBLICATION_AMBIGUOUS, _DEPOSIT_PM_HINT))
+    # AGGIUNTA 5: il ritorno INTERO (risposte salvate comprese) si sigilla e si riverifica con
+    # sdir.riverifica_deposito, che rifa' la scelta completa dalle risposte. OBBLIGATORIO (RV-D4 P1).
+    value["ricevuta_fonte"] = deepcopy(result)
+    if value.get("prova") == "testo_pdf" and _deposit_sdir(value) == _SDIR_EMARKET and choice is None:
         # Si archiviano i byte del PDF del comunicato: devono essere quelli letti dalla fonte.
         expected = (value.get("sha256_pdf") or {}).get(value.get("url"))
         pdf = (pdf_fetch or _fetch_deposit_pdf)(value.get("url"))
         if not isinstance(pdf, bytes) or sha256(pdf).hexdigest() != expected:
             raise ValueError("eMarket SDIR deposit PDF differs from the bytes read by the source; " + _DEPOSIT_PM_HINT)
         _archive_bytes(root / "publication-receipts", pdf, ".pdf")
-    _check_deposit_value(value, ticker, tipo, report_date, as_of, root)
+    _check_deposit_value(value, ticker, tipo, report_date, as_of, root, text)
     raw = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    if len(raw) > MAX_BYTES:
+        raise ValueError("SDIR deposit receipt is larger than the archive limit (%d bytes); %s"
+                         % (len(raw), _DEPOSIT_PM_HINT))
     _path, digest = _archive_bytes(root / "publication-receipts", raw, ".json")
     return {**value, "sha256": digest}
 
 
-def verify_deposit_companion(sealed, root, ticker, tipo, report_date, as_of):
+def verify_deposit_companion(sealed, root, ticker, tipo, report_date, as_of, text=None, identity=None):
     """Senza rete: byte archiviati == sigillo, contenuto == sigillo, regola ripassata."""
     if not isinstance(sealed, dict) or not isinstance(sealed.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", sealed["sha256"]):
         raise ValueError("eMarket SDIR deposit receipt is malformed")
@@ -771,14 +1346,233 @@ def verify_deposit_companion(sealed, root, ticker, tipo, report_date, as_of):
     if len(raw) > MAX_BYTES or sha256(raw).hexdigest() != sealed["sha256"]:
         raise ValueError("Archived eMarket SDIR deposit receipt bytes changed")
     value = json.loads(raw)
-    if not same_exact_value(value, {key: sealed.get(key) for key in ("contract", *_DEPOSIT_FIELDS)}):
+    # Il sigillo e' {archivio + sha256}: stesse CHIAVI e stessi valori (anche «sdir» presente/assente).
+    if not same_exact_value(value, {key: item for key, item in sealed.items() if key != "sha256"}):
         raise ValueError("Archived eMarket SDIR deposit receipt metadata changed")
-    _check_deposit_value(value, ticker, tipo, report_date, as_of, root)
+    if isinstance(value, dict) and value.get("contract") == _EU_DEPOSIT_CONTRACT:
+        _check_eu_deposit_value(value, ticker, tipo, report_date, as_of, text,
+                                (identity or {}).get("isin"), identity is not None,
+                                identity_name=(identity or {}).get("name"))
+    else:
+        _check_deposit_value(value, ticker, tipo, report_date, as_of, root, text)
     return deepcopy(sealed)
 
 
+def _check_eu_deposit_value(value, ticker, tipo, report_date, as_of, text=None, identity_isin=None,
+                            check_identity_isin=False, *, identity_name=None):
+    """Riverifica PURA della ricevuta UE sigillata: emittente, tipo, periodo, natura della data, data dopo il
+    periodo e non dopo il cutoff, poi la riverifica senza rete del modulo del paese (depositi_ue). Un 'ambiguo'
+    vale solo con la scelta col nome in copertina, RIFATTA qui sul testo del documento archiviato."""
+    from bellomberg.market_data.depositi_ue import riverifica_ricevuta
+    choice = value.get("scelta_copertina") if isinstance(value, dict) else None
+    if isinstance(value, dict) and value.get("stato") == "ambiguo" and choice is not None:
+        if text is None:
+            raise ValueError("EU deposit choice by cover name cannot be re-verified without the document text; "
+                             + _DEPOSIT_PM_HINT)
+        again = _cover_named_candidate(text, report_date, tipo, value.get("candidati"),
+                                       _eu_document_names(value.get("paese")))
+        if not same_exact_value(again, choice):
+            raise ValueError("EU deposit choice by cover name differs from the document cover; " + _DEPOSIT_PM_HINT)
+    elif isinstance(value, dict) and choice is not None:
+        raise ValueError("EU deposit receipt carries a cover-name choice without ambiguity; " + _DEPOSIT_PM_HINT)
+    sealed_value, value = value, _deposit_effective(value)
+    if (not isinstance(value, dict) or value.get("contract") != _EU_DEPOSIT_CONTRACT
+            or value.get("stato") not in (("ambiguo",) if choice is not None else ("ok",))
+            or value.get("ticker") != (ticker or "").strip().upper() or value.get("tipo") != tipo
+            or value.get("periodo_fine") != report_date or value.get("natura_data") not in _EU_NATURE_LABELS
+            or any(not isinstance(value.get(key), str) or not value[key].strip()
+                   for key in ("data_deposito", "titolo", "fonte", "fonte_modulo"))):
+        raise ValueError("EU official deposit receipt conflicts with the document issuer, type or period; "
+                         + _DEPOSIT_PM_HINT)
+    if not (date.fromisoformat(report_date) < date.fromisoformat(value["data_deposito"])
+            and _deposit_instant(value) <= _cutoff_instant(as_of)):
+        raise ValueError("EU official deposit date is not after the reporting period or is after the cutoff; "
+                         + _DEPOSIT_PM_HINT)
+    fallback = sealed_value.get("esito_sdir") is not None
+    if fallback:
+        _check_origin_fallback(sealed_value)
+    _check_eu_identity(sealed_value, ticker, identity_isin, check_identity_isin, identity_name=identity_name)
+    receipt = {key: item for key, item in sealed_value.items()
+               if key not in _EU_LOCAL_KEYS}
+    ok, reason = riverifica_ricevuta(receipt, ticker=value["ticker"], tipo=tipo, periodo_fine=report_date,
+                                     dopo_sdir_italiano=fallback)
+    if ok is not True:
+        raise ValueError("EU official deposit receipt failed the offline re-verification (%s); %s"
+                         % (str(reason)[:200], _DEPOSIT_PM_HINT))
+    _check_eu_source_declarations(value, tipo)
+
+
+# Fuso con cui ogni modulo UE dichiara l'ora di un esito 'ok' (RV-D4 P2-a: il 'fuso' sigillato non lo ricalcola
+# nessuno). Costante del modulo dove esiste; letterale dove il modulo lo scrive a mano (dichiarato: da allineare se
+# il modulo cambia). Un modulo fuori elenco = rifiuto.
+_EU_MODULE_TIMEZONES = {"bellomberg.market_data.ue_afm": ("FUSO", None),
+                        "bellomberg.market_data.ue_fsma": ("FUSO", None),
+                        "bellomberg.market_data.ue_newsweb": ("FUSO", None),
+                        "bellomberg.market_data.ue_amf": (None, "UTC"),
+                        "bellomberg.market_data.ue_nasdaq_nordic": (None, "UTC"),
+                        "bellomberg.market_data.ue_cnmv": (None, "Europe/Madrid")}
+
+
+def _eu_expected_timezone(module_name):
+    import importlib
+    entry = _EU_MODULE_TIMEZONES.get(module_name)
+    if entry is None:
+        return None
+    constant, literal = entry
+    return getattr(importlib.import_module(module_name), constant, None) if constant else literal
+
+
+def _check_eu_source_declarations(value, tipo):
+    """Fuso e natura della data DICHIARATI dalla ricevuta = quelli del modulo / del registro del paese."""
+    from bellomberg.market_data.depositi_ue import COPERTURA_UE
+    country = COPERTURA_UE.get(value.get("paese") or "") or {}
+    nature = (country.get("natura_data_per_tipo") or {}).get(tipo, country.get("natura_data"))
+    zone = _eu_expected_timezone(value.get("fonte_modulo"))
+    if not zone or value.get("fuso") != zone:
+        raise ValueError("EU deposit time zone differs from the one its source module declares; " + _DEPOSIT_PM_HINT)
+    if not nature or value.get("natura_data") != nature:
+        raise ValueError("EU deposit date nature differs from the country registry; " + _DEPOSIT_PM_HINT)
+
+
+def _check_eu_identity(value, ticker, identity_isin=None, check_identity_isin=False, *, identity_name=None):
+    """Identita' UE sigillata: riverifica senza rete del modulo (ID-UE) con lo stesso ISIN chiesto, poi ISIN e LEI
+    passati alla fonte del deposito = quelli dell'identita' (solo se 'ok'; altrimenti nessuno dei due)."""
+    from bellomberg.market_data.identita_ue import riverifica_identita
+    identity_eu = value.get("identita_ue")
+    if not isinstance(identity_eu, dict):
+        raise ValueError("EU issuer identity (GLEIF) is missing from the deposit receipt; " + _DEPOSIT_PM_HINT)
+    if check_identity_isin and (identity_isin is not None or value.get("esito_sdir") is None) and (
+            identity_eu.get("isin_chiamante") != identity_isin):
+        # RV-D4 P3-5: l'ISIN chiesto a GLEIF e' quello dell'identita' confermata (non solo quello della ricevuta)
+        raise ValueError("EU issuer identity (GLEIF) was resolved with an ISIN other than the confirmed identity's; "
+                         + _DEPOSIT_PM_HINT)
+    # RV-ID: il nome con cui si riverifica e' quello dell'IDENTITA' CONFERMATA (chi chiama), non quello della
+    # ricevuta (controllo circolare); la ricevuta deve riportare lo stesso nome. Senza identita' (collettore,
+    # che gira DOPO verify_document_receipt) resta il nome della ricevuta: limite dichiarato.
+    if identity_name is not None and value.get("nome") != identity_name:
+        raise ValueError("EU deposit receipt issuer name differs from the confirmed identity; " + _DEPOSIT_PM_HINT)
+    name = identity_name if identity_name is not None else value.get("nome")
+    ok, reason = riverifica_identita(identity_eu, ticker=(ticker or "").strip().upper(), nome=name,
+                                     isin=identity_eu.get("isin_chiamante"))
+    expected = ((identity_eu.get("isin"), identity_eu.get("lei")) if identity_eu.get("stato") == "ok"
+                else (None, None))
+    if ok is not True or (value.get("isin"), value.get("lei")) != expected:
+        raise ValueError("EU issuer identity (GLEIF) failed the offline re-verification or differs from the "
+                         "deposit lookup (%s); %s" % (str(reason)[:160], _DEPOSIT_PM_HINT))
+
+
+def _acquire_eu_deposit(ticker, tipo, report_date, as_of, root, lookup=None, *, issuer_name=None, isin=None,
+                        text=None, sdir_outcome=None, reason_prefix=""):
+    """Una lettura dell'instradatore UE con l'IDENTITA' CONFERMATA (nome; ISIN solo se l'identita' lo ha, mai dal
+    simbolo); solo l'esito ok, riverificato senza rete, viene sigillato INTERO in archivio."""
+    if lookup is None:
+        from bellomberg.market_data.depositi_ue import get_data_deposito as lookup
+    # Identita' UE (ID-UE 05/10, solo GLEIF): ISIN e LEI si usano SOLO con stato 'ok'; l'esito si sigilla intero.
+    from bellomberg.market_data.identita_ue import risolvi_identita_ue
+    identity_eu = risolvi_identita_ue(ticker, nome=issuer_name, isin=isin)
+    if not isinstance(identity_eu, dict):
+        raise ValueError("%s; EU issuer identity (GLEIF) is malformed; %s" % (_PUBLICATION_AMBIGUOUS, _DEPOSIT_PM_HINT))
+    if identity_eu.get("stato") == "STALE":
+        # ID-UE/main 05/10: un'identita' STALE non si sigilla (va riletta): rifiuto dichiarato
+        raise ValueError("%s; %sEU issuer identity (GLEIF) is STALE and cannot be sealed: %s; %s"
+                         % (_PUBLICATION_AMBIGUOUS, reason_prefix, str(identity_eu.get("motivo"))[:200], _DEPOSIT_PM_HINT))
+    identity_ok = identity_eu.get("stato") == "ok"
+    if not identity_ok:
+        reason_prefix += ("EU issuer identity (GLEIF) %s (%s): %s; "
+                          % (identity_eu.get("stato"), identity_eu.get("errore"), str(identity_eu.get("motivo"))[:200]))
+    result = lookup(ticker, tipo=tipo, periodo_fine=report_date, isin=identity_eu.get("isin") if identity_ok else None,
+                    lei=identity_eu.get("lei") if identity_ok else None, nome=issuer_name)
+    choice = None
+    if (isinstance(result, dict) and result.get("stato") == "ambiguo" and text is not None
+            and result.get("errore") != "nome_non_univoco" and not result.get("omonimi")):
+        # Documenti DIVERSI per lo stesso periodo: conta quello che la Trade Idea usa (nome in copertina).
+        # Un ambiguo d'IDENTITA' (omonimi AFM) non si sceglie mai.
+        choice = _cover_named_candidate(text, report_date, tipo, result.get("candidati"),
+                                        _eu_document_names(result.get("paese")))
+    if not isinstance(result, dict) or (result.get("stato") != "ok" and choice is None):
+        detail = result if isinstance(result, dict) else {}
+        extra = ("; no single candidate carries the document name read on the cover"
+                 if detail.get("stato") == "ambiguo" else "")
+        raise ValueError("%s; %sEU official deposit %s (%s): %s%s; %s" % (_PUBLICATION_AMBIGUOUS, reason_prefix,
+            detail.get("stato", "malformed"), detail.get("errore"), str(detail.get("motivo"))[:300], extra,
+            _DEPOSIT_PM_HINT))
+    value = {"contract": _EU_DEPOSIT_CONTRACT, **deepcopy(result)}
+    if choice is not None:
+        value["scelta_copertina"] = choice
+    if sdir_outcome is not None:
+        value["esito_sdir"] = sdir_outcome
+    value["identita_ue"] = deepcopy(identity_eu)
+    _check_eu_deposit_value(value, ticker, tipo, report_date, as_of, text, identity_name=issuer_name)
+    raw = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    if len(raw) > MAX_BYTES:
+        raise ValueError("EU official deposit receipt is larger than the archive limit (%d bytes); %s"
+                         % (len(raw), _DEPOSIT_PM_HINT))
+    _path, digest = _archive_bytes(root / "publication-receipts", raw, ".json")
+    return {**value, "sha256": digest}
+
+
 _COVER_PERIOD_LOCATOR = "cover_report_title_period/1"
+# INSTRADAMENTO PER LISTINO (D4 05/10, aggiornato D4b): da dove viene la data ufficiale di deposito.
+#   .MI (paese IT)                 -> router SDIR italiani `sdir.get_data_deposito` (eMarket SDIR / 1INFO-SDIR);
+#   paese UE coperto (depositi_ue) -> `depositi_ue.get_data_deposito` (paese dall'ISIN se l'identita' lo ha,
+#                                     altrimenti dal listino: lo decide `paese_di_instradamento`, registro unico);
+#   altrimenti                     -> nessuna fonte: limite DICHIARATO (`_publication_limit_note`).
+# filings.xbrl.org NON e' agganciato: `date_added` e' la data di inserimento nel repository, non la data di
+# pubblicazione (misura della bozza D4 05/10, non rifatta qui).
+_DEPOSIT_ROUTE_IT, _DEPOSIT_ROUTE_EU = "sdir_it", "depositi_ue"
+
+
+def _listing_suffix(ticker):
+    ticker = str(ticker or "").strip().upper()
+    return "." + ticker.rsplit(".", 1)[1] if "." in ticker else None
+
+
+def _deposit_route(ticker, isin=None):
+    """'sdir_it' | 'depositi_ue' | None. Nessuna rete: registri di depositi_ue e mercati.MERCATI."""
+    if _listing_suffix(ticker) is None:
+        return None             # USA: la data viene dal catalogo SEC, non da un deposito
+    from bellomberg.market_data.depositi_ue import COPERTURA_UE, paese_di_instradamento
+    route = paese_di_instradamento(ticker, isin)
+    if route["errore"]:
+        return None
+    if route["paese"] == "IT":
+        return _DEPOSIT_ROUTE_IT if _listing_suffix(ticker) == ".MI" else None
+    return _DEPOSIT_ROUTE_EU if (COPERTURA_UE.get(route["paese"] or "") or {}).get("modulo") else None
+
+
+def _route_document_names(ticker, isin=None):
+    """Nomi locali per il tipo in copertina: solo per i listini instradati a depositi_ue."""
+    if _deposit_route(ticker, isin) != _DEPOSIT_ROUTE_EU:
+        return None
+    from bellomberg.market_data.depositi_ue import paese_di_instradamento
+    return _eu_document_names(paese_di_instradamento(ticker, isin)["paese"])
+
+
+def _publication_limit_note(ticker, isin=None):
+    """Limite DICHIARATO per un listino estero senza fonte ufficiale agganciata; None per i listini con fonte e per
+    quelli senza suffisso (USA: catalogo SEC). Mercato e paese dai registri unici (`copertura.copertura_usa` ->
+    `mercati.MERCATI`, `depositi_ue.COPERTURA_UE`), mai da una lista di suffissi copiata qui."""
+    suffix = _listing_suffix(ticker)
+    if suffix is None or _deposit_route(ticker, isin) is not None:
+        return None
+    from bellomberg.market_data.copertura import copertura_usa
+    from bellomberg.market_data.depositi_ue import COPERTURA_UE, paese_di_instradamento
+    market = copertura_usa(ticker, "official publication-date source").get("mercato")
+    route = paese_di_instradamento(ticker, isin)
+    country = COPERTURA_UE.get(route["paese"] or "") or {}
+    if route["errore"]:
+        reason = "the identity ISIN cannot route the listing (%s)" % str(route["perche"])[:120]
+    elif country.get("motivo_limite_en"):
+        reason = country["motivo_limite_en"]
+    elif market:
+        reason = "official deposit sources are wired only for Italian SDIR and covered EU countries"
+    else:
+        return None     # suffisso non da listino (classe di azioni?): nessuna affermazione sul mercato
+    return "no official publication-date source (%s, %s): %s; %s" % (market or "?", suffix, reason, _DEPOSIT_PM_HINT)
+
+
 _ISSUER_FULL_TEXT_LOCATOR = "confirmed_issuer_name_in_full_text/1"
+_ISSUER_NAME_ORIGIN = "identit\u00e0 confermata (identity resolver)"
 _ISSUER_NAME_SOURCE = ("confirmed issuer identity (identity resolver); the isin_it store holds ISIN and eMarket id "
                        "only, no issuer-name field")
 
@@ -787,8 +1581,10 @@ def _cover_period_context(text):
     """Nome della relazione + periodo nella copertina (primi 2.000 caratteri), es. «Relazione finanziaria
     semestrale al 30 giugno 2026» / «HALF-YEAR FINANCIAL REPORT AT 30 JUNE 2026». Ritorna [(data, citazione)];
     la citazione e' unica nel testo intero (altrimenti il prefisso dall'inizio del documento)."""
-    names = "|".join(pattern for patterns in _DEPOSIT_DOCUMENT_TYPES.values() for pattern in patterns)
-    pattern = re.compile(r"(?:" + names + r")\s+(?:al|at|as\s+at|as\s+of)\s+(?P<date>" + _DATE_PATTERN + r")", re.I)
+    names = "|".join(pattern for patterns in _deposit_document_types().values() for pattern in patterns)
+    # Qualificatori ammessi fra nome e «al» (D4 05/10): «Relazione finanziaria semestrale consolidata al ...».
+    pattern = re.compile(r"(?:" + names + r")(?:\s+(?:consolidat[ao]|consolidated|condensed|abbreviat[ao])){0,2}"
+                         r"\s+(?:al|at|as\s+at|as\s+of)\s+(?P<date>" + _DATE_PATTERN + r")", re.I)
     result = []
     for match in pattern.finditer(text[:2000]):
         try:
@@ -844,7 +1640,7 @@ def verify_european_locators(text, extracted, verification, metadata):
 
 def _resolve_metadata_claims(source, text, identity, publication_receipt=None, legal_identity_resolver=None,
                              *, legacy_locators=False, publication_matches=None, deposit_resolver=None,
-                             european_locators=False):
+                             european_locators=False, publication_limit_note=None, document_names=None):
     resolved = deepcopy(source)
     origins = {}
     deposit_pending = False
@@ -868,7 +1664,8 @@ def _resolve_metadata_claims(source, text, identity, publication_receipt=None, l
             matches = _primary_publication_context(text) if publication_matches is None else publication_matches
             if len({item[0] for item in matches}) != 1:
                 if deposit_resolver is None or legacy_locators:
-                    raise ValueError('Publication requires one unambiguous primary header or cover date; optional claims cannot resolve contradictory publication facts')
+                    raise ValueError('Publication requires one unambiguous primary header or cover date; optional claims cannot resolve contradictory publication facts'
+                                     + (('; ' + publication_limit_note) if publication_limit_note else ''))
                 # Copertina senza data univoca: la data la da' il deposito ufficiale (dopo il periodo).
                 deposit_pending = True
                 continue
@@ -910,19 +1707,19 @@ def _resolve_metadata_claims(source, text, identity, publication_receipt=None, l
         _proof(text, resolved[kind + "_quote"])
         origins[kind] = "verified_pm_locator" if quote or claimed else "automatic_primary_text_locator"
     if deposit_pending:
-        tipo = _deposit_document_type(text)
+        tipo = _deposit_document_type(text, resolved["report_date"], document_names)
         if tipo is None:
             raise ValueError(_PUBLICATION_AMBIGUOUS + "; eMarket SDIR deposit not searched: report type not unique on "
-                             "the cover; " + _DEPOSIT_PM_HINT)
-        sealed = deposit_resolver(resolved["report_date"], tipo)
-        if source.get("published_at") and source["published_at"] != sealed["data_deposito"]:
+                             "the cover (" + _DOCUMENT_TYPE_RULE + "); " + _DEPOSIT_PM_HINT)
+        sealed = deposit_resolver(resolved["report_date"], tipo, text)
+        if source.get("published_at") and source["published_at"] != _deposit_public_date(sealed):
             raise ValueError("PM publication date conflicts with the eMarket SDIR deposit date")
-        resolved["published_at"], resolved["publication_quote"] = sealed["data_deposito"], None
+        resolved["published_at"], resolved["publication_quote"] = _deposit_public_date(sealed), None
         resolved["deposit_receipt"] = sealed
         if source.get("publication_quote"):
             # La citazione del PM non e' una data di pubblicazione: dichiarata, non usata come prova.
             resolved["request_publication_quote"] = source["publication_quote"]
-        origins["publication"] = _DEPOSIT_BASIS
+        origins["publication"] = _deposit_basis(sealed)
     if resolved.get("publication_quote") and resolved["publication_quote"] == resolved["report_date_quote"]:
         raise ValueError("Publication and reporting period require distinct contextual evidence")
     issuer_quote = source.get("issuer_quote") or (sec_cover['issuer_quote'] if sec_cover else None)
@@ -1160,7 +1957,10 @@ def _verified_candidate(source, fetched, identity, as_of, root, publication_rece
     source, origins = _resolve_metadata_claims(source, text, identity, publication_receipt,legal_identity_resolver,
         legacy_locators=legacy, publication_matches=publication_matches,
         deposit_resolver=deposit_resolver if publication_receipt is None else None,
-        european_locators=(not legacy and str(identity.get('ticker', '')).upper().endswith('.MI')))
+        european_locators=(not legacy and str(identity.get('ticker', '')).upper().endswith('.MI')),
+        document_names=_route_document_names(identity.get('ticker'), identity.get('isin')),
+        publication_limit_note=None if legacy else _publication_limit_note(identity.get('ticker'),
+                                                                           identity.get('isin')))
     unused_report_quote = source.pop('request_report_date_quote', None)
     unused_issuer_quote = source.pop('request_issuer_quote', None)
     deposit = source.pop("deposit_receipt", None)
@@ -1229,13 +2029,15 @@ def _verified_candidate(source, fetched, identity, as_of, root, publication_rece
     if deposit is not None:
         # Solo quando usato: le ricevute con data in copertina restano identiche.
         verification = metadata["pm_source_verification"]
-        verification["publication_basis"] = _DEPOSIT_BASIS
+        verification["publication_basis"] = _deposit_basis(deposit)
         verification["deposit_receipt"] = deepcopy(deposit)
         verification["publication_declaration"] = _deposit_declaration(deposit)
         if unused_publication_quote:
             verification["pm_publication_quote_not_evidence"] = unused_publication_quote
-        verification["proofs"]["publication"] = {"source_url": deposit["url"], "sha256": deposit["sha256"],
-            "locator": "/data_deposito", "value": deposit["data_deposito"]}
+        effective = _deposit_effective(deposit)
+        verification["proofs"]["publication"] = {"source_url": effective.get("url"), "sha256": deposit["sha256"],
+            "locator": "/scelta_copertina/candidato/data" if deposit.get("scelta_copertina") else "/data_deposito",
+            "value": effective["data_deposito"]}
     candidate = {"stato": "verificato", "url": source["url"], "path": str(path), "sha256": fetched["sha256"], "filed_date": source["published_at"], "metadati": metadata}
     return candidate, text
 
@@ -1333,7 +2135,8 @@ def _verify_publication_companion(receipt, url, ticker, identity, as_of, root):
 
 def ingest_document_sources(ticker, identity, as_of, sources, *, archive_root, issuer_website=None, download=None,
                             publication_catalog=None, publisher_proofs=None, allow_partial=False,
-                            deposit_lookup=None, isin_lookup=None, deposit_pdf_fetch=None):
+                            deposit_lookup=None, isin_lookup=None, deposit_pdf_fetch=None, fiscal_year_end_sources=(),
+                            deposit_eu_lookup=None):
     if (not isinstance(identity, dict) or identity.get("status") != "confirmed"
             or identity.get("ticker") != ticker or not identity.get("name")
             or not identity.get("exchange") or not identity.get("currency")):
@@ -1345,6 +2148,11 @@ def ingest_document_sources(ticker, identity, as_of, sources, *, archive_root, i
         raise ValueError("Server publisher proofs must match the requested document URLs")
     root = Path(archive_root).resolve() / "pm-public-documents"
     candidates = []
+    # Fine esercizio (trimestrali non solari): annuali ammesse PRIMA in questa richiesta, poi quelle del chiamante.
+    fiscal_sources = []
+    for entry in fiscal_year_end_sources or ():
+        if isinstance(entry, dict) and entry.get("fonte") in ("relazione_annuale", "fornitore_prezzi"):
+            fiscal_sources.append(deepcopy(entry))
     for source in sources:
         safe_url, fetched = None, {}
         try:
@@ -1363,12 +2171,28 @@ def ingest_document_sources(ticker, identity, as_of, sources, *, archive_root, i
             if _host(fetched["url_finale"]) != _host(source["url"]):
                 raise ValueError("Public acquisition changed the publisher host")
             publication = _acquire_publication_companion(source["url"], ticker, identity, as_of, root, publication_catalog)
-            deposit_resolver = ((lambda report_date, tipo: _acquire_deposit_companion(
-                ticker, tipo, report_date, as_of, root, deposit_lookup, issuer_name=identity["name"],
-                isin_lookup=isin_lookup, pdf_fetch=deposit_pdf_fetch))
-                if str(ticker).upper().endswith(".MI") else None)
+            route = _deposit_route(ticker, identity.get("isin"))
+            if route == _DEPOSIT_ROUTE_IT:
+                deposit_resolver = (lambda report_date, tipo, text: _acquire_deposit_companion(
+                    ticker, tipo, report_date, as_of, root, deposit_lookup, issuer_name=identity["name"],
+                    isin_lookup=isin_lookup, pdf_fetch=deposit_pdf_fetch, text=text,
+                    identity_isin=identity.get("isin"), eu_lookup=deposit_eu_lookup,
+                    fiscal_sources=sorted(fiscal_sources, key=lambda entry: entry["fonte"] != "relazione_annuale")))
+            elif route == _DEPOSIT_ROUTE_EU:
+                deposit_resolver = (lambda report_date, tipo, text: _acquire_eu_deposit(
+                    ticker, tipo, report_date, as_of, root, deposit_lookup, issuer_name=identity["name"],
+                    isin=identity.get("isin"), text=text))
+            else:
+                deposit_resolver = None
             candidate, text = _verified_candidate(source, fetched, identity, as_of, root, publication,
                 deposit_resolver=deposit_resolver)
+            report = candidate["metadati"].get("report_date")
+            if (isinstance(report, str) and report[5:] != "12-31"
+                    and _deposit_document_type(text, report, _route_document_names(ticker, identity.get("isin")))
+                    == "annuale"):
+                fiscal_sources.insert(0, {"valore": report[5:], "fonte": "relazione_annuale",
+                    "dettaglio": "relazione annuale al %s ammessa in questa richiesta (sha256 %s)"
+                                 % (report, candidate["sha256"][:12])})
             candidates.append({**candidate, "publication_receipt": publication, "status": "verified", "request": source, "url_finale": fetched["url_finale"], "bytes": fetched["bytes"], "content_type": fetched["content_type"], "text_sha256": sha256(text.encode()).hexdigest(),
                 **({"publisher_proof": deepcopy(proof)} if proof is not None else {})})
         except (ValueError, OSError, http.client.HTTPException, KeyError) as exc:
@@ -1424,8 +2248,9 @@ def verify_document_receipt(receipt, ticker, identity, as_of, *, archive_root, i
         sealed_deposit = metadata.get("deposit_receipt")
         candidate, text = _verified_candidate(source, {**row, "publisher": policy}, identity, as_of, root, publication,
             text_extraction=metadata.get('text_extraction', LEGACY_HTML_TEXT_EXTRACTOR),
-            deposit_resolver=(None if sealed_deposit is None else (lambda report_date, tipo:
-                verify_deposit_companion(sealed_deposit, root, ticker, tipo, report_date, as_of))))
+            deposit_resolver=(None if sealed_deposit is None else (lambda report_date, tipo, text:
+                verify_deposit_companion(sealed_deposit, root, ticker, tipo, report_date, as_of, text=text,
+                                         identity=identity))))
         if candidate != {key: row[key] for key in candidate} or sha256(text.encode()).hexdigest() != row["text_sha256"]:
             raise ValueError("Accepted primary document text, metadata or locators changed")
         checked.append(candidate)

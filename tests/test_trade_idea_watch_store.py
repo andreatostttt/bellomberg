@@ -646,8 +646,24 @@ def test_summary(db):
 
 
 def test_conftest_tripwire_covers_watch_store():
-    """Rilievo RV-P-A 5: lo store usa sqlite3.connect raw; il presidio del conftest lo copre."""
+    """Rilievo RV-P-A 5: lo store usa sqlite3.connect raw; il presidio del conftest lo copre.
+
+    ZR 05/10: in un clone pulito il DB di produzione NON esiste e il costruttore si ferma prima
+    (FileNotFoundError, nessuna apertura): la guardia si prova quindi su `_connect`, l'unico
+    punto da cui lo store apre il DB, indipendente dall'esistenza del file. Se il DB esiste
+    (macchina del PM) si prova anche il costruttore, come prima."""
+    import os
     from bellomberg.storage import memory_db
+    store = object.__new__(TradeIdeaWatchStore)
+    store.db_path = os.fspath(memory_db.SQLITE_PATH)
     with pytest.raises(BaseException) as info:
-        TradeIdeaWatchStore(memory_db.SQLITE_PATH)
+        with store._connect(read_only=True):
+            pass
     assert type(info.value).__name__ == "ProduzioneToccata"
+    if os.path.isfile(memory_db.SQLITE_PATH):
+        with pytest.raises(BaseException) as info:
+            TradeIdeaWatchStore(memory_db.SQLITE_PATH)
+        assert type(info.value).__name__ == "ProduzioneToccata"
+    else:
+        with pytest.raises(FileNotFoundError):
+            TradeIdeaWatchStore(memory_db.SQLITE_PATH)

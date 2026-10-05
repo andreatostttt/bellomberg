@@ -532,14 +532,28 @@ def test_pinned_tls_peer_and_hostname_are_checked_without_second_host_resolution
 
 @pytest.fixture
 def document_admission(migrated, tmp_path, monkeypatch):
+    # Contratto attuale (Excel archiviato, commit 1326312): l'avvio HTTP ammette solo la
+    # ricerca. Preflight VERO in modalita' ricerca con la research_admission vera; il
+    # documento PM passa dal trasporto intercettato (un solo download misurato).
+    from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE
+    from bellomberg.valuation import trade_idea_model as model
     current = store(migrated)
     priced = _priced_request(budget="30")
+    for row in priced["catalog_snapshot"]["models"].values():
+        row["supported_efforts"] = ["low", "medium", "max"]
     download, calls = transport()
+    original_ingest = sources.ingest_document_sources
+    monkeypatch.setattr(sources, "ingest_document_sources",
+        lambda *a, **k: original_ingest(*a, **k, download=download))
     workers = []
+    def research_qualifier(ticker, identity, day, **kwargs):
+        return model.research_admission(ticker, identity, day, providers=_profile_providers(day),
+            analysis_mode=RESEARCH_ANALYSIS_MODE, **kwargs)
     def real_preflight(ticker, pm_view, view_source, budget, **options):
         return trade_idea.preflight_trade_idea(ticker, pm_view, view_source, budget,
+            analysis_mode=options.get("analysis_mode"), execution_policy=options.get("execution_policy"),
             archive_root=options.get("archive_root", tmp_path / "source-archive"),
-            source_qualifier=options.get("source_qualifier", qualifier(download)),
+            source_qualifier=options.get("source_qualifier", research_qualifier),
             catalog_fetcher=lambda: priced["catalog_snapshot"],
             identity_resolver=options.get("identity_resolver", lambda _ticker: deepcopy(IDENTITY)),
             key_checker=lambda: None,
@@ -559,10 +573,35 @@ def document_admission(migrated, tmp_path, monkeypatch):
         yield client, current, body, priced, calls, workers
 
 
+def research_grant(fingerprint):
+    """Il solo grant ammesso dal contratto di ricerca: comitato, zero revisioni Excel."""
+    return {"accepted": True, "source_fingerprint": fingerprint,
+            "activities": ["committee"], "max_revision_rounds": 0}
+
+
+def research_worker_options(tmp_path, download, rechecks=None):
+    """Worker di ricerca isolato: la sessione fonti usa il trasporto intercettato."""
+    from bellomberg.agents.company_source_research import ResearchSession
+    from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE
+    from bellomberg.valuation import trade_idea_model as model
+    def recheck(ticker, identity, day, **kwargs):
+        # La controverifica del worker: ricevuta accettata riletta dall'archivio, niente rete.
+        assert "accepted_document_receipt" in kwargs and "document_sources" not in kwargs
+        checked = model.research_admission(ticker, identity, day, providers=_profile_providers(day),
+            analysis_mode=RESEARCH_ANALYSIS_MODE, **kwargs)
+        if rechecks is not None:
+            rechecks.append((checked["status"], list(checked["reasons"])))
+        return checked
+    return {**worker_options(tmp_path), "source_qualifier": recheck,
+        "source_session_factory": lambda **kwargs: ResearchSession(**kwargs, download=download),
+        "preparer_binder": lambda *_a, **_k: pytest.fail("Research run reached an Excel preparer")}
+
+
 def accept_document_run(client, body, priced):
     checked = client.post("/trade-ideas/preflight", json=body)
     assert checked.status_code == 200 and checked.json()["ok"], checked.text
-    grant = {**deepcopy(priced["authorization"]), "source_fingerprint": checked.json()["source_qualification"]["fingerprint"]}
+    assert checked.json()["analysis_mode"] == "fundamentals_research_v1"
+    grant = research_grant(checked.json()["source_qualification"]["fingerprint"])
     start_body = {**deepcopy(body), "idempotency_key": "E1-actual-source-run", "cost_acknowledged": True,
                   "authorization": grant}
     accepted = client.post("/trade-ideas/runs", json=start_body)
@@ -602,52 +641,29 @@ def test_actual_http_preflight_start_persist_worker_exact_documents_and_paid_bou
     assert retry.status_code == 202 and workers == [run_id]
     assert len([row for row in calls if row[0] == "request"]) == 1
 
-    # Exercise the real worker through accepted-source revalidation, a measured
-    # synthetic preparation call and a real common Excel at R1. The native
-    # author/committee contract has a separate full replay; do not reintroduce
-    # the historical pre-R0 workbook preparation into the production workflow.
-    seen, models = [], []
-    from types import SimpleNamespace
-    from test_trade_idea_pipeline import FakeMessages, _call_kwargs
-    def binder(gate, ticker):
-        assert gate.store.get_run(run_id)["cost"]["requests"] == 0
-        seen.append("accepted-sources-verified-before-preparer")
-        fake = FakeMessages("0.001")
-        budgeted = gate.wrap_client(SimpleNamespace(messages=fake), role="aux:preparation")
-        arguments = _call_kwargs()
-        arguments["model"] = trade_idea.model_for_role("aux")
-        arguments["max_tokens"] = 1000
-        budgeted.messages.create(**arguments)
-        assert fake.calls == 1
-        return (lambda *_: deepcopy(internal["source_report"]["source_plan"])), {"status": "authorized"}
-    def initial(board):
-        assert board.source_qualification["fingerprint"] == start_body["authorization"]["source_fingerprint"]
-        workbook = prepare(board.source_qualification, board.valuation_preparer, tmp_path / "worker" / "model")
-        assert workbook["valuation_usability"]["usable"], workbook.get("error")
-        trade_idea._record_candidate_model(board, workbook)
-        models.append(workbook)
+    # Worker VERO di ricerca: la ricevuta del documento accettato e' ricontrollata sui byte
+    # archiviati SENZA riscaricare, prima di ogni lavoro pagato; nessun Excel a R1 (archiviato:
+    # la parte storica e' in archive/private/attic/tests_excel_archiviato_20261005/test_trade_idea_pm_sources_legacy.py).
+    seen = []
     def first_round(board, round_n):
-        if round_n == 0:
-            assert not board.valuation_results
-            return
-        assert round_n == 1
-        initial(board)
-        assert trade_idea._verified_candidate_valuations(board)
-        seen.append("committee-sees-exact-real-common-model")
+        assert round_n == 0
+        assert board.source_qualification["fingerprint"] == start_body["authorization"]["source_fingerprint"]
+        assert board.source_qualification["document_receipt"]["fingerprint"] == checked["document_sources"]["fingerprint"]
+        assert board.valuation_preparer is None and not board.valuation_results
+        assert current.get_run(run_id)["cost"]["requests"] == 0
+        seen.append("accepted-sources-verified-before-committee")
         current.request_stop(run_id)
-        raise RuntimeError("Intentional offline E1 stop after the R1 compiler boundary")
+        raise RuntimeError("Intentional offline E1 stop at the research R0 boundary")
     monkeypatch.setattr(trade_idea, "deliver_trade_idea", lambda *_a, **_k: pytest.fail("Cancelled E1 worker delivered"))
-    detail = trade_idea.execute_trade_idea(run_id, store=current, **worker_options(tmp_path),
-        source_qualifier=qualifier(lambda *_a, **_k: pytest.fail("PM sources re-downloaded after grant")),
-        preparer_binder=binder, valuation_evaluator=initial, round_runner=first_round,
+    no_download = lambda *_a, **_k: pytest.fail("PM sources re-downloaded after grant")
+    detail = trade_idea.execute_trade_idea(run_id, store=current,
+        **research_worker_options(tmp_path, no_download), round_runner=first_round,
         catalog_fetcher=lambda: priced["catalog_snapshot"])
-    assert seen == ["accepted-sources-verified-before-preparer", "committee-sees-exact-real-common-model"], detail["run"]["reason"]
+    assert seen == ["accepted-sources-verified-before-committee"], detail["run"]["reason"]
     assert detail["run"]["technical_status"] == "cancelled"
-    assert detail["cost"]["requests"] == 1 and detail["cost"]["charged_usd"] == "0.001"
-    assert detail["cost"]["overrun"] is False and detail["cost"]["unknown_requests"] == 0
-    assert detail["cost"]["by_phase"]["model_preparation"]["requests"] == 1
-    assert len(models) == 1 and Path(models[0]["path"]).is_file()
+    assert detail["cost"]["requests"] == 0 and detail["cost"]["unknown_requests"] == 0
     assert len([row for row in calls if row[0] == "request"]) == 1
+    assert not list(tmp_path.rglob("*.xlsx"))
 
 
 @pytest.mark.parametrize("mutation", ["archive_bytes", "metadata", "path", "missing_isolated_archive"])
@@ -674,15 +690,24 @@ def test_accepted_document_mismatch_blocks_worker_before_first_paid_call(
         # public detail DTO. Inject a corrupted read at that exact storage seam;
         # document qualification and authorization remain their real functions.
         monkeypatch.setattr(current, "get_accepted_request", lambda _identifier: deepcopy(raw))
-    options = worker_options(tmp_path)
+    rechecks = []
+    options = research_worker_options(tmp_path, lambda *_a, **_k: pytest.fail("PM sources re-downloaded"), rechecks)
     if mutation == "missing_isolated_archive":
         options.pop("document_archive_root")
     detail = trade_idea.execute_trade_idea(run_id, store=current, **options,
-        source_qualifier=qualifier(lambda *_a, **_k: pytest.fail("PM sources re-downloaded")),
-        preparer_binder=lambda *_a, **_k: pytest.fail("Paid preparer reached after document mismatch"),
         round_runner=lambda *_a, **_k: pytest.fail("Committee started after document mismatch"),
         catalog_fetcher=lambda: priced["catalog_snapshot"])
     assert detail["run"]["technical_status"] == "failed", detail["run"]["reason"]
+    # Ogni mutazione cade per il SUO motivo documentale, non per un guasto generico.
+    expected = {"archive_bytes": "SHA256 differs from archived bytes",
+                "metadata": "text, metadata or locators changed",
+                "path": "archive escapes the server root",
+                "missing_isolated_archive": "archivio fonti PM isolato richiesto"}[mutation]
+    if mutation == "missing_isolated_archive":
+        assert expected in detail["run"]["reason"] and rechecks == []
+    else:
+        assert len(rechecks) == 1 and rechecks[0][0] == "blocked"
+        assert any(expected in reason for reason in rechecks[0][1]), rechecks
     assert detail["cost"]["requests"] == 0 and detail["email"]["attempts"] == 0
     assert len([row for row in calls if row[0] == "request"]) == 1
 
@@ -701,11 +726,11 @@ def test_source_change_between_preflight_and_grant_creates_no_run(document_admis
     client, current, body, priced, calls, workers = document_admission
     response = client.post("/trade-ideas/preflight", json=body)
     assert response.status_code == 200 and response.json()["ok"], response.text
-    grant = {**deepcopy(priced["authorization"]), "source_fingerprint": response.json()["source_qualification"]["fingerprint"]}
+    grant = research_grant(response.json()["source_qualification"]["fingerprint"])
     body["document_sources"][0]["publication_quote"] = "Published on 2026-09-09"
     changed = client.post("/trade-ideas/runs", json={**body, "authorization": grant,
         "idempotency_key": "changed-source", "cost_acknowledged": True})
-    assert changed.status_code == 428
+    assert changed.status_code == 428 and "Snapshot del preflight" in changed.text, changed.text
     assert current.list_runs()["total"] == 0 and workers == []
 
 

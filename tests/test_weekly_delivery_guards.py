@@ -67,6 +67,10 @@ def _render_store(tmp_path, memo_id):
 def test_two_memos_render_real_pdfs_to_distinct_paths_and_reuse_original(tmp_path, monkeypatch):
     from bellomberg.reporting import pdf_institutional
     monkeypatch.setattr(pdf_institutional, 'REPORT_DIR', tmp_path / 'reports')
+    # I grafici del renderer vero vanno in charts_institutional.DIR (fissato all'import
+    # sulla cartella report dell'albero): anche loro nel tmp (ZR 05/10).
+    from bellomberg.reporting import charts_institutional
+    monkeypatch.setattr(charts_institutional, 'DIR', str(tmp_path / 'reports' / 'inst_charts'))
     first, module = _render_store(tmp_path, 1)
     second, _ = _render_store(tmp_path, 2)
     inputs = {'memo_markdown': '# Frozen synthetic memo\nSources and limits are explicit.',

@@ -274,10 +274,20 @@ def live_metadata(model):
     import requests
     response = requests.get("https://openrouter.ai/api/v1/models", timeout=30)
     response.raise_for_status()
-    matches = [row for row in response.json()["data"] if row.get("id") == model]
+    data = response.json()["data"]
+    matches = [row for row in data if row.get("id") == model]
+    base, _, variant = str(model).partition(":")
+    if not matches and variant in _ROUTING_VARIANTS:
+        # Le varianti di instradamento OpenRouter (:exacto, :nitro, :floor) non sono nel
+        # catalogo: listino del modello base, DICHIARATO nel metadato (costo vero dal journal).
+        matches = [dict(row, pricing_basis="base model " + base + " (routing variant :" + variant
+                        + " not listed)") for row in data if row.get("id") == base]
     if len(matches) != 1:
         raise ValueError("configured model absent or ambiguous in live pricing catalog")
     return matches[0]
+
+
+_ROUTING_VARIANTS = frozenset({"exacto", "nitro", "floor"})
 
 
 def _model_dossier(dossier):
@@ -310,6 +320,55 @@ def _model_dossier(dossier):
         for name in counters:
             del coverage[name]
     return projected
+
+
+MANUAL_RECONCILIATION_LABEL = "riconciliato manualmente non fatturabile (costo 0 attestato, mai ritentabile)"
+# RV-COST P3: una riga v2 E' autorizzata a un nuovo tentativo finanziato: testo distinto e vero.
+MANUAL_RECONCILIATION_V2_LABEL = ("riconciliato manualmente non fatturabile (costo 0 attestato); "
+                                  "nuovo tentativo finanziato autorizzato dall'operatore")
+# Le SOLE chiavi della ricevuta storica: preventivo (basis, context_length, max_price,
+# reserve_nano_usd) + esito (stop_reason, cost_usd) + giudizio manuale. Qualunque prova di
+# fatturazione in piu' (usage, id, response_sha256, provider, settlement...) = non e' questa forma.
+MANUAL_RECONCILIATION_KEYS = frozenset({"basis", "billing_reconciliation", "context_length", "cost_usd",
+                                        "max_price", "reserve_nano_usd", "stop_reason"})
+
+
+def manual_reconciliation_status(row, receipt):
+    """ZR 05/10: rifiuto 'rejected' SENZA pre_provider_rejection = riconciliazione manuale
+    STORICA (la forma che authorize_credit_retry pretende). Ammessa SOLO la forma esatta:
+    stop_reason request_rejected, costo 0 esatto in riga e ricevuta, nessuna risposta,
+    nessun response_id/generation_id fatturato, giudizio reconciled_nonbillable* senza
+    ricevuta d'uso ne' generation id, e NESSUNA chiave oltre MANUAL_RECONCILIATION_KEYS
+    (RV-COST P2-a). Qualunque altra combinazione = errore. Non autorizza
+    mai un nuovo tentativo (preparation_rejections.retry_allowed -> False)."""
+    judgment = receipt.get("billing_reconciliation")
+    if (set(receipt) != MANUAL_RECONCILIATION_KEYS
+            or receipt.get("stop_reason") != "request_rejected"
+            or type(row["cost"]) is not int or row["cost"] != 0
+            or type(receipt.get("cost_usd")) not in (int, float) or receipt["cost_usd"] != 0
+            or row["response"] is not None
+            or receipt.get("response_id") is not None or receipt.get("generation_id") is not None
+            or not isinstance(judgment, dict)
+            or not str(judgment.get("status", "")).startswith("reconciled_nonbillable")
+            or judgment.get("generation_id_available") is not False
+            or judgment.get("api_usage_receipt_available") is not False):
+        raise ValueError("invalid pre-provider rejection receipt")
+    return judgment["status"]
+
+
+def manual_reconciliation_declared(row, receipt):
+    """Etichetta per una riga 'rejected' gia' VALIDATA la cui ricevuta e' la riconciliazione
+    manuale: storica (nessuna prova) -> MANUAL_RECONCILIATION_LABEL; autorizzata v2 (la prova
+    incorpora quella ricevuta) -> MANUAL_RECONCILIATION_V2_LABEL. Un rifiuto pre-provider v1
+    autentico (o ogni altra riga) -> None: non e' una riconciliazione manuale."""
+    if row["state"] != "rejected":
+        return None
+    if "pre_provider_rejection" not in receipt:
+        return MANUAL_RECONCILIATION_LABEL
+    proof = receipt["pre_provider_rejection"]
+    if isinstance(proof, dict) and proof.get("version") == 2:
+        return MANUAL_RECONCILIATION_V2_LABEL
+    return None
 
 
 class BudgetedProposer:
@@ -351,12 +410,19 @@ class BudgetedProposer:
         with self._db() as db:
             rows = db.execute("SELECT * FROM requests").fetchall()
             cap = db.execute("SELECT cap FROM authorization WHERE id=1").fetchone()[0]
-        unverifiable = []
+        unverifiable, reconciled, labels = [], [], set()
         for row in rows:
             receipt = self._validate_receipt(row, require_response=False)
             if (row["response"] is not None and row["cost"] is not None
                     and not receipt.get("response_sha256")):
                 unverifiable.append(row["key"])
+            # RV-COST P2-b/P3: si dichiara SOLO una riga a costo CERTO gia' validata come
+            # riconciliazione manuale (storica, o autorizzata v2 che la incorpora): stessa
+            # regola del registro (manual_reconciliation_declared).
+            label = manual_reconciliation_declared(row, receipt) if row["cost"] is not None else None
+            if label:
+                reconciled.append(row["key"])
+                labels.add(label)
         unknown = sum(row["cost"] is None for row in rows)
         result = {"authorized_usd": cap / 1e9, "requests": len(rows), "unknown_requests": unknown,
                 "spent_usd": None if unknown else sum(row["cost"] for row in rows) / 1e9,
@@ -365,6 +431,10 @@ class BudgetedProposer:
         if unverifiable:
             result.update(unverifiable_responses=unverifiable,
                           replay_status="legacy_unverifiable; original costs and records retained")
+        if reconciled:
+            # Costo 0 DICHIARATO, non sparito: la riga resta nei conteggi e nei totali.
+            result.update(manually_reconciled_nonbillable=reconciled,
+                          manual_reconciliation_status="; ".join(sorted(labels)))
         return result
 
     def _request(self, dossier, contract):
@@ -757,6 +827,9 @@ class BudgetedProposer:
         if _nano(receipt.get("cost_usd")) != row["cost"]:
             raise ValueError("preparation cost differs from its provider receipt")
         if row["state"] == "rejected":
+            if "pre_provider_rejection" not in receipt:
+                manual_reconciliation_status(row, receipt)  # solleva su ogni altra forma
+                return receipt
             from .preparation_rejections import validate_proof
             validate_proof(receipt)
             return receipt

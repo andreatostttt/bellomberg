@@ -106,7 +106,8 @@ def test_single_native_correction_changes_only_refs_preserves_usage_and_exact_at
     result,calls,roles,original=native(review_board,monkeypatch,corrected)
     assert json.loads(result)==corrected and json.loads(original)==review()
     assert len(calls)==1 and roles==["red_team"]
-    assert calls[0]["max_tokens"]==65536 and calls[0]["model"]==trade_idea.model_for_role("red_team")
+    # PM 02/10 (TOKEN-LIMITS-20261002): Red Team ordinario a 128000; la correzione citazioni usa lo stesso tetto.
+    assert calls[0]["max_tokens"]==red_team.TRADE_IDEA_RED_MAX_TOKENS==128000 and calls[0]["model"]==trade_idea.model_for_role("red_team")
     assert calls[0]["thinking"]=={"type":"effort","effort":"max"} and "tools" not in calls[0]
     assert calls[0]["response_format"]["json_schema"]["name"]=="trade_idea_committee_review"
     assert review_board.data["_red_team_citation_correction"]["evidence_refs_only"] is True

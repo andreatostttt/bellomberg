@@ -166,10 +166,13 @@ def test_shared_pair_and_explicit_zip_exclude_original_private_channels(public_m
     workbook.close()
     text = '\n'.join(page.extract_text() or '' for page in PdfReader(next(
         item['path'] for item in shared['artifacts'] if item['kind'] == 'pdf')).pages)
-    assert ('Estratto condivisibile del modello' if language == 'it' else 'Shareable model extract') in text
-    assert "'Summary'!E8" in text
-    assert ('not the complete research dossier' in text) if language == 'en' else ('non è il dossier di ricerca completo' in text)
-    assert CANARY not in text
+    # Line breaks depend on the installed font (Arial on Windows, DejaVu on a Linux runner):
+    # sentences are checked on the whitespace-normalized text, the canary on both forms.
+    words = ' '.join(text.split())
+    assert ('Estratto condivisibile del modello' if language == 'it' else 'Shareable model extract') in words
+    assert "'Summary'!E8" in words
+    assert ('not the complete research dossier' in words) if language == 'en' else ('non è il dossier di ricerca completo' in words)
+    assert CANARY not in text and CANARY not in ''.join(text.split())
     assert Path(payload['path']).read_bytes() == original_bytes
     # Recovery reuses the sealed shared generation; no recomputation or AI is needed.
     from bellomberg.valuation import trade_idea_model

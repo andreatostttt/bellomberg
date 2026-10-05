@@ -40,13 +40,34 @@ def test_thread_del_pre_run_daemon():
 
 
 def test_tetto_totale_nessun_titolo_nuovo_dopo_la_scadenza():
+    # Cantiere zero rossi 05/10 (TIMING): prima AAA dormiva 0,4 s reali e il test dormiva 0,8 s
+    # sperando che AAA fosse concluso (sotto carico no: AAA «non aggiornato», rosso). Ora orologio
+    # finto iniettato: AAA porta l'orologio OLTRE il tetto mentre lavora (download lungo), il test
+    # attende la fine dei due futuri (rete larga 10 s) e la garanzia resta: dopo il tetto nessun
+    # titolo nuovo parte.
+    from concurrent.futures import wait
+    orologio = [1000.0]
+
+    class Lungo(_Svc):
+        def run_programmato(self, t):
+            esito = super().run_programmato(t)
+            orologio[0] = 1000.3             # AAA finisce DOPO il tetto (1000.0 + 0.2)
+            return esito
+
     store = _Store(["AAA.MI", "BBB.MI"])
-    svc = _Svc(store, {"AAA.MI": 0.4})
-    agg = AggiornamentoPreRun(svc, ["AAA.MI", "BBB.MI"], avvio_run=time.monotonic(), attesa_max_s=0.1,
-                              max_workers=1, tetto_totale_s=0.2, esclusi_fn=frozenset)
+    svc = Lungo(store, {})
+    agg = AggiornamentoPreRun(svc, ["AAA.MI", "BBB.MI"], avvio_run=1000.0, attesa_max_s=0.1,
+                              max_workers=1, tetto_totale_s=0.2, esclusi_fn=frozenset,
+                              orologio=lambda: orologio[0])
     agg.avvia()
-    time.sleep(0.8)                      # AAA finisce dopo il tetto: BBB non deve partire
-    assert svc.chiamate == ["AAA.MI"]
+    # wait() non vede un Future annullato con cancel() fuori da un executor: si guarda done()
+    _, non_finiti = wait([agg._futuri["AAA.MI"]], timeout=10)
+    assert not non_finiti
+    fine = time.monotonic() + 10          # rete larga: il lavoratore passa a BBB subito dopo AAA
+    while not agg._futuri["BBB.MI"].done() and time.monotonic() < fine:
+        time.sleep(0.005)
+    assert svc.chiamate == ["AAA.MI"]    # BBB non e' partito
+    assert agg._futuri["BBB.MI"].cancelled()
     esiti = agg.esiti()
     assert esiti["BBB.MI"]["stato"] == "non_aggiornato" and "tetto" in esiti["BBB.MI"]["motivo"]
     assert esiti["AAA.MI"]["stato"] == "aggiornato"

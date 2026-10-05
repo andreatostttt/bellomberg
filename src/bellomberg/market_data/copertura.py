@@ -205,8 +205,12 @@ def valuta_dal_book(ticker: str, db_path: Optional[str] = None) -> Dict[str, Any
     (W1, 04/10, Opus 5.5; stessa query dell'endpoint insider di W2: un solo posto).
 
     {"valuta": str|None, "origine": "posizione"|"fuori_book"|"db_assente"|"illeggibile",
-     "nota": str} — mai eccezioni. `nota` va nel payload: fuori dal book (o DB non
+     "nota": str, "nome": str|None} — mai eccezioni. `nota` va nel payload: fuori dal book (o DB non
     leggibile) la presunzione «listino USA dal simbolo» e' DICHIARATA, non taciuta.
+    `nome` (W1 handoff-3, 05/10) = il nome della riga attiva (None se assente, se la colonna
+    `nome` non esiste in un DB vecchio, o se il DB non si legge): serve a
+    `isin_automatico` per cercare l'emittente di un .MI su Borsa Italiana. Una colonna `nome`
+    mancante NON rende illeggibile la valuta (si legge solo se c'e').
 
     Lettura: `memory_db.connect_sqlite` (la via sorvegliata dal tripwire dei test sul DB di
     produzione: decisione main 04/10) + `PRAGMA query_only=ON` subito dopo, cosi' la
@@ -221,25 +225,28 @@ def valuta_dal_book(ticker: str, db_path: Optional[str] = None) -> Dict[str, Any
         from bellomberg.storage import memory_db
         path = db_path or memory_db.SQLITE_PATH
         if not os.path.exists(str(path)):
-            return {"valuta": None, "origine": "db_assente", "nota": message(
+            return {"valuta": None, "origine": "db_assente", "nome": None, "nota": message(
                 "valuta della posizione non leggibile (DB del book assente): {p}",
                 "Position currency unreadable (book DB missing): {p}", p=presunto)}
         conn = memory_db.connect_sqlite(str(path))
         try:
             conn.execute("PRAGMA query_only=ON")
-            row = conn.execute("SELECT valuta FROM positions WHERE UPPER(TRIM(ticker))=? "
-                               "AND is_active=1", (t,)).fetchone()
+            colonne = {r[1] for r in conn.execute("PRAGMA table_info(positions)").fetchall()}
+            row = conn.execute("SELECT valuta, %s FROM positions WHERE UPPER(TRIM(ticker))=? "
+                               "AND is_active=1" % ("nome" if "nome" in colonne else "NULL"),
+                               (t,)).fetchone()
         finally:
             conn.close()
     except Exception as e:
-        return {"valuta": None, "origine": "illeggibile", "nota": message(
+        return {"valuta": None, "origine": "illeggibile", "nome": None, "nota": message(
             "valuta della posizione non leggibile ({e}): {p}",
             "Position currency unreadable ({e}): {p}", e=type(e).__name__, p=presunto)}
     v = (str(row[0]).strip().upper() or None) if row and row[0] is not None else None
+    nome = (str(row[1]).strip() or None) if row and row[1] is not None else None
     if v:
-        return {"valuta": v, "origine": "posizione", "nota": message(
+        return {"valuta": v, "origine": "posizione", "nome": nome, "nota": message(
             "valuta dalla posizione nel book: {v}", "Currency from the book position: {v}", v=v)}
-    return {"valuta": None, "origine": "fuori_book", "nota": message(
+    return {"valuta": None, "origine": "fuori_book", "nome": nome, "nota": message(
         "valuta non nota ({t} non e' una posizione attiva del book o non ha valuta): {p}",
         "Currency unknown ({t} is not an active book position or has no currency): {p}",
         t=t or "<vuoto>", p=presunto)}

@@ -977,10 +977,10 @@ def test_v4_prose_tag_is_not_a_source_and_v3_gate_keeps_inline_citations():
 # --------------------------------------------------------------------------- store
 
 def v4_request(ticker=TICKER):
-    payload = request(ticker)
+    # Z3b 05/10: qualificazione di ricerca VERA (research_required), non piu' il finto 'qualified'.
+    from _trade_idea_research_request import research_request
+    payload = research_request(request(ticker))
     payload["execution_policy"] = EXECUTION_POLICY_V4
-    payload["analysis_mode"] = payload["source_qualification"]["analysis_mode"] = MODE
-    payload["authorization"].update(activities=["committee"], max_revision_rounds=0)
     for selected in payload["models"].values():
         selected["reasoning_effort"] = "medium"
     return payload
@@ -1040,10 +1040,9 @@ def test_store_v4_band_receipt_is_the_size_source(migrated):
 def test_store_v3_still_requires_the_sizing_source(migrated):
     from test_trade_idea_store import result as v3_result
     current = store(migrated)
-    payload = request("TEST")
-    payload["analysis_mode"] = payload["source_qualification"]["analysis_mode"] = MODE
+    from _trade_idea_research_request import research_request
+    payload = research_request(request("TEST"), archive_root=migrated.parent / "research-archive")
     payload["execution_policy"] = EXECUTION_POLICY_V3
-    payload["authorization"].update(activities=["committee"], max_revision_rounds=0)
     for selected in payload["models"].values():
         selected["reasoning_effort"] = "medium"
     ident, token = _new_run(current, "v3-run", payload)

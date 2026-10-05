@@ -665,6 +665,18 @@ def scheda_da_run(ticker, *, profilo, run, ultimo, escluso=False, freschezza, no
 
 
 def impagina(schede, *, max_caratteri=MAX_CARATTERI, intestazione):
+    """Testo del contesto entro il budget (v. _impagina).
+
+    La lingua si legge UNA volta per chiamata (cantiere zero rossi 05/10): senza contesto ogni
+    text() rileggeva preferences.json dal disco (~3.500 letture su 80 titoli, l'85% del tempo).
+    Un language_context gia' attivo resta quello (nessuna lettura); stessi testi IT ed EN.
+    """
+    from bellomberg.core.language import capture_language, language_context
+    with language_context(capture_language()):
+        return _impagina(schede, max_caratteri=max_caratteri, intestazione=intestazione)
+
+
+def _impagina(schede, *, max_caratteri, intestazione):
     """Testo del contesto entro il budget.
 
     Base: per titolo fino a `limite` cambiamenti (per punteggio). Se la base entra, lo spazio

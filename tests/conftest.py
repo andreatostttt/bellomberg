@@ -448,7 +448,7 @@ def mai_la_produzione_store_watch(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def valuta_dal_book_finta(monkeypatch):
+def valuta_dal_book_finta(monkeypatch, tmp_path):
     """(b-ter) 04/10 (W1, Opus 5.5, assegnata da main): i wrapper dei tool solo-USA leggono la
     valuta della posizione con `copertura.valuta_dal_book`, che apre il DB del book. Nei test
     il book NON si legge mai: la funzione e' sostituita da un finto che risponde «fuori book»
@@ -466,8 +466,44 @@ def valuta_dal_book_finta(monkeypatch):
         # produzione -> mai letto
         if db_path is not None:
             return _vera(ticker, db_path=db_path)
-        return {"valuta": None, "origine": "fuori_book", "nota": "test: book non letto"}
+        return {"valuta": None, "origine": "fuori_book", "nota": "test: book non letto",
+                "nome": None}
     monkeypatch.setattr(_cop, "valuta_dal_book", _finta)
+
+    # W1 handoff-3 05/10: la risoluzione automatica dell'ISIN dei .MI
+    # (market_data/isin_automatico.py) fa RETE in due punti soli: `_nome_dal_fornitore`
+    # (yfinance) e `_risolvi` (Borsa Italiana). Nei test si neutralizzano QUEI due punti
+    # dell'orchestratore, NON `borsa_italiana.risolvi_isin` ne' i lettori: i test di IT1/IT2
+    # che provano la funzione vera la chiamano intatta. La memoria dei tentativi va in
+    # tmp_path (mai data/cache_fonti_it). Le originali restano in `_nome_dal_fornitore_vero`
+    # e `_risolvi_vero` per chi prova il cablaggio vero con fornitori finti.
+    from bellomberg.market_data import isin_automatico as _ia
+    for nome_attr in ("_nome_dal_fornitore", "_risolvi"):
+        if not hasattr(_ia, nome_attr + "_vero"):
+            monkeypatch.setattr(_ia, nome_attr + "_vero", getattr(_ia, nome_attr), raising=False)
+    monkeypatch.setattr(_ia, "_nome_dal_fornitore",
+                        lambda ticker: (None, None, "test: nome dal fornitore prezzi non chiesto"))
+    monkeypatch.setattr(_ia, "_risolvi", lambda ticker, nome: {
+        "ticker": str(ticker or "").strip().upper(), "stato": "non_trovato",
+        "errore": "test", "motivo": "test: risoluzione ISIN non eseguita", "isin": None,
+        "salvato": False, "negozio": None})
+    monkeypatch.setattr(_ia, "PERCORSO_TENTATIVI", str(tmp_path / "isin_tentativi_auto.json"))
+
+
+@pytest.fixture(autouse=True)
+def negozi_isin_in_tmp(monkeypatch, tmp_path):
+    """(W1 handoff-3, richiesta main 05/10) I negozi ISIN dei titoli italiani si ridirigono
+    SEMPRE in tmp_path per TUTTA la suite: negozio confermato (data/isin_it.json della macchina),
+    negozio automatico, cache delle fonti italiane, memoria dei tentativi. Altrimenti un test
+    darebbe esiti diversi in un clone pulito (nessun negozio) e sulla macchina del PM (negozio
+    vero). Si ridirigono PERCORSI, non funzioni: risolvi_isin e i lettori restano veri. Chi
+    vuole un negozio lo scrive in tmp_path (o ripunta il percorso col proprio monkeypatch)."""
+    from bellomberg.market_data import borsa_italiana as _bi
+    from bellomberg.market_data import isin_automatico as _ia
+    monkeypatch.setattr(_bi, "PERCORSO_ISIN", str(tmp_path / "isin_it_test.json"))
+    monkeypatch.setattr(_bi, "PERCORSO_ISIN_AUTO", str(tmp_path / "isin_it_auto_test.json"))
+    monkeypatch.setattr(_bi, "CACHE_DIR", str(tmp_path / "cache_fonti_it_test"))
+    monkeypatch.setattr(_ia, "PERCORSO_TENTATIVI", str(tmp_path / "isin_tentativi_auto.json"))
 
 
 @pytest.fixture(scope="session")

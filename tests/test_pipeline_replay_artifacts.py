@@ -209,178 +209,38 @@ def _assert_recovered(state, blackboard):
     return value
 
 
-def test_recovery_executes_research_prepare_real_valuation_and_workbook(replay, tmp_path, capsys):
-    memo_id = replay.db.save_memo("SYNTHETIC recovery test")
-    bb = base.Blackboard(memory_db=replay.db, memo_id=memo_id)
-    bb.r2_specialists = cm.R2_SPECIALISTS
-    bb.current_round = 1
-    cls = next(cls for cls in replay.roster if cls.name == "fundamentals")
-    cls(bb).run(1)
-    value = _assert_recovered(replay, bb)
-    assert "RITENTO" in capsys.readouterr().out
-    assert replay.db.get_valuation_snapshot(value["snapshot_id"], generation_id=value["generation_id"])
-    with replay.db._conn() as conn:
-        reports = conn.execute("SELECT content FROM specialist_reports WHERE memo_id=?", (memo_id,)).fetchall()
-    assert any("SYNTHETIC REPLAY REPORT fundamentals R1" in row[0] for row in reports)
 
 
-def test_recovered_desk_sees_blocked_gate_missing_fields_and_cutoff(replay, monkeypatch):
-    source = bundle_for(profile="manufacturing")
-    incomplete = [row for row in source["case"]["records"] if row["driver"] != "shares"]
-    real_bundle_for = bundle_for
-    monkeypatch.setattr(sys.modules[__name__], "bundle_for",
-                        lambda **kwargs: real_bundle_for(records=incomplete, **kwargs))
-    bb = base.Blackboard(memory_db=replay.db)
-    bb.current_round = 1
-    cls = next(cls for cls in replay.roster if cls.name == "fundamentals")
-    cls(bb).run(1)
-    client = replay.clients[("fundamentals", 1)]
-    tool_text = client.messaggi_per_call[-1][-1]["content"][0]["content"]
-    summary = json.loads(next(line for line in tool_text.splitlines() if line.startswith("{")))
-    payload = bb.valuation_results["SYNTH-EXT"]
-    assert summary["valuation_usability"] == payload["valuation_usability"]
-    assert summary["valuation_usability"]["usable"] is False
-    assert summary["valuation_usability"]["missing_fields"]
-    assert summary["fair_value"] is None
-    assert summary["information_cutoff"] == "2026-09-10"
-    assert summary["snapshot_id"] == payload["snapshot_id"]
-    assert "...[truncated]" in tool_text
-    assert not replay.network
-
-
-def test_full_orchestrator_replay_persists_and_captures_real_pdf_and_excel(replay, tmp_path, capsys):
-    cm.run_multi_agent()
-    log = capsys.readouterr().out
-    assert "RITENTO" in log
-    expected = {(cls.name, round_n) for cls in REAL_ROSTER for round_n in (0, 1)}
-    expected |= {(name, 2) for name in cm.R2_SPECIALISTS}
-    assert set(replay.clients) == expected and len(expected) == 15
-    assert len(replay.capo_calls) == 1
-    assert len(replay.side_calls) == 1 and replay.extractor_calls == []
-    assert all(call.get("tool_choice", {}).get("name") != "emit_action_table"
-               for call in replay.side_calls)
-    assert "SYNTHETIC REPLAY CRITIQUE" in str(replay.capo_calls[0])
-    assert "14.13" in str(replay.capo_calls[0])
-    archive = next((tmp_path / "research_notes").glob("*_blackboard.json"))
-    archived = json.loads(archive.read_text(encoding="utf-8"))
-    assert "get_valuation" in str(archived["tool_log"])
-    heartbeat = json.loads(Path(base.Blackboard.HEARTBEAT_PATH).read_text(encoding="utf-8"))
-    assert heartbeat["running"] is False
-    with replay.db._conn() as conn:
-        memo = conn.execute("SELECT id,full_markdown,pdf_path,dcf_files FROM memos").fetchone()
-        usage = conn.execute("SELECT agent,api_calls FROM llm_usage WHERE memo_id=?", (memo[0],)).fetchall()
-        reports = conn.execute("SELECT specialist,round_n FROM specialist_reports WHERE memo_id=?", (memo[0],)).fetchall()
-        decisions = conn.execute(
-            "SELECT id,ticker,proposal_action,proposal_ticker,proposal_ticker_cell,"
-            "assessment_status,assessment_reason,status FROM decisions WHERE memo_id=?",
-            (memo[0],)).fetchall()
-        action_usage = conn.execute(
-            "SELECT agent,api_calls FROM llm_usage WHERE memo_id=? AND agent='_action_table'",
-            (memo[0],)).fetchall()
-        links = conn.execute("SELECT decision_id,generation_id FROM valuation_snapshot_links WHERE decision_id IS NOT NULL").fetchall()
-    assert "SYNTHETIC REPLAY: prova locale" in memo[1]
-    # Fifteen desk calls + Capo + red team. Deterministic ACTION TABLE parsing
-    # makes no provider call and therefore must not fabricate an extractor usage row.
-    assert len(reports) >= 6 and len(usage) == 17, (reports, usage)
-    assert action_usage == []
-    assert len(decisions) == 1
-    decision = decisions[0]
-    assert tuple(decision[1:6]) == (
-        "SYNTH-EXT", "BUY", "SYNTH-EXT", "SYNTH-EXT", "BLOCKED")
-    assert "synthetic issuer identity mismatch" in decision[6]
-    assert decision[7] == "SKIPPED"  # hard BLOCK applied after source + assessment persistence
-    raw_source = next((tmp_path / "research_notes").glob("*_capo_raw.md"))
-    raw_text = raw_source.read_text(encoding="utf-8")
-    assert raw_text.endswith(replay.memo)
-    assert "| BUY | SYNTH-EXT | 250 | At review | HIGH |" in raw_text
-    published = next(path for path in (tmp_path / "research_notes").glob("*.md")
-                     if not path.name.endswith("_capo_raw.md"))
-    assert published.read_text(encoding="utf-8") == memo[1]
-    assert "## PROPOSTE NON OPERATIVE" in memo[1]
-    assert "| BUY | SYNTH-EXT | 250 | At review | HIGH |" not in memo[1]
-    assert "synthetic issuer identity mismatch" in memo[1]
-    latest = replay.db.get_latest_valuation_snapshots()["SYNTH-EXT"]["payload"]
-    assert (decision[0], latest["generation_id"]) in [tuple(row) for row in links]
-    pdf = Path(memo[2])
-    assert pdf.read_bytes().startswith(b"%PDF-") and pdf.stat().st_size > 5000
-    from pypdf import PdfReader
-    document = PdfReader(pdf)
-    assert len(document.pages) >= 2
-    pdf_text = " ".join("".join(page.extract_text() for page in document.pages).split())
-    assert "SYNTHETIC REPLAY" in pdf_text
-    assert "PROPOSTE NON OPERATIVE" in pdf_text
-    assert "BLOCKED" in pdf_text and "synthetic issuer identity mismatch" in pdf_text
-    assert "BUY" in pdf_text and "SYNTH-EXT" in pdf_text and "250.0" in pdf_text
-    xlsx = Path(latest["path"])
-    assert json.loads(memo[3]) == [str(xlsx)]
-    assert len(replay.smtp) == 1
-    mime_bytes = replay.smtp[0].as_bytes()
-    mime = BytesParser(policy=policy.default).parsebytes(mime_bytes)
-    attachments = {part.get_filename(): part.get_payload(decode=True) for part in mime.iter_attachments()}
-    assert attachments == {pdf.name: pdf.read_bytes(), xlsx.name: xlsx.read_bytes()}
-    email_html = mime.get_body(preferencelist=("html",)).get_content()
-    assert "14.13" in email_html
-    assert "BUY SYNTH-EXT" in email_html and "BLOCKED" in email_html
-    assert "EUR 250.0" in email_html
-    assert "synthetic issuer identity mismatch" in email_html
-    assert not replay.network
-    _assert_recovered(replay, replay.blackboard)
-    (tmp_path / "synthetic-committee.eml").write_bytes(mime_bytes)
-    (tmp_path / "synthetic-committee.log").write_text(log, encoding="utf-8")
-    (tmp_path / "synthetic-committee-receipt.json").write_text(json.dumps({
-        "scope": "Full orchestrator offline replay; synthetic LLM/provider responses; no live run or delivery",
-        "desk_rounds": len(replay.clients), "capo_calls": len(replay.capo_calls),
-        "red_team_calls": len(replay.side_calls), "action_table_extractor_calls": len(replay.extractor_calls),
-        "usage_rows": len(usage), "persisted_reports": len(reports),
-        "memo_id": memo[0], "decision_id": decision[0],
-        "snapshot_id": latest["snapshot_id"], "generation_id": latest["generation_id"],
-        "pdf": pdf.name, "workbook": xlsx.name,
-        "attachment_sha256": {name: sha256(content).hexdigest() for name, content in attachments.items()},
-        "smtp_captured": len(replay.smtp), "network_attempts": len(replay.network),
-        "simulated_boundaries": ["LLM responses", "research queue", "news provider", "empty portfolio",
-            "risk/market services", "reflection", "quant appendix", "SMTP"],
-        "real_issuer_follow_up": "APERTA: this synthetic replay does not resolve the real issuer case",
-    }, indent=2), encoding="utf-8")
-
-
-@pytest.mark.parametrize("usable", [True, False])
-def test_chat_stream_preserves_valuation_gate_cutoff_and_fv_before_truncation(replay, monkeypatch, usable):
+# Contratto ATTUALE (ZR 05/10, Z1). I 4 test del replay settimanale LEGACY con valutazione/workbook
+# (recupero desk + get_valuation, gate prima del troncamento, orchestratore PDF+XLSX+MIME, stream chat che
+# preserva gate/cutoff/FV) sono in archive/private/attic/tests_excel_archiviato_20261005/test_pipeline_replay_artifacts_legacy.py:
+# dal 1326312 get_valuation risponde excel_archived e una weekly NUOVA legacy e' rifiutata
+# (consigliere_multi.py:1250-1261); la weekly viva di ricerca e' in tests/test_weekly_research_native.py.
+# Le fixture replay/replay_loop restano: tests/test_language_agent_outputs.py le importa.
+def test_chat_stream_get_valuation_reaches_the_model_as_the_archived_contract(replay_loop, monkeypatch):
     from bellomberg.agents import chat_engine
-    source = bundle_for(profile="manufacturing")
-    if not usable:
-        source = bundle_for(profile="manufacturing", records=[
-            row for row in source["case"]["records"] if row["driver"] != "shares"])
+    from _contratto_excel_archiviato import ARCHIVIATO, blinda_ramo_archiviato
     first = [_chunk({"tool_calls": [{"index": 0, "id": "v", "function": {
         "name": "get_valuation", "arguments": '{"ticker":"SYNTH-EXT"}'}}]}, finish="tool_calls")]
     run, _, _, requests = _chat(monkeypatch, [first, [_chunk({"content": "Synthetic response"}, finish="stop")]])
     results = []
 
     def dispatch(name, args, **kwargs):
-        result = chat_tools.dispatch(name, args, prepared_bundle=source, **kwargs)
+        result = chat_tools.dispatch(name, args, **kwargs)
         results.append(result)
         return result
 
     monkeypatch.setattr(chat_engine, "dispatch", dispatch)
     monkeypatch.setattr(chat_engine, "get_tools_for_agent", lambda _: chat_tools.get_tools_for_agent("fundamentals"))
-    events = replay.loop.run_until_complete(run())
-    assert len(requests) == 2 and len(results) == 1
+    chiamate = blinda_ramo_archiviato(monkeypatch)
+    events = replay_loop.run_until_complete(run())
+    assert chiamate == []
+    assert len(requests) == 2
     content = next(message["content"] for message in requests[1]["messages"] if message["role"] == "tool")
+    # Il modello legge il buco dichiarato, non un fair value ne' un silenzio.
+    assert "excel_archived" in content and ARCHIVIATO["error"] in content
     summary = json.loads(next(line for line in content.splitlines() if line.startswith("{")))
-    value = results[0]["data"]
-    assert summary["valuation_usability"] == value["valuation_usability"]
-    assert summary["valuation_usability"]["usable"] is usable
-    assert summary["fair_value"] == (pytest.approx(14.13) if usable else None)
-    assert summary["information_cutoff"] == "2026-09-10"
-    assert summary["snapshot_id"] == value["snapshot_id"]
-    assert len(content) <= 12000
-    if not usable:
-        assert summary["valuation_usability"]["missing_fields"]
-    sse = next(json.loads(event.split("data: ", 1)[1]) for event in events if event.startswith("event: tool_result"))
-    original = json.dumps(results[0], ensure_ascii=False, default=str)
-    assert sse["result_size_bytes"] == len(original)
-    if usable:
-        assert sse["result_preview"] == original[:300] + "..."
-    else:
-        assert '"error": "FV n.d.' in sse["result_preview"]
-        assert "shares: model: input documentato mancante" in sse["result_preview"]
-    assert not replay.network
+    assert summary["fair_value"] is None and summary["valuation_usability"]["usable"] is False
+    assert summary["error"] == ARCHIVIATO["error"] and "14.13" not in content
+    assert results == [ARCHIVIATO]
+    assert any(event.startswith("event: tool_result") for event in events)

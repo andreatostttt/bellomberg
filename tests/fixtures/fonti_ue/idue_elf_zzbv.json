@@ -1,0 +1,26 @@
+{
+ "data": {
+  "type": "entity-legal-forms",
+  "id": "ZZBV",
+  "attributes": {
+   "code": "ZZBV",
+   "country": "Synthland",
+   "countryCode": "ZZ",
+   "status": "ACTV",
+   "names": [
+    {
+     "localName": "Besloten Vennootschap",
+     "language": "x",
+     "languageCode": "xx",
+     "transliteratedName": "Besloten Vennootschap"
+    },
+    {
+     "localName": "Société à responsabilité limitée",
+     "language": "x",
+     "languageCode": "xx",
+     "transliteratedName": "Société à responsabilité limitée"
+    }
+   ]
+  }
+ }
+}

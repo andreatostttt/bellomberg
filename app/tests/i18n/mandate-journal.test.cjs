@@ -77,6 +77,88 @@ test('mandate preview discards a late response and only a matching readback conf
   assert.equal(savedBody, undefined);
 });
 
+test('the text panel names the real mandate state: never «declared» for a missing or incomplete mandate', async () => {
+  // 05/10 (Claude Opus 5.5): the panel chip printed status_declared whenever no preview was open,
+  // also for an absent or incomplete mandate.
+  for (const [patch, key] of [[{ dichiarato: false, causa: 'assente' }, 'status_absent'],
+    [{ dichiarato: false, causa: 'campi_mancanti' }, 'status_incomplete'],
+    [{ origine: 'esempio' }, 'status_example'], [{}, 'status_declared']]) {
+    const h = harness('MandatoPage', { mandato: { ...state(), ...patch } }); h.language.impostaLinguaCorrente('it');
+    const it = h.load('i18n/it/mandate.ts').mandate;
+    h.render(); await h.settle();
+    h.nodes(n => n.type === 'button' && n.props?.children === it.reads_full)[0].props.onClick(); h.render();
+    const dialog = h.nodes(n => n.props?.role === 'dialog');
+    assert.equal(dialog.length, 1, 'fixture: the text panel is open');
+    const chip = h.nodes(n => typeof n.props?.className === 'string' && n.props.className.includes('mnd-drawer-status'));
+    assert.equal(chip.length, 1, key + ': one state chip in the panel');
+    assert.equal(chip[0].props.children, it[key], key + ': the chip says the state the backend declared');
+    const html = renderToStaticMarkup(dialog[0]);
+    if (key !== 'status_declared') assert.ok(!html.includes('>' + it.status_declared + '<'), key + ': no «' + it.status_declared + '» in the panel');
+    let stopped = false;
+    dialog[0].props.onKeyDown({ key: 'Escape', preventDefault() {}, stopPropagation() { stopped = true; } }); h.render();
+    assert.equal(h.nodes(n => n.props?.role === 'dialog').length, 0, 'ESC closes the panel');
+    assert.ok(stopped && dialog[0].ref && 'current' in dialog[0].ref, 'the panel is wired to the focus helper');
+  }
+});
+
+test('single choices and cut conditions can go back to «not set»', async () => {
+  // 05/10 (Claude Opus 5.5): the Nuova page had dropped the empty option of the old select.
+  const campi = { ...state().campi,
+    politica_impiego: field('cassa', 'scelta', { obbligatorio: false, scelte: ['prudente', 'neutra'] }),
+    tipo_investimento: field('profilo', 'scelta', { scelte: ['long_term', 'trading'] }),
+    condizioni_taglio_oltre: field('disciplina', 'interruttori', { scelte: ['sharpe_12m_negativo', 'nessun_catalyst_90g'] }) };
+  const valori = { ...state().valori, profilo: { orizzonte_anni: 5, tipo_investimento: 'long_term' },
+    cassa: { politica_impiego: 'prudente' }, disciplina: { condizioni_taglio_oltre: { sharpe_12m_negativo: true, nessun_catalyst_90g: false } } };
+  const h = harness('MandatoPage', { mandato: { ...state(), campi, valori },
+    mandatoAnteprima: v => ({ testo: 'Synthetic text', impronta: 'synthetic-fingerprint-b', origine: 'personalizzato', output_language: 'it', valori: v }) });
+  h.language.impostaLinguaCorrente('it'); const it = h.load('i18n/it/mandate.ts').mandate;
+  h.render(); await h.settle();
+  const unset = cls => h.nodes(n => n.type === 'button' && n.props && 'data-unset' in n.props && String(n.props.className).includes('mnd-choice') === cls)[0];
+  // segmented single choice (optional field)
+  assert.equal(unset(false).props.children, it.not_set);
+  assert.equal(unset(false).props['aria-pressed'], false, 'a saved value is not shown as «not set»');
+  unset(false).props.onClick(); h.render();
+  assert.equal(unset(false).props['aria-pressed'], true);
+  const before = h.calls.length;
+  await h.nodes(n => n.props?.['data-action'] === 'preview')[0].props.onClick();
+  const sent = h.calls.slice(before).find(c => c.method === 'mandatoAnteprima' && c.args.length);
+  assert.ok(sent, 'fixture: the preview reached the backend');
+  assert.equal(sent.args[0].cassa.politica_impiego, null, 'an optional choice left «not set» is sent as null, not as a default');
+  // card single choice
+  h.render(); assert.equal(unset(true).props['aria-pressed'], false);
+  unset(true).props.onClick(); h.render();
+  assert.equal(unset(true).props['aria-pressed'], true);
+  assert.equal(h.nodes(n => n.type === 'button' && String(n.props?.className).startsWith('mnd-choice') && n.props['aria-pressed'] === true).length, 1, 'only «not set» is pressed');
+  // cut conditions: on -> off -> not set
+  const cond = () => h.nodes(n => n.type === 'button' && String(n.props?.className).startsWith('mnd-cond'))[0];
+  assert.equal(cond().props['data-stato'], 'on');
+  cond().props.onClick(); h.render(); assert.equal(cond().props['data-stato'], 'off');
+  cond().props.onClick(); const html = h.render(); assert.equal(cond().props['data-stato'], 'unset');
+  assert.ok(html.includes(it.cond_unset), 'the condition says it is still to choose');
+});
+
+test('side panels take the focus, keep TAB inside, close on ESC and give the focus back', () => {
+  // 05/10 (Claude Opus 5.5): the Mandate text panel and the Journal history were aria-modal
+  // dialogs that left the focus behind them.
+  ambienteBrowser(); const effects = [];
+  const fakeReact = { useRef: v => ({ current: v }), useEffect: fn => { effects.push(fn); } };
+  const { usaFocusPannello } = creaCaricatore({ stub: { react: fakeReact } })('lib/usaFocusPannello.ts');
+  const el = name => ({ name, isConnected: true, closest: () => null, focus() { globalThis.document.activeElement = this; } });
+  const opener = el('opener'), first = el('first'), last = el('last');
+  const box = { contains: x => x === first || x === last, querySelectorAll: () => [first, last], hasAttribute: () => false };
+  globalThis.document.body = el('body'); globalThis.document.activeElement = opener;
+  let closed = 0; const p = usaFocusPannello(true, () => { closed++; }); p.ref.current = box;
+  const cleanup = effects.shift()();
+  assert.equal(globalThis.document.activeElement, first, 'opening moves the focus into the panel');
+  const key = (k, shiftKey = false) => { let prevented = false, stopped = false;
+    p.onKeyDown({ key: k, shiftKey, preventDefault() { prevented = true; }, stopPropagation() { stopped = true; } }); return { prevented, stopped }; };
+  last.focus(); assert.ok(key('Tab').prevented); assert.equal(globalThis.document.activeElement, first, 'TAB from the last control wraps to the first');
+  first.focus(); key('Tab', true); assert.equal(globalThis.document.activeElement, last, 'SHIFT+TAB from the first wraps to the last');
+  const esc = key('Escape'); assert.equal(closed, 1); assert.ok(esc.stopped, 'ESC closes the panel and stays inside it');
+  globalThis.document.activeElement = globalThis.document.body; cleanup();
+  assert.equal(globalThis.document.activeElement, opener, 'closing gives the focus back to the opener');
+});
+
 test('captured mandate grammar remains stable while parser diagnostics follow the current interface', () => {
   const load = creaCaricatore(); const { leggiNumeroMandato } = load('lib/mandato.ts');
   const campo = field('rischio', 'pct', { intervallo: [0, 100] });

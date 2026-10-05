@@ -17,8 +17,9 @@ def parent_case(path, fault=None, v2=False):
         payload['execution_policy'] = 'trade-idea-research/2'
         for role, selected in payload['models'].items():
             selected['reasoning_effort'] = 'low' if role == 'capo' else 'medium'
-    payload['analysis_mode'] = payload['source_qualification']['analysis_mode'] = RESEARCH_ANALYSIS_MODE
-    payload['authorization'].update(activities=['committee'], max_revision_rounds=0)
+    # Z3b 05/10: qualificazione di ricerca VERA (research_required), non piu' il finto 'qualified'.
+    from _trade_idea_research_request import research_request
+    payload = research_request(payload, archive_root=path.parent / 'research-archive')
     parent = current.create_run(payload, idempotency_key='capo-source')['run']['id']
     token = current.claim_run(parent)
     model = payload['models']['capo']['model']

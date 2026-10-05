@@ -14,8 +14,7 @@ from bellomberg.core.language import language_context
 from bellomberg.storage.trade_idea_store import BudgetBlocked
 from test_trade_idea_store import (db_path, migrated, request, store, result as store_result,
                                   all_checks, _save_resume_checkpoint)
-from trade_idea_evolution_fixtures import (DESKS, MODEL_META_TOOLS, committee_review,
-                                         model_build_tool_blocks, review_tool_block)
+from trade_idea_evolution_fixtures import DESKS
 from test_trade_idea_live_consultation import board
 from test_trade_idea_committee_model_context import model_board
 
@@ -54,6 +53,27 @@ def _gate(s, run_id, payload):
         token = conn.execute("SELECT worker_token FROM trade_idea_runs WHERE id=?", (run_id,)).fetchone()[0]
     return trade_idea.TradeIdeaBudgetGate(s, run_id, token,
         payload["catalog_snapshot"], catalog_fetcher=lambda: payload["catalog_snapshot"])
+
+
+def _assert_excel_run_refused_before_work(s, run_id, tmp_path):
+    """Contratto attuale (Excel archiviato 03/10, commit 1326312): il worker rifiuta una run
+    non research PRIMA del claim: nessun catalogo pagato, nessun round, nessun preparatore,
+    nessuna scrittura su stato, costi, progresso o risultato, nessun Excel."""
+    from pathlib import Path
+    from bellomberg.storage.trade_idea_store import RunConflict
+    before = s.get_run(run_id)
+    assert before["run"].get("analysis_mode") is None
+    with pytest.raises(RunConflict, match="Run Excel in archivio"):
+        trade_idea.execute_trade_idea(run_id, store=s, lock_path=Path(tmp_path) / "archived.lock",
+            output_dir=Path(tmp_path) / "archived",
+            round_runner=lambda *_a: pytest.fail("archived Excel run reached the committee"),
+            preparer_binder=lambda *_a, **_k: pytest.fail("archived Excel run reached a preparer"),
+            source_qualifier=lambda *_a, **_k: pytest.fail("archived Excel run rechecked sources"),
+            catalog_fetcher=lambda: pytest.fail("archived Excel run fetched the paid catalog"))
+    after = s.get_run(run_id)
+    for key in ("run", "cost", "progress", "result", "email", "artifacts"):
+        assert after[key] == before[key], key
+    assert not list(Path(tmp_path).rglob("*.xlsx"))
 
 
 def _call_kwargs():
@@ -420,8 +440,13 @@ def test_final_partial_pdf_demotes_untouched_dcn_before_email(migrated, tmp_path
     detail = s.get_run(run_id)
     assert detail["run"]["destination"]["kind"] == "research"
     assert detail["run"]["technical_status"] == "incomplete"
-    assert detail["email"]["status"] == "accepted"
-    assert observed == ["trade-idea-research.pdf"]
+    # Contratto PM 03/10 (cancello finale del memo): un pacchetto parziale resta archiviato
+    # come research ma NON raggiunge l'SMTP. La garanzia originale (DCN mai consegnata con
+    # un PDF parziale) resta, piu' stretta: nessun tentativo di invio.
+    assert detail["email"]["status"] == "blocked" and detail["email"]["attempts"] == 0
+    assert "Final memo not deliverable" in detail["email"]["error"]
+    assert observed == []
+    assert detail["artifacts"]["artifacts"][0]["name"] == "trade-idea-research.pdf"
     assert (tmp_path / "delivery" / "trade-idea.pdf").exists()
     assert verify_trade_idea_manifest(detail["artifacts"])
     from pathlib import Path
@@ -496,8 +521,13 @@ def test_demoted_report_recovers_after_crash_before_manifest_reseal(migrated, tm
     trade_idea.deliver_trade_idea(s, run_id, output_dir=tmp_path / "delivery",
         send=lambda manifest, language: (observed.append(manifest["artifacts"][0]["name"])
             or {"email_status": "accepted", "status": "accepted"}))
-    assert observed == ["trade-idea-research.pdf"]
-    assert s.get_run(run_id)["email"]["status"] == "accepted"
+    # La ripresa completa il PDF research e risigilla il manifest; il PDF resta parziale,
+    # quindi per il cancello finale del memo (PM 03/10) l'email e' bloccata senza tentativi.
+    recovered = s.get_run(run_id)
+    assert recovered["artifacts"]["artifacts"][0]["name"] == "trade-idea-research.pdf"
+    assert recovered["run"]["destination"]["kind"] == "research"
+    assert observed == []
+    assert recovered["email"]["status"] == "blocked" and recovered["email"]["attempts"] == 0
 
 
 def test_final_partial_pdf_cannot_demote_pm_touched_dcn_or_send(migrated, tmp_path):
@@ -521,8 +551,25 @@ def test_final_partial_pdf_cannot_demote_pm_touched_dcn_or_send(migrated, tmp_pa
 
 
 def test_alternate_db_without_isolated_risk_loaders_blocks_before_paid_call(migrated, tmp_path):
+    # Portato in modalita' ricerca (Excel archiviato 03/10: una run non research si ferma
+    # prima ancora del claim). Garanzia conservata: su un DB alternativo senza loader di
+    # rischio/stress isolati la run fallisce prima di ogni round e di ogni chiamata pagata.
+    from copy import deepcopy
+    from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE
+    from bellomberg.valuation import trade_idea_model as model
+    from test_trade_idea_pm_sources import IDENTITY, _profile_providers
+    day = datetime.now(timezone.utc).date().isoformat()
+    admission = model.research_admission(IDENTITY["ticker"], deepcopy(IDENTITY), day,
+        archive_root=tmp_path, providers=_profile_providers(day), analysis_mode=RESEARCH_ANALYSIS_MODE)
+    assert admission["status"] == "research_required", admission["reasons"]
     s = store(migrated)
-    run_id = s.create_run(_priced_request(), idempotency_key="risk-isolation")["run"]["id"]
+    research_request = {**_priced_request(), "analysis_mode": RESEARCH_ANALYSIS_MODE,
+        "ticker": IDENTITY["ticker"], "company_name": IDENTITY["name"],
+        "exchange": IDENTITY["exchange"], "currency": IDENTITY["currency"],
+        "source_qualification": admission,
+        "authorization": {"accepted": True, "source_fingerprint": admission["fingerprint"],
+                          "activities": ["committee"], "max_revision_rounds": 0}}
+    run_id = s.create_run(research_request, idempotency_key="risk-isolation")["run"]["id"]
     calls = []
     trade_idea.execute_trade_idea(run_id, store=s, lock_path=tmp_path / "paid.lock",
         output_dir=tmp_path / "report", round_runner=lambda *_: calls.append("round"),
@@ -675,213 +722,12 @@ def test_capo_native_timeout_follows_cap_and_injected_client_is_untouched(model_
     assert all(getattr(supplied._http.timeout, key) == 37.0 for key in ("read", "write", "pool"))
 
 
-@pytest.mark.parametrize("capo_malformed,provider_failure", [(False, None), (True, None),
-    (False, "HTTP 503 service unavailable"), (False, "HTTP 504 provider timeout"),
-    (False, "provider disconnected after dispatch"), (False, "incomplete_response"),
-    (False, "stream_disconnected")])
-def test_full_committee_replay_uses_real_desk_red_team_and_capo_classes(
-        migrated, tmp_path, monkeypatch, capo_malformed, provider_failure):
-    """Every agent class runs; only the provider, market tools and book are synthetic."""
-    from bellomberg.agents import chat_tools
-    from bellomberg.agents.specialists import base as specialist_base
-    from bellomberg.core import current_facts, llm_client, mandato_pm, paths
-    from bellomberg.core.llm_client import Usage
-    from trade_idea_fixtures import bind_workbook, research_result
-    from copy import deepcopy
-    from test_trade_idea_economic import qualified, _operating_plan
-    from bellomberg.valuation import trade_idea_model
-    qualification = qualified(tmp_path)
-    assert qualification["status"] == "qualified", qualification["reasons"]
-    basis_plan = deepcopy(_operating_plan())
-    actual_models, build_events = [], []
-    real_build = trade_idea_model.build_from_plan
-    def build_common(*args, **kwargs):
-        assert {desk for desk in DESKS if desk != "fundamentals"} <= {
-            desk for desk in DESKS for call in provider_calls
-            if "You are the " + desk + " desk" in str(call.get("system"))
-            and "Round 1." in str(call.get("messages"))}
-        built = real_build(*args, **kwargs)
-        actual_models.append(built)
-        build_events.append(deepcopy(kwargs["author_context"]))
-        return built
-    monkeypatch.setattr(trade_idea_model, "build_from_plan", build_common)
-    monkeypatch.setattr(paths, "MODELS_DIR", tmp_path)
-    monkeypatch.setattr(paths, "REPORT_DIR", tmp_path)
-
-    with sqlite3.connect(migrated) as conn:
-        conn.execute("INSERT INTO decisions(id,timestamp,action,ticker,rationale,status,"
-                     "pm_feedback,veto,veto_reason) VALUES(2,'2026-09-01','RESEARCH',"
-                     "'SYNTH-EXT','historical thesis','PENDING',?,1,?)",
-                     ("Synthetic PM veto: renewal proof absent", "Synthetic PM veto"))
-        conn.execute("INSERT INTO decision_notes(decision_id,autore,testo,timestamp) "
-                     "VALUES(2,'PM','Synthetic PM note: cash bridge needed','2026-09-10')")
+def test_full_committee_excel_run_is_refused_before_any_paid_work(migrated, tmp_path):
+    # Il replay del comitato col workbook e' in archive/private/attic/tests_excel_archiviato_20261005/
+    # test_trade_idea_pipeline_legacy.py; qui il contratto attuale della stessa run.
     s = store(migrated)
     payload = _priced_request(budget="20")
     payload.update(ticker="SYNTH-EXT", currency="EUR", language="en",
                    view_text="Switching costs make this business immune to a downturn.")
-    payload["source_qualification"] = qualification
-    payload["authorization"]["source_fingerprint"] = qualification["fingerprint"]
     run_id = s.create_run(payload, idempotency_key="whole-committee")["run"]["id"]
-    capo_payload = research_result("rejected", run_id=run_id)
-    for key in ("run_id", "run_type", "pm_view", "destination"):
-        capo_payload.pop(key, None)
-    provider_calls = []
-    tool_calls = []
-
-    def response(model, blocks, stop_reason):
-        return SimpleNamespace(id="synthetic-provider-" + str(len(provider_calls)),
-            model=model, stop_reason=stop_reason, content=blocks,
-            usage=Usage(input_tokens=120, output_tokens=180,
-                cache_read_input_tokens=0, cache_creation_input_tokens=0,
-                cost_usd=0.001))
-
-    class SyntheticStream:
-        def __init__(self, kwargs): self.kwargs = kwargs
-        def __enter__(self): return self
-        def __exit__(self, *args): return False
-        def get_final_message(self):
-            if provider_failure == "stream_disconnected":
-                raise RuntimeError("Provider stream disconnected after partial output")
-            final = bind_workbook(deepcopy(capo_payload), actual_models[-1])
-            return response(self.kwargs["model"],
-                [SimpleNamespace(type="text", text="{broken" if capo_malformed
-                                 else json.dumps(final))], "end_turn")
-
-    class SyntheticMessages:
-        def create(self, **kwargs):
-            provider_calls.append(kwargs)
-            if provider_failure and provider_failure != "stream_disconnected":
-                if provider_failure == "incomplete_response":
-                    return response(kwargs["model"], [SimpleNamespace(type="text", text="Partial visible output")], "max_tokens")
-                raise RuntimeError(provider_failure)
-            messages = kwargs["messages"]
-            tool_done = any(isinstance(row.get("content"), list)
-                and any(isinstance(block, dict) and block.get("type") == "tool_result"
-                        for block in row["content"])
-                for row in messages)
-            tools = [row["name"] for row in kwargs.get("tools") or []]
-            build = model_build_tool_blocks(kwargs, basis_plan,
-                [row["id"] for row in qualification["source_report"]["documents"]])
-            if build:
-                return response(kwargs["model"], [SimpleNamespace(type="tool_use",
-                    id="build-" + str(len(provider_calls)) + "-" + str(index), **item)
-                    for index, item in enumerate(build)], "tool_use")
-            meta = review_tool_block(kwargs, actual_models[-1] if actual_models else None)
-            if meta:
-                return response(kwargs["model"], [SimpleNamespace(type="tool_use",
-                    id="review-" + str(len(provider_calls)), **meta)], "tool_use")
-            available = [name for name in tools if name not in MODEL_META_TOOLS]
-            if available and not tool_done and kwargs.get("tool_choice") != {"type": "none"}:
-                return response(kwargs["model"],
-                    [SimpleNamespace(type="tool_use", id="tool-" + str(len(provider_calls)),
-                        name=available[0], input={"ticker": "SYNTH-EXT"})], "tool_use")
-            if (kwargs.get("response_format") or {}).get("json_schema", {}).get("name") == "trade_idea_committee_review":
-                text = json.dumps(committee_review())
-            else:
-                text = ("SYNTH-EXT research: observed tool data are synthetic and dated; "
-                        "renewal economics and cash conversion remain unresolved [src: synthetic_tool]. " * 12)
-            return response(kwargs["model"],
-                [SimpleNamespace(type="text", text=text)], "end_turn")
-
-        def stream(self, **kwargs):
-            provider_calls.append(kwargs)
-            return SyntheticStream(kwargs)
-
-    class SyntheticClient:
-        def __init__(self, **kwargs):
-            import httpx
-            self._http = SimpleNamespace(timeout=httpx.Timeout(kwargs.get("timeout", 3600.0)))
-            self.messages = SyntheticMessages()
-
-    def dispatch(name, input_, **kwargs):
-        tool_calls.append((name, kwargs.get("caller")))
-        if name == "get_valuation":
-            return {"ok": False, "data": {"ok": False, "error": "No authorized workbook",
-                "valuation_usability": {"usable": False}, "exclude_from_action_table": True},
-                "_source": "synthetic fixture"}
-        today = datetime.now(timezone.utc).date()
-        day = today
-        while day.weekday() >= 5:
-            day -= timedelta(days=1)
-        return {"ok": True, "data": {"ticker": "SYNTH-EXT",
-            "as_of": "2026-09-27", "price": 100, "currency": "EUR", "status": "ready",
-            "px": 100, "price_asof": day.isoformat(),
-            "source": "yfinance daily Close (not an intraday quote)"},
-            "_source": "synthetic fixture", "_timestamp": "2026-09-27T20:00:00Z"}
-
-    monkeypatch.setattr(specialist_base, "OpenRouterClient", SyntheticClient)
-    monkeypatch.setattr(llm_client, "OpenRouterClient", SyntheticClient)
-    monkeypatch.setattr(trade_idea, "OpenRouterClient", SyntheticClient)
-    monkeypatch.setattr(chat_tools, "dispatch", dispatch)
-    monkeypatch.setattr(chat_tools, "_compatta_portfolio_live",
-                        lambda portfolio: {"positions": portfolio["positions"],
-                                           "cash_disponibile_eur": portfolio["cash_disponibile_eur"]})
-    monkeypatch.setattr(current_facts, "current_facts_block", lambda: "Synthetic offline facts only")
-    synthetic_mandate = mandato_pm.profilo_esempio()
-    monkeypatch.setattr(mandato_pm, "carica", lambda: synthetic_mandate)
-    book = {"positions": [], "cash_source": "sqlite:cash_state",
-            "cash_disponibile_eur": 10000, "stale_positions": [], "fx_incomplete": []}
-    trade_idea.execute_trade_idea(run_id, store=s,
-        lock_path=tmp_path / "whole-committee.lock", output_dir=tmp_path / "delivery",
-        portfolio_loader=lambda: book, mandate_loader=lambda: synthetic_mandate,
-        preparer_binder=lambda *_: (None, {"status": "disabled", "reason": "synthetic policy"}),
-        source_qualifier=lambda *_a, **_k: qualification,
-        risk_loader=lambda: {"error": "synthetic risk unavailable"},
-        stress_loader=lambda: {"error": "synthetic stress unavailable"},
-        candidate_metrics_loader=lambda *_: {"status": "unavailable", "reason": "synthetic"},
-        delivery_sender=lambda manifest, language: {"email_status": "accepted",
-            "status": "accepted", "message_id": "synthetic-message"},
-        catalog_fetcher=lambda: payload["catalog_snapshot"],
-        isolated_tool_dispatcher=dispatch,
-        isolated_facts_loader=lambda: "Synthetic offline facts only")
-    detail = s.get_run(run_id)
-    if provider_failure:
-        assert detail["run"]["technical_status"] == "incomplete"
-        assert detail["result"] is None
-        assert detail["progress"]["primary_failure"]["message"] in detail["run"]["reason"]
-        assert detail["states"]["analysis"] == "incomplete"
-        if provider_failure == "incomplete_response":
-            assert "truncated" in detail["run"]["reason"]
-            assert detail["cost"]["charged_usd"] == "0.001"
-            assert detail["cost"]["unknown_requests"] == 0
-        else:
-            assert (provider_failure if provider_failure != "stream_disconnected" else "stream disconnected") in detail["run"]["reason"]
-            assert detail["cost"]["unknown_requests"] == 1
-            assert Decimal(detail["cost"]["unknown_reserved_usd"]) > 0
-            assert detail["cost"]["remaining_known_usd"] is None
-        if provider_failure != "stream_disconnected":
-            assert len(provider_calls) == 1
-        assert detail["cost"]["requests"] == len(provider_calls)
-        return
-    reports = detail["progress"]["reports"]
-    assert len(reports) == 6, (detail["run"]["reason"], detail["progress"].get("events"))
-    assert {row["specialist"] for row in reports} == {
-        "macro", "eventdesk", "crypto", "fundamentals", "quant", "options"}
-    assert detail["progress"]["red_team"]["report"]
-    assert detail["result"]["judgment"] == ("incomplete" if capo_malformed else "rejected")
-    if capo_malformed:
-        assert "Capo Trade Idea non valido" in detail["result"]["data_gaps"][0]
-        assert detail["result"]["proposal"] is None
-        assert detail["progress"]["routing_checks"]["capo_valid"] is False
-    assert detail["run"]["destination"]["kind"] == "research"
-    assert detail["run"]["technical_status"] == ("incomplete" if capo_malformed else "completed")
-    assert detail["email"]["status"] == "accepted"
-    assert detail["cost"]["requests"] == len(provider_calls)
-    assert len(build_events) == 1
-    assert {row["desk"] for row in build_events[0]["consultations"]} == set(DESKS)-{"fundamentals"}
-    assert all(row["status"] == "complete" and row["usage"] and row["fundamentals_decision"]
-               for row in build_events[0]["consultations"])
-    for desk in DESKS:
-        assert any("You are the " + desk + " desk" in str(call.get("system"))
-                   and "Round 2." in str(call["messages"][0].get("content"))
-                   and actual_models[-1]["generation_id"] in str(call["messages"][0].get("content"))
-                   for call in provider_calls)
-    assert len(tool_calls) >= 16
-    specialist_prompt = str(next(call["messages"] for call in provider_calls
-                                 if "You are the macro desk" in str(call.get("system"))))
-    red_prompt = str(next(call["messages"] for call in provider_calls
-        if (call.get("response_format") or {}).get("json_schema", {}).get("name") == "trade_idea_committee_review"))
-    for prompt in (specialist_prompt, red_prompt):
-        assert "Synthetic PM veto: renewal proof absent" in prompt
-        assert "Synthetic PM note: cash bridge needed" in prompt
-        assert "cash_disponibile_eur" in prompt
+    _assert_excel_run_refused_before_work(s, run_id, tmp_path)

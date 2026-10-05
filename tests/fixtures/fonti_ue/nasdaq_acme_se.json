@@ -1,0 +1,306 @@
+{
+  "results": {
+    "item": [
+      {
+        "disclosureId": 900002,
+        "categoryId": 75,
+        "headline": "New number of votes in Acme Sintetica",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Total number of voting rights",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900002&lang=en&src=listed",
+        "releaseTime": "2026-08-31 11:00:00",
+        "published": "2026-08-31 11:00:00",
+        "market": "Main Market, Stockholm",
+        "attachment": [],
+        "company": "Acme Sintetica, AB",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900003,
+        "categoryId": 75,
+        "headline": "Nytt antal röster i Acme Sintetica",
+        "language": "sv",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Total number of voting rights",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900003&lang=sv&src=listed",
+        "releaseTime": "2026-08-31 11:00:00",
+        "published": "2026-08-31 11:00:00",
+        "market": "Main Market, Stockholm",
+        "attachment": [],
+        "company": "Acme Sintetica, AB",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900004,
+        "categoryId": 78,
+        "headline": "Acme Sintetica Group - the second quarter 2026",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Half Year financial report",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900004&lang=en&src=listed",
+        "releaseTime": "2026-07-17 05:20:00",
+        "published": "2026-07-17 05:20:00",
+        "market": "Main Market, Stockholm",
+        "attachment": [
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-report.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000040"
+          },
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-presentation.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000041"
+          }
+        ],
+        "company": "Acme Sintetica, AB",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900005,
+        "categoryId": 78,
+        "headline": "Acme Sintetica-koncernen - det andra kvartalet 2026",
+        "language": "sv",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Half Year financial report",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900005&lang=sv&src=listed",
+        "releaseTime": "2026-07-17 05:20:00",
+        "published": "2026-07-17 05:20:00",
+        "market": "Main Market, Stockholm",
+        "attachment": [
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-report.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000050"
+          }
+        ],
+        "company": "Acme Sintetica, AB",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900006,
+        "categoryId": 55,
+        "headline": "Invitation to the Q2 2026 interim report webcast of Acme Sintetica",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Investor News",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900006&lang=en&src=listed",
+        "releaseTime": "2026-07-03 06:30:00",
+        "published": "2026-07-03 06:30:00",
+        "market": "Main Market, Stockholm",
+        "attachment": [],
+        "company": "Acme Sintetica, AB",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900007,
+        "categoryId": 153,
+        "headline": "Acme Sintetica Group - the first quarter 2026",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Interim report (Q1 and Q3)",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900007&lang=en&src=listed",
+        "releaseTime": "2026-04-24 05:20:00",
+        "published": "2026-04-24 05:20:00",
+        "market": "Main Market, Stockholm",
+        "attachment": [
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-report.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000070"
+          }
+        ],
+        "company": "Acme Sintetica, AB",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900008,
+        "categoryId": 436,
+        "headline": "Acme Sintetica publishes Annual Report 2025",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Other information disclosed according to the rules of the Exchange",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900008&lang=en&src=listed",
+        "releaseTime": "2026-02-26 14:35:00",
+        "published": "2026-02-26 14:35:00",
+        "market": "Main Market, Stockholm",
+        "attachment": [
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-report.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000080"
+          }
+        ],
+        "company": "Acme Sintetica, AB",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900009,
+        "categoryId": 436,
+        "headline": "Acme Sintetica publicerar årsredovisning 2025",
+        "language": "sv",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Other information disclosed according to the rules of the Exchange",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900009&lang=sv&src=listed",
+        "releaseTime": "2026-02-26 14:35:00",
+        "published": "2026-02-26 14:35:00",
+        "market": "Main Market, Stockholm",
+        "attachment": [
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-report.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000090"
+          }
+        ],
+        "company": "Acme Sintetica, AB",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900010,
+        "categoryId": 73,
+        "headline": "Acme Sintetica Group - the fourth quarter and full year 2025",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Financial Statement Release",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900010&lang=en&src=listed",
+        "releaseTime": "2026-01-28 06:20:00",
+        "published": "2026-01-28 06:20:00",
+        "market": "Main Market, Stockholm",
+        "attachment": [
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-report.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000100"
+          }
+        ],
+        "company": "Acme Sintetica, AB",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900011,
+        "categoryId": 153,
+        "headline": "Acme Sintetica Group - the third quarter 2025",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Interim report (Q1 and Q3)",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900011&lang=en&src=listed",
+        "releaseTime": "2025-10-17 05:20:00",
+        "published": "2025-10-17 05:20:00",
+        "market": "Main Market, Stockholm",
+        "attachment": [
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-report.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000110"
+          }
+        ],
+        "company": "Acme Sintetica, AB",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900012,
+        "categoryId": 153,
+        "headline": "Acme Sintetica Group - the second quarter 2025",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Interim report (Q1 and Q3)",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900012&lang=en&src=listed",
+        "releaseTime": "2025-07-17 05:20:00",
+        "published": "2025-07-17 05:20:00",
+        "market": "Main Market, Stockholm",
+        "attachment": [
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-report.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000120"
+          }
+        ],
+        "company": "Acme Sintetica, AB",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900013,
+        "categoryId": 153,
+        "headline": "Acme Sintetica Group - the first quarter 2025",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Interim report (Q1 and Q3)",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900013&lang=en&src=listed",
+        "releaseTime": "2025-04-23 05:20:00",
+        "published": "2025-04-23 05:20:00",
+        "market": "Main Market, Stockholm",
+        "attachment": [
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-report.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000130"
+          }
+        ],
+        "company": "Acme Sintetica, AB",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900014,
+        "categoryId": 270,
+        "headline": "Acme Sintetica publishes Annual Report 2024",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Annual Financial Report",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900014&lang=en&src=listed",
+        "releaseTime": "2025-02-27 14:17:00",
+        "published": "2025-02-27 14:17:00",
+        "market": "Main Market, Stockholm",
+        "attachment": [
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-report.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000140"
+          }
+        ],
+        "company": "Acme Sintetica, AB",
+        "cnsTypeId": "6"
+      }
+    ]
+  },
+  "count": 13
+}

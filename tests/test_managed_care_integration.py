@@ -14,6 +14,7 @@ from bellomberg.valuation import dcf_engine, sector_analysis
 from test_managed_care_calendar import calendar_case
 from test_sector_valuation_integration import isolated_tools
 from test_valuation_snapshot_persistence import db
+from _prerequisiti_node import APP, richiedi_node_modules
 
 DAY = '2026-09-10'
 SYMBOL = 'SYNTH.EXT'
@@ -158,69 +159,6 @@ def test_symbol_does_not_select_assumptions_and_sensitivity_uses_consumed_driver
     assert changed['snapshot_id'] != first['snapshot_id']
 
 
-def test_real_adapter_chat_build_cache_and_committee_share_result(isolated_tools, monkeypatch):
-    tools = isolated_tools
-    monkeypatch.setattr(dcf_engine, 'REPORT_DIR', tools.directory)
-    bundle = make_bundle()
-    chat = tools.chat.dispatch('get_valuation', {'ticker':SYMBOL}, prepared_bundle=bundle)['data']
-    build = tools.build(SYMBOL, prepared_bundle=bundle, as_of=DAY)
-    assert chat['valuation_usability']['usable'], chat['valuation_usability']
-    assert build['fair_value_base'] == chat['fair_value_base']
-    assert build['valuation_decision'] == chat['valuation_decision']
-    assert chat['snapshot_id'] == bundle['snapshot_id']
-    tools.memory.history = [{'valuation_payload':deepcopy(build),'generation_id':build['generation_id']}]
-    cached = tools.chat.dispatch('get_valuation', {'ticker':SYMBOL}, prepared_bundle=bundle)['data']
-    assert cached['reused'] is True
-    assert cached['generation_id'] == build['generation_id']
-    row = json.loads(sector_analysis.valuation_results_block({SYMBOL:cached}).splitlines()[-1])
-    assert row['fair_value'] == build['fair_value_base']
-    assert row['valuation_usability']['usable']
-    records, context = records_for()
-    records = [r for r in records if r['driver'] != 'capital.subsidiaries.0.permitted_distribution']
-    incomplete = tools.build(SYMBOL, prepared_bundle=make_bundle(records=records, context=context), as_of=DAY)
-    assert not incomplete['valuation_usability']['usable'] and incomplete.get('fair_value_base') is None
-    assert incomplete['path'] and Path(incomplete['path']).is_file()
-    assert 'incompleto' in incomplete['engine_note']
-
-
-def test_public_tool_arguments_acquire_records_without_prepared_bundle(isolated_tools, monkeypatch):
-    tools = isolated_tools
-    monkeypatch.setattr(dcf_engine, 'REPORT_DIR', tools.directory)
-    bundle = make_bundle()
-    sources = bundle['case']['sources']
-    calls = []
-    def profile(ticker, *, as_of):
-        calls.append(ticker)
-        return deepcopy(sources['profile'])
-    records, context = records_for()
-    providers = {'profile': profile}  # no injected economic calculator or prepared bundle
-    chat = tools.chat.dispatch('get_valuation', {'ticker':SYMBOL, 'method_records':records,
-        'analysis_context':context}, sector_providers=providers, as_of=DAY)['data']
-    assert chat['valuation_usability']['usable'], chat
-    build = tools.build(SYMBOL, method_records=records, analysis_context=context, sector_providers=providers, as_of=DAY)
-    assert build['valuation_usability']['usable'], build
-    assert build['fair_value_base'] == chat['fair_value_base']
-    assert calls == [SYMBOL, SYMBOL]
-    # A RESEARCH bundle acquired before the analyst supplied records is revised
-    # through the same validator, without any further provider call.
-    incomplete = sector_analysis.prepare_sector_analysis(SYMBOL, as_of=DAY, providers=providers)
-    count = len(calls)
-    revised = tools.chat.dispatch('get_valuation', {'ticker':SYMBOL, 'method_records':records,
-        'analysis_context':context}, prepared_bundle=incomplete)['data']
-    assert revised['valuation_usability']['usable'], revised
-    assert len(calls) == count
-    assert revised['snapshot_id'] != incomplete['snapshot_id']
-    changed_records = deepcopy(records)
-    for row in changed_records:
-        if row['driver'] == 'capital.ke': row['value'] = .11
-    changed = tools.chat.dispatch('get_valuation', {'ticker':SYMBOL, 'method_records':changed_records},
-        prepared_bundle=revised['acquisition_snapshot'])['data']
-    assert changed['valuation_usability']['usable'], changed
-    assert changed['fair_value_base'] < revised['fair_value_base']
-    assert len(changed['acquisition_snapshot']['case']['records']) == len(records)
-    assert changed['acquisition_snapshot']['case']['sources']['method_inputs']['data']['previous_acquisition']['records'] == revised['acquisition_snapshot']['case']['sources']['method_inputs']['records']
-
-
 def test_readiness_without_record_bindings_does_not_certify_a_value():
     from test_sector_usability import payload_for
     from bellomberg.valuation.dcf_quality import assess_valuation_usability
@@ -342,6 +280,32 @@ def test_real_research_database_f17_and_react_preserve_complete_and_missing_case
         pytest.skip('Backend/DB/F17 assertions completed; Node rendering is not run inside '
                     'the subprocess-blocking harness and requires the separate guarded Node proof. '
                     'Frozen fixture: ' + str(ui_fixture))
-    rendered = subprocess.run(['node','--test','tests/product/sector-valuation.cjs'], cwd=Path('app').resolve(),
+    # Prerequisito dichiarato (ZR 05/10): senza `npm ci` in app/ il rosso dice cosa fare, non uno stack
+    # di node; cartella app/ ancorata al repo, non alla cwd di pytest.
+    node = richiedi_node_modules('react', 'react-dom', 'typescript')
+    rendered = subprocess.run([node,'--test','tests/product/sector-valuation.cjs'], cwd=APP,
         env={**os.environ,'SECTOR_VALUATION_FIXTURE':str(ui_fixture)}, text=True, capture_output=True)
     assert rendered.returncode == 0, rendered.stdout + rendered.stderr
+
+
+# Contratto ATTUALE (ZR 05/10, Z1): i 2 test chat/build/cache e argomenti pubblici del tool sono in
+# archive/private/attic/tests_excel_archiviato_20261005/test_managed_care_integration_legacy.py (dispatch get_valuation archiviato
+# dal 1326312, censimento Z4). Qui le stesse due forme di chiamata ricevono il contratto dichiarato.
+from _contratto_excel_archiviato import blinda_ramo_archiviato, file_in, spia_chiamante, verifica_archiviato
+
+
+@pytest.mark.parametrize('forma', ['bundle_preparato', 'argomenti_pubblici'])
+def test_managed_care_tool_calls_meet_the_archived_contract(isolated_tools, monkeypatch, forma):
+    tools = isolated_tools
+    usati = []
+    if forma == 'bundle_preparato':
+        args, kwargs = {'ticker': SYMBOL}, {'prepared_bundle': make_bundle()}
+    else:
+        records, context = records_for()
+        args = {'ticker': SYMBOL, 'method_records': records, 'analysis_context': context}
+        kwargs = {'sector_providers': {'profile': spia_chiamante(usati, 'provider profile')}, 'as_of': DAY}
+    prima = file_in(tools.directory)
+    chiamate = blinda_ramo_archiviato(monkeypatch)
+    risposta = tools.chat.dispatch('get_valuation', args, **kwargs)
+    verifica_archiviato(risposta, chiamate + usati, cartella=tools.directory, prima=prima)
+    assert tools.memory.reads == 0 and tools.memory.saved == []

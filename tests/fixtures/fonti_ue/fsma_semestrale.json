@@ -1,0 +1,57 @@
+{
+  "resultCount": 3,
+  "storiResultItems": [
+    {
+      "requiredReportingTopicId": "00000000-0000-4000-8000-000000000001",
+      "companyName": "ACME SINTETICA",
+      "companyNumber": "0000000001",
+      "nationality": "BE",
+      "reportingTopicName": "Announcement of acquisition of own shares",
+      "datePublication": "2026-07-10T17:45:00.12",
+      "dateReceived": "2026-07-10T17:50:01.5",
+      "lei": "ZZTEST00000000ACME38",
+      "mainDocuments": [
+        {"fileDataId": "00000000-0000-4000-8000-0000000000a1", "language": "en", "title": "ACME buyback update week 28.pdf", "originalFileName": "ACME buyback update week 28.pdf", "size": 10, "fileType": "pdf"}
+      ],
+      "attachments": [],
+      "isinCodes": [{"code": "BE00ZZSYNT07", "startDate": "2020-01-01T00:00:00", "isinType": "Shares", "market": "Euronext Brussels"}],
+      "documentTitle": ""
+    },
+    {
+      "requiredReportingTopicId": "00000000-0000-4000-8000-000000000002",
+      "companyName": "ACME SINTETICA",
+      "companyNumber": "0000000001",
+      "nationality": "BE",
+      "reportingTopicName": "Half-yearly financial report",
+      "datePublication": "2026-07-29T07:00:00.9",
+      "dateReceived": "2026-07-29T07:31:12.4",
+      "lei": "ZZTEST00000000ACME38",
+      "mainDocuments": [
+        {"fileDataId": "00000000-0000-4000-8000-0000000000b1", "language": "nl", "title": "ACME HY26 Financial Statements (Dutch).pdf", "originalFileName": "ACME HY26 Financial Statements (Dutch).pdf", "size": 10, "fileType": "pdf"},
+        {"fileDataId": "00000000-0000-4000-8000-0000000000b2", "language": "fr", "title": "ACME HY26 Financial Statements (French).pdf", "originalFileName": "ACME HY26 Financial Statements (French).pdf", "size": 10, "fileType": "pdf"},
+        {"fileDataId": "00000000-0000-4000-8000-0000000000b3", "language": "en", "title": "ACME HY26 Financial Statements.pdf", "originalFileName": "ACME HY26 Financial Statements.pdf", "size": 10, "fileType": "pdf"}
+      ],
+      "attachments": [
+        {"fileDataId": "00000000-0000-4000-8000-0000000000b4", "language": "en", "title": null, "originalFileName": "HY26_ACME_Press Release_English.pdf", "size": 10, "fileType": "pdf"}
+      ],
+      "isinCodes": [{"code": "BE00ZZSYNT07", "startDate": "2020-01-01T00:00:00", "isinType": "Shares", "market": "Euronext Brussels"}],
+      "documentTitle": ""
+    },
+    {
+      "requiredReportingTopicId": "00000000-0000-4000-8000-000000000003",
+      "companyName": "ACME SINTETICA",
+      "companyNumber": "0000000001",
+      "nationality": "BE",
+      "reportingTopicName": "Announcement of notification of major shareholding",
+      "datePublication": "2026-08-12T18:00:00",
+      "dateReceived": "2026-08-12T18:02:00",
+      "lei": "ZZTEST00000000ACME38",
+      "mainDocuments": [
+        {"fileDataId": "00000000-0000-4000-8000-0000000000c1", "language": "en", "title": "ACME transparency notification.pdf", "originalFileName": "ACME transparency notification.pdf", "size": 10, "fileType": "pdf"}
+      ],
+      "attachments": null,
+      "isinCodes": [{"code": "BE00ZZSYNT07", "startDate": "2020-01-01T00:00:00", "isinType": "Shares", "market": "Euronext Brussels"}],
+      "documentTitle": ""
+    }
+  ]
+}

@@ -23,8 +23,16 @@ def _provider_reply(body, text, tool_calls=None, *, ident):
         'prompt_tokens_details': {'cached_tokens': 0, 'cache_write_tokens': 0},
         'completion_tokens_details': {'reasoning_tokens': 0}}
     if body.get('stream'):
+        # ZR 05/10: dal 02/10 anche i DESK vanno in streaming (prima solo Red/Capo): le
+        # chiamate ai tool devono viaggiare nel delta SSE, non solo il testo.
+        delta = {'content': text}
+        if tool_calls:
+            delta['tool_calls'] = [{'index': index, 'id': ident + '-' + str(index), 'type': 'function',
+                'function': {'name': name, 'arguments': json.dumps(arguments)}}
+                for index, (name, arguments) in enumerate(tool_calls)]
         data = {'id': ident, 'model': body['model'], 'choices': [
-            {'index': 0, 'delta': {'content': text}, 'finish_reason': 'stop'}], 'usage': usage}
+            {'index': 0, 'delta': delta, 'finish_reason': 'tool_calls' if tool_calls else 'stop'}],
+            'usage': usage}
         return httpx.Response(200, headers={'content-type': 'text/event-stream'},
             content=('data: ' + json.dumps(data) + '\n\ndata: [DONE]\n\n').encode())
     message = {'role': 'assistant', 'content': text}
@@ -180,8 +188,12 @@ def test_native_weekly_sources_all_desks_red_capo_pdf_and_two_exact_recoveries(r
         'workbook_calls': {key: forbidden[key] for key in ('prepare_binding', 'compiler', 'coverage')},
         'research_ref': store.get('red_team')['research_ref'], 'costs': costs,
         'original_artifact_hashes': artifacts, 'remaining_work': recovered['remaining_work']}
-    (Path(os.environ['BELLOMBERG_OFFLINE_TEST_SANDBOX']) / 'native-weekly-evidence.json').write_text(
-        json.dumps(evidence, indent=2, ensure_ascii=False), encoding='utf-8')
+    # ZR 05/10: la prova esportata esiste solo sotto tools/testing/offline_pytest.py, che crea
+    # la sandbox; con pytest nudo (clone pulito) le asserzioni sopra restano tutte, l'export no
+    # (stesso schema di test_documented_consumers / test_managed_care_integration).
+    if os.environ.get('BELLOMBERG_OFFLINE_TEST_SANDBOX'):
+        (Path(os.environ['BELLOMBERG_OFFLINE_TEST_SANDBOX']) / 'native-weekly-evidence.json').write_text(
+            json.dumps(evidence, indent=2, ensure_ascii=False), encoding='utf-8')
 
 
 @pytest.mark.parametrize('fault', ['timeout', 'disconnect', 'incomplete', '503', '504'])

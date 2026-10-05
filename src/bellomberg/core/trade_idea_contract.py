@@ -45,6 +45,13 @@ def validate_run_authorization(authorization, source_qualification):
         raise ValueError("authorization invalid: " + str(exc)) from exc
     if not isinstance(source_qualification, dict) or source_qualification.get("status") not in ("qualified", "preparation_required", "research_required"):
         raise ValueError("sources are not qualified before authorization")
+    from bellomberg.core.research_analysis import is_research_mode as _research
+    if _research(source_qualification) and source_qualification.get('status') != 'research_required':
+        # Z3b 05/10 (difesa in profondita', cancello di spesa): la ricerca ammette solo il grant
+        # 'committee', controllato sotto per research_required; nessun produttore reale emette
+        # ricerca con altro status, e se accadesse non deve aggirare quel controllo.
+        raise ValueError('Research analysis mode requires research_required sources; status '
+                         + str(source_qualification.get('status')) + ' refused')
     if source_qualification.get('status') == 'research_required':
         from bellomberg.valuation.trade_idea_model import validate_research_admission
         from bellomberg.core.research_analysis import is_research_mode

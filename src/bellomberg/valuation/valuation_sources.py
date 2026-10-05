@@ -75,19 +75,22 @@ def collect_documents(ticker, *, as_of, archive_root, filing_results=(), catalog
             extracted = estrai_testo(str(path), contenuto=raw, **extractor)
             if (accepted_verification.get('contract') == 'trade-idea-pm-documents/1'
                     and (accepted_verification.get('deposit_receipt') is not None
-                         or accepted_verification.get('publication_basis') == 'emarket_sdir_deposit_receipt')):
-                # Data di pubblicazione dal deposito eMarket SDIR: si riverifica qui, senza rete.
+                         or accepted_verification.get('publication_basis') in ('emarket_sdir_deposit_receipt',
+                                                                               'eu_official_deposit_receipt'))):
+                # Data di pubblicazione dal deposito ufficiale (SDIR italiani o fonte UE): riverifica senza rete.
                 from bellomberg.agents.trade_idea_sources import (verify_deposit_companion,
-                    _deposit_document_type, _deposit_declaration)
+                    _deposit_document_type, _deposit_declaration, _deposit_basis, _deposit_public_date,
+                    _deposit_type_names)
                 deposit = accepted_verification.get('deposit_receipt')
-                tipo = _deposit_document_type(extracted.get("testo", ""))
-                if (accepted_verification.get('publication_basis') != 'emarket_sdir_deposit_receipt'
-                        or not isinstance(deposit, dict) or tipo is None
-                        or not isinstance(accepted_metadata.get('report_date'), str)):
+                tipo = (_deposit_document_type(extracted.get("testo", ""), accepted_metadata['report_date'],
+                                               _deposit_type_names(deposit) if isinstance(deposit, dict) else None)
+                        if isinstance(accepted_metadata.get('report_date'), str) else None)
+                if (not isinstance(deposit, dict) or tipo is None
+                        or accepted_verification.get('publication_basis') != _deposit_basis(deposit)):
                     raise ValueError("eMarket SDIR deposit publication declaration is incomplete")
                 verify_deposit_companion(deposit, root / "pm-public-documents", accepted_verification.get('ticker'),
-                    tipo, accepted_metadata['report_date'], as_of)
-                if (deposit['data_deposito'] != published
+                    tipo, accepted_metadata['report_date'], as_of, text=extracted.get("testo", ""))
+                if (_deposit_public_date(deposit) != published
                         or accepted_verification.get('publication_declaration') != _deposit_declaration(deposit)):
                     raise ValueError("publication date differs from the declared eMarket SDIR deposit")
             if extracted.get("stato") not in ("ok", "parziale") or not extracted.get("testo", "").strip():

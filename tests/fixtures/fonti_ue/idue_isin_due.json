@@ -1,0 +1,84 @@
+{
+ "meta": {
+  "goldenCopy": {
+   "publishDate": "2026-10-05T00:00:00Z"
+  },
+  "pagination": {
+   "currentPage": 1,
+   "perPage": 15,
+   "from": 1,
+   "to": 2,
+   "total": 2,
+   "lastPage": 1
+  }
+ },
+ "links": {},
+ "data": [
+  {
+   "type": "lei-records",
+   "id": "ZZTEST0000000000A191",
+   "attributes": {
+    "lei": "ZZTEST0000000000A191",
+    "entity": {
+     "legalName": {
+      "name": "ACME SINTETICA N.V.",
+      "language": "en"
+     },
+     "otherNames": [],
+     "transliteratedOtherNames": [],
+     "legalAddress": {
+      "language": "en",
+      "addressLines": [
+       "Via Sintetica 1"
+      ],
+      "city": "Zetaville",
+      "country": "NL",
+      "postalCode": "00000"
+     },
+     "jurisdiction": "NL",
+     "status": "ACTIVE",
+     "legalForm": {
+      "id": "ZZNV",
+      "other": null
+     }
+    },
+    "registration": {
+     "status": "ISSUED"
+    }
+   }
+  },
+  {
+   "type": "lei-records",
+   "id": "ZZTEST0000000000B258",
+   "attributes": {
+    "lei": "ZZTEST0000000000B258",
+    "entity": {
+     "legalName": {
+      "name": "ACME SINTETICA HOLDING N.V.",
+      "language": "en"
+     },
+     "otherNames": [],
+     "transliteratedOtherNames": [],
+     "legalAddress": {
+      "language": "en",
+      "addressLines": [
+       "Via Sintetica 1"
+      ],
+      "city": "Zetaville",
+      "country": "NL",
+      "postalCode": "00000"
+     },
+     "jurisdiction": "NL",
+     "status": "ACTIVE",
+     "legalForm": {
+      "id": "ZZNV",
+      "other": null
+     }
+    },
+    "registration": {
+     "status": "ISSUED"
+    }
+   }
+  }
+ ]
+}

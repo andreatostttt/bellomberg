@@ -10,6 +10,7 @@ from test_trade_idea_context_projection_gate import _board, _request
 from test_trade_idea_pipeline import _priced_request
 from test_trade_idea_run_controls_api import admission, db_path, migrated
 from bellomberg.api import trade_idea_routes as routes
+from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE
 
 
 def recovery_fixture():
@@ -64,7 +65,7 @@ def test_failed_author_recovery_rejects_changed_paid_contract(mutation):
 def test_failed_response_selection_uses_normal_authenticated_resume(admission, monkeypatch, acknowledged):
     client, current, _, _, _, workers = admission
     calls = []
-    monkeypatch.setattr(current, 'get_run', lambda _: {'recovery': {}})
+    monkeypatch.setattr(current, 'get_run', lambda _: {'run': {'analysis_mode': RESEARCH_ANALYSIS_MODE}, 'recovery': {}})
     monkeypatch.setattr(routes, 'active_paid_reason', lambda *_a, **_k: None)
     def create(parent, **kwargs):
         calls.append((parent, kwargs))

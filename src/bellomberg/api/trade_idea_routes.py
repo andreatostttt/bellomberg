@@ -189,6 +189,21 @@ def _save_admission_source_receipt(db_path, receipt):
         raise ValueError('Ricevuta di controverifica fonti non salvabile; avvio bloccato') from exc
 
 
+def _run_absent(exc):
+    """Vero solo per il KeyError con cui lo store dichiara la run assente (TradeIdeaStore._row)."""
+    return (type(exc) is KeyError and bool(exc.args) and isinstance(exc.args[0], str)
+            and exc.args[0].startswith("Trade Idea run absent: "))
+
+
+def _keyerror_http(exc, operation):
+    """KeyError dello store -> 404 SOLO per la run assente; ogni altra chiave mancante e' un
+    record incoerente dichiarato (500), mai «non trovata». Solo il tipo, mai il testo."""
+    if _run_absent(exc):
+        return HTTPException(404, "Run Trade Idea non trovata")
+    return HTTPException(500, "Record Trade Idea incoerente (" + type(exc).__name__
+                         + "): operazione di " + operation + " bloccata")
+
+
 def _store(db_path=SQLITE_PATH):
     try:
         return TradeIdeaStore(db_path)
@@ -701,7 +716,7 @@ def install_trade_idea_routes(app, require_session, *, db_path=SQLITE_PATH,
         try:
             return _public_detail(store().get_run(run_id), run_id=run_id)
         except KeyError as exc:
-            raise HTTPException(404, "Run Trade Idea non trovata") from exc
+            raise _keyerror_http(exc, "lettura") from exc
 
     @router.post("/runs/{run_id}/stop")
     def stop(run_id: str):
@@ -710,7 +725,7 @@ def install_trade_idea_routes(app, require_session, *, db_path=SQLITE_PATH,
             current.request_stop(run_id)
             state = current.get_run(run_id)["run"]["technical_status"]
         except KeyError as exc:
-            raise HTTPException(404, "Run Trade Idea non trovata") from exc
+            raise _keyerror_http(exc, "arresto") from exc
         if state == "running":
             proc, alive = _worker_state(run_id)
             if alive is None:
@@ -740,6 +755,9 @@ def install_trade_idea_routes(app, require_session, *, db_path=SQLITE_PATH,
         try:
             previous = current.get_run(run_id)
             from bellomberg.core.research_analysis import is_research_mode
+            if not isinstance(previous, dict) or not isinstance(previous.get('run'), dict):
+                # Z3b 05/10: un record senza 'run' non e' «non trovato» (era un KeyError -> 404).
+                raise HTTPException(500, "Record Trade Idea malformato: dati della run assenti; prosecuzione bloccata")
             if not is_research_mode(previous['run']):
                 raise RunConflict('Run Excel in archivio: prosecuzione analisi disattivata; restano consultazione e recupero dei risultati gia prodotti')
             successor = (previous.get('recovery') or {}).get('successor_run_id')
@@ -757,7 +775,9 @@ def install_trade_idea_routes(app, require_session, *, db_path=SQLITE_PATH,
                 **({'capo_finalization_request_id': body.capo_finalization_request_id}
                    if body.capo_finalization_request_id is not None else {}))
         except KeyError as exc:
-            raise HTTPException(404, "Run Trade Idea non trovata") from exc
+            # Solo l'assenza della run dichiarata dallo store e' un 404; ogni altra chiave
+            # mancante (riserva di costo, consegna, campo del record) e' un errore dichiarato.
+            raise _keyerror_http(exc, "prosecuzione") from exc
         except (IdempotencyConflict, RunConflict, BudgetBlocked, ValueError) as exc:
             raise HTTPException(409, str(exc)) from exc
         child = accepted['run']['id']
@@ -778,7 +798,7 @@ def install_trade_idea_routes(app, require_session, *, db_path=SQLITE_PATH,
                               send_email=False)
             return _public_detail(current.get_run(run_id), run_id=run_id)
         except KeyError as exc:
-            raise HTTPException(404, "Run Trade Idea non trovata") from exc
+            raise _keyerror_http(exc, "consegna") from exc
         except (RunConflict, ValueError, RuntimeError, OSError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
@@ -796,7 +816,7 @@ def install_trade_idea_routes(app, require_session, *, db_path=SQLITE_PATH,
                 raise RunConflict("Run in corso: riconciliazione dei costi solo a run ferma")
             return reconcile_trade_idea_costs(current, run_id, apply=bool(body and body.apply))
         except KeyError as exc:
-            raise HTTPException(404, "Run Trade Idea non trovata") from exc
+            raise _keyerror_http(exc, "riconciliazione") from exc
         except (RunConflict, ValueError, RuntimeError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
@@ -805,7 +825,7 @@ def install_trade_idea_routes(app, require_session, *, db_path=SQLITE_PATH,
         try:
             detail = store().get_run(run_id)
         except KeyError as exc:
-            raise HTTPException(404, "Run Trade Idea non trovata") from exc
+            raise _keyerror_http(exc, "download") from exc
         if detail.get("manifest_integrity") is False:
             raise HTTPException(409, "Manifest di consegna modificato; download bloccato")
         manifest = detail.get("artifacts") or {}
@@ -833,7 +853,7 @@ def install_trade_idea_routes(app, require_session, *, db_path=SQLITE_PATH,
         try:
             detail = current.get_run(run_id)
         except KeyError as exc:
-            raise HTTPException(404, "Run Trade Idea non trovata") from exc
+            raise _keyerror_http(exc, "email") from exc
         if detail.get("manifest_integrity") is False:
             raise HTTPException(409, "Manifest di consegna modificato; invio bloccato")
         status_now = detail["email"]["status"]

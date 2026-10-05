@@ -489,7 +489,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     },
     {
         "name": "get_insider_trades",
-        "description": "Form 4 SEC insider trades per un ticker: chi (CEO/CFO/director), cosa (BUY/SELL), quante azioni, prezzo, valore totale. Real-time via Finnhub, poi SEC EDGAR (fonti_mute dice chi non ha risposto). Titoli italiani (.MI): internal dealing da eMarket SDIR, con stato dichiarato (ok / vuoto_misurato / KO / non_coperto / STALE): un KO NON vuol dire 'nessun insider'. Altri listini esteri: 'non coperto' dichiarato, nessuna chiamata a Finnhub/SEC (togliere il suffisso aggancerebbe un omonimo USA); gemello USA solo con proxy_usa=true.",
+        "description": "Form 4 SEC insider trades per un ticker: chi (CEO/CFO/director), cosa (BUY/SELL), quante azioni, prezzo, valore totale. Real-time via Finnhub, poi SEC EDGAR (fonti_mute dice chi non ha risposto). Titoli italiani (.MI): internal dealing dallo SDIR dell'emittente (eMarket SDIR o 1INFO-SDIR, scelto dall'instradatore e dichiarato in 'sdir'/'instradamento'; ISIN risolto in automatico su Borsa Italiana se manca, dichiarato in 'risoluzione_isin'), con stato dichiarato (ok / vuoto_misurato / KO / non_coperto / STALE): un KO NON vuol dire 'nessun insider'. Altri listini esteri: 'non coperto' dichiarato, nessuna chiamata a Finnhub/SEC (togliere il suffisso aggancerebbe un omonimo USA); gemello USA solo con proxy_usa=true.",
         "input_schema": {"type": "object", "properties": {
             "ticker": {"type": "string"},
             "days": {"type": "integer", "default": 30},
@@ -498,7 +498,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     },
     {
         "name": "get_earnings_calendar",
-        "description": "Earnings calendar prossimi N giorni. Se ticker fornito, filtra per quello. Altrimenti ritorna tutti gli earnings del periodo (max 100). Per un titolo italiano (.MI) il calendario viene da Borsa Italiana (eventi societari: items nella finestra + prossimo), con stato dichiarato: KO / non_coperto / tabella ticker->ISIN mancante = errore, NON 'nessun evento'; STALE = dato vecchio con la data vera di lettura.",
+        "description": "Earnings calendar prossimi N giorni. Se ticker fornito, filtra per quello. Altrimenti ritorna tutti gli earnings del periodo (max 100). Per un titolo italiano (.MI) il calendario viene da Borsa Italiana (eventi societari: items nella finestra + prossimo), con stato dichiarato: KO / non_coperto = errore, NON 'nessun evento'; ISIN assente dalle tabelle = risolto in automatico su Borsa Italiana (dichiarato in 'risoluzione_isin'), se non risolvibile errore col motivo; STALE = dato vecchio con la data vera di lettura.",
         "input_schema": {"type": "object", "properties": {
             "days_ahead": {"type": "integer", "default": 14},
             "ticker": {"type": "string",
@@ -1148,10 +1148,15 @@ def _prossima_trimestrale(ticker: str) -> Tuple[Any, Any, Any]:
         rifiuto, _nn = _strumento_non_societario(t)
         if rifiuto is not None:
             return None, None, rifiuto["error"]
+        from bellomberg.market_data.isin_automatico import assicura_isin_it, risoluzione_ok
+        ris = assicura_isin_it(t)   # W1 05/10: voce .MI mancante -> ISIN risolto su Borsa (dichiarato)
         r = get_eventi_societari(t)
         stato = r.get("stato")
         if stato not in ("ok", "vuoto_misurato", "STALE"):
-            return None, None, "calendario Borsa Italiana %s: %s" % (stato, r.get("motivo") or r.get("errore"))
+            extra = (" | risoluzione ISIN %s: %s" % (ris.get("stato"), ris.get("motivo"))
+                     if ris and not risoluzione_ok(ris) else "")
+            return None, None, "calendario Borsa Italiana %s: %s%s" % (
+                stato, r.get("motivo") or r.get("errore"), extra)
         oggi = oggi_roma().isoformat()
         futuri = sorted(e["data"] for e in (r.get("eventi") or [])
                         if e.get("data") and e["data"] > oggi and e.get("tipo") == "risultati")
@@ -1181,9 +1186,13 @@ def _fonte_borsa_italiana(ticker: str, days: int) -> Tuple[List[Dict[str, Any]],
     rifiuto, nota_natura = _strumento_non_societario(ticker)
     if rifiuto is not None:
         return [], "NON INTERROGATA (apposta): " + rifiuto["error"], 0, 0
+    from bellomberg.market_data.isin_automatico import assicura_isin_it, risoluzione_ok
+    ris = assicura_isin_it(ticker)   # W1 05/10: voce .MI mancante -> ISIN risolto su Borsa (dichiarato)
     r = get_eventi_societari(ticker)
     stato = r.get("stato")
     motivo = r.get("motivo") or r.get("errore") or "n.d."
+    if ris and not risoluzione_ok(ris):
+        motivo = "%s | risoluzione ISIN %s: %s" % (motivo, ris.get("stato"), ris.get("motivo"))
     if stato == "non_coperto":
         return [], "NON COPRE questo emittente: " + str(motivo), 1, 0
     if stato not in ("ok", "vuoto_misurato", "STALE"):
@@ -1196,6 +1205,9 @@ def _fonte_borsa_italiana(ticker: str, days: int) -> Tuple[List[Dict[str, Any]],
     riga = _esito_fonte(len(eventi), 1, 0, [])
     if nota_natura:
         riga += " [" + nota_natura + "]"
+    if risoluzione_ok(ris):
+        riga += " [ISIN risolto ora su Borsa Italiana col nome %r (%s)]" % (
+            ris.get("nome_usato"), ris.get("fonte_nome"))
     if r.get("voce_da") == "automatico":
         riga += " [ISIN risolto AUTOMATICAMENTE su Borsa Italiana (negozio isin_it_auto, non confermato dal PM): verifica il titolo prima di usare il dato]"
     if stato == "STALE":
@@ -1463,6 +1475,8 @@ def _eventi_borsa_italiana(ticker: str, days: int) -> Dict[str, Any]:
     rifiuto, nota_natura = _strumento_non_societario(ticker)
     if rifiuto is not None:
         return {**rifiuto, "source": "Borsa Italiana (non interrogata)", "count": 0, "items": []}
+    from bellomberg.market_data.isin_automatico import assicura_isin_it, con_risoluzione
+    ris = assicura_isin_it(ticker)   # W1 05/10: voce .MI mancante -> ISIN risolto su Borsa (dichiarato)
     r = get_eventi_societari(ticker)
     eventi = r.get("eventi") or []
     try:
@@ -1494,7 +1508,7 @@ def _eventi_borsa_italiana(ticker: str, days: int) -> Dict[str, Any]:
                          "(stato originale %s)" % (r.get("letto_il"), r.get("stato_originale")))
     elif stato not in ("ok", "vuoto_misurato"):
         out["error"] = "calendario Borsa Italiana: stato inatteso %r" % (stato,)
-    return out
+    return con_risoluzione(out, ris)
 
 
 def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
@@ -1743,7 +1757,9 @@ def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
             # appena letta); n.d. = fallback +120g DICHIARATO dentro memory_db.
             _vu, _vus, _vnota = None, None, None
             try:
-                _vu, _vus, _vnota = _prossima_trimestrale(tool_input["ticker"])
+                from bellomberg.market_data.isin_automatico import budget_per_chiamante, budget_risoluzione
+                with budget_risoluzione(budget_per_chiamante(caller)):
+                    _vu, _vus, _vnota = _prossima_trimestrale(tool_input["ticker"])
             except Exception as _e:
                 _vnota = "scadenza dal calendario non calcolata (%s)" % type(_e).__name__
             r = MemoryDB().add_guidance(
@@ -2209,17 +2225,21 @@ def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
         if tool_name == "get_corporate_events_for_ticker":
             ticker = tool_input["ticker"].upper()
             days = int(tool_input.get("days", 30))
-            payload, firma = _eventi_societari_per_ticker(ticker, days)
+            from bellomberg.market_data.isin_automatico import budget_per_chiamante, budget_risoluzione
+            with budget_risoluzione(budget_per_chiamante(caller)):   # W1: budget della risoluzione ISIN
+                payload, firma = _eventi_societari_per_ticker(ticker, days)
             return _stamp(payload, firma)
 
         if tool_name == "get_insider_trades":
             # W1 (04/10): guardia di copertura PRIMA di Finnhub/SEC (Finnhub toglie il
-            # suffisso: omonimo), .MI -> internal dealing eMarket SDIR, gemello solo con proxy_usa
+            # suffisso: omonimo), .MI -> internal dealing dallo SDIR (sdir.py), gemello solo con proxy_usa
             from bellomberg.agents.agent_tools import insider_dichiarati
-            payload, firma = insider_dichiarati(tool_input["ticker"],
-                                                days=int(tool_input.get("days", 30)),
-                                                max_trades=20,
-                                                proxy_usa=bool(tool_input.get("proxy_usa", False)))
+            from bellomberg.market_data.isin_automatico import budget_per_chiamante, budget_risoluzione
+            with budget_risoluzione(budget_per_chiamante(caller)):   # W1: budget della risoluzione ISIN
+                payload, firma = insider_dichiarati(tool_input["ticker"],
+                                                    days=int(tool_input.get("days", 30)),
+                                                    max_trades=20,
+                                                    proxy_usa=bool(tool_input.get("proxy_usa", False)))
             return _stamp(payload, firma)
 
         if tool_name == "get_earnings_calendar":
@@ -2229,7 +2249,9 @@ def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
             if ticker and str(ticker).strip().upper().endswith(".MI"):
                 # W1 (04/10): Finnhub toglie .MI (omonimo / niente dati sui nomi italiani):
                 # il calendario di un titolo italiano viene da Borsa Italiana, stato dichiarato
-                payload = _eventi_borsa_italiana(str(ticker).strip().upper(), days)
+                from bellomberg.market_data.isin_automatico import budget_per_chiamante, budget_risoluzione
+                with budget_risoluzione(budget_per_chiamante(caller)):   # W1: budget della risoluzione ISIN
+                    payload = _eventi_borsa_italiana(str(ticker).strip().upper(), days)
                 return _stamp(payload, "Borsa Italiana eventi societari (%s)"
                               % str(ticker).strip().upper())
             if ticker:

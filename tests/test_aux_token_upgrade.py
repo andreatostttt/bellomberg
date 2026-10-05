@@ -124,10 +124,16 @@ def test_compatibility_does_not_hide_tampered_legacy_cost(tmp_path, phase, agent
 # replayed with its original reasoning after a crash, never paid twice; an uncertain
 # old request stays blocked.
 @pytest.mark.parametrize("old_cap", [1000, 8000])
-def test_reflection_disabled_thinking_replays_after_effort_low_upgrade(tmp_path, old_cap):
+def test_reflection_disabled_thinking_replays_after_effort_low_upgrade(tmp_path, old_cap, monkeypatch):
     store, dispatches = journal(tmp_path), []
     client = client_with_receipts(dispatches)
+    # Riga di un journal VECCHIO (prima della regola PM 05/10 «mai spento"): la si scrive col
+    # vecchio {"enabled": false}; il replay sotto deve restare quello di allora.
+    vero = llm_client._reasoning_openai
+    monkeypatch.setattr(llm_client, "_reasoning_openai", lambda th, model="": (
+        dict(llm_client.REASONING_DISABLED) if (th or {}).get("type") == "disabled" else vero(th, model)))
     original = request(client, store, "reflection", "_reflection", old_cap, thinking={"type": "disabled"})
+    monkeypatch.setattr(llm_client, "_reasoning_openai", vero)
     for _ in range(2):
         replay = request(client, journal(tmp_path), "reflection", "_reflection", 8000,
                          thinking={"type": "effort", "effort": "low"})
@@ -136,12 +142,16 @@ def test_reflection_disabled_thinking_replays_after_effort_low_upgrade(tmp_path,
     assert store.summary()["request_count"] == 1
 
 
-def test_reflection_uncertain_disabled_request_is_not_repaid_with_effort_low(tmp_path):
+def test_reflection_uncertain_request_is_declared_and_the_new_attempt_proceeds(tmp_path, capsys):
+    """Regola PM 05/10/2026: l'esito incerto della prima chiamata si DICHIARA e non blocca;
+    il nuovo tentativo parte (qui cade di nuovo per il guasto finto) e l'incerta resta contata."""
     store, dispatches = journal(tmp_path), []
     client = client_with_receipts(dispatches, fault="disconnect")
     with pytest.raises(llm_client.APIConnectionError):
         request(client, store, "reflection", "_reflection", 1000, thinking={"type": "disabled"})
-    with pytest.raises(RequestBlocked):
+    with pytest.raises(llm_client.APIConnectionError):
         request(client, journal(tmp_path), "reflection", "_reflection", 8000,
                 thinking={"type": "effort", "effort": "low"})
-    assert len(dispatches) == 1
+    assert len(dispatches) == 2
+    assert "incerto DICHIARATO" in capsys.readouterr().out
+    assert journal(tmp_path).summary()["unknown_requests"] == 2

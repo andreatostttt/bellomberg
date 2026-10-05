@@ -2,6 +2,7 @@
 import pytest
 
 from bellomberg.api import trade_idea_routes as routes
+from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE
 from test_trade_idea_run_controls_api import admission, db_path, migrated
 
 
@@ -9,7 +10,7 @@ from test_trade_idea_run_controls_api import admission, db_path, migrated
 def test_resume_carries_exact_truncated_request_only_after_cost_consent(admission, monkeypatch, acknowledged):
     client, current, _, _, _, workers = admission
     calls = []
-    monkeypatch.setattr(current, "get_run", lambda _: {"recovery": {}})
+    monkeypatch.setattr(current, "get_run", lambda _: {"run": {"analysis_mode": RESEARCH_ANALYSIS_MODE}, "recovery": {}})
     monkeypatch.setattr(routes, "active_paid_reason", lambda *_a, **_k: None)
     def create(parent, **kwargs):
         calls.append((parent, kwargs))
@@ -49,7 +50,7 @@ def test_recovery_request_remains_authenticated(admission):
 def test_explicit_price_refresh_is_forwarded_only_when_true_and_can_combine_with_report(admission, monkeypatch, price_refresh, selected):
     client, current, _, _, _, workers = admission
     calls = []
-    monkeypatch.setattr(current, 'get_run', lambda _: {'recovery': {}})
+    monkeypatch.setattr(current, 'get_run', lambda _: {'run': {'analysis_mode': RESEARCH_ANALYSIS_MODE}, 'recovery': {}})
     monkeypatch.setattr(routes, 'active_paid_reason', lambda *_a, **_k: None)
     def create(parent, **kwargs):
         calls.append((parent, kwargs))
@@ -71,7 +72,7 @@ def test_explicit_price_refresh_is_forwarded_only_when_true_and_can_combine_with
 def test_price_refresh_requires_cost_consent_and_preserves_store_accounting_blocks(admission, monkeypatch):
     client, current, _, _, _, workers = admission
     calls = []
-    monkeypatch.setattr(current, 'get_run', lambda _: {'recovery': {}})
+    monkeypatch.setattr(current, 'get_run', lambda _: {'run': {'analysis_mode': RESEARCH_ANALYSIS_MODE}, 'recovery': {}})
     monkeypatch.setattr(routes, 'active_paid_reason', lambda *_a, **_k: None)
     def blocked(*args, **kwargs):
         calls.append((args, kwargs))
@@ -94,3 +95,40 @@ def test_price_refresh_consent_must_be_an_explicit_boolean(admission, bad):
         'idempotency_key': 'bad-price-consent', 'cost_acknowledged': True,
         'authorize_price_refresh': bad})
     assert response.status_code == 422 and workers == []
+
+
+def test_resume_absent_run_is_404_without_continuation_or_worker(admission, monkeypatch):
+    # Z3b 05/10 (classe C): solo l'assenza dichiarata dallo store e' «non trovata».
+    client, current, _, _, _, workers = admission
+    monkeypatch.setattr(routes, 'active_paid_reason', lambda *_a, **_k: None)
+    monkeypatch.setattr(current, 'create_continuation', lambda *_a, **_k: pytest.fail('absent run continued'))
+    response = client.post('/trade-ideas/runs/absent-parent/resume', json={
+        'idempotency_key': 'absent-parent', 'cost_acknowledged': True})
+    assert response.status_code == 404 and 'Run Trade Idea non trovata' in response.text
+    assert workers == []
+
+
+def test_resume_malformed_record_is_declared_not_reported_as_absent(admission, monkeypatch):
+    # Prima del 05/10 un record senza 'run' diventava KeyError -> 404 «non trovata»: un
+    # fallback silenzioso che nascondeva un guasto dello store dietro un'assenza.
+    client, current, _, _, _, workers = admission
+    monkeypatch.setattr(current, 'get_run', lambda _: {'recovery': {}})
+    monkeypatch.setattr(routes, 'active_paid_reason', lambda *_a, **_k: None)
+    monkeypatch.setattr(current, 'create_continuation', lambda *_a, **_k: pytest.fail('malformed run continued'))
+    response = client.post('/trade-ideas/runs/malformed-parent/resume', json={
+        'idempotency_key': 'malformed-parent', 'cost_acknowledged': True})
+    assert response.status_code == 500 and 'Record Trade Idea malformato' in response.text, response.text
+    assert 'non trovata' not in response.text and workers == []
+
+
+def test_resume_internal_missing_key_is_declared_not_reported_as_absent(admission, monkeypatch):
+    client, current, _, _, _, workers = admission
+    monkeypatch.setattr(current, 'get_run', lambda _: {'run': {'analysis_mode': RESEARCH_ANALYSIS_MODE}, 'recovery': {}})
+    monkeypatch.setattr(routes, 'active_paid_reason', lambda *_a, **_k: None)
+    def broken(*_a, **_k):
+        raise KeyError('cost reservation absent')
+    monkeypatch.setattr(current, 'create_continuation', broken)
+    response = client.post('/trade-ideas/runs/inconsistent-parent/resume', json={
+        'idempotency_key': 'inconsistent-parent', 'cost_acknowledged': True})
+    assert response.status_code == 500 and 'Record Trade Idea incoerente (KeyError)' in response.text, response.text
+    assert 'non trovata' not in response.text and 'cost reservation' not in response.text and workers == []

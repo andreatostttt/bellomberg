@@ -36,7 +36,8 @@ def test_ogni_slug_distinto_e_sondato_una_volta_con_pochi_token():
     cl = _Client(ko={})
     esiti = lc.sonda_modelli(["a/uno", "a/uno", "b/due"], client=cl)
     assert [c["model"] for c in cl.chiamate] == ["a/uno", "b/due"]
-    assert all(c["max_tokens"] <= 8 for c in cl.chiamate)
+    assert all(c["max_tokens"] == 2048 for c in cl.chiamate)   # ragionamento acceso: oltre il budget minimo 1024
+    assert all(c["thinking"] == {"type": "effort", "effort": "minimal"} for c in cl.chiamate)
     assert esiti == {"a/uno": {"ok": True, "motivo": None}, "b/due": {"ok": True, "motivo": None}} or \
         all(e["ok"] and e["motivo"] is None for e in esiti.values())
 
@@ -76,7 +77,7 @@ def test_sonda_has_real_receipts_and_is_reused_without_second_charge(tmp_path):
     client = lc.OpenRouterClient(api_key="offline", trasporto=httpx.MockTransport(send))
     journal = RequestJournal(tmp_path / "sonda.sqlite", run_id="probe-run",
         authorization={"source": "test"}, authorized_usd="1", metadata=lambda model: {
-            "id": model, "context_length": 1000, "pricing": {"prompt": "0.000001", "completion": "0.000002"}})
+            "id": model, "context_length": 100000, "pricing": {"prompt": "0.000001", "completion": "0.000002"}})
     for _ in range(2):
         with lc.request_scope(journal, phase="sonda"):
             receipts = lc.sonda_modelli(["test/one", "test/two", "test/one"], client=client)

@@ -136,23 +136,21 @@ def test_score_rejects_workbook_changed_after_valid_generation(tmp_path, monkeyp
     assert specialist_scores.fundamentals_score(portfolio) is None
 
 
-def test_external_planned_case_crosses_real_tool_storage_and_f17(tmp_path, monkeypatch):
+
+
+def test_external_planned_case_meets_the_archived_tool_contract(tmp_path, monkeypatch):
+    """Contratto ATTUALE (ZR 05/10, Z1). Il percorso tool get_valuation -> tesi SQLite -> F17 per un caso
+    esterno al book e' archiviato dal 1326312 (censimento Z4): corpo in
+    archive/private/attic/tests_excel_archiviato_20261005/test_sector_research_legacy.py. Qui: il caso pianificato riceve il
+    contratto dichiarato e il DB valutazioni resta senza tesi."""
     from bellomberg.storage import memory_db
     from bellomberg.agents import chat_tools
-    from test_sector_valuation_api import endpoint
+    from _contratto_excel_archiviato import blinda_ramo_archiviato, file_in, verifica_archiviato
     monkeypatch.setattr(memory_db.MemoryDB, "_init_chroma", lambda self: None)
     db = memory_db.MemoryDB(str(tmp_path / "chain.db"), str(tmp_path / "chroma"))
-    monkeypatch.setattr(memory_db, "MemoryDB", lambda: db)
     bundle = sector.prepare_sector_analysis("OUTSIDE.EU", as_of=DAY, providers=providers_for("insurance_pc"))
-    result = chat_tools.dispatch("get_valuation", {"ticker": "OUTSIDE.EU"}, prepared_bundle=bundle)["data"]
-    assert result["_thesis_saved"]["thesis_id"]
-    saved = db.get_valuation_history("OUTSIDE.EU")[0]
-    assert saved["fair_value"] is None
-    assert saved["snapshot_id"] == bundle["snapshot_id"]
-    assert saved["valuation_payload"]["valuation_decision"] == result["valuation_decision"]
-    model = endpoint(tmp_path, db.get_latest_valuation_snapshots())["models"][0]
-    assert model["ticker"] == "OUTSIDE.EU" and model["file"] == ""
-    assert model["snapshot_id"] == result["snapshot_id"]
-    assert model["generation_id"] == result["generation_id"]
-    assert model["valuation_usability"]["usable"] is False and model["fair_value"] is None
-    assert model["acquisition_tasks"] == result["acquisition_tasks"]
+    prima = file_in(tmp_path)
+    chiamate = blinda_ramo_archiviato(monkeypatch)
+    risposta = chat_tools.dispatch("get_valuation", {"ticker": "OUTSIDE.EU"}, prepared_bundle=bundle)
+    verifica_archiviato(risposta, chiamate, cartella=tmp_path, prima=prima)
+    assert db.get_valuation_history("OUTSIDE.EU") == []

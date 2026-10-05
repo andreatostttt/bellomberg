@@ -1,0 +1,20 @@
+{
+ "data": {
+  "type": "entity-legal-forms",
+  "id": "ZZSE",
+  "attributes": {
+   "code": "ZZSE",
+   "country": "Synthland",
+   "countryCode": "ZZ",
+   "status": "ACTV",
+   "names": [
+    {
+     "localName": "Société Européenne",
+     "language": "x",
+     "languageCode": "xx",
+     "transliteratedName": "Société Européenne"
+    }
+   ]
+  }
+ }
+}

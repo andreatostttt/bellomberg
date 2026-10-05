@@ -46,21 +46,31 @@ def test_orfano_vecchio_recuperato_recente_no(tmp_path):
 
 
 def test_run_due_limitato_ai_titoli_e_in_parallelo(tmp_path):
+    # Cantiere zero rossi 05/10 (TIMING): prima la sovrapposizione si sperava con sleep(0.2) (rosso
+    # sotto carico: il secondo thread partiva dopo la fine del primo). Ora una BARRIERA a 2: passa
+    # solo se i due titoli sono DAVVERO in volo insieme; serializzati, il primo resta fermo fino al
+    # timeout (rete larga 10 s, mai raggiunta quando il parallelo c'e') e i run cadono in errore.
     store = _store(tmp_path, ("NOVA.DE", "KORE.MI", "ACME.PA"))
-    attivi, massimo = [0], [0]
+    attivi, massimo, incontrati = [0], [0], []
     lock = threading.Lock()
+    barriera = threading.Barrier(2)
 
     def lenta(profilo, archivio):
         with lock:
             attivi[0] += 1
             massimo[0] = max(massimo[0], attivi[0])
-        time.sleep(0.2)
-        with lock:
-            attivi[0] -= 1
+        try:
+            barriera.wait(timeout=10)       # entrambi in volo nello stesso istante
+            incontrati.append(profilo["ticker"])
+        finally:
+            with lock:
+                attivi[0] -= 1
         return _ok(profilo, archivio)
 
     out = _service(store, tmp_path, lenta).run_due(tickers={"NOVA.DE", "KORE.MI"}, max_workers=4)
     assert sorted(o["ticker"] for o in out) == ["KORE.MI", "NOVA.DE"]
+    assert sorted(incontrati) == ["KORE.MI", "NOVA.DE"], out
+    assert all(o["status"] == "ok" for o in out), out
     assert massimo[0] == 2
     assert store.list_runs("ACME.PA", limit=1) == []
 

@@ -38,36 +38,27 @@ def _portfolio(*tickers):
     return {"n_positions": len(tickers), "positions": [{"ticker": t} for t in tickers]}
 
 
-@pytest.mark.parametrize("state", ["absent", "disabled", "invalid", "trigger", "ticker"])
-def test_missing_authorization_never_invokes_ai_and_delivers_reason(coverage_env, monkeypatch, tmp_path, state):
-    bb = coverage_env
-    policy = tmp_path / "policy.json"
-    configs = {"disabled": {"version": 1, "enabled": False}, "invalid": {"enabled": True},
-               "trigger": _policy(triggers=["portfolio"]), "ticker": _policy(tickers=["OTHER"])}
-    if state in configs:
-        policy.write_text(json.dumps(configs[state]), encoding="utf-8")
+@pytest.mark.parametrize("arguments", [{}, {"method_records": []}, {"growth_path": [0.0123]},
+                                       {"analysis_context": {"as_of": "2026-09-10"}}])
+def test_archived_get_valuation_never_invokes_ai_sources_or_reuses_a_saved_workbook(coverage_env, monkeypatch, arguments):
+    # ZR 05/10 (Z4): contratto attuale (1326312). Le garanzie storiche di copertura/riuso sono in
+    # archive/private/attic/tests_excel_archiviato_20261005/test_committee_valuation_coverage_legacy.py.
+    from bellomberg.valuation import dcf_engine
+    from bellomberg.storage import valuation_versions
     def forbidden(*a, **k):
-        pytest.fail("Unapproved AI preparation")
-    runtime = preparation_runtime.PreparationRuntime(policy, data_root=tmp_path,
-        archive_root=tmp_path / "sources", output_dir=tmp_path, proposer_factory=lambda *a, **k: forbidden)
-    monkeypatch.setattr(preparation_runtime, "installation_runtime", lambda: runtime)
-    binding = preparation_runtime.bind_installation_preparer("committee")
-    bb.valuation_preparer = binding["preparer"]
-    bb.data["_valuation_preparation"] = binding["state"]
-    bundle = _bundle()
-    monkeypatch.setattr(sector_analysis, "prepare_sector_analysis", lambda *a, **k: deepcopy(bundle))
-    cm._ensure_portfolio_valuations(bb, _portfolio("SYNTH-EXT", "SYNTH-EXT"))
-    from bellomberg.reporting.valuation_delivery import build_manifest
-    from bellomberg.reporting.email_sender import corpo_valutazioni
-    result = bb.valuation_results["SYNTH-EXT"]
-    reason = "ticker_not_authorized" if state == "ticker" else binding["state"]["reason"]
-    assert result["preparation"] == {"status": "disabled", "reason": reason}
-    assert result["valuation_usability"]["usable"] is False
-    assert reason in result["error"]
-    receipt = build_manifest(bb.valuation_results, roots=[tmp_path], attempts=bb.valuation_attempts)
-    assert receipt["attachments"] == [] and len(receipt["attempts"]) == 1
-    assert reason in corpo_valutazioni(bb.valuation_results, [], delivery=receipt)
-    assert not (tmp_path / "valuation_ai_budgets").exists()
+        pytest.fail("Archived get_valuation reached sources, AI, cache or workbook engine")
+    monkeypatch.setattr(sector_analysis, "prepare_sector_analysis", forbidden)
+    monkeypatch.setattr(dcf_engine, "generate_valuation", forbidden)
+    monkeypatch.setattr(memory_db.MemoryDB, "get_valuation_history", forbidden)
+    monkeypatch.setattr(valuation_versions.ValuationVersions, "current", forbidden)
+    monkeypatch.setattr(preparation_runtime, "installation_runtime", forbidden)
+    result = chat_tools.dispatch("get_valuation", {"ticker": "SYNTH-EXT", **arguments},
+        caller="committee-orchestrator", prepared_bundle=_bundle(), valuation_preparer=forbidden)
+    assert (result["ok"], result["status"], result["code"]) == (False, "archived", "excel_archived")
+    assert "Archivio Excel" in result["error"]
+    assert not {"valuation_usability", "reused", "path", "acquisition_snapshot", "_thesis_saved"} & set(result)
+    with coverage_env.memory_db._conn() as conn:
+        assert conn.execute("SELECT count(*) FROM valuation_theses").fetchone()[0] == 0
 
 
 def test_previous_success_failure_and_attempt_only_are_not_retried(coverage_env, monkeypatch):
@@ -81,39 +72,6 @@ def test_previous_success_failure_and_attempt_only_are_not_retried(coverage_env,
     assert bb.valuation_attempts == before
     assert bb.data["_valuation_coverage"]["already_requested"] == ["DONE", "FAILED", "ATTEMPTED"]
     assert bb.tool_log == []
-
-
-def test_dispatch_exception_is_recorded_and_does_not_skip_next_holding(coverage_env, monkeypatch):
-    bb = coverage_env
-    original = chat_tools.dispatch
-    bundle = _bundle()
-    def dispatch(name, arguments, **kwargs):
-        if arguments["ticker"] == "BROKEN":
-            raise RuntimeError("Synthetic acquisition failure")
-        return original(name, arguments, **kwargs)
-    monkeypatch.setattr(chat_tools, "dispatch", dispatch)
-    monkeypatch.setattr(sector_analysis, "prepare_sector_analysis", lambda *a, **k: deepcopy(bundle))
-    cm._ensure_portfolio_valuations(bb, _portfolio("BROKEN", "SYNTH-EXT"))
-    assert "Synthetic acquisition failure" in bb.valuation_results["BROKEN"]["error"]
-    assert bb.valuation_results["BROKEN"]["exclude_from_action_table"] is True
-    assert bb.valuation_results["SYNTH-EXT"]["acquisition_snapshot"]["snapshot_id"] == bundle["snapshot_id"]
-    assert len(bb.valuation_attempts) == len(bb.tool_log) == 2
-
-
-def test_existing_verified_workbook_is_reused_without_preparer(coverage_env, monkeypatch, tmp_path):
-    bb = coverage_env
-    bundle = bundle_for()
-    monkeypatch.setattr(sector_analysis, "prepare_sector_analysis", lambda *a, **k: deepcopy(bundle))
-    first = chat_tools.dispatch("get_valuation", {"ticker": "SYNTH-EXT"}, prepared_bundle=bundle)["data"]
-    assert first["valuation_usability"]["usable"], first.get("error")
-    from pathlib import Path
-    original_bytes = Path(first["path"]).read_bytes()
-    cm._ensure_portfolio_valuations(bb, _portfolio("SYNTH-EXT"))
-    result = bb.valuation_results["SYNTH-EXT"]
-    assert result["reused"] is True and result["generation_id"] == first["generation_id"]
-    assert Path(result["path"]).read_bytes() == original_bytes
-    from bellomberg.reporting.valuation_delivery import build_manifest
-    assert build_manifest(bb.valuation_results, roots=[tmp_path])["attachments"] == [result["path"]]
 
 
 @pytest.mark.parametrize("empty_options", [{}, {"analysis_context": {}}, {"method_records": None},

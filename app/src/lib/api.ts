@@ -359,6 +359,19 @@ export interface DecisionNote {
   timestamp: string;
 }
 
+// Registro eventi append-only di una decisione (GET /decisions/{id}/events, migrazione 13).
+export interface DecisionEvent {
+  id: number;
+  decision_id: number;
+  event_type: string;
+  from_status?: string | null;
+  to_status?: string | null;
+  actor?: string | null;
+  reason?: string | null;
+  details_json?: string | null;
+  created_at: string;
+}
+
 export interface Decision {
   id: number;
   trade_idea?: {
@@ -639,6 +652,11 @@ export interface Memo {
   notes?: string | null;
   // solo su GET /memos/{id}: la lista NON lo trasporta (bugfix 202-C)
   full_markdown?: string | null;
+  // Archivio (voce 8, 04/10): i memo Trade Idea entrano con etichetta; campi additivi
+  kind?: 'consigliere' | 'trade_idea' | string | null;
+  label?: string | null;
+  trade_idea_run_id?: string | null;
+  trade_idea_provenance_error?: string | null;
 }
 
 /** Un passo di memo trovato dalla ricerca semantica sui chunk embeddati.
@@ -1527,6 +1545,9 @@ export const Bellomberg = {
   // F10-C (PM 17/07): archivia / riporta in pagina (true/false; null = automatico)
   setDecisionArchive: (id: number, archived: boolean | null) =>
     api.post(`/decisions/${id}/archive`, { archived }).then(r => r.data),
+  // cronologia in sola lettura della pagina Decisioni (registro decision_events)
+  decisionEvents: (id: number) =>
+    api.get<{events: DecisionEvent[]}>(`/decisions/${id}/events`).then(r => r.data),
   // Verifica ISIN e divergenza manuale NON hanno piu' chiamate proprie qui:
   // viaggiano nel corpo di previewTrade/logTrade e il backend le scrive nella
   // transazione del trade confermato (tabelle append-only: mai prima della conferma).

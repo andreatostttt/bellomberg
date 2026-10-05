@@ -155,7 +155,18 @@ def test_specialist_crash_reuses_paid_response_and_completed_tool_then_second_re
             finish = "tool_calls"
         else:
             message, finish = {"content": "Verified report. " * 80}, "stop"
-        return httpx.Response(200, json={"id": "reply-" + str(len(dispatched)), "model": "test/model",
+        reply = "reply-" + str(len(dispatched))
+        if dispatched[-1].get("stream"):
+            # ZR 05/10: dal 02/10 il desk col client vero va in STREAMING (SSE); stessa
+            # risposta a pezzi, con la usage nel chunk finale come OpenRouter.
+            delta = ({"tool_calls": [dict(call, index=i) for i, call in enumerate(message["tool_calls"])]}
+                     if "tool_calls" in message else message)
+            chunks = [{"id": reply, "model": "test/model", "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+                      {"id": reply, "model": "test/model", "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]},
+                      {"id": reply, "model": "test/model", "choices": [], "usage": usage}]
+            body = "".join("data: " + json.dumps(c) + "\n\n" for c in chunks) + "data: [DONE]\n\n"
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body.encode("utf-8"))
+        return httpx.Response(200, json={"id": reply, "model": "test/model",
             "choices": [{"message": message, "finish_reason": finish}], "usage": usage})
     class Crash(BaseException):
         pass
@@ -165,7 +176,9 @@ def test_specialist_crash_reuses_paid_response_and_completed_tool_then_second_re
         bb = Blackboard()
         bb.request_journal = RequestJournal(tmp_path / "llm.sqlite", run_id="crash-test",
             authorization={"source": "offline_test"}, authorized_usd="1",
-            metadata=lambda model: {"id": model, "context_length": 40000,
+            # ZR 05/10: il cap del desk e' ora 128000 token (> 40000 di prima): la quota esige
+            # max_tokens < context_length: 200000 (riserva 0,456 USD entro l autorizzazione di 1 USD).
+            metadata=lambda model: {"id": model, "context_length": 200_000,
                 "pricing": {"prompt": "0.000001", "completion": "0.000002"}})
         for key, value in persisted.items():
             setattr(bb, key, json.loads(json.dumps(value)))

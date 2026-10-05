@@ -146,7 +146,10 @@ def test_native_complete_red_json_is_valid_and_uses_committee_context(model_boar
         "objection": "Explain terminal reinvestment.", "evidence_refs": ["primary"], "requested_change": "Explain the supplied RONIC evidence."}]}
     result, calls = native_red(model_board, monkeypatch, "end_turn", json.dumps(review))
     assert validate_committee_review(result) == review
-    assert len(calls) == 1 and calls[0]["max_tokens"] == 65536 and calls[0]["thinking"] == {"type": "effort", "effort": "max"}
+    # Tetto Red Trade Idea alzato 65536 -> 128000 dal commit 1326312 (65536 resta il tetto
+    # storico dei checkpoint: test_auxiliary_output_caps). Garanzia: UNA chiamata al tetto vigente.
+    assert red_team.TRADE_IDEA_RED_MAX_TOKENS == 128000
+    assert len(calls) == 1 and calls[0]["max_tokens"] == 128000 and calls[0]["thinking"] == {"type": "effort", "effort": "max"}
     context = json.loads(calls[0]["messages"][0]["content"].split("EXACT COMMON MODEL DRIVERS AND EVIDENCE:\n",1)[1])
     assert len(context["consultations"]) == 5
     assert context["input_basis"]["archived_growth_thesis_history"]["status"] == "archived_reference"

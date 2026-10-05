@@ -150,9 +150,10 @@ def test_billable_failure_after_send_is_not_retried_and_stays_unknown(call, tmp_
     summary = journal.summary()
     assert summary["released_requests"] == [] and summary["unknown_requests"] == 1
     assert costs_unresolved(summary) is True
-    with pytest.raises(RequestBlocked):
-        journal.prepare({"model": MODEL, "max_tokens": 20, "messages": [{"role": "user", "content": "next"}]},
-                        {"phase": "R1", "agent": "rates", "round_n": 1})
+    # Regola PM 05/10/2026: l'incerta resta contata e DICHIARATA, il lavoro successivo parte.
+    nuovo, _, _ = journal.prepare({"model": MODEL, "max_tokens": 20, "messages": [{"role": "user", "content": "next"}]},
+                                  {"phase": "R1", "agent": "rates", "round_n": 1})
+    assert nuovo and _rows(journal)[0] == ("unknown", None)   # l'incerta resta incerta, non cancellata
 
 
 @pytest.mark.parametrize("steps", [["connect", "connect"], ["admission", "connect"]])
@@ -357,7 +358,7 @@ def test_model_probe_never_retries_even_when_unbilled(tmp_path, monkeypatch):
     client = llm.OpenRouterClient(api_key="test-only", max_retries=0, trasporto=httpx.MockTransport(transport))
     journal = _journal(tmp_path)
     with llm.request_scope(journal, phase="model_probe"):
-        esiti = llm.sonda_modelli(["synthetic/zz-a", "synthetic/zz-b"], client=client)
+        esiti = llm.sonda_modelli(["synthetic/zz-a", "synthetic/zz-b"], client=client, max_tokens=20)
     assert len(dispatched) == 2 and waits == []
     assert [e["ok"] for e in esiti.values()] == [False, False]
     assert [r[0] for r in _rows(journal)] == ["released", "released"]

@@ -1,0 +1,44 @@
+{
+ "total_count": 3,
+ "results": [
+  {
+   "uin_idt_uin": "ZZ000030",
+   "informationdeposee_inf_dat_emt": "2026-03-20T17:45:00+00:00",
+   "informationdeposee_inf_tit_inf": "Document d'enregistrement universel 2025",
+   "informationdeposee_inf_lng_inf": "Français",
+   "sous_type_d_information": "Document de référence",
+   "subtype_of_information": "Registration document",
+   "url_de_recuperation": "https://fr.ftp.opendatasoft.com/datadila/INFOFI/ZZZ/8888/01/FCZZZ000030.zip",
+   "identificationsociete_iso_cd_isi": "FR00ZZSYNT08",
+   "identificationsociete_iso_cd_lei": "9999ZZSYNTETICA00080",
+   "identificationsociete_iso_nom_soc": "ACME SINTETICA SA",
+   "informationdeposee_inf_upg_inf_inf_upg_sts": null
+  },
+  {
+   "uin_idt_uin": "ZZ000031",
+   "informationdeposee_inf_dat_emt": "2026-03-20T17:45:00+00:00",
+   "informationdeposee_inf_tit_inf": "2025 Universal Registration Document",
+   "informationdeposee_inf_lng_inf": "Anglais",
+   "sous_type_d_information": "Document de référence",
+   "subtype_of_information": "Registration document",
+   "url_de_recuperation": "https://fr.ftp.opendatasoft.com/datadila/INFOFI/ZZZ/8888/01/FCZZZ000031.zip",
+   "identificationsociete_iso_cd_isi": "FR00ZZSYNT08",
+   "identificationsociete_iso_cd_lei": "9999ZZSYNTETICA00080",
+   "identificationsociete_iso_nom_soc": "ACME SINTETICA SA",
+   "informationdeposee_inf_upg_inf_inf_upg_sts": null
+  },
+  {
+   "uin_idt_uin": "ZZ000032",
+   "informationdeposee_inf_dat_emt": "2026-06-15T08:00:00+00:00",
+   "informationdeposee_inf_tit_inf": "Amendement au Document d'enregistrement universel 2025",
+   "informationdeposee_inf_lng_inf": "Français",
+   "sous_type_d_information": "Document de référence",
+   "subtype_of_information": "Registration document",
+   "url_de_recuperation": "https://fr.ftp.opendatasoft.com/datadila/INFOFI/ZZZ/8888/01/FCZZZ000032.pdf",
+   "identificationsociete_iso_cd_isi": "FR00ZZSYNT08",
+   "identificationsociete_iso_cd_lei": "9999ZZSYNTETICA00080",
+   "identificationsociete_iso_nom_soc": "ACME SINTETICA SA",
+   "informationdeposee_inf_upg_inf_inf_upg_sts": null
+  }
+ ]
+}

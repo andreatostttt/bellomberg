@@ -1,0 +1,18 @@
+{
+ "total_count": 1,
+ "results": [
+  {
+   "uin_idt_uin": "ZZ000100",
+   "informationdeposee_inf_dat_emt": "2026-04-23T15:45:00+00:00",
+   "informationdeposee_inf_tit_inf": "Information financière du premier trimestre 2026",
+   "informationdeposee_inf_lng_inf": "Français",
+   "sous_type_d_information": "Information financière trimestrielle",
+   "subtype_of_information": "Quarterly financial information",
+   "url_de_recuperation": "https://fr.ftp.opendatasoft.com/datadila/INFOFI/ZZZ/8888/01/FCZZZ000100.pdf",
+   "identificationsociete_iso_cd_isi": "FR00ZZSYNT08",
+   "identificationsociete_iso_cd_lei": "9999ZZSYNTETICA00080",
+   "identificationsociete_iso_nom_soc": "ACME SINTETICA SA",
+   "informationdeposee_inf_upg_inf_inf_upg_sts": null
+  }
+ ]
+}

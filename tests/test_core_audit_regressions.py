@@ -314,23 +314,32 @@ def test_politics_reads_the_actual_polymarket_tool_contract(monkeypatch):
 
 
 @pytest.mark.parametrize("assumption", ["terminal_growth", "wacc_delta_bp"])
-def test_valuation_explicit_zero_is_a_new_assumption(monkeypatch, assumption):
+def test_valuation_explicit_zero_meets_the_archived_contract(monkeypatch, assumption):
+    """Contratto ATTUALE (ZR 05/10): get_valuation e' archiviato dal 03/10 (commit 1326312).
+
+    Il test storico ("uno 0 esplicito e' un'assunzione nuova, niente riuso cache") provava
+    un ramo che dal 03/10 nessun percorso vivo raggiunge (censimento Z4): il suo corpo e' in
+    quarantena in archive/private/attic/tests_excel_archiviato_20261005/test_core_audit_regressions_legacy.py.
+    Qui si prova che la stessa chiamata, con lo 0 esplicito, non ARRIVA a niente di
+    quel ramo: risposta excel_archived dichiarata, zero generazioni, zero acquisizioni
+    dai provider, zero letture/scritture del DB valutazioni, nessun riuso spacciato per dato.
+    """
     import bellomberg.agents.chat_tools as ct
-    from bellomberg.valuation import dcf_engine
-    from bellomberg.valuation.sector_analysis import prepare_sector_analysis
-    from datetime import datetime
+    from bellomberg.valuation import dcf_engine, sector_analysis
     calls = []
-    monkeypatch.setitem(sys.modules, 'bellomberg.storage.memory_db', NS(MemoryDB=lambda: NS(
-        get_valuation_history=lambda *a, **k: [dict(date=datetime.now().isoformat(),
-            fair_value=100, sanity_severity="OK")])) )
-    bundle = prepare_sector_analysis("SYNTH", as_of=datetime.now().date().isoformat(), providers={
-        "profile": lambda ticker, *, as_of: {"status": "ok", "source_id": "synthetic-profile", "as_of": as_of,
-            "data": {"info": {"quoteType": "EQUITY", "industry": "Software - Application"}, "vehicle_registry": None}}})
-    monkeypatch.setattr(dcf_engine, "generate_valuation", lambda *a, **kw: calls.append(kw) or {})
-    result = ct.dispatch("get_valuation", {"ticker": "SYNTH", assumption: 0}, prepared_bundle=bundle)
-    assert len(calls) == 1
-    assert calls[0]["prepared_bundle"]["case"]["assumptions"][assumption] == 0
-    assert result.get("data", {}).get("reused") is not True
+    monkeypatch.setitem(sys.modules, 'bellomberg.storage.memory_db', NS(
+        MemoryDB=lambda *a, **k: calls.append("MemoryDB") or NS()))
+    monkeypatch.setattr(dcf_engine, "generate_valuation", lambda *a, **kw: calls.append("generate") or {})
+    monkeypatch.setattr(sector_analysis, "prepare_sector_analysis",
+                        lambda *a, **kw: calls.append("prepare") or {})
+    monkeypatch.setattr(sector_analysis, "default_sector_providers",
+                        lambda *a, **kw: calls.append("providers") or {})
+    result = ct.dispatch("get_valuation", {"ticker": "SYNTH", assumption: 0})
+    assert calls == []
+    assert result["ok"] is False
+    assert result["status"] == "archived" and result["code"] == "excel_archived"
+    assert result.get("error")  # il buco e' dichiarato con un testo, non una risposta muta
+    assert "fair_value" not in str(result) and result.get("data", {}).get("reused") is not True
 
 
 @pytest.mark.parametrize("invalid", [float("nan"), float("inf"), None, True, "2"])

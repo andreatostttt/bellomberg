@@ -19,13 +19,39 @@ def client(research,monkeypatch):
     monkeypatch.setattr(api,"_SESSIONS",{"research-session":time.time()+3600})
     app=FastAPI()
     install_trade_idea_workspace_routes(app,api.require_session,workspace=workspace)
+    app.state.research_workspace=workspace
     with TestClient(app,headers={"X-BB-Token":"research-session"}) as client:
         yield client,workspace,current,run,model
 
 
+class _Reply:
+    """Risposta pubblica dell'azione, come la serializzava la vecchia POST /actions."""
+    def __init__(self,status_code,payload):
+        import json
+        self.status_code,self._payload=status_code,payload
+        self.text=json.dumps(payload,ensure_ascii=False)
+    def json(self):
+        return self._payload
+
+
 def post(client,run,model,kind,data,key=None):
-    return client.post(f"/trade-ideas/runs/{run}/workspace/actions",json={
-        "kind":kind,"data":data,"generation_id":model["generation_id"],"request_id":key or str(uuid4())})
+    # Contratto attuale (Excel archiviato, commit 1326312): le azioni via HTTP sono
+    # rifiutate con 409 excel_archived PRIMA di toccare il servizio; consultazione e
+    # download dei risultati salvati restano. L'azione si esegue quindi sul servizio
+    # vero (gia' provato in test_trade_idea_workspace.py) e qui si prova lo strato HTTP.
+    from bellomberg.api.trade_idea_workspace_routes import _public_event
+    workspace=client.app.state.research_workspace
+    key=key or str(uuid4())
+    before=len(workspace.events.list(run))
+    refused=client.post(f"/trade-ideas/runs/{run}/workspace/actions",json={
+        "kind":kind,"data":data,"generation_id":model["generation_id"],"request_id":key})
+    assert refused.status_code==409 and refused.json()["detail"]["code"]=="excel_archived", refused.text
+    assert len(workspace.events.list(run))==before
+    try:
+        event=workspace.act(run,kind,data,request_id=key,generation_id=model["generation_id"])
+    except (ValueError,TypeError) as exc:
+        return _Reply(422,{"detail":str(exc)})
+    return _Reply(200,_public_event(event))
 
 
 def test_auth_required_real_persisted_question_and_shape_rejected(client):
@@ -38,7 +64,9 @@ def test_auth_required_real_persisted_question_and_shape_rejected(client):
     saved=api.get(url).json()
     assert saved["history"][0]["id"]==first.json()["id"]
     assert "acquisition_snapshot" not in first.text and "C:\\" not in first.text
-    assert api.post(url+"/actions",json={"kind":"question","data":{},"generation_id":model["generation_id"]}).status_code==422
+    shapeless=api.post(url+"/actions",json={"kind":"question","data":{},"generation_id":model["generation_id"]})
+    assert shapeless.status_code==409 and len(workspace.events.list(run))==1
+    assert post(api,run,model,"question",{}).status_code==422
     assert post(api,run,dict(model,generation_id="missing"),"question",{"question":"value"}).status_code==422
 
 
@@ -74,9 +102,13 @@ def test_saved_operation_recovery_is_authenticated_visible_and_never_recomputed(
     monkeypatch.setattr(workspace,'_question',lambda *a:pytest.fail('Recovery must not compute'))
     recover=url+'/actions/'+key+'/recover'
     assert api.post(recover,headers={'X-BB-Token':'expired'}).status_code==401
-    response=api.post(recover)
-    assert response.status_code==200 and response.json()['data']['status']=='answered'
-    assert api.post(recover).json()==response.json()
+    refused=api.post(recover)
+    assert refused.status_code==409 and refused.json()['detail']['code']=='excel_archived'
+    assert api.get(url).json()['pending_actions'][0]['request_id']==key
+    from bellomberg.api.trade_idea_workspace_routes import _public_event
+    response=_public_event(workspace.recover(run,key))
+    assert response['data']['status']=='answered'
+    assert _public_event(workspace.recover(run,key))==response
     assert not api.get(url).json()['pending_actions']
     assert len(workspace.events.list(run))==1 and current.get_run(run)['cost']['requests']==0
 
@@ -97,71 +129,18 @@ def test_objection_monitor_comparison_cost_and_missing_export_errors(client):
     assert post(api,run,model,"export",{"scope":"shareable","exclusions_acknowledged":False}).status_code==422
 
 
-def test_source_acquisition_sealed_then_real_document_refresh_and_tamper_rejection(client,tmp_path):
-    from copy import deepcopy
-    from datetime import datetime,timezone
-    from test_trade_idea_source_refresh import model_and_source,DAY
-    from test_trade_idea_store import request,result
-    from bellomberg.storage.memory_db import MemoryDB
-    api,workspace,current,_,_=client
-    model,document,_,_=model_and_source(tmp_path/"source-model")
-    database=MemoryDB.__new__(MemoryDB); database.db_path=current.db_path
-    thesis=database.save_valuation_thesis(model["ticker"],valuation_payload=model,reuse_generation=True)
-    assert thesis
-    model["_thesis_saved"]={"thesis_id":thesis}
-    asked=request(model["ticker"]); asked.update(currency="EUR")
-    run=current.create_run(asked,idempotency_key=str(uuid4()))["run"]["id"]
-    worker=current.claim_run(run)
-    report=result(model["ticker"],proposal=False)
-    report["valuation_refs"]=[{"generation_id":model["generation_id"],"snapshot_id":model["snapshot_id"],
-        "valuation_date":model["valuation_date"],"interpretation":"Declared source refresh fixture"}]
-    current.update_progress(run,worker,"done",{"valuation_results":{model["ticker"]:model}})
-    current.finish_run(run,worker,report,"incomplete",reason="Synthetic source refresh API")
-    workspace.clock=lambda:datetime.fromisoformat(DAY).replace(tzinfo=timezone.utc)
-    original=Path(model["path"]).read_bytes()
-    committee_result=deepcopy(current.get_run(run)["result"])
-    # A large verified source correction can move FV far from price. The model
-    # remains usable, while the old committee conclusion still requires review.
-    import json
-    large=deepcopy(document)
-    body=json.loads(large["text"]); body["observations"][0]["value"]=120.
-    large["text"]=json.dumps(body,sort_keys=True); large["sha256"]=sha256(large["text"].encode()).hexdigest()
-    workspace.source_fetcher=lambda *_:{"documents":[deepcopy(large)]}
-    first=post(api,run,model,"acquire_sources",{})
-    assert first.status_code==200,first.text
-    refreshed=post(api,run,model,"refresh",{"kind":"documents","source_event_id":first.json()["id"]})
-    assert refreshed.status_code==200 and refreshed.json()["data"]["status"]=="ready",refreshed.text
-    refreshed_model=refreshed.json()["data"]["model"]
-    assert refreshed_model["valuation_usability"]["usable"] is True
-    assert refreshed_model["generation_id"]!=model["generation_id"]
-    assert refreshed_model["snapshot_id"]!=model["snapshot_id"]
-    assert refreshed_model["fair_value_base"]!=model["fair_value_base"]
-    saved=workspace.events.get(run,refreshed.json()["id"])["data"]["model"]
-    records=[row for row in saved["acquisition_snapshot"]["case"]["records"]
-             if row["driver"]=="opening_nwc" and row["scenario"]=="model"]
-    assert len(records)==1 and records[0]["value"]==120.
-    assert records[0]["source_locator"]==large["id"]
-    assert refreshed.json()["data"]["invalidates_conclusion"]
-    assert current.get_run(run)["run"]["phase"]=="review_required"
-    assert current.get_run(run)["result"]==committee_result
-    assert api.get(f"/trade-ideas/runs/{run}/workspace").json()["conclusions_status"]=="review_required"
-    assert Path(model["path"]).read_bytes()==original
-    workspace.source_fetcher=lambda *_:{"documents":[deepcopy(document)]}
-    rejected=post(api,run,model,"acquire_sources",{"documents":[document]})
-    assert rejected.status_code==422
-    acquired=post(api,run,model,"acquire_sources",{})
-    assert acquired.status_code==200,acquired.text
-    assert "source_catalog_path" not in acquired.text and "C:\\" not in acquired.text
-    updated=post(api,run,model,"refresh",{"kind":"documents","source_event_id":acquired.json()["id"]})
-    assert updated.status_code==200,updated.text
-    assert updated.json()["data"]["status"]=="ready",updated.text
-    variant=updated.json()["data"]["model"]
-    assert variant["generation_id"]!=model["generation_id"] and variant["fair_value_base"]!=model["fair_value_base"]
-    assert current.get_run(run)["run"]["phase"]=="review_required"
-    assert Path(model["path"]).read_bytes()==original
-    assert api.get(updated.json()["artifact"]["download_url"]).status_code==200
-    source_event=workspace.events.get(run,acquired.json()["id"])
-    Path(source_event["data"]["source_catalog_path"]).write_text("tampered",encoding="utf-8")
-    invalid=post(api,run,model,"refresh",{"kind":"documents","source_event_id":acquired.json()["id"]})
-    assert invalid.status_code==422 and "changed" in invalid.text
+def test_source_acquisition_and_document_refresh_are_archived_before_the_service(client):
+    # Contratto attuale (Excel archiviato, commit 1326312): acquisizione fonti e refresh del
+    # modello del workspace erano raggiungibili SOLO da POST /actions, ora 409 excel_archived
+    # prima del servizio. Il test storico end-to-end e' in quarantena:
+    # archive/private/attic/tests_excel_archiviato_20261005/test_trade_idea_workspace_api_legacy.py
+    api,workspace,current,run,model=client
+    before=len(workspace.events.list(run))
+    calls=[]
+    workspace.source_fetcher=lambda *_:calls.append("fetch") or pytest.fail("archived acquisition reached the fetcher")
+    for kind,data in (("acquire_sources",{}),("refresh",{"kind":"documents","source_event_id":1})):
+        reply=api.post(f"/trade-ideas/runs/{run}/workspace/actions",json={"kind":kind,"data":data,
+            "generation_id":model["generation_id"],"request_id":str(uuid4())})
+        assert reply.status_code==409 and reply.json()["detail"]["code"]=="excel_archived", reply.text
+    assert calls==[] and len(workspace.events.list(run))==before
     assert current.get_run(run)["cost"]["requests"]==0

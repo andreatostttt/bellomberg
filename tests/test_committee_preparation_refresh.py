@@ -10,7 +10,9 @@ from test_valuation_automation import automation, TICKER
 from test_sector_analysis import DAY, providers_for
 
 
-@pytest.mark.parametrize('route', ['queue', 'committee'])
+# Rotta 'committee' (dispatch get_valuation col preparatore): archiviata dal 1326312, corpo in
+# archive/private/attic/tests_excel_archiviato_20261005/test_committee_preparation_refresh_legacy.py; contratto qui sotto.
+@pytest.mark.parametrize('route', ['queue'])
 def test_next_generation_reviews_published_basis_on_both_routes(automation, monkeypatch, route):
     from bellomberg.agents import chat_tools
     from bellomberg.storage import memory_db, valuation_versions
@@ -36,22 +38,10 @@ def test_next_generation_reviews_published_basis_on_both_routes(automation, monk
     def collect(*args, **kwargs):
         return {'status': 'ready', 'documents': _documents(), 'issues': []}
     manager.collect = collect
-    if route == 'queue':
-        manager.enqueue_refresh(TICKER, 'filing_diff', 'next-information-cutoff')
-        result = manager.run_one(owner='refresh')
-        assert result['status'] == 'succeeded', result
-        updated = manager.versions.current(TICKER)['current']
-    else:
-        monkeypatch.setattr(memory_db, 'MemoryDB', lambda: manager.versions.db)
-        monkeypatch.setattr(valuation_versions, 'ValuationVersions', lambda *a, **k: manager.versions)
-        monkeypatch.setattr(chat_tools, 'REPORT_DIR', manager.runtime.output_dir)
-        monkeypatch.setattr(preparation_sources, 'collect_preparation_evidence', collect)
-        updated = chat_tools.dispatch('get_valuation', {'ticker': TICKER},
-            prepared_bundle=acquire(TICKER, as_of=tomorrow.date().isoformat()),
-            valuation_preparer=manager.runtime.preparer_for('committee'))['data']
-        assert updated['valuation_usability']['usable'], updated.get('error')
-        assert updated['model_publication']['status'] == 'published'
-
+    manager.enqueue_refresh(TICKER, 'filing_diff', 'next-information-cutoff')
+    result = manager.run_one(owner='refresh')
+    assert result['status'] == 'succeeded', result
+    updated = manager.versions.current(TICKER)['current']
     requests = [json.loads(item['messages'][0]['content'])['contract']
                 for item in observed['paid'][first_count:]]
     assert len(requests) == 4
@@ -66,3 +56,20 @@ def test_next_generation_reviews_published_basis_on_both_routes(automation, monk
     with manager.versions.db._conn() as conn:
         assert conn.execute('SELECT count(*) FROM valuation_theses').fetchone()[0] == 2
         assert conn.execute('SELECT count(*) FROM valuation_publications').fetchone()[0] == 2
+
+
+def test_committee_route_meets_the_archived_contract(tmp_path, monkeypatch):
+    """Contratto ATTUALE (ZR 05/10, Z1) della rotta 'committee' archiviata dal 1326312: con un bundle
+    acquisito e un preparatore autorizzato, dispatch('get_valuation') risponde excel_archived e il
+    preparatore (che spenderebbe richieste a pagamento) non viene mai invocato."""
+    from bellomberg.agents import chat_tools
+    from bellomberg.valuation import sector_analysis
+    from _contratto_excel_archiviato import blinda_ramo_archiviato, file_in, spia_chiamante, verifica_archiviato
+    monkeypatch.setattr(chat_tools, 'REPORT_DIR', tmp_path)
+    bundle = sector_analysis.prepare_sector_analysis(TICKER, as_of=DAY, providers=providers_for('software'))
+    usati = []
+    prima = file_in(tmp_path)
+    chiamate = blinda_ramo_archiviato(monkeypatch)
+    risposta = chat_tools.dispatch('get_valuation', {'ticker': TICKER}, prepared_bundle=bundle,
+                                   valuation_preparer=spia_chiamante(usati, 'preparatore committee'))
+    verifica_archiviato(risposta, chiamate + usati, cartella=tmp_path, prima=prima)

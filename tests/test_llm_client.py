@@ -112,17 +112,21 @@ def test_wrong_response_identity_keeps_unknown_reservation(tmp_path):
     assert journal.summary()["reserved_usd"] > 0
 
 
-def test_crash_after_reserve_blocks_reopen_before_any_dispatch(tmp_path):
+def test_crash_after_reserve_is_declared_and_the_run_proceeds(tmp_path, capsys):
+    """Regola PM 05/10/2026: un esito/costo incerto si DICHIARA e non ferma la run. La riga
+    rimasta 'reserved' dopo un crash resta incerta (conteggiata), il lavoro nuovo parte."""
     journal = _journal(tmp_path)
     body = {"model": "test/model", "max_tokens": 20, "messages": [{"role": "user", "content": "frozen"}]}
     request_id, _, _ = journal.prepare(body, {"phase": "R1"})
-    with pytest.raises(RuntimeError, match="unresolved") as exc:
-        _journal(tmp_path).prepare({**body, "messages": [{"role": "user", "content": "different"}]}, {"phase": "R2"})
-    assert exc.value.request_id == request_id
-    assert journal.summary()["unknown_requests"] == 1
+    reopened = _journal(tmp_path)
+    nuovo, _, _ = reopened.prepare({**body, "messages": [{"role": "user", "content": "different"}]}, {"phase": "R2"})
+    assert nuovo != request_id
+    out = capsys.readouterr().out
+    assert "incerto DICHIARATO" in out and request_id in out
+    assert reopened.summary()["unknown_requests"] >= 1
 
 
-def test_known_overrun_is_recorded_as_measured_cost_but_still_blocks_spending(tmp_path):
+def test_known_overrun_is_recorded_as_measured_cost_and_declared(tmp_path):
     journal = _journal(tmp_path)
     body = {"model": "test/model", "max_tokens": 20, "messages": [{"role": "user", "content": "frozen"}]}
     request_id, _, _ = journal.prepare(body, {"phase": "R1"})
@@ -132,8 +136,9 @@ def test_known_overrun_is_recorded_as_measured_cost_but_still_blocks_spending(tm
     assert summary["cost_usd"] == 0.2 and summary["known_cost_usd"] == 0.2
     assert summary["unknown_requests"] == 0 and summary["overrun_requests"] == 1
     assert summary["requests"][0]["state"] == "overrun"
-    with pytest.raises(RuntimeError, match="unresolved"):
-        journal.prepare({**body, "messages": [{"role": "user", "content": "next"}]}, {"phase": "R2"})
+    # Regola PM 05/10/2026: il costo oltre la prenotazione e' MISURATO e dichiarato, non ferma la run.
+    nuovo, _, _ = journal.prepare({**body, "messages": [{"role": "user", "content": "next"}]}, {"phase": "R2"})
+    assert nuovo != request_id and journal.summary()["overrun_requests"] == 1
 
 
 @pytest.mark.parametrize("malformed", ["nan_cost", "choices_item", "choices_mapping"])
@@ -427,7 +432,7 @@ def test_richiesta_thinking_diventa_reasoning(monkeypatch):
     c.messages.create(thinking={"type": "adaptive"}, **base)
     assert t.richieste[0]["reasoning"] == llm_client.REASONING_ADAPTIVE == {"effort": "medium"}
     c.messages.create(thinking={"type": "disabled"}, **base)
-    assert t.richieste[1]["reasoning"] == llm_client.REASONING_DISABLED == {"enabled": False}
+    assert t.richieste[1]["reasoning"] == llm_client.REASONING_ADAPTIVE   # regola PM 05/10: mai spento
     c.messages.create(thinking={"type": "enabled", "budget_tokens": 2048}, **base)
     assert t.richieste[2]["reasoning"] == {"max_tokens": 2048}
     c.messages.create(**base)
@@ -494,6 +499,7 @@ def test_effort_consigliere_per_desk_e_round(model, agente, round_n, expected):
     ) == expected
 
 
+@pytest.mark.skip(reason="regola PM 05/10/2026: il ragionamento non si spegne mai; il recupero dal 400 su {enabled:false} non e' piu' raggiungibile")
 def test_ragionamento_obbligatorio_ritenta_con_minimal_e_lo_dichiara(monkeypatch):
     """Misurato 05/09: GLM e Gemini rispondono 400 «Reasoning is mandatory for this endpoint
     and cannot be disabled» a {"enabled": false}; con `effort: minimal` ragionano 0 token.
@@ -531,6 +537,7 @@ def test_altri_400_non_vengono_ritentati_con_minimal(monkeypatch):
     assert not llm_client.RAGIONAMENTO_OBBLIGATORIO
 
 
+@pytest.mark.skip(reason="regola PM 05/10/2026: il ragionamento non si spegne mai; il recupero dal 400 su {enabled:false} non e' piu' raggiungibile")
 def test_ragionamento_obbligatorio_anche_in_streaming(monkeypatch):
     llm_client.RAGIONAMENTO_OBBLIGATORIO.clear()
     rifiuto = httpx.Response(400, json={"error": {"code": 400, "message":
@@ -881,7 +888,7 @@ def test_stream_async_eventi_e_final_message(monkeypatch):
         return eventi, fin
 
     eventi, fin = asyncio.run(corsa())
-    assert t.richieste[0]["reasoning"] == {"enabled": False}
+    assert "reasoning" not in t.richieste[0]   # z-ai/: acceso nativo (regola PM 05/10: mai spento)
     assert [e.type for e in eventi] == ["content_block_start", "content_block_delta",
                                         "content_block_delta", "content_block_stop"]
     assert fin.stop_reason == "end_turn"

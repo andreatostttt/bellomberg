@@ -120,6 +120,11 @@ def run_offline(monkeypatch, tmp_path):
     monkeypatch.setattr(cm, "REPORT_DIR", tmp_path / "report")
     monkeypatch.setattr("bellomberg.core.paths.DATA_DIR", tmp_path / "runtime-data")
     monkeypatch.setattr("bellomberg.core.paths.REPORT_DIR", tmp_path / "report")
+    # charts_institutional.DIR nasce da core.paths.REPORT_DIR all'IMPORT: se il modulo era gia'
+    # importato (suite intera) puntava alla cartella report dell'albero e i test che rimontano
+    # il renderer PDF vero ci disegnavano i grafici (tripwire spia scritture, ZR 05/10).
+    import bellomberg.reporting.charts_institutional as _charts_inst
+    monkeypatch.setattr(_charts_inst, "DIR", str(tmp_path / "report" / "inst_charts"))
     monkeypatch.setenv("CONSIGLIERE_PARALLEL", "1")
     # --- tool locali e sonde esterne
     monkeypatch.setattr(cm, "tool_get_macro_dashboard", lambda: {"indicators": {}})
@@ -338,10 +343,34 @@ def test_run_policy_binds_common_preparer_and_emails_new_workbook(run_offline, m
                 seen_by_r2.append(desk._build_round_context(2))
                 if not desk_requests:
                     # A bare follow-up must reuse the same run, not pay/acquire again.
+                    # ZR 05/10: la copertura del comitato (ramo legacy) riceve oggi il contratto
+                    # ARCHIVIATO (get_valuation -> excel_archived): il seguito riusa quell'esito,
+                    # senza una seconda chiamata (corpo storico in archive/private/attic/tests_excel_archiviato_20261005/).
                     follow_up = desk._execute_meta_tool("get_valuation", {"ticker": "SYNTH-EXT"})
-                    assert follow_up["data"]["generation_id"] == self.bb.valuation_results["SYNTH-EXT"]["generation_id"]
+                    assert follow_up["data"]["code"] == "excel_archived"
+                    assert follow_up["data"]["reused_in_run"] is True
+                    assert follow_up["data"] == {**self.bb.valuation_results["SYNTH-EXT"], "reused_in_run": True}
             self.bb.write(self.name, round_n, "Synthetic prepared desk report " + "x" * 200)
     monkeypatch.setattr(cm, "SPECIALIST_ORDER", [PreparedDesk, _DeskQuant])
+    if not desk_requests:
+        # ZR 05/10 (contratto archiviato, commit 1326312): la copertura del comitato chiede
+        # get_valuation UNA volta, riceve excel_archived, non paga alcuna preparazione, e la
+        # consegna si ferma dichiarando il workbook non consegnabile: nessuna email.
+        from bellomberg.agents import chat_tools
+        from bellomberg.storage.weekly_run_store import WeeklyRunBlocked
+        native_dispatch, valuation_calls = chat_tools.dispatch, []
+        def counting_dispatch(name, *args, **kwargs):
+            if name == "get_valuation":
+                valuation_calls.append(kwargs.get("caller"))
+            return native_dispatch(name, *args, **kwargs)
+        monkeypatch.setattr(chat_tools, "dispatch", counting_dispatch)
+        with pytest.raises(WeeklyRunBlocked, match="Workbook richiesto non consegnabile: SYNTH-EXT: Generazione Excel archiviata"):
+            cm.run_multi_agent()
+        assert valuation_calls == ["committee-orchestrator"]
+        assert stages == [] and run_offline.inviati == []
+        assert run_offline.catturato["bb"].valuation_results["SYNTH-EXT"]["code"] == "excel_archived"
+        assert not list((tmp_path / "report").rglob("*.xlsx"))
+        return
     cm.run_multi_agent()
     bb = run_offline.catturato["bb"]
     assert bb.data["_valuation_preparation"]["status"] == "enabled"
@@ -401,9 +430,27 @@ def test_run_sintetica_contesto_filing_tre_fonti_e_un_titolo_lento(run_offline, 
         return {"url": "https://www.sec.gov/Archives/x.htm", "sha256": "b" * 64, "sezione": s,
                 "inizio": 0, "fine": len(t), "pagine_fisiche": [], "testo": t}
 
+    # Cantiere zero rossi 05/10 (TIMING): prima LENTO dormiva 3 s e gli altri tre dovevano finire
+    # entro 1 s REALE dall'avvio della run (rosso possibile sotto carico). Ora LENTO si ferma su un
+    # evento liberato alla fine (in corso per costruzione) e wait() del pre-run e' sostituita:
+    # registra il timeout che il codice calcola (scadenza assoluta, <= FILING_ATTESA_MAX_S), lascia
+    # finire gli altri tre (rete larga 30 s) e guarda i futuri senza attendere oltre.
+    from concurrent.futures import wait as wait_vera
+    from bellomberg.market_data import filing_prerun
+    lento_libero = threading.Event()
+    attese = []
+
+    def wait_registrata(fs, timeout=None):
+        attese.append(timeout)
+        fine = time.monotonic() + 30
+        while sum(not f.done() for f in fs) > 1 and time.monotonic() < fine:
+            time.sleep(0.01)
+        return wait_vera(fs, timeout=0)
+    monkeypatch.setattr(filing_prerun, "wait", wait_registrata)
+
     def pipeline(profilo, archivio):
         if profilo["ticker"] == "LENTO.MI":
-            time.sleep(3)
+            lento_libero.wait(30)
         meta = lambda d: {"metadati": {"periodo_fine": d}}
         return {"stato": "ok", "motivi": [], "variante": profilo.get("tipo"),
                 "coppia": {"prima": meta("2025-06-30"), "dopo": meta("2026-06-30")},
@@ -420,9 +467,10 @@ def test_run_sintetica_contesto_filing_tre_fonti_e_un_titolo_lento(run_offline, 
     # matrice di correlazione (fonti esterne): passi estranei al filing, stubbati qui.
     monkeypatch.setattr(cm, "_ensure_portfolio_valuations", lambda *a, **k: None)
     monkeypatch.setattr(cm, "_try_correlation_matrix", lambda *a, **k: None)
-    cm.run_multi_agent()
-    ctx = run_offline.catturato["bb"].data["_filing_context"]
     try:
+        cm.run_multi_agent()
+        ctx = run_offline.catturato["bb"].data["_filing_context"]
+        assert len(attese) == 1 and 0 <= attese[0] <= 1.0, attese   # scadenza assoluta dall'avvio
         for t in ("NOVA.DE", "KORE.MI", "ACME.PA"):
             riga = next(l for l in ctx.splitlines() if l.startswith(t + " · "))
             assert "aggiornato" in riga and "NON AGGIORNATO" not in riga
@@ -433,6 +481,7 @@ def test_run_sintetica_contesto_filing_tre_fonti_e_un_titolo_lento(run_offline, 
         assert "NON AGGIORNATO: aggiornamento oltre 1 s (in corso)" in lento
         assert ctx.splitlines()[-1].startswith("TRONCAMENTI:")
     finally:
+        lento_libero.set()
         # I thread del pool non sono daemon: si attende LENTO.MI per non lasciarlo al test successivo.
         for th in threading.enumerate():
             if th.name.startswith("filing-prerun"):

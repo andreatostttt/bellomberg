@@ -125,7 +125,12 @@ def test_nessun_file_usa_un_nome_mai_definito():
     for percorso in sorted(_file_python()):
         misurati += 1
         try:
-            with open(percorso, encoding="utf-8") as fh:
+            # utf-8-sig, non utf-8: si legge il file COME LO LEGGE l'interprete. Python
+            # accetta il BOM UTF-8 in testa a un sorgente (PEP 263) e lo scarta; con
+            # "utf-8" il BOM restava nel testo come U+FEFF e ast.parse diceva "NON
+            # COMPILA" di un file che compila e gira (tests/test_preparation_growth_
+            # thesis.py, 05/10). Un file che non compila DAVVERO resta rosso qui sotto.
+            with open(percorso, encoding="utf-8-sig") as fh:
                 sorgente = fh.read()
         except (OSError, UnicodeDecodeError) as e:
             illeggibili.append("%s (%s)" % (os.path.relpath(percorso, RADICE), e))

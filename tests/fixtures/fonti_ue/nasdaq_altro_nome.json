@@ -1,0 +1,96 @@
+{
+  "results": {
+    "item": [
+      {
+        "disclosureId": 900002,
+        "categoryId": 75,
+        "headline": "New number of votes in Acme Sintetica",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Total number of voting rights",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900002&lang=en&src=listed",
+        "releaseTime": "2026-08-31 11:00:00",
+        "published": "2026-08-31 11:00:00",
+        "market": "Main Market, Stockholm",
+        "attachment": [],
+        "company": "Acme Sintetica Holding, AB",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900003,
+        "categoryId": 75,
+        "headline": "Nytt antal röster i Acme Sintetica",
+        "language": "sv",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Total number of voting rights",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900003&lang=sv&src=listed",
+        "releaseTime": "2026-08-31 11:00:00",
+        "published": "2026-08-31 11:00:00",
+        "market": "Main Market, Stockholm",
+        "attachment": [],
+        "company": "Acme Sintetica Holding, AB",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900004,
+        "categoryId": 78,
+        "headline": "Acme Sintetica Group - the second quarter 2026",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Half Year financial report",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900004&lang=en&src=listed",
+        "releaseTime": "2026-07-17 05:20:00",
+        "published": "2026-07-17 05:20:00",
+        "market": "Main Market, Stockholm",
+        "attachment": [
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-report.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000040"
+          },
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-presentation.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000041"
+          }
+        ],
+        "company": "Acme Sintetica Holding, AB",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900005,
+        "categoryId": 78,
+        "headline": "Acme Sintetica-koncernen - det andra kvartalet 2026",
+        "language": "sv",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Half Year financial report",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900005&lang=sv&src=listed",
+        "releaseTime": "2026-07-17 05:20:00",
+        "published": "2026-07-17 05:20:00",
+        "market": "Main Market, Stockholm",
+        "attachment": [
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-report.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000050"
+          }
+        ],
+        "company": "Acme Sintetica Holding, AB",
+        "cnsTypeId": "6"
+      }
+    ]
+  },
+  "count": 4
+}

@@ -99,6 +99,20 @@ def _git(cwd, *args):
                           encoding="utf-8", errors="replace", check=True).stdout
 
 
+_RESEARCH_CI_FINTO = (
+    "import os, site, sys\nsys.path.append(site.getusersitepackages())  # -I: come offline_pytest.py\nimport pytest\n"
+    "os.chdir(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))\n"
+    "sys.exit(pytest.main(['tests/', '-q', '-p', 'no:cacheprovider', '-rfE']))\n")
+
+
+def _research_ci_finto(root):
+    """Dal 1326312 il passo pytest e' `python -I tools/testing/research_ci.py` (lista esplicita del
+    privato): nei tree sintetici uno stub che lancia i LORO tests/ come faceva il vecchio argv."""
+    d = root / "tools" / "testing"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "research_ci.py").write_text(_RESEARCH_CI_FINTO, encoding="utf-8")
+
+
 @pytest.fixture
 def repo_finto(tmp_path):
     """Un repo git minimo che somiglia al privato: due file che escono, uno che resta."""
@@ -374,6 +388,7 @@ def test_modificati_vede_anche_lo_staged_e_il_cancellato(repo_finto):
 
 
 def test_esegui_suite_dentro_il_tree(tmp_path):
+    _research_ci_finto(tmp_path)
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "test_ok.py").write_text("def test_ok():\n    assert 1\n", encoding="utf-8")
     rc, riga = ep.esegui_suite(str(tmp_path))
@@ -449,6 +464,7 @@ def test_esegui_suite_non_fa_vedere_al_tree_il_db_del_pm(tmp_path, monkeypatch):
     """`memory_db` si ancora alla cartella del file, ma BELLOMBERG_DATA_DIR la scavalcherebbe:
     dentro il tree esportato quella variabile non deve arrivare."""
     monkeypatch.setenv("BELLOMBERG_DATA_DIR", "C:\\finta\\cartella\\dati")
+    _research_ci_finto(tmp_path)
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "test_env.py").write_text(
         "import os\n\n\ndef test_env():\n    assert not os.environ.get('BELLOMBERG_DATA_DIR')\n",
@@ -482,6 +498,25 @@ def test_pubblica_in_svuota_copia_e_fa_un_commit_solo_senza_push(repo_finto, clo
     assert log.splitlines()[0] == "sync 2026-09-03 (privato abc1234)" and len(log.splitlines()) == 2
     assert not any("push" in c for c in comandi)
     assert _git(clone_pubblico, "status", "--porcelain") == ""
+
+
+def test_pubblica_in_conserva_il_bit_di_esecuzione_del_privato(repo_finto, clone_pubblico, tmp_path, monkeypatch):
+    """05/10: i launcher macOS sono 100755 nel privato; su Windows la copia perde il bit e il
+    clone (core.filemode=false) li registrerebbe 100644: il deposito riporta il modo del privato."""
+    (repo_finto / "tools" / "macos").mkdir(parents=True)
+    (repo_finto / "tools" / "macos" / "Avvia ACME.command").write_text("#!/bin/bash\necho ok\n", encoding="utf-8")
+    _git(repo_finto, "add", "-A")
+    _git(repo_finto, "update-index", "--chmod=+x", "--", "tools/macos/Avvia ACME.command")
+    _git(repo_finto, "commit", "-q", "-m", "launcher")
+    monkeypatch.setattr(ep, "REPO", str(repo_finto))
+    _git(clone_pubblico, "config", "core.filemode", "false")
+    scelti = ["capo.py", "tools/macos/Avvia ACME.command"]
+    temp = tmp_path / "temp"
+    ep.copia_in_temp(str(repo_finto), scelti, str(temp))
+    ep.pubblica_in(str(clone_pubblico), str(temp), "sync 2026-10-05 (privato abc1234)", scelti, vietate=[])
+    modi = {r.split("\t", 1)[1]: r.split()[0] for r in _git(clone_pubblico, "ls-files", "-s").splitlines()}
+    assert modi["tools/macos/Avvia ACME.command"] == "100755"
+    assert modi["capo.py"] == "100644"
 
 
 def test_il_commit_pubblico_e_noreply_anche_nel_COMMITTER(repo_finto, clone_pubblico, tmp_path):
@@ -585,6 +620,7 @@ def test_la_suite_gira_in_un_tree_che_e_un_repo_git_e_non_lo_lascia(tmp_path):
     """Tre test del progetto derivano i loro input da `git ls-files`/`git check-ignore`: in una
     cartella nuda git esce 128, quei test asseriscono sul VUOTO e cadono con un messaggio falso.
     Il `.git` serve solo alla misura e non deve sopravvivere: nel pubblico c'e' gia' il suo."""
+    _research_ci_finto(tmp_path)
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "test_git.py").write_text(
         "import subprocess\n\n\ndef test_git():\n"
@@ -610,6 +646,7 @@ def _tree_suite(tmp_path, test_codice, lockfile=False):
     tree = tmp_path / "tree"
     (tree / "tests").mkdir(parents=True)
     (tree / "tests" / "test_x.py").write_text(test_codice, encoding="utf-8")
+    _research_ci_finto(tree)
     if lockfile:
         (tree / "app").mkdir()
         (tree / "app" / "package-lock.json").write_text("{}\n", encoding="utf-8")
@@ -640,7 +677,7 @@ def test_la_suite_gira_su_una_copia_e_non_scrive_nell_artefatto(tmp_path):
                                  "    pathlib.Path('generato.txt').write_text('x')\n")
     rc, riga = ep.esegui_suite(str(tree))
     assert rc == 0 and "1 passed" in riga
-    assert sorted(p.name for p in tree.rglob("*") if p.is_file()) == ["test_x.py"]
+    assert sorted(p.name for p in tree.rglob("*") if p.is_file()) == ["research_ci.py", "test_x.py"]
     assert not os.path.exists(str(tree) + ".suite")
 
 
@@ -1059,6 +1096,10 @@ def test_un_argv_che_non_fa_il_comando_della_ci_e_rosso(monkeypatch):
 # --- cablaggio in main: i passi della suite VERA arrivano nel manifest, e senza passi OK niente deposito ---
 
 def test_main_scrive_nel_manifest_i_passi_della_suite_vera(repo_finto, allowlist_finta, monkeypatch):
+    _research_ci_finto(repo_finto)
+    _git(repo_finto, "add", "-A")
+    _git(repo_finto, "commit", "-q", "-m", "stub research_ci")
+    allowlist_finta.write_text(allowlist_finta.read_text(encoding="utf-8") + "tools/testing/research_ci.py\n", encoding="utf-8")
     catturato = {}
     scrivi = ep.scrivi_manifest
 
@@ -1254,6 +1295,8 @@ def test_main_ferma_se_la_suite_cade_e_non_committa(repo_finto, clone_pubblico, 
                                                     monkeypatch, capsys):
     """La suite dentro il tree esportato e' una misura di coerenza: se cade, niente commit."""
     (repo_finto / "tests" / "test_b.py").write_text("def test_b():\n    assert 0\n", encoding="utf-8")
+    _research_ci_finto(repo_finto)
+    allowlist_finta.write_text(allowlist_finta.read_text(encoding="utf-8") + "tools/testing/research_ci.py\n", encoding="utf-8")
     _git(repo_finto, "add", "-A")
     _git(repo_finto, "commit", "-q", "-m", "test che cade")
     monkeypatch.setattr(ep, "REPO", str(repo_finto))
@@ -1297,3 +1340,248 @@ def test_copia_in_temp_dichiara_i_file_tracciati_ma_assenti_dal_disco(repo_finto
         ep.copia_in_temp(str(repo_finto), ["capo.py", "tests/test_a.py"], str(dest))
     assert "capo.py" in str(e.value) and "assent" in str(e.value).lower()
     assert not (dest / "tests" / "test_a.py").exists()
+
+
+# --- PM 05/10: un sync che cambia solo app/ non rilancia pytest (e lo dice) ----------------------
+# Deposito VERO in un clone finto: `esegui_suite` vera, processi finti (`_lancio_finto`), cancello
+# finto sano, certificato e pre-push veri. I file sono sintetici; nessun dato del PM.
+
+def _sync(repo, clone, monkeypatch, *extra):
+    """Un `main --dest --commit`: (exit, nomi dei processi lanciati dalla suite, nell'ordine)."""
+    lancia, chiamate = _lancio_finto()
+    monkeypatch.setattr(ep, "_lancia", lancia)
+    rc = ep.main(["--dest", str(clone), "--commit", "--corpus-root", str(repo), *extra])
+    return rc, [c["nome"] for c in chiamate]
+
+
+def _commit(repo, messaggio="cambio"):
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", messaggio)
+
+
+def _prepara_privato_con_app(repo, allowlist, monkeypatch):
+    (repo / "app" / "src").mkdir(parents=True)
+    (repo / "app" / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    (repo / "app" / "src" / "vista.ts").write_text("export const a = 1\n", encoding="utf-8")
+    (repo / "apps").mkdir()
+    (repo / "apps" / "x.ts").write_text("export const b = 1\n", encoding="utf-8")
+    (repo / "app.py").write_text("Y = 1\n", encoding="utf-8")
+    (repo / "util.py").write_text("Z = 1\n", encoding="utf-8")
+    _commit(repo, "app")
+    allowlist.write_text("*.py\n!prova_*.py\ntests/*.py\napp/\napps/\n", encoding="utf-8")
+    monkeypatch.setattr(ep, "REPO", str(repo))
+    monkeypatch.setattr(ep, "ALLOWLIST", str(allowlist))
+    monkeypatch.setattr(ep, "_cancello", _cancello_sano)
+
+
+def _con_origin(clone, tmp_path, nome="remote.git"):
+    remote = tmp_path / nome
+    remote.mkdir()
+    _git(remote, "init", "--bare", "-q")
+    _git(clone, "remote", "add", "origin", str(remote))
+    return remote
+
+
+@pytest.fixture
+def gia_sincronizzato(repo_finto, clone_pubblico, allowlist_finta, vietate_finte, npm_finto,
+                      monkeypatch, tmp_path, capsys):
+    """Il clone dopo un primo sync completo (che rimuove `vecchio.txt`: cambio fuori da app/,
+    quindi pytest gira) del privato con app/."""
+    remote = _con_origin(clone_pubblico, tmp_path)
+    _prepara_privato_con_app(repo_finto, allowlist_finta, monkeypatch)
+    rc, nomi = _sync(repo_finto, clone_pubblico, monkeypatch)
+    assert rc == 0 and "pytest" in nomi, capsys.readouterr().out
+    capsys.readouterr()
+    ramo = _git(clone_pubblico, "symbolic-ref", "--short", "HEAD").strip()
+    _git(clone_pubblico, "push", "-q", "origin", ramo)     # la base del salto e' il commit sul server
+    return repo_finto, clone_pubblico, remote
+
+
+def _manifest_certificato(clone):
+    cert = clone / ".git" / "bellomberg-release" / "certificate.json"
+    return json.loads(cert.read_text(encoding="utf-8"))["manifest"]
+
+
+def test_sync_solo_app_salta_pytest_lo_dichiara_e_il_push_certificato_passa(
+        gia_sincronizzato, monkeypatch, capsys):
+    repo, clone, remote = gia_sincronizzato
+    base = _git(clone, "rev-parse", "HEAD").strip()
+    (repo / "app" / "src" / "vista.ts").write_text("export const a = 2\n", encoding="utf-8")
+    (repo / "app" / "src" / "nuova.ts").write_text("export const c = 3\n", encoding="utf-8")
+    _commit(repo)
+    rc, nomi = _sync(repo, clone, monkeypatch)
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "pytest" not in nomi and "npm ci" in nomi and "build:bundles" in nomi
+    assert ("SUITE PYTHON SALTATA: 2 file cambiati dall'ultimo sync %s, tutti sotto app/" % base[:7]) in out
+    messaggio = _git(clone, "log", "-1", "--format=%B")
+    assert messaggio.startswith("sync ")
+    assert ("suite Python non eseguita: solo app/ cambiato (2 file) rispetto a %s" % base[:7]) in messaggio
+    doc = _manifest_certificato(clone)
+    assert doc["verifica"]["pytest_saltato"] == {"base": base, "file": 2}
+    assert doc["verifica"]["stato"] == "OK"
+    pytest_passo = [p for p in doc["verifica"]["suite_passi"] if p["nome"] == "pytest"][0]
+    assert pytest_passo["esito"] == "NON ESEGUITO" and "solo app/" in pytest_passo["motivo"]
+    # Il registro resta leggibile (la seconda riga del messaggio non ci finisce) e porta l'hash nuovo.
+    head = _git(clone, "rev-parse", "HEAD").strip()
+    assert ep.leggi_registro(ep.REGISTRO)[-1] == head
+    ramo = _git(clone, "symbolic-ref", "--short", "HEAD").strip()
+    _git(clone, "push", "origin", ramo)                  # pre-push vero: rimisura il salto
+    assert _git(remote, "rev-parse", ramo).strip() == head
+
+
+@pytest.mark.parametrize("fuori", ["modifica capo.py", "rimuovi util.py", "apps/x.ts", "app.py"])
+def test_sync_con_un_file_fuori_da_app_fa_girare_pytest(gia_sincronizzato, monkeypatch, capsys, fuori):
+    """Anche UN file fuori da app/ (una modifica, una rimozione) rimette pytest; `apps/x` e
+    `app.py` alla radice NON sono app/."""
+    repo, clone, _ = gia_sincronizzato
+    (repo / "app" / "src" / "vista.ts").write_text("export const a = 5\n", encoding="utf-8")
+    if fuori == "modifica capo.py":
+        (repo / "capo.py").write_text("X = 7\n", encoding="utf-8")
+    elif fuori == "rimuovi util.py":
+        _git(repo, "rm", "-q", "util.py")
+    elif fuori == "apps/x.ts":
+        (repo / "apps" / "x.ts").write_text("export const b = 9\n", encoding="utf-8")
+    else:
+        (repo / "app.py").write_text("Y = 9\n", encoding="utf-8")
+    _commit(repo)
+    rc, nomi = _sync(repo, clone, monkeypatch)
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "pytest" in nomi
+    assert "SALTATA" not in out and "fuori da app/" in out
+    assert "suite Python" not in _git(clone, "log", "-1", "--format=%B")
+    assert _manifest_certificato(clone)["verifica"]["pytest_saltato"] is None
+
+
+def test_suite_sempre_fa_girare_pytest_anche_se_cambia_solo_app(gia_sincronizzato, monkeypatch, capsys):
+    repo, clone, _ = gia_sincronizzato
+    (repo / "app" / "src" / "vista.ts").write_text("export const a = 6\n", encoding="utf-8")
+    _commit(repo)
+    rc, nomi = _sync(repo, clone, monkeypatch, "--suite-sempre")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "pytest" in nomi and "SALTATA" not in out and "--suite-sempre" in out
+    assert "suite Python" not in _git(clone, "log", "-1", "--format=%B")
+
+
+def test_confronto_guasto_fa_girare_pytest_e_lo_dice(gia_sincronizzato, monkeypatch, capsys):
+    repo, clone, _ = gia_sincronizzato
+    (repo / "app" / "src" / "vista.ts").write_text("export const a = 8\n", encoding="utf-8")
+    _commit(repo)
+
+    def guasto(*_a, **_k):
+        raise RuntimeError("ls-tree finto rotto")
+    monkeypatch.setattr(ep, "cambiati_dal_clone", guasto)
+    rc, nomi = _sync(repo, clone, monkeypatch)
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "pytest" in nomi and "SALTATA" not in out
+    assert "confronto col clone NON riuscito (ls-tree finto rotto)" in out
+
+
+def test_clone_senza_head_fa_girare_pytest(repo_finto, allowlist_finta, vietate_finte, npm_finto,
+                                           monkeypatch, tmp_path, capsys):
+    """Il primo sync su un clone vergine non ha base: niente confronto, suite completa."""
+    clone = tmp_path / "vergine"
+    clone.mkdir()
+    _git(clone, "init", "-q")
+    _git(clone, "config", "user.name", "Mario Rossi")
+    _git(clone, "config", "user.email", NOREPLY)
+    _con_origin(clone, tmp_path)
+    _prepara_privato_con_app(repo_finto, allowlist_finta, monkeypatch)
+    with pytest.raises(RuntimeError, match="HEAD"):
+        ep.cambiati_dal_clone(str(clone), str(repo_finto), ["app/src/vista.ts"])
+    rc, nomi = _sync(repo_finto, clone, monkeypatch)
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "pytest" in nomi and "SALTATA" not in out and "confronto col clone NON riuscito" in out
+
+
+def test_zero_file_cambiati_lascia_la_suite_come_prima(gia_sincronizzato, monkeypatch, capsys):
+    repo, clone, _ = gia_sincronizzato
+    prima = _git(clone, "rev-parse", "HEAD").strip()
+    rc, nomi = _sync(repo, clone, monkeypatch)
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "pytest" in nomi and "0 file cambiati" in out and "niente da pubblicare" in out
+    assert _git(clone, "rev-parse", "HEAD").strip() == prima
+
+
+@pytest.mark.parametrize("cambiati, atteso", [
+    (["app/src/a.ts"], True),
+    (["app/package.json", "app/src/b.tsx"], True),
+    ([], False),
+    (["apps/x"], False),
+    (["app.py"], False),
+    (["app"], False),
+    (["app/src/a.ts", "capo.py"], False),
+    (["application/a.ts"], False),
+])
+def test_solo_app_vuole_il_prefisso_esatto_con_la_barra(cambiati, atteso):
+    assert ep.solo_app(cambiati) is atteso
+
+
+@pytest.mark.parametrize("autocrlf", ["false", "true"])
+def test_cambiati_dal_clone_misura_come_git_add(tmp_path, autocrlf):
+    """Review 05/10 (D1, D2): «cambiato» e' cio' che `git add` committerebbe. Un file `text eol=lf`
+    passato a CRLF NON cambia (git lo normalizza); un file `-text` passato a CRLF CAMBIA (git lo
+    committa cosi'), qualunque sia core.autocrlf."""
+    attributi = b"* text eol=lf\nbin.dat -text\n"
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    _git(clone, "init", "-q")
+    _git(clone, "config", "core.autocrlf", autocrlf)
+    _git(clone, "config", "user.name", "Mario Rossi")
+    _git(clone, "config", "user.email", NOREPLY)
+    for nome, dati in ((".gitattributes", attributi), ("uguale.txt", b"a\n"), ("crlf.txt", b"r1\nr2\n"),
+                       ("cambia.txt", b"v1\n"), ("via.txt", b"x\n"), ("bin.dat", b"k\nk\n")):
+        (clone / nome).write_bytes(dati)
+    _commit(clone, "base")
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    for nome, dati in ((".gitattributes", attributi), ("uguale.txt", b"a\n"), ("crlf.txt", b"r1\r\nr2\r\n"),
+                       ("cambia.txt", b"v2\n"), ("nuovo.txt", b"n\n"), ("bin.dat", b"k\r\nk\r\n")):
+        (tree / nome).write_bytes(dati)
+    scelti = [".gitattributes", "uguale.txt", "crlf.txt", "cambia.txt", "nuovo.txt", "bin.dat"]
+    stato_prima = _git(clone, "count-objects", "-v")
+    base, cambiati = ep.cambiati_dal_clone(str(clone), str(tree), scelti)
+    assert base == _git(clone, "rev-parse", "HEAD").strip()
+    assert cambiati == ["bin.dat", "cambia.txt", "nuovo.txt", "via.txt"]
+    assert _git(clone, "count-objects", "-v") == stato_prima        # nessun oggetto scritto nel clone
+    with pytest.raises(RuntimeError, match="a-capo"):
+        ep.cambiati_dal_clone(str(clone), str(tree), ["a\nb.txt"])
+
+
+def test_sync_solo_app_sopra_un_sync_mai_pushato_fa_girare_pytest(gia_sincronizzato, monkeypatch, capsys):
+    """Review 05/10 (D1): un sync depositato e non pushato non fa da base al salto."""
+    repo, clone, _ = gia_sincronizzato
+    (repo / "capo.py").write_text("X = 3\n", encoding="utf-8")
+    _commit(repo)
+    assert _sync(repo, clone, monkeypatch)[0] == 0                 # X: suite completa, NON pushato
+    capsys.readouterr()
+    (repo / "app" / "src" / "vista.ts").write_text("export const a = 4\n", encoding="utf-8")
+    _commit(repo)
+    rc, nomi = _sync(repo, clone, monkeypatch)
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "pytest" in nomi and "SALTATA" not in out and "non ancora pushato" in out
+
+
+def test_certificato_fallito_dopo_il_commit_lo_dice_e_dice_come_toglierlo(
+        gia_sincronizzato, monkeypatch, capsys):
+    """Review 05/10 (D3): il commit c'e' ed e' registrato; «nessun commit» sarebbe falso."""
+    repo, clone, _ = gia_sincronizzato
+    (repo / "capo.py").write_text("X = 4\n", encoding="utf-8")
+    _commit(repo)
+
+    def rifiuta(*_a, **_k):
+        raise ValueError("certificato finto rifiutato")
+    monkeypatch.setattr(ep, "certifica_deposito", rifiuta)
+    rc, _ = _sync(repo, clone, monkeypatch)
+    out = capsys.readouterr().out
+    h = _git(clone, "rev-parse", "HEAD").strip()
+    assert rc == 2
+    assert "%s e' FATTO nel clone e REGISTRATO" % h[:7] in out and "NON pushare" in out
+    assert "reset --hard %s^" % h in out and "nessun commit" not in out
+    assert ep.leggi_registro(ep.REGISTRO)[-1] == h

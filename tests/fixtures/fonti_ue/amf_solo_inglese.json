@@ -1,0 +1,31 @@
+{
+ "total_count": 2,
+ "results": [
+  {
+   "uin_idt_uin": "ZZ000089",
+   "informationdeposee_inf_dat_emt": "2026-07-08T10:00:00+00:00",
+   "informationdeposee_inf_tit_inf": "Half yearly report on ACME SINTETICA liquidity contract",
+   "informationdeposee_inf_lng_inf": "Anglais",
+   "sous_type_d_information": "Rapports financiers et d'audit semestriels/examens réduits",
+   "subtype_of_information": "Half yearly financial reports and audit reports/limited reviews",
+   "url_de_recuperation": "https://fr.ftp.opendatasoft.com/datadila/INFOFI/ZZZ/8888/01/FCZZZ000089.pdf",
+   "identificationsociete_iso_cd_isi": "FR00ZZSYNT08",
+   "identificationsociete_iso_cd_lei": "9999ZZSYNTETICA00080",
+   "identificationsociete_iso_nom_soc": "ACME SINTETICA SA",
+   "informationdeposee_inf_upg_inf_inf_upg_sts": null
+  },
+  {
+   "uin_idt_uin": "ZZ000090",
+   "informationdeposee_inf_dat_emt": "2026-07-29T05:30:00+00:00",
+   "informationdeposee_inf_tit_inf": "Half-year financial report 2026",
+   "informationdeposee_inf_lng_inf": "Anglais",
+   "sous_type_d_information": "Rapports financiers et d'audit semestriels/examens réduits",
+   "subtype_of_information": "Half yearly financial reports and audit reports/limited reviews",
+   "url_de_recuperation": "https://fr.ftp.opendatasoft.com/datadila/INFOFI/ZZZ/8888/01/FCZZZ000090.pdf",
+   "identificationsociete_iso_cd_isi": "FR00ZZSYNT08",
+   "identificationsociete_iso_cd_lei": "9999ZZSYNTETICA00080",
+   "identificationsociete_iso_nom_soc": "ACME SINTETICA SA",
+   "informationdeposee_inf_upg_inf_inf_upg_sts": null
+  }
+ ]
+}

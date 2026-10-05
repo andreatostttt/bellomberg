@@ -133,7 +133,7 @@ def test_decisions_provenienza_doppia_dichiarata(db, client, migra, monkeypatch)
 
 @pytest.fixture
 def fonti_insider(monkeypatch):
-    from bellomberg.market_data import emarket_sdir, finnhub_news, sec_edgar
+    from bellomberg.market_data import finnhub_news, sdir, sec_edgar
     conta = {"finnhub": 0, "sec": 0, "emarket": 0}
     risposta_it = {"stato": "KO"}
 
@@ -154,11 +154,12 @@ def fonti_insider(monkeypatch):
             motivo.append("SEC QQMUTA")
         return []
 
-    def it(ticker, *, giorni=180):
+    def it(ticker, *, giorni=180, nome=None):
         conta["emarket"] += 1
         conta["giorni"] = giorni
         base = {"ticker": ticker.strip().upper(), "comunicazioni": [], "stato": risposta_it["stato"],
-                "errore": None, "motivo": None}
+                "errore": None, "motivo": None, "sdir": "eMarket SDIR",
+                "instradamento": {"regola": "finta", "scelta": "emarket"}}
         if risposta_it["stato"] == "KO":
             base.update(errore="negozio_assente", motivo="negozio ISIN assente: QQMOTIVO")
         elif risposta_it["stato"] == "ok":
@@ -166,7 +167,8 @@ def fonti_insider(monkeypatch):
         return base
     monkeypatch.setattr(finnhub_news, "fetch_insider_trades", fn)
     monkeypatch.setattr(sec_edgar, "get_insider_trades", sec)
-    monkeypatch.setattr(emarket_sdir, "get_internal_dealing", it)
+    # handoff-3 (W1, ok main 05/10): l'internal dealing passa dall'instradatore sdir.py
+    monkeypatch.setattr(sdir, "get_internal_dealing", it)
     conta["risposta_it"] = risposta_it
     conta["finnhub_modo"] = finnhub_modo
     return conta
@@ -174,7 +176,8 @@ def fonti_insider(monkeypatch):
 
 def test_insider_mi_va_su_emarket_e_dichiara_il_ko(client, fonti_insider):
     out = client.get("/news/insider-trades/qqsyn.mi?days=40").json()
-    assert out["source"] == "emarket_sdir" and out["stato"] == "KO"
+    assert out["source"] == "sdir" and out["stato"] == "KO"
+    assert out["sdir"] == "eMarket SDIR" and out["instradamento"]["scelta"] == "emarket"
     assert "QQMOTIVO" in out["error"] and out["count"] == 0
     assert out["internal_dealing"]["errore"] == "negozio_assente"
     assert (fonti_insider["finnhub"], fonti_insider["sec"], fonti_insider["emarket"]) == (0, 0, 1)

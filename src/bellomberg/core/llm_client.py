@@ -116,6 +116,9 @@ PREFISSI_CACHE_CONTROL = ("anthropic/",)
 # 20/09: capacita' verificate sullo slug standard (non Contributor): auto-only
 # per tool_choice, Max disponibile. La scelta dei modelli resta nel .env.
 MUSE_STANDARD = "meta/muse-spark-1.3"
+# Muse rifiuta {"enabled": false} (400 «Reasoning is mandatory», sonda run 05/10 19:26): sotto journal
+# il retry minimal e' vietato, quindi lo si sa PRIMA della prima chiamata (minimal dichiarato).
+RAGIONAMENTO_OBBLIGATORIO_NOTO = frozenset({MUSE_STANDARD})
 
 VARIABILI_BASE = (
     "OPENROUTER_API_KEY", "CHAT_MODEL", "CHAT_MAX_TOKENS", "CONSIGLIERE_MODEL",
@@ -712,6 +715,16 @@ def _dichiara_effort_omesso(model, effort):
         pass
 
 
+_SPENTI_ACCESI_DICHIARATI = set()
+
+
+def _dichiara_spento_acceso(model):
+    if model not in _SPENTI_ACCESI_DICHIARATI:
+        _SPENTI_ACCESI_DICHIARATI.add(model)
+        print("[llm_client] " + str(model) + ": ragionamento richiesto SPENTO, inviato ACCESO "
+              "(regola PM 05/10: mai spento per nessun modello)")
+
+
 def _reasoning_openai(thinking, model=""):
     if thinking is None:
         return None
@@ -731,15 +744,12 @@ def _reasoning_openai(thinking, model=""):
             return None   # misurato: su GLM ogni effort azzera il ragionamento; omesso = acceso
         return dict(REASONING_ADAPTIVE)
     if tipo == "disabled":
-        if model in RAGIONAMENTO_OBBLIGATORIO:
-            # Gia' rifiutato una volta: minimal (0 token misurati). AMMESSO anche su z-ai/
-            # (decisione coordinatore 04/10, REV G7/R1): la regola «a z-ai/ non parte mai un
-            # effort» vale per le chiamate che vogliono la deliberazione ACCESA (adaptive /
-            # effort), dove un effort esplicito la azzererebbe. Qui la si vuole SPENTA e il
-            # modello rifiuta {"enabled": false}: minimal e' il modo misurato (05/09) per
-            # ottenere 0 token, cioe' proprio «disabled». Omettere il campo la accenderebbe.
-            return dict(REASONING_MINIMO)
-        return dict(REASONING_DISABLED)
+        # REGOLA PM 05/10/2026 (Opus 5.5): il ragionamento NON si spegne MAI, per NESSUN modello.
+        # Muse e Opus 5.5 rifiutano {"enabled": false} con un 400 che il journal tiene incerto e
+        # che fermava la run a chiunque scarichi la repo. «disabled» chiesto da un chiamante
+        # vale come «adaptive» (acceso), dichiarato una volta per modello nel log.
+        _dichiara_spento_acceso(model)
+        return _reasoning_openai({"type": "adaptive"}, model)
     if tipo == "minimal":
         # Percorsi di recupero che devono contenere il reasoning senza pagare
         # prima il 400 "Reasoning is mandatory" dei modelli che non accettano
@@ -1773,7 +1783,7 @@ class _StreamAsync:
 # ritentativo (un 403 e' lo stesso errore ripetuto). Non cambia nessuna model string.
 # ---------------------------------------------------------------------------
 
-def sonda_modelli(slugs, client=None, max_tokens=5, timeout_s=45.0):
+def sonda_modelli(slugs, client=None, max_tokens=2048, timeout_s=45.0):   # ragionamento acceso: spazio oltre il budget minimo (1024)
     """{slug: {"ok": bool, "motivo": None|str, "durata_s": float}} per ogni slug distinto
     (ordine di prima apparizione). `client` finto nei test; in produzione OpenRouterClient
     senza retry: la sonda misura, non insiste. Anche il nuovo tentativo dopo un guasto
@@ -1801,7 +1811,7 @@ def _sonda_modelli(slugs, client, max_tokens, timeout_s):
         try:
             response = client.messages.create(model=s, max_tokens=int(max_tokens),
                                    messages=[{"role": "user", "content": "ping"}],
-                                   thinking={"type": "disabled"})
+                                   thinking={"type": "effort", "effort": "minimal"})   # acceso (regola PM 05/10)
             usage = getattr(response, "usage", None)
             esiti[s] = {"ok": True, "motivo": None, "durata_s": round(time.perf_counter() - t0, 2),
                 "request_id": getattr(response, "request_id", None),

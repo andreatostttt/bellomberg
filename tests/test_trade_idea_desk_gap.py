@@ -4,7 +4,7 @@ import pytest
 from bellomberg.agents import trade_idea
 from bellomberg.core.trade_idea_policy import EXECUTION_POLICY_V3, ROLE_EFFORT_V3
 from test_trade_idea_no_workbook_e2e import no_workbook_case, _provider_round  # noqa: F401
-from test_trade_idea_delivery import smtp  # noqa: F401
+from _smtp_cattura import smtp  # noqa: F401
 from test_trade_idea_source_research import frozen_clock  # noqa: F401
 from test_trade_idea_store import db_path, migrated  # noqa: F401
 

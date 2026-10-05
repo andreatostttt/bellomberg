@@ -114,6 +114,9 @@ def _nano(value):
         raise ValueError("invalid request cost") from exc
 
 
+_ROUTING_VARIANTS = frozenset({"exacto", "nitro", "floor"})   # OpenRouter: varianti che rispondono col nome base
+
+
 # Every reasoning field llm_client._reasoning_openai can send for an effort variable,
 # including none (adaptive or any effort on z-ai/). Used only to recognise paid Capo work.
 _CAPO_REASONING_ON_WIRE = (None, {"enabled": False}, *({"effort": e} for e in
@@ -150,6 +153,7 @@ class RequestJournal:
         self.metadata = metadata
         self._quotes = {}
         self._inflight = set()
+        self._dichiarate = set()   # richieste incerte gia' dichiarate a log (regola PM 05/10)
         self._external_inflight = set()
         # RV-KA (05/10): failed requests whose outcome could not be written (DB locked...).
         # Fail closed: they block every further request of this run in this process.
@@ -247,13 +251,26 @@ class RequestJournal:
             if row["state"] == "received" and (not receipt.get("response_id")
                     or _nano(receipt.get("cost_usd")) != row["cost"]):
                 raise ValueError("linked preparer cost differs from its receipt")
+            manual = None
             if row["state"] == "rejected":
-                from bellomberg.valuation.preparation_rejections import validate_proof
-                validate_proof(receipt)
+                from bellomberg.valuation.preparation_ai import manual_reconciliation_declared
+                if "pre_provider_rejection" in receipt:
+                    from bellomberg.valuation.preparation_rejections import validate_proof
+                    validate_proof(receipt)
+                    if row["cost"] is not None:
+                        manual = manual_reconciliation_declared(row, receipt)  # v2 -> etichetta v2; v1 -> None
+                else:
+                    # ZR 05/10: riconciliazione manuale storica, solo la forma esatta; il costo 0
+                    # resta nel conteggio e la riga lo DICHIARA.
+                    from bellomberg.valuation.preparation_ai import (manual_reconciliation_status,
+                                                                      MANUAL_RECONCILIATION_LABEL)
+                    manual_reconciliation_status(row, receipt)
+                    manual = MANUAL_RECONCILIATION_LABEL
             result.append({"request_id": link["key"], "accounting_owner": "valuation_preparer",
                 "journal_ref": sha256(str(path).encode()).hexdigest(), "owned": bool(link["owned"]),
                 "state": row["state"], "reserved": row["reserved"], "cost": row["cost"],
-                "response_id": receipt.get("response_id")})
+                "response_id": receipt.get("response_id"),
+                **({"cost_status": manual} if manual else {})})
         return result
 
     def _quote(self, body):
@@ -351,9 +368,14 @@ class RequestJournal:
                 self._verify_row(row)
             unresolved = [row for row in rows if row["state"] in ("unknown", "incomplete", "overrun")
                           or row["state"] == "reserved" and row["request_id"] not in self._inflight]
-            if unresolved:
-                raise RequestBlocked("unresolved request or billing; reconcile before further spending",
-                                     unresolved[0]["request_id"])
+            # REGOLA PM 05/10/2026 (confermata dal PM, Opus 5.5): un costo incerto si DICHIARA, non
+            # ferma la run. La riga resta 'unknown' (riconciliabile, conta nel tetto con la sua
+            # prenotazione); il replay di cio' che e' gia' pagato resta sopra (_find): nessuna doppia spesa.
+            for row in unresolved:
+                if row["request_id"] not in self._dichiarate:
+                    self._dichiarate.add(row["request_id"])
+                    print("[request_journal] costo/esito incerto DICHIARATO, la run prosegue: richiesta "
+                          + str(row["request_id"]) + " stato " + str(row["state"]))
             cap = db.execute("SELECT cap FROM authorization WHERE id=1").fetchone()[0]
             committed = sum(row["cost"] if row["cost"] is not None else row["reserved"] for row in rows)
             if cap is not None and committed + quote["reserve_nano_usd"] > cap:
@@ -476,8 +498,12 @@ class RequestJournal:
                 raise ValueError("cannot overwrite an original provider receipt")
             receipt = json.loads(row["receipt"])
             expected_model = json.loads(row["request"]).get("model")
+            base, _, variant = str(expected_model).partition(":")
+            # Run 05/10 20:19: OpenRouter risponde col modello BASE a una variante di instradamento
+            # (":exacto" -> "deepseek/...-0731"): stessa identita', dichiarata nella ricevuta.
+            via_variante = variant in _ROUTING_VARIANTS and fields.get("model") == base
             identity = bool(isinstance(fields.get("id"), str) and fields["id"].strip()
-                            and fields.get("model") == expected_model)
+                            and (fields.get("model") == expected_model or via_variante))
             if not identity:
                 cost = None  # An unrelated response is not a measured bill for this request.
             choices = fields.get("choices")
@@ -488,6 +514,8 @@ class RequestJournal:
             receipt.update({"response_id": fields.get("id"), "model": fields.get("model"),
                 "provider": fields.get("provider"), "usage": fields.get("usage"),
                 "complete": bool(complete), "identity_verified": identity,
+                **({"identity_basis": "routing variant :" + variant + " answered as base model"}
+                   if identity and via_variante else {}),
                 "response_sha256": sha256(text.encode()).hexdigest(), "diagnostic": _evidence(diagnostic)[0],
                 "evidence_issues": evidence_issues})
             db.execute("UPDATE requests SET state=?,cost=?,response=?,receipt=?,error=? WHERE request_id=?",

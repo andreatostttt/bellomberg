@@ -126,7 +126,12 @@ def test_weekly_status_allows_only_run_bound_durable_source_replay(run_offline):
     assert 'Esito tool incerto' in store.status()['blocked_reason']
 
 
-def test_normal_weekly_sources_to_real_excel_pdf_and_two_delivery_recoveries(run_offline, monkeypatch, tmp_path):
+def test_normal_weekly_sources_to_real_pdf_without_excel_and_two_delivery_recoveries(run_offline, monkeypatch, tmp_path):
+    # ZR 05/10 (Z4): ripuntato al percorso VIVO. Dal 03/10 (1326312) la weekly nuova e' research:
+    # get_valuation e' indisponibile al desk e nessun workbook viene preparato. Garanzie conservate:
+    # fonti societarie vere (sessione + trasporto congelato) -> report -> PDF, e due recuperi
+    # delivery_only che ripristinano gli stessi byte senza fonti, renderer o AI. Il corpo storico
+    # (fonti -> preparazione -> Excel) e' in archive/private/attic/tests_excel_archiviato_20261005/test_weekly_company_research_legacy.py.
     from datetime import datetime, timezone
     from functools import partial
     from importlib import import_module
@@ -136,7 +141,6 @@ def test_normal_weekly_sources_to_real_excel_pdf_and_two_delivery_recoveries(run
     from bellomberg.agents.company_source_research import ResearchSession
     from bellomberg.agents.specialists.base import Specialist
     from bellomberg.valuation import preparation_runtime, preparation_sources
-    from bellomberg.valuation.preparation_service import collect_and_prepare
     from test_company_source_research import FrozenTransport, html, SITE, PAGE, DOCUMENT
     from test_input_preparation import _operating_plan
     from test_weekly_recovery import _store
@@ -150,6 +154,8 @@ def test_normal_weekly_sources_to_real_excel_pdf_and_two_delivery_recoveries(run
         def now(cls, tz=None):
             return cls.fromisoformat(DAY + 'T12:00:00+00:00').astimezone(tz or timezone.utc)
     monkeypatch.setattr(weekly_lifecycle, 'datetime', Clock)
+    # run_offline fissa il contratto storico; la weekly ordinaria di oggi e' research.
+    monkeypatch.setattr(cm, '_weekly_contract', run_offline.native_weekly_contract)
     text = 'Synthetic issuer\nPublished on 2026-09-09\nYear ended 2025-12-31\n' + _documents()[0]['text']
     transport = FrozenTransport({'/investors/': (b'<html><body><a href="report.html">Annual report</a></body></html>', 'text/html'),
         '/investors/report.html': (html(text), 'text/html')})
@@ -161,22 +167,15 @@ def test_normal_weekly_sources_to_real_excel_pdf_and_two_delivery_recoveries(run
             profile_provider=lambda *a, **k: {'status': 'ok', 'data': {'info': {'website': SITE}}},
             session_factory=partial(ResearchSession, download=transport))
     monkeypatch.setattr(bindings, 'bind_weekly_company_research', bind)
-    monkeypatch.setattr(preparation_sources, 'collect_preparation_evidence', lambda *a, **k:
-        {'status': 'incomplete', 'preparation_ready': False, 'documents': [], 'issues': []})
-    def propose(dossier, contract):
-        ident = dossier['documents'][0]['id']
-        def replace(value):
-            if isinstance(value, dict):
-                return {key: replace(item) for key, item in value.items()}
-            if isinstance(value, list):
-                return [replace(item) for item in value]
-            return ident if value == 'annual-1' else value
-        return replace(_operating_plan())
-    def prepare(bundle, **kwargs):
-        return collect_and_prepare(bundle, archive_root=tmp_path / 'filing_archive',
-            output_dir=cm.REPORT_DIR, propose=propose, research_sources=kwargs['research_sources'])
-    monkeypatch.setattr(preparation_runtime, 'bind_installation_preparer', lambda trigger:
-        {'preparer': prepare, 'state': {'status': 'enabled', 'triggers': ['committee']}})
+    # Il ramo archiviato non deve partire: raccolta per la preparazione e preparatore sono trappole.
+    def archived(*_a, **_k):
+        raise AssertionError('archived Excel preparation reached from a research weekly')
+    monkeypatch.setattr(preparation_sources, 'collect_preparation_evidence', archived)
+    monkeypatch.setattr(preparation_runtime, 'bind_installation_preparer', archived)
+    dispatched = []
+    original_dispatch = chat_tools.dispatch
+    monkeypatch.setattr(chat_tools, 'dispatch', lambda name, *a, **k:
+        dispatched.append(name) or original_dispatch(name, *a, **k))
     monkeypatch.setattr(chat_tools, 'REPORT_DIR', str(cm.REPORT_DIR))
     monkeypatch.setattr('bellomberg.core.paths.MODELS_DIR', cm.MODELS_DIR)
     calls = []
@@ -195,12 +194,9 @@ def test_normal_weekly_sources_to_real_excel_pdf_and_two_delivery_recoveries(run
                     'source': {'url': DOCUMENT}})
                 assert acquired['ok'], acquired
             elif round_n == 1:
-                desk._sector_bundles['SYNTH-EXT'] = _bundle()
                 result = desk._execute_meta_tool('get_valuation', {'ticker': 'SYNTH-EXT'})
-                payload = result.get('data', result)
-                (tmp_path / 'source-workbook-result.json').write_text(json.dumps(payload, default=str), encoding='utf-8')
-                assert payload['valuation_usability']['usable'], (payload.get('error'), payload.get('preparation'), payload.get('valuation_usability'))
-                assert payload['_thesis_saved'].get('thesis_id'), payload.get('_thesis_saved')
+                assert result['ok'] is False and result['status'] == 'not_available_in_research_mode', result
+                assert 'valuation_usability' not in result and 'get_valuation' not in dispatched
             self.board.write(self.name, round_n, 'Offline statement-based report ' + 'evidence ' * 40)
             self.run_result_status = 'complete'
     monkeypatch.setattr(cm, 'SPECIALIST_ORDER', [ResearchDesk])
@@ -209,7 +205,9 @@ def test_normal_weekly_sources_to_real_excel_pdf_and_two_delivery_recoveries(run
     monkeypatch.setattr(renderer, 'REPORT_DIR', Path(cm.REPORT_DIR))
     first = cm.run_multi_agent(send_email=False)
     assert first['status'] == 'completed'
-    assert {'Markdown', 'PDF', 'Excel', 'Excel metadata'} <= {row['kind'] for row in first['artifacts']}
+    kinds = {row['kind'] for row in first['artifacts']}
+    assert {'Markdown', 'PDF'} <= kinds and not {'Excel', 'Excel metadata'} & kinds, kinds
+    assert not list(Path(cm.REPORT_DIR).rglob('*.xlsx')) and not list(Path(cm.MODELS_DIR).rglob('*.xlsx'))
     assert len(transport.requests) == 2 and calls == [0, 1, 2]
     saved_decisions = _store().get('decisions_finalized')
     originals = {row['path']: row['sha256'] for row in first['artifacts']}

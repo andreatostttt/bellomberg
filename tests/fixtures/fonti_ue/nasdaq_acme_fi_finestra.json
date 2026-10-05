@@ -1,0 +1,157 @@
+{
+  "results": {
+    "item": [
+      {
+        "disclosureId": 900015,
+        "categoryId": 66,
+        "headline": "Acme Sintetica Oyj: Managers' transactions",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Managers' Transactions",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900015&lang=en&src=listed",
+        "releaseTime": "2026-09-02 13:00:00",
+        "published": "2026-09-02 13:00:00",
+        "market": "Main Market, Helsinki",
+        "attachment": [],
+        "company": "Acme Sintetica Oyj",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900016,
+        "categoryId": 78,
+        "headline": "Acme Sintetica Oyj: Half-year financial report",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Half Year financial report",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900016&lang=en&src=listed",
+        "releaseTime": "2026-08-05 05:00:00",
+        "published": "2026-08-05 05:00:00",
+        "market": "Main Market, Helsinki",
+        "attachment": [
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-report.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000160"
+          }
+        ],
+        "company": "Acme Sintetica Oyj",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900017,
+        "categoryId": 78,
+        "headline": "Acme Sintetica Oyj: Puolivuosikatsaus",
+        "language": "fi",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Half Year financial report",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900017&lang=fi&src=listed",
+        "releaseTime": "2026-08-05 05:00:00",
+        "published": "2026-08-05 05:00:00",
+        "market": "Main Market, Helsinki",
+        "attachment": [
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-report.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000170"
+          }
+        ],
+        "company": "Acme Sintetica Oyj",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900018,
+        "categoryId": 153,
+        "headline": "Acme Sintetica Oyj: Interim report",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Interim report (Q1 and Q3)",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900018&lang=en&src=listed",
+        "releaseTime": "2026-05-07 05:00:00",
+        "published": "2026-05-07 05:00:00",
+        "market": "Main Market, Helsinki",
+        "attachment": [
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-report.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000180"
+          }
+        ],
+        "company": "Acme Sintetica Oyj",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900019,
+        "categoryId": 270,
+        "headline": "Acme Sintetica Oyj: Annual Report 2024 restated",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Annual Financial Report",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900019&lang=en&src=listed",
+        "releaseTime": "2026-03-10 15:00:00",
+        "published": "2026-03-10 15:00:00",
+        "market": "Main Market, Helsinki",
+        "attachment": [
+          {
+            "mimetype": "application/pdf",
+            "fileName": "acme-sintetica-report.pdf",
+            "attachmentUrl": "https://attachment.news.eu.nasdaq.com/asint9000190"
+          }
+        ],
+        "company": "Acme Sintetica Oyj",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900020,
+        "categoryId": 73,
+        "headline": "Acme Sintetica Oyj: Financial statements release",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Financial Statement Release",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900020&lang=en&src=listed",
+        "releaseTime": "2026-02-12 06:00:00",
+        "published": "2026-02-12 06:00:00",
+        "market": "Main Market, Helsinki",
+        "attachment": [],
+        "company": "Acme Sintetica Oyj",
+        "cnsTypeId": "6"
+      },
+      {
+        "disclosureId": 900021,
+        "categoryId": 436,
+        "headline": "Acme Sintetica Oyj: Financial calendar",
+        "language": "en",
+        "languages": [
+          "en",
+          "sv"
+        ],
+        "cnsCategory": "Other information disclosed according to the rules of the Exchange",
+        "messageUrl": "https://view.news.eu.nasdaq.com/view?id=bsint900021&lang=en&src=listed",
+        "releaseTime": "2025-12-15 10:00:00",
+        "published": "2025-12-15 10:00:00",
+        "market": "Main Market, Helsinki",
+        "attachment": [],
+        "company": "Acme Sintetica Oyj",
+        "cnsTypeId": "6"
+      }
+    ]
+  },
+  "count": 7
+}

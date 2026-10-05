@@ -42,24 +42,20 @@ def test_sidecar_preserves_quality_without_changing_block(tmp_path):
     assert saved["sanity"]["severity"] == "BLOCK"
 
 
-def test_analysis_context_is_forwarded_and_never_reuses_old_valuation(monkeypatch):
+def test_archived_get_valuation_ignores_analysis_context_and_never_reuses_old_valuation(monkeypatch):
+    # ZR 05/10 (Z4): contratto attuale (1326312). L'inoltro di analysis_context a generate_valuation
+    # e' in archive/private/attic/tests_excel_archiviato_20261005/test_dcf_quality_integration_legacy.py.
     import bellomberg.agents.chat_tools as ct
     from bellomberg.valuation import dcf_engine
-    calls = []
-    monkeypatch.setitem(sys.modules, "bellomberg.storage.memory_db", NS(MemoryDB=lambda: NS(
-        get_valuation_history=lambda *a, **k: [dict(date=datetime.now().isoformat(),
-            fair_value=100, sanity_severity="OK")])) )
-    monkeypatch.setattr(dcf_engine, "generate_valuation", lambda *a, **kw: calls.append(kw) or {})
+    def forbidden(*a, **kw):
+        pytest.fail("Archived get_valuation reached history, providers or the workbook engine")
+    monkeypatch.setitem(sys.modules, "bellomberg.storage.memory_db", NS(MemoryDB=forbidden))
+    monkeypatch.setattr(dcf_engine, "generate_valuation", forbidden)
     context = {"as_of": "2026-09-10"}
-    providers = {"profile": lambda ticker, *, as_of: {
-        "status": "ok", "source_id": "synthetic-profile", "as_of": as_of,
-        "data": {"info": {"quoteType": "EQUITY", "industry": "Software - Application"},
-                 "vehicle_registry": None}}}
-    ct.dispatch("get_valuation", {"ticker": "SYNTH", "analysis_context": context},
-                sector_providers=providers, as_of=context["as_of"])
-    assert len(calls) == 1
-    # S2 carries the exact context inside the acquired bundle, not a parallel kwarg.
-    assert calls[0]["prepared_bundle"]["analysis_context"] == context
+    result = ct.dispatch("get_valuation", {"ticker": "SYNTH", "analysis_context": context},
+                         sector_providers={"profile": forbidden}, as_of=context["as_of"])
+    assert (result["ok"], result["status"], result["code"]) == (False, "archived", "excel_archived")
+    assert not {"valuation_usability", "reused", "fair_value_base", "analysis_context"} & set(result)
 
 
 def test_previous_snapshot_reads_flagged_without_touching_bytes(tmp_path):

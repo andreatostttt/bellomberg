@@ -243,6 +243,119 @@ def test_only_explicit_text_eol_normalization_is_allowed(release):
     assert not guard._stessi_byte_o_eol(b"X\0\r\n", b"X\0\n")
 
 
+def _app_only_release(release, also=None):
+    """A second commit on top of the synthetic release that changes app/ (and `also`, if given),
+    plus the manifest that declares the pytest skip against the first commit."""
+    repo, _, artifact = release
+    base = git(repo, "rev-parse", "HEAD").stdout.strip()
+    changes = {"app/src/view.ts": b"export const a = 1\n"}
+    if also:
+        changes[also] = b"Synthetic change\n"
+    for directory in (repo, artifact):
+        for name, data in changes.items():
+            (directory / name).parent.mkdir(parents=True, exist_ok=True)
+            (directory / name).write_bytes(data)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "app change")
+    doc = manifest(artifact)
+    doc["verifica"]["pytest_saltato"] = {"base": base, "file": len(changes)}
+    doc["verifica"]["suite_passi"][1].update(esito="NON ESEGUITO", exit=None, motivo="solo app/")
+    return doc
+
+
+def _push_base(release):
+    """The synthetic release is the commit already on the server: the base of the skip."""
+    repo, _, artifact = release
+    guard.certifica_deposito(repo, manifest(artifact), artifact)
+    git(repo, "push", "origin", "main")
+
+
+def test_app_only_pytest_skip_is_certified_and_pushed(release):
+    repo, remote, artifact = release
+    _push_base(release)
+    doc = _app_only_release(release)
+    guard.certifica_deposito(repo, doc, artifact)
+    result = git(repo, "push", "origin", "main", check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("change", [
+    lambda d: d["verifica"].pop("pytest_saltato"),
+    lambda d: d["verifica"].update(pytest_saltato={"base": "abc", "file": 1}),
+    lambda d: d["verifica"].update(pytest_saltato={"base": "a" * 40, "file": 0}),
+    lambda d: d["verifica"]["suite_passi"][1].update(esito="OK", exit=0),
+    lambda d: d["verifica"]["suite_passi"][2].update(esito="NON ESEGUITO", exit=None),
+])
+def test_pytest_skip_manifest_must_be_well_formed(release, change):
+    doc = _app_only_release(release)
+    guard.valida_manifest(doc)
+    change(doc)
+    with pytest.raises(ValueError, match="Manifest"):
+        guard.valida_manifest(doc)
+
+
+@pytest.mark.parametrize("mutation", ["outside_app", "apps_dir", "count", "base"])
+def test_pytest_skip_is_remeasured_on_git_objects(release, mutation):
+    repo, remote, artifact = release
+    doc = _app_only_release(release, also={"outside_app": "readme.txt", "apps_dir": "apps/x.ts"}.get(mutation))
+    if mutation == "count":
+        doc["verifica"]["pytest_saltato"]["file"] = 2
+    elif mutation == "base":
+        doc["verifica"]["pytest_saltato"]["base"] = "0" * 40
+    with pytest.raises(ValueError, match="Salto di pytest"):
+        guard.certifica_deposito(repo, doc, artifact)
+    assert not (repo / ".git" / "bellomberg-release" / "certificate.json").exists()
+
+
+def test_push_remeasures_the_pytest_skip_of_the_certificate(release):
+    """A certificate whose skip no longer matches the commit (edited after certification) blocks."""
+    repo, remote, artifact = release
+    _push_base(release)
+    base = git(remote, "rev-parse", "main").stdout.strip()
+    path = guard.certifica_deposito(repo, _app_only_release(release), artifact)
+    cert = json.loads(path.read_text(encoding="utf-8"))
+    cert["manifest"]["verifica"]["pytest_saltato"]["file"] = 5
+    path.write_text(json.dumps(cert), encoding="utf-8")
+    result = git(repo, "push", "origin", "main", check=False)
+    assert result.returncode != 0 and "Salto di pytest" in result.stderr, result.stderr
+    assert git(remote, "rev-parse", "main").stdout.strip() == base
+
+
+def test_push_rejects_a_skip_whose_base_is_not_on_the_server(release):
+    """Review 05/10 (D1): an unpushed, never-certified commit X under the app-only commit Y. Y's
+    skip is measured against X, so X would reach the server without pytest: the push stops."""
+    repo, remote, artifact = release
+    _push_base(release)
+    for directory in (repo, artifact):
+        (directory / "tool.py").write_bytes(b"X = 1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "uncertified sync")
+    doc = _app_only_release(release)
+    guard.certifica_deposito(repo, doc, artifact)          # Y alone looks app-only over X
+    result = git(repo, "push", "origin", "main", check=False)
+    assert result.returncode != 0 and "base del salto" in result.stderr, result.stderr
+    assert "tool.py" not in git(remote, "ls-tree", "-r", "--name-only", "main").stdout
+
+
+def test_message_rewrite_of_an_app_only_sync_is_certifiable(release):
+    """Review 05/10 (D4): after a metadata-only rewrite HEAD^ is no longer the measured base; the
+    rewrite path does not re-measure the skip (verifica_push already skips it there)."""
+    repo, remote, artifact = release
+    git(repo, "commit", "--amend", "-qm", "Release (Codex GPT-6)")
+    _push_base(release)
+    doc = _app_only_release(release)
+    git(repo, "commit", "--amend", "-qm", "App change (Codex GPT-6)")
+    doc["verifica"]["pytest_saltato"]["base"] = git(repo, "rev-parse", "HEAD^").stdout.strip()
+    path = guard.certifica_deposito(repo, doc, artifact)
+    previous = json.loads(path.read_text(encoding="utf-8"))
+    git(repo, "push", "origin", "main")
+    old, new = _rewrite_messages(repo)
+    path = guard.certifica_riscrittura_messaggi(repo, previous, artifact)
+    result = git(repo, "push", f"--force-with-lease=refs/heads/main:{old}", "origin", "main", check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert git(remote, "rev-parse", "main").stdout.strip() == new
+
+
 def _rewrite_messages(repo):
     """Real commit objects, preserving every byte except messages and parent OIDs."""
     mapping = {}

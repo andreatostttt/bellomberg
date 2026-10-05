@@ -16,7 +16,7 @@ from bellomberg.agents import trade_idea
 from bellomberg.core.trade_idea_policy import EXECUTION_POLICY_V2, ROLE_EFFORT_V2
 from test_trade_idea_no_workbook_e2e import no_workbook_case, _native_rows, _provider_round
 from test_trade_idea_report_v2 import editorial_fixture
-from test_trade_idea_delivery import smtp
+from _smtp_cattura import smtp
 from test_trade_idea_source_research import frozen_clock
 from test_trade_idea_store import db_path, migrated
 

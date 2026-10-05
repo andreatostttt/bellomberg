@@ -11,6 +11,17 @@
      pytest, tsc, test:release, build:bundles, contratti del mandato), TUTTI anche dopo un rosso,
      ognuno col suo timeout ed esito OK/KO/NON ESEGUITO (13/09; un passo KO = STOP, ogni rosso
      locale blocca il deposito; --senza-suite la salta e il riepilogo lo DICE)
+     PM 05/10 (sync del frontend): con --dest --commit, PRIMA della suite si MISURA il tree che sta
+     per uscire contro `git ls-tree -r HEAD` del clone (l'ultimo sync, gia' registrato in STORIA):
+     l'hash che `git add` dara' a ogni percorso (`git hash-object` con la config del clone e il
+     .gitattributes nuovo), aggiunti/modificati/rimossi; la base dev'essere anche origin/<ramo>
+     (un sync mai pushato non fa da base). Se ci sono cambi e stanno TUTTI
+     sotto `app/` (prefisso esatto: `apps/x` o `app.py` non valgono) il passo pytest NON gira — gli
+     altri passi della CI (Node) e il cancello si', per intero — e lo si DICE: riga «SUITE PYTHON
+     SALTATA» a terminale, riga nel messaggio del commit pubblico, `pytest_saltato` nel manifest
+     (base + numero di file), che certificato e pre-push RIMISURANO sugli oggetti git
+     (verifica_deposito). Zero cambi, un file fuori da app/, clone senza HEAD o confronto guasto =
+     suite completa come prima (fail closed). --suite-sempre forza il banco completo.
   6. riepilogo: file, byte, esito per controllo, suite
   7. solo con --dest <clone pubblico> --commit: svuota il working tree del clone (tranne .git),
      copia il tree, git add -A, UN commit 'sync YYYY-MM-DD (privato <hash>)' con l'autore del
@@ -27,6 +38,7 @@ Uso:  python tools/release/export_pubblico.py                       # dry-run
       python tools/release/export_pubblico.py --tieni --corpus-root <snapshot_privato>
       python tools/release/export_pubblico.py --tieni                # lascia il temporaneo
       python tools/release/export_pubblico.py --dest <clone del repo NUOVO> --commit
+      python tools/release/export_pubblico.py --dest <clone> --commit --suite-sempre   # pytest anche se solo app/
 
 Stato (T7 del piano): completo. Il cancello e' tools/release/verifica_pubblico.py (`CONTROLLI`);
 il push non lo fa questo script, mai: e' P4 e lo ordina il PM.
@@ -611,7 +623,7 @@ def _riga_passo(esito):
     return "%s NON ESEGUITO: %s" % (esito["nome"], esito["motivo"])
 
 
-def esegui_suite(temp_dir, attesi=None, lancia=None, orologio=None):
+def esegui_suite(temp_dir, attesi=None, lancia=None, orologio=None, salta_pytest=None):
     """I passi della CI su una COPIA del tree esportato: misura di coerenza, non di leak. Cure della review T7:
       · l'ambiente non porta ne' il DB ne' le chiavi del PM: via `BELLOMBERG_*` e, dal 13/09, via
         ogni variabile che porta il NOME di una riga del `.env` privato (nel dry-run il payload
@@ -632,6 +644,8 @@ def esegui_suite(temp_dir, attesi=None, lancia=None, orologio=None):
         un timeout che uccide l'albero dei processi, e ognuno finisce OK, KO o NON ESEGUITO col
         motivo. Senza `app/package-lock.json` i passi Node sono NON ESEGUITI (dichiarati) e pytest
         gira come prima. `lancia` e `orologio` si iniettano nelle prove.
+      · PM 05/10: `salta_pytest` = il motivo (misurato da chi chiama: solo app/ cambiato dall'ultimo
+        sync) per cui il SOLO passo pytest finisce NON ESEGUITO; gli altri passi girano come sempre.
     L'output completo resta in `<temp>.suite.log`, una sezione per passo; la riga nomina i test
     rossi, i passi e cio' che la macchina locale NON replica della CI."""
     lancia = lancia or _lancia
@@ -683,7 +697,9 @@ def esegui_suite(temp_dir, attesi=None, lancia=None, orologio=None):
                 # gira come prima di questa cura (e il manifest resta INCOMPLETO).
                 bloccanti = [d for d in passo.dipende
                              if fatti[d]["esito"] != "OK" and (lockfile or not per_nome[d].node)]
-                if passo.node and not lockfile:
+                if passo.nome == "pytest" and salta_pytest:
+                    esito = _esito_passo(passo.nome, "NON ESEGUITO", motivo=salta_pytest)
+                elif passo.node and not lockfile:
                     esito = _esito_passo(passo.nome, "NON ESEGUITO",
                                          motivo="nessun app/package-lock.json nella copia")
                 elif bloccanti:
@@ -770,20 +786,25 @@ def hash_artefatto(tree_dir):
 
 def scrivi_manifest(path, commit_sorgente, sha_artefatto, n_file, input_manifest,
                     rc_cancello, rc_suite, solo=None, senza_suite=False, sporchi=0,
-                    esiti_manifest=None, sha_artefatto_post=None, n_file_post=None, passi=None):
+                    esiti_manifest=None, sha_artefatto_post=None, n_file_post=None, passi=None,
+                    pytest_saltato=None):
     """Sidecar senza valori privati: solo hash, conteggi, KO/assenze e stato delle prove.
     Versione 2 (13/09): `verifica.suite_passi` porta i passi della CI sulla copia (nome, esito,
-    exit, secondi, motivo; mai l'output). Passi assenti o NON ESEGUITI = INCOMPLETO, un KO = KO."""
+    exit, secondi, motivo; mai l'output). Passi assenti o NON ESEGUITI = INCOMPLETO, un KO = KO.
+    PM 05/10: `pytest_saltato` = {base, file} quando il SOLO pytest e' stato saltato perche' dall'
+    ultimo sync e' cambiato solo app/: quel NON ESEGUITO (e nessun altro) non rende INCOMPLETO."""
     esiti_manifest = esiti_manifest or {}
     rigoroso = bool(esiti_manifest.get("rigoroso"))
     suite_passi = None if passi is None else [
         {k: p.get(k) for k in ("nome", "esito", "exit", "secondi", "motivo")} for p in passi]
     esiti_passi = [p["esito"] for p in suite_passi or ()]
+    esiti_richiesti = [p["esito"] for p in suite_passi or ()
+                       if not (pytest_saltato and p["nome"] == "pytest" and p["esito"] == "NON ESEGUITO")]
     incompleto = bool(not rigoroso or solo or senza_suite or not input_manifest
                       or input_manifest.get("fonti_ko")
                       or input_manifest.get("conteggi", {}).get(
                           "payload_canali_guasti", 0)
-                      or suite_passi is None or "NON ESEGUITO" in esiti_passi)
+                      or suite_passi is None or "NON ESEGUITO" in esiti_richiesti)
     stato = ("KO" if ("KO" in esiti_passi or ((int(rc_cancello) or int(rc_suite)) and not incompleto))
              else "INCOMPLETO" if incompleto else "OK")
     doc = {
@@ -810,6 +831,7 @@ def scrivi_manifest(path, commit_sorgente, sha_artefatto, n_file, input_manifest
             "controlli_solo": list(solo or ()),
             "suite_non_eseguita": bool(senza_suite),
             "suite_passi": suite_passi,
+            "pytest_saltato": dict(pytest_saltato) if pytest_saltato else None,
             "sorgente_sporca_file": int(sporchi),
             "stato": stato,
             "rigoroso": rigoroso,
@@ -931,15 +953,105 @@ def storia_del_clone(dest, registro=None):
 
 
 def registra_commit(registro, h, messaggio):
-    """Appende l'hash depositato: e' cio' che rende misurabile il sync successivo."""
+    """Appende l'hash depositato: e' cio' che rende misurabile il sync successivo. Del messaggio va
+    solo la PRIMA riga: una seconda riga (la dichiarazione del salto di pytest, 05/10) finirebbe nel
+    registro senza '#' e il sync dopo si fermerebbe su un «hash» che non e' un hash."""
     with open(registro, "a", encoding="utf-8") as fh:
-        fh.write("%s  # %s\n" % (h, messaggio))
+        fh.write("%s  # %s\n" % (h, (messaggio.splitlines() or [""])[0]))
+
+
+# --- PM 05/10: i sync del solo frontend non rilanciano pytest -------------------------------------
+
+PREFISSO_APP = "app/"
+
+
+def _oid_come_git_add(dest, temp_dir, percorsi):
+    """{percorso: hash del blob} come lo calcolera' `git add` nel clone: `git hash-object
+    --stdin-paths` con la `.git` del clone (la SUA config: autocrlf, filtri) e il tree esportato come
+    work-tree (il `.gitattributes` NUOVO). Senza -w: nessun oggetto scritto. Review 05/10 (D1): la
+    tolleranza CRLF fatta a mano dava «non cambiato» a un file `-text` passato da LF a CRLF, che git
+    invece committa. Un percorso con a-capo non si passa per righe: RuntimeError (suite completa)."""
+    if any("\n" in p or "\r" in p for p in percorsi):
+        raise RuntimeError("un percorso contiene un a-capo: hash-object --stdin-paths non lo regge")
+    if not percorsi:
+        return {}
+    r = subprocess.run(["git", "--git-dir", os.path.join(dest, ".git"), "--work-tree", temp_dir,
+                        "hash-object", "--stdin-paths"], cwd=temp_dir, input="\n".join(percorsi) + "\n",
+                       capture_output=True, encoding="utf-8", errors="replace", check=False)
+    oid = (r.stdout or "").split()
+    if r.returncode != 0 or len(oid) != len(percorsi) or not all(
+            re.fullmatch(r"[0-9a-f]{40}", o) for o in oid):
+        raise RuntimeError("git hash-object nel tree: exit %d, %d hash su %d percorsi — %s"
+                           % (r.returncode, len(oid), len(percorsi), (r.stderr or "").strip()[-200:]))
+    return dict(zip(percorsi, oid))
+
+
+def cambiati_dal_clone(dest, temp_dir, scelti):
+    """(hash INTERO dell'HEAD del clone, percorsi aggiunti/modificati/rimossi fra quell'HEAD e il
+    tree che sta per uscire). Una MISURA sui byte: hash git di ogni file scelto contro `git ls-tree
+    -r` dell'HEAD; legge solo oggetti git, non scrive nel clone. Clone senza HEAD, oggetti non sha1,
+    voci che non sono file (symlink, submodule) = RuntimeError: chi chiama fa girare la suite."""
+    r = _run(["git", "rev-parse", "--verify", "--quiet", "HEAD^{commit}"], dest, check=False)
+    base = (r.stdout or "").strip()
+    if r.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", base):
+        raise RuntimeError("il clone non ha un HEAD sha1 leggibile (git rev-parse exit %d): nessun "
+                           "sync precedente con cui confrontare" % r.returncode)
+    pubblicati = {}
+    for voce in _git_nel_clone(dest, "ls-tree", "-rz", "--full-tree", base).split("\0"):
+        if not voce:
+            continue
+        meta, percorso = voce.split("\t", 1)
+        modo, tipo, oid = meta.split()
+        if tipo != "blob" or modo not in ("100644", "100755"):
+            raise RuntimeError("l'HEAD del clone porta una voce che non e' un file (%s %s): %s"
+                               % (modo, tipo, percorso))
+        pubblicati[percorso] = oid
+    scelti_posix = [f.replace(os.sep, "/") for f in scelti]
+    nuovi = _oid_come_git_add(dest, temp_dir, scelti_posix)
+    cambiati = [f for f in scelti_posix if pubblicati.get(f) != nuovi[f]]
+    cambiati += [p for p in pubblicati if p not in nuovi]               # rimossi
+    return base, sorted(cambiati)
+
+
+def base_sul_server(dest, base):
+    """La base del salto dev'essere il commit gia' sul server (`refs/remotes/origin/<ramo>` del
+    clone): un sync depositato e mai pushato (magari rifiutato dal certificato) non fa da base,
+    perche' il push porterebbe fuori anche lui senza pytest. Altrimenti RuntimeError (suite completa)."""
+    ramo = _git_nel_clone(dest, "symbolic-ref", "--short", "HEAD").strip()
+    r = _run(["git", "rev-parse", "--verify", "--quiet", "refs/remotes/origin/%s^{commit}" % ramo],
+             dest, check=False)
+    remoto = (r.stdout or "").strip()
+    if r.returncode != 0 or remoto != base:
+        raise RuntimeError("l'HEAD del clone %s non e' origin/%s (%s): un sync non ancora pushato non "
+                           "fa da base al salto" % (base[:7], ramo, remoto[:7] or "assente"))
+
+
+def solo_app(cambiati):
+    """Vero se c'e' almeno un cambio e TUTTI stanno sotto `app/` (prefisso esatto, con la barra)."""
+    return bool(cambiati) and all(p.startswith(PREFISSO_APP) for p in cambiati)
 
 
 def _msg_non_registrato(registro, h, messaggio, errore):
     return ("commit %s FATTO nel clone ma NON registrato in %s (%s): aggiungi a mano la riga "
             "«%s  # %s» prima del prossimo sync, o quel sync si fermera' sul commit dell'export "
-            "stesso (D6)" % (h, registro, errore, h, messaggio))
+            "stesso (D6)" % (h, registro, errore, h, (messaggio.splitlines() or [""])[0]))
+
+
+def _eseguibili_privati(scelti, repo=None):
+    """I file fra quelli scelti che nell'indice del repo privato hanno modo 100755. Si legge
+    `ls-files -s` intero e si filtra (la lista dei file come argomenti supera la riga di comando
+    di Windows). Un errore di git ferma il deposito: un bit perso non e' un dettaglio muto."""
+    scelti = set(scelti)
+    r = subprocess.run(["git", "ls-files", "-s", "-z"], cwd=repo or REPO, capture_output=True,
+                       encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        raise RuntimeError("git ls-files -s nel privato: exit %d — %s" % (r.returncode, (r.stderr or "").strip()[-300:]))
+    out = []
+    for riga in r.stdout.split("\0"):
+        meta, _, rel = riga.partition("\t")
+        if meta.startswith("100755 ") and rel in scelti:
+            out.append(rel)
+    return sorted(out)
 
 
 def pubblica_in(dest, temp_dir, messaggio, scelti, esegui=None, vietate=None, registro=None):
@@ -989,6 +1101,10 @@ def pubblica_in(dest, temp_dir, messaggio, scelti, esegui=None, vietate=None, re
         raise RuntimeError("l'indice del clone ha %d file sui %d copiati: qualcosa li toglie "
                            "(.gitignore pubblicato, .git/info/exclude, core.excludesFile) — %s"
                            % (len(indice), len(attesi), ", ".join(mancanti[:10])))
+    # 05/10: la copia su Windows perde il bit di esecuzione e il clone ha core.filemode=false,
+    # quindi `add -A` registrerebbe 100644 anche i launcher macOS: si riporta il modo del privato.
+    for rel in _eseguibili_privati(attesi):
+        git("update-index", "--chmod=+x", "--", rel)
     if not git("status", "--porcelain").strip():
         return None
     git("commit", "-q", "-m", messaggio)
@@ -1009,6 +1125,8 @@ def main(argv=None):
     ap.add_argument("--dest", default=None, help="clone del repo pubblico (senza: solo dry-run in temp)")
     ap.add_argument("--commit", action="store_true", help="con --dest: svuota, copia, UN commit (mai push)")
     ap.add_argument("--senza-suite", action="store_true", help="salta pytest nel tree (il riepilogo lo dice)")
+    ap.add_argument("--suite-sempre", action="store_true",
+                    help="con --commit: pytest gira anche se dall'ultimo sync e' cambiato solo app/")
     ap.add_argument("--solo", default=None, help="controlli del cancello (il verdetto resta INCOMPLETO)")
     ap.add_argument("--tieni", action="store_true", help="non cancella la cartella temporanea")
     ap.add_argument("--anche-sporco", action="store_true", help="esporta anche file modificati (dichiarato)")
@@ -1082,10 +1200,39 @@ def main(argv=None):
         if a.corpus_root is not None:
             parametri_cancello["corpus_root"] = a.corpus_root
         rc_cancello = _cancello(temp, **parametri_cancello)
+        # PM 05/10: col deposito, PRIMA della suite, si misura cosa cambia rispetto all'ultimo sync.
+        # Solo app/ = pytest saltato e DICHIARATO; ogni altro esito (o un guasto) = suite completa.
+        pytest_saltato, nota_commit = None, ""
+        if a.dest and a.commit and not a.senza_suite:
+            try:
+                base, cambiati = cambiati_dal_clone(a.dest, temp, scelti)
+                if solo_app(cambiati) and not a.suite_sempre:
+                    base_sul_server(a.dest, base)
+            except (RuntimeError, OSError, ValueError) as e:
+                print("confronto col clone NON riuscito (%s): la suite Python gira per intero" % e)
+            else:
+                fuori = [p for p in cambiati if not p.startswith(PREFISSO_APP)]
+                if not cambiati:
+                    print("confronto col clone: 0 file cambiati da %s: la suite gira come sempre" % base[:7])
+                elif not solo_app(cambiati):
+                    print("confronto col clone: %d file cambiati da %s, %d fuori da app/ (%s): la suite"
+                          " Python gira per intero" % (len(cambiati), base[:7], len(fuori),
+                                                       ", ".join(fuori[:5]) + (" ..." if len(fuori) > 5 else "")))
+                elif a.suite_sempre:
+                    print("confronto col clone: %d file cambiati da %s, tutti sotto app/: --suite-sempre,"
+                          " la suite Python gira per intero" % (len(cambiati), base[:7]))
+                else:
+                    pytest_saltato = {"base": base, "file": len(cambiati)}
+                    nota_commit = ("suite Python non eseguita: solo app/ cambiato (%d file) rispetto a %s"
+                                   % (len(cambiati), base[:7]))
+                    print("SUITE PYTHON SALTATA: %d file cambiati dall'ultimo sync %s, tutti sotto app/"
+                          " (pytest NON ESEGUITO; cancello e passi Node per intero; --suite-sempre"
+                          " per il banco completo)" % (len(cambiati), base[:7]))
         if a.senza_suite:
             rc_suite, riga, passi = 0, "NON ESEGUITA (--senza-suite): il verdetto non la conta", None
         else:
-            esito_suite = esegui_suite(temp, attesi=len(scelti))
+            esito_suite = esegui_suite(temp, attesi=len(scelti), **(
+                {"salta_pytest": nota_commit} if pytest_saltato else {}))
             rc_suite, riga = esito_suite
             passi = getattr(esito_suite, "passi", None)     # una suite senza passi = manifest INCOMPLETO
         sha_dopo_suite, file_dopo_suite = hash_artefatto(temp)
@@ -1108,7 +1255,8 @@ def main(argv=None):
             rc_cancello, rc_suite, solo=solo, senza_suite=a.senza_suite,
             sporchi=len(sporchi),
             esiti_manifest=getattr(rc_cancello, "esiti_manifest", None),
-            sha_artefatto_post=sha_dopo_suite, n_file_post=file_dopo_suite, passi=passi)
+            sha_artefatto_post=sha_dopo_suite, n_file_post=file_dopo_suite, passi=passi,
+            pytest_saltato=pytest_saltato)
         print("manifest: %s (artefatto sha256 %s; stato %s)"
               % (manifest_path, sha_artefatto[:12], doc_manifest["verifica"]["stato"]))
         rc = max(rc_cancello, 1 if rc_suite else 0)
@@ -1117,11 +1265,14 @@ def main(argv=None):
                   % (rc_cancello, rc_suite, "" if a.tieni else " — con --tieni la temp resta da guardare"))
             return rc
         if a.dest and a.commit:
+            h = None
             try:
                 valida_manifest(doc_manifest)
                 prepara_guardia(a.dest)
-                h = pubblica_in(a.dest, temp, "sync %s (privato %s)"
-                                % (_dt.date.today().isoformat(), hash_privato), scelti)
+                messaggio = "sync %s (privato %s)" % (_dt.date.today().isoformat(), hash_privato)
+                if nota_commit:            # PM 05/10: il salto di pytest sta anche nella storia pubblica
+                    messaggio += "\n\n" + nota_commit
+                h = pubblica_in(a.dest, temp, messaggio, scelti)
                 certificato = certifica_deposito(a.dest, doc_manifest, temp)
                 print("certificato persistente e guardia pre-push: %s" % certificato)
             except (RuntimeError, OSError, ValueError) as e:
@@ -1129,6 +1280,12 @@ def main(argv=None):
                 if "NON registrato" in str(e):     # D6: il commit c'e', manca solo la riga nel registro
                     print("il deposito e' FATTO: aggiungi a mano la riga indicata al registro, poi il"
                           " push resta al PM")
+                    return 2
+                if h:      # review 05/10 (D3): il commit C'E' ed e' registrato, manca il certificato
+                    print("il commit %s e' FATTO nel clone e REGISTRATO in %s ma NON certificato: NON"
+                          " pushare (la guardia pre-push lo fermerebbe). Per toglierlo: cancella la sua"
+                          " riga da %s e `git -C %s reset --hard %s^`" % (h[:7], REGISTRO, REGISTRO, a.dest, h))
+                    a.tieni = True
                     return 2
                 print("il clone %s puo' essere a meta' sync (svuotato e ricopiato, nessun commit):"
                       " `git -C %s status`, e per tornare a HEAD"

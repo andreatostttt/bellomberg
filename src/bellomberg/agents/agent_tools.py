@@ -2880,22 +2880,34 @@ def tool_get_gov_contracts(ticker, limit=30, proxy_usa=False):
         return {"error": "quiver gov contracts: " + str(e)}
 
 
+# === W1 (05/10, decisione PM): i .MI funzionano anche SENZA la tabella ISIN privata ===
+# Logica in market_data/isin_automatico.py (un solo posto anche per l'API); qui si
+# ri-esportano gli stessi nomi per compatibilita'.
+from bellomberg.market_data.isin_automatico import (  # noqa: E402,F401
+    nome_emittente_it, assicura_isin_it, con_risoluzione)
+
+
 # Comunicazioni di internal dealing restituite al modello (il resto e' contato e dichiarato):
 # ognuna porta il dettaglio delle operazioni e il tool_result ha un tetto.
 INTERNAL_DEALING_MAX = 15
 
 
 def _internal_dealing_it(ticker, days, rifiuto_usa):
-    """Insider di un titolo italiano: eMarket SDIR (IT1). Gli stati KO / non_coperto / STALE
-    si DICHIARANO; nessun ripiego su Finnhub o SEC (togliendo .MI si aggancerebbe un omonimo)."""
-    from bellomberg.market_data.emarket_sdir import get_internal_dealing
+    """Insider di un titolo italiano dallo SDIR giusto (handoff-3: instradatore sdir.py fra eMarket
+    SDIR e 1INFO-SDIR). Gli stati KO / non_coperto / STALE si DICHIARANO; nessun ripiego su
+    Finnhub o SEC (togliendo .MI si aggancerebbe un omonimo)."""
+    from bellomberg.market_data import sdir as _sdir
+    from bellomberg.market_data.isin_automatico import giorni_validi, nome_noto
     try:
         giorni = int(days)
     except (TypeError, ValueError):
         giorni = days   # get_internal_dealing lo rifiuta con errore «parametro» dichiarato
-    r = get_internal_dealing(ticker, giorni=giorni)
+    # RV-W1: giorni non validi = il lettore rifiuta per parametro: niente rete di risoluzione prima
+    ris = assicura_isin_it(ticker) if giorni_validi(giorni) else None
+    r = _sdir.get_internal_dealing(ticker, giorni=giorni, nome=nome_noto(ticker, ris))
     comunicazioni = r.get("comunicazioni") or []
-    payload = {"ticker": r.get("ticker") or ticker, "source": "emarket_sdir (internal dealing)",
+    payload = {"ticker": r.get("ticker") or ticker,
+               "source": "sdir (internal dealing): %s" % (r.get("sdir") or "nessuno SDIR"),
                "stato": r.get("stato"), "errore": r.get("errore"), "motivo": r.get("motivo"),
                "letto_il": r.get("letto_il"), "count": len(comunicazioni),
                "comunicazioni": comunicazioni[:INTERNAL_DEALING_MAX]}
@@ -2903,7 +2915,8 @@ def _internal_dealing_it(ticker, days, rifiuto_usa):
         payload["comunicazioni_tagliate"] = ("mostrate %d su %d (le piu' recenti in testa come "
                                              "le da' la fonte)" % (INTERNAL_DEALING_MAX, len(comunicazioni)))
     for k in ("isin", "emarket_id", "url", "limiti", "troncato", "pdf_letti", "pdf_non_letti",
-              "pdf_falliti", "parse_falliti", "cache", "stato_originale", "voce_da"):
+              "pdf_falliti", "parse_falliti", "cache", "stato_originale", "voce_da",
+              "sdir", "instradamento", "oneinfo_ndg", "fonte"):
         if k in r:
             payload[k] = r[k]
     if r.get("voce_da") == "automatico":
@@ -2922,18 +2935,22 @@ def _internal_dealing_it(ticker, days, rifiuto_usa):
     elif stato == "vuoto_misurato":
         # misura della SOLA categoria eMarket (regola main 04/10, misura IT2): mai presentarla
         # come assenza di operazioni degli insider
-        payload["esito"] = ("nessuna comunicazione nella categoria internal dealing di eMarket "
-                            "negli ultimi %s giorni (misura della sola categoria eMarket SDIR)" % giorni)
+        # handoff-3: la categoria e' quella dello SDIR scelto dall'instradatore (eMarket o 1INFO)
+        _cat = r.get("sdir") or "SDIR non dichiarato dall'instradatore"
+        payload["esito"] = ("nessuna comunicazione nella categoria internal dealing di %s "
+                            "negli ultimi %s giorni (misura della sola categoria internal dealing dello SDIR, "
+                            "non l'assenza di operazioni)" % (_cat, giorni))
     elif stato not in ("ok",):
         payload["error"] = "internal dealing: stato inatteso %r" % (stato,)
-    return payload
+    return con_risoluzione(payload, ris)
 
 
 def insider_dichiarati(ticker, days=90, max_trades=30, proxy_usa=False):
     """Insider trades con guardia di copertura (W1). Ritorna (payload, firma) per i due
     consumatori (agent_tools e chat_tools).
 
-    - listino estero: nessuna chiamata a Finnhub/SEC; `.MI` -> internal dealing eMarket SDIR;
+    - listino estero: nessuna chiamata a Finnhub/SEC; `.MI` -> internal dealing dallo SDIR scelto
+      dall'instradatore (eMarket SDIR o 1INFO-SDIR, ISIN risolto in automatico se assente);
       gli altri -> «non coperto» col gemello USA (usato SOLO con proxy_usa=true, etichettato);
     - USA: Finnhub, poi SEC Form 4; i motivi delle fonti mute stanno in `fonti_mute` e una SEC
       muta senza trade e' un `error` (mai «0 insider» muto)."""
@@ -2942,7 +2959,7 @@ def insider_dichiarati(ticker, days=90, max_trades=30, proxy_usa=False):
     if g["rifiuto"] is not None:
         if t.endswith(".MI"):
             return (_internal_dealing_it(t, days, g["rifiuto"]),
-                    "eMarket SDIR internal dealing (%s)" % t)
+                    "SDIR internal dealing (eMarket SDIR / 1INFO-SDIR) (%s)" % t)
         return g["rifiuto"], "copertura insider (%s): nessuna fonte interrogata" % t
     simbolo = g["simbolo"]
     motivi_fh, motivi_sec = [], []
@@ -2971,9 +2988,12 @@ def insider_dichiarati(ticker, days=90, max_trades=30, proxy_usa=False):
 
 
 def tool_get_insider_trades(ticker, days=90, proxy_usa=False):
-    """Insider trades / Form 4 (Finnhub se disponibile, poi SEC EDGAR; .MI -> eMarket SDIR)."""
+    """Insider trades / Form 4 (Finnhub se disponibile, poi SEC EDGAR; .MI -> internal dealing
+    dallo SDIR scelto dall'instradatore: eMarket SDIR o 1INFO-SDIR)."""
+    from bellomberg.market_data.isin_automatico import BUDGET_DESK_S, budget_risoluzione
     try:
-        payload, _firma = insider_dichiarati(ticker, days=days, max_trades=30, proxy_usa=proxy_usa)
+        with budget_risoluzione(BUDGET_DESK_S):   # tool dei desk del comitato: budget lungo
+            payload, _firma = insider_dichiarati(ticker, days=days, max_trades=30, proxy_usa=proxy_usa)
         return payload
     except Exception as e:
         return {"error": "insider trades: " + str(e)}
@@ -2982,7 +3002,7 @@ def tool_get_insider_trades(ticker, days=90, proxy_usa=False):
 TOOLS_SCHEMA.append({"name": "get_congress_trades", "description": "US CONGRESS stock trades (Quiver Quantitative, PAID). Which senators/representatives bought or sold a ticker and when - a strong political smart-money signal. Pass a ticker, or omit for the latest congressional trades across the market. Core tool for political/policy theses.", "input_schema": {"type": "object", "properties": {"ticker": {"type": "string", "description": "Ticker (optional; omit for latest market-wide)"}, "limit": {"type": "integer", "default": 50}, "proxy_usa": PROXY_USA_PROP}}})
 TOOLS_SCHEMA.append({"name": "get_lobbying", "description": "Corporate LOBBYING spend disclosures (Quiver, PAID). How much a company spends lobbying and on which issues - signals regulatory exposure and political positioning. Use for policy/regulation theses. US issuers only: a foreign listing gets a DECLARED 'non coperto'.", "input_schema": {"type": "object", "properties": {"ticker": {"type": "string"}, "limit": {"type": "integer", "default": 30}, "proxy_usa": PROXY_USA_PROP}, "required": ["ticker"]}})
 TOOLS_SCHEMA.append({"name": "get_gov_contracts", "description": "US GOVERNMENT CONTRACTS awarded to a company (Quiver, PAID). Federal awards are a hard revenue/visibility signal (defense, healthcare, infrastructure). Use for fundamentals + policy theses. US issuers only: a foreign listing gets a DECLARED 'non coperto'.", "input_schema": {"type": "object", "properties": {"ticker": {"type": "string"}, "limit": {"type": "integer", "default": 30}, "proxy_usa": PROXY_USA_PROP}, "required": ["ticker"]}})
-TOOLS_SCHEMA.append({"name": "get_insider_trades", "description": "INSIDER TRADES / Form 4 - officers and directors buying or selling (Finnhub PAID, fallback SEC EDGAR). Insider buying is bullish, clustered selling a caution. Use for fundamentals conviction. Italian listings (.MI): internal dealing from eMarket SDIR (stato ok/vuoto_misurato/KO/non_coperto/STALE declared; KO is NOT zero insiders). Other foreign listings: DECLARED 'non coperto', no call to Finnhub/SEC (stripping the suffix would hit a US namesake).", "input_schema": {"type": "object", "properties": {"ticker": {"type": "string"}, "days": {"type": "integer", "default": 90}, "proxy_usa": PROXY_USA_PROP}, "required": ["ticker"]}})
+TOOLS_SCHEMA.append({"name": "get_insider_trades", "description": "INSIDER TRADES / Form 4 - officers and directors buying or selling (Finnhub PAID, fallback SEC EDGAR). Insider buying is bullish, clustered selling a caution. Use for fundamentals conviction. Italian listings (.MI): internal dealing from the issuer's SDIR (eMarket SDIR or 1INFO-SDIR, chosen by the router and declared in 'sdir'/'instradamento'; ISIN resolved automatically on Borsa Italiana if missing, declared in 'risoluzione_isin') (stato ok/vuoto_misurato/KO/non_coperto/STALE declared; KO is NOT zero insiders). Other foreign listings: DECLARED 'non coperto', no call to Finnhub/SEC (stripping the suffix would hit a US namesake).", "input_schema": {"type": "object", "properties": {"ticker": {"type": "string"}, "days": {"type": "integer", "default": 90}, "proxy_usa": PROXY_USA_PROP}, "required": ["ticker"]}})
 TOOL_DISPATCHER["get_congress_trades"] = tool_get_congress_trades
 TOOL_DISPATCHER["get_lobbying"] = tool_get_lobbying
 TOOL_DISPATCHER["get_gov_contracts"] = tool_get_gov_contracts

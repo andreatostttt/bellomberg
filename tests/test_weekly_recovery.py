@@ -18,6 +18,18 @@ def _store():
     return WeeklyRunStore(db, memo_id)
 
 
+def _research_contract(run_offline, monkeypatch):
+    """ZR 05/10: una run NUOVA nasce col contratto research (fundamentals_research_v1);
+    il contratto legacy con workbook e' archiviato (1326312) e la sua ripresa analitica e'
+    bloccata per decisione PM. I desk finti scrivono il rapporto senza produrre workbook."""
+    monkeypatch.setattr(cm, "_weekly_contract", run_offline.native_weekly_contract)
+
+    def research_report(self, round_n):
+        self.run_result_status = "complete"
+        self.bb.write(self.name, round_n, "Synthetic research report %s R%d " % (self.name, round_n) + "x" * 200)
+    monkeypatch.setattr(_DeskFinto, "run", research_report)
+
+
 @pytest.mark.parametrize("broken", ["database", "portfolio", "placeholder"])
 def test_prerequisite_failure_prevents_every_paid_phase(run_offline, monkeypatch, broken):
     def fail(*args, **kwargs):
@@ -45,6 +57,7 @@ def test_missing_database_does_not_bootstrap_an_empty_book_or_dispatch(run_offli
 @pytest.mark.parametrize("fault", ["503", "504", "timeout", "disconnect", "incomplete"])
 def test_provider_first_cause_and_unknown_cost_survive_both_resumes(run_offline, monkeypatch, fault):
     from bellomberg.core.llm_client import OpenRouterClient
+    _research_contract(run_offline, monkeypatch)
     from bellomberg.valuation import preparation_ai
     monkeypatch.setattr(preparation_ai, "live_metadata", lambda model: {
         "id": model, "context_length": 1000, "pricing": {"prompt": "0.000001", "completion": "0.000002"}})
@@ -71,8 +84,9 @@ def test_provider_first_cause_and_unknown_cost_survive_both_resumes(run_offline,
     assert first["desk"] == "fundamentals" and first["round"] == 0
     assert first["request_id"]
     for _ in range(2):
-        with pytest.raises(Exception):
+        with pytest.raises(Exception) as resumed:
             cm.run_multi_agent(resume_memo_id=store.memo_id, authorize_new_ai=True, send_email=False)
+        assert "Run legacy in archivio" not in str(resumed.value)
     status = store.status()
     assert status["first_error"] == first
     assert len(calls) == 1 and status["status"] == "incomplete"
@@ -82,7 +96,11 @@ def test_provider_first_cause_and_unknown_cost_survive_both_resumes(run_offline,
     assert run_offline.catturato == {} and run_offline.inviati == []
 
 
-def test_crash_resume_second_resume_reuses_completed_reports_and_workbook(run_offline, monkeypatch):
+def test_crash_resume_second_resume_reuses_completed_reports(run_offline, monkeypatch):
+    # ZR 05/10: era ..._and_workbook sul contratto legacy (corpo originale in
+    # archive/private/attic/tests_excel_archiviato_20261005/test_weekly_recovery_legacy.py). Il riuso dei rapporti
+    # completati vale sul contratto research vivo; il riuso del workbook e' codice archiviato.
+    _research_contract(run_offline, monkeypatch)
     original = _DeskFinto.run
     attempts = []
     fail_once = [True]
@@ -205,6 +223,7 @@ def test_incomplete_requested_workbook_blocks_completion_and_email(run_offline, 
 
 
 def test_changed_book_blocks_analytical_resume_but_saved_material_remains(run_offline, monkeypatch):
+    _research_contract(run_offline, monkeypatch)
     original = _DeskFinto.run
     def run(self, round_n):
         if self.name == "quant" and round_n == 1:

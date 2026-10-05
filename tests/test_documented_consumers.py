@@ -11,6 +11,7 @@ from datetime import date, timedelta
 from test_sector_operating_drivers import DAY, bundle_for, operating_records
 from test_sector_valuation_integration import isolated_tools
 from test_valuation_snapshot_persistence import db
+from _prerequisiti_node import APP, richiedi_node_modules
 from test_sector_bank_capital import bank_bundle,bank_records
 from test_sector_rab_drivers import rab_bundle,rab_records
 from test_sector_nav_drivers import nav_bundle,nav_records
@@ -78,27 +79,6 @@ def test_documented_value_survives_later_read_in_committee_database_f17_and_scor
 
 
 @pytest.mark.parametrize('factory,records_factory,method,missing',CASES)
-def test_documented_tool_build_cache_and_committee_use_one_result(isolated_tools,monkeypatch,factory,records_factory,method,missing):
-    from bellomberg.valuation.sector_analysis import valuation_results_block
-    tools=isolated_tools; bundle=factory(); symbol=bundle['case']['ticker']
-    monkeypatch.setattr(tools.engine,'REPORT_DIR',tools.directory)
-    first=tools.chat.dispatch('get_valuation',{'ticker':symbol},prepared_bundle=bundle)['data']
-    assert first['valuation_usability']['usable'], first
-    built=tools.build(symbol,prepared_bundle=bundle,as_of=DAY)
-    assert built['fair_value_base']==first['fair_value_base']
-    assert built['snapshot_id']==first['snapshot_id']
-    tools.memory.history=[{'fair_value':first['fair_value_base'],'valuation_payload':first,
-                           'generation_id':first['generation_id'],'excel_path':first['path']}]
-    def forbidden(*a,**k):
-        raise AssertionError('Valid documented cache should not regenerate')
-    monkeypatch.setattr(tools.engine,'generate_valuation',forbidden)
-    cached=tools.chat.dispatch('get_valuation',{'ticker':symbol},prepared_bundle=bundle)['data']
-    assert cached['generation_id']==first['generation_id']
-    block=valuation_results_block({symbol:cached})
-    assert method in block and str(first['fair_value_base']) in block
-
-
-@pytest.mark.parametrize('factory,records_factory,method,missing',CASES)
 def test_documented_research_persistence_score_f17_and_render(tmp_path,monkeypatch,db,factory,records_factory,method,missing):
     from bellomberg.valuation import dcf_engine,sector_analysis
     from bellomberg.core import current_facts
@@ -137,6 +117,26 @@ def test_documented_research_persistence_score_f17_and_render(tmp_path,monkeypat
         pytest.skip('Backend/DB/score/F17 assertions completed; Node rendering is not run inside '
                     'the subprocess-blocking harness and requires the separate guarded Node proof. '
                     'Frozen fixture: ' + str(models))
-    rendered=subprocess.run(['node','--test','tests/product/sector-valuation.cjs'],cwd=Path('app').resolve(),
+    # Prerequisito dichiarato (ZR 05/10): senza `npm ci` in app/ il rosso dice cosa fare, non uno stack
+    # di node; cartella app/ ancorata al repo, non alla cwd di pytest.
+    node = richiedi_node_modules('react', 'react-dom', 'typescript')
+    rendered=subprocess.run([node,'--test','tests/product/sector-valuation.cjs'],cwd=APP,
         env={**os.environ,'DOCUMENTED_VALUATION_FIXTURE':str(models)},capture_output=True,text=True)
     assert rendered.returncode==0,rendered.stdout+rendered.stderr
+
+
+# Contratto ATTUALE (ZR 05/10, Z1): il test chat/build/cache/comitato per i 14 metodi documentati e' in
+# archive/private/attic/tests_excel_archiviato_20261005/test_documented_consumers_legacy.py (dispatch get_valuation archiviato
+# dal 1326312, censimento Z4). Qui ogni famiglia riceve il contratto dichiarato, senza toccare il ramo.
+from _contratto_excel_archiviato import blinda_ramo_archiviato, file_in, verifica_archiviato
+
+
+@pytest.mark.parametrize('factory,records_factory,method,missing',CASES)
+def test_documented_families_meet_the_archived_contract(isolated_tools,monkeypatch,factory,records_factory,method,missing):
+    tools=isolated_tools; bundle=factory(); symbol=bundle['case']['ticker']
+    assert bundle['decision']['method_id']==method  # la famiglia e' davvero quella del caso
+    prima=file_in(tools.directory)
+    chiamate=blinda_ramo_archiviato(monkeypatch)
+    risposta=tools.chat.dispatch('get_valuation',{'ticker':symbol},prepared_bundle=bundle)
+    verifica_archiviato(risposta,chiamate,cartella=tools.directory,prima=prima)
+    assert tools.memory.reads==0 and tools.memory.saved==[]

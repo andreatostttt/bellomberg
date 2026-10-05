@@ -7,11 +7,13 @@ import pytest
 from bellomberg.agents import consigliere_multi as cm, red_team, chat_tools, weekly_lifecycle
 from bellomberg.core import llm_client
 from bellomberg.valuation import preparation_ai
-from test_cablaggio_consigliere_multi import run_offline
+from test_cablaggio_consigliere_multi import run_offline, _DeskFinto
 from test_weekly_recovery import _store
 
 
 NATIVE_RED_TEAM = red_team.run_red_team
+NATIVE_WEEKLY_CONTRACT = cm._weekly_contract
+consigliere_multi = cm
 
 
 class Crash(BaseException):
@@ -44,6 +46,14 @@ def setup_provider(monkeypatch):
         return client
     monkeypatch.setattr(llm_client, 'OpenRouterClient', create_client)
     monkeypatch.setattr(red_team, 'run_red_team', NATIVE_RED_TEAM)
+    # ZR 05/10: run NUOVA = contratto research (fundamentals_research_v1). Sul contratto legacy
+    # (workbook, archiviato in 1326312) la ripresa analitica e' bloccata per decisione PM.
+    monkeypatch.setattr(consigliere_multi, '_weekly_contract', NATIVE_WEEKLY_CONTRACT)
+    def research_report(self, round_n):
+        # Desk finto in modalita' research: rapporto in blackboard, nessun workbook.
+        self.run_result_status = 'complete'
+        self.bb.write(self.name, round_n, 'Synthetic research report %s R%d ' % (self.name, round_n) + 'x' * 200)
+    monkeypatch.setattr(_DeskFinto, 'run', research_report)
     monkeypatch.setattr(chat_tools, 'dispatch', lambda *args, **kwargs:
                         tool_calls.append(args) or {'source': 'frozen synthetic risk', 'status': 'ok'})
     return requests, tool_calls, clients

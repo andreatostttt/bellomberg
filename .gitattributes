@@ -63,3 +63,14 @@ tests/fixtures/sec_cover/uber-catalog.json -text
 tests/test_prev_close_dal_carico.py -text
 tests/test_sec_preparation_two_filings.py -text
 *.command text eol=lf
+# ZR 05/10 (Z1): workbook STORICO sintetico congelato: byte esatti su ogni checkout (lo sha256 sta nel sidecar).
+tests/fixtures/workbook_storico/* -text
+# 05/10 (handoff-3, Opus 5.5): fixture SINTETICHE delle fonti italiane e UE a byte esatti su ogni checkout: alcune
+# prove confrontano lo sha256 dei corpi salvati e un CR aggiunto da autocrlf le farebbe fallire solo su Windows.
+tests/fixtures/fonti_it/** -text
+tests/fixtures/fonti_ue/** -text
+
+# 05/10 (handoff-3, Opus 5.5): i PDF delle fixture sono generati da reportlab SENZA compressione, quindi sono
+# ASCII puro e git li prendeva per testo: con core.autocrlf un checkout Windows aggiungeva CR e spostava gli
+# offset della tabella xref (PDF rotti, test rossi solo su quel clone). Sempre binari, byte identici ovunque.
+*.pdf -text

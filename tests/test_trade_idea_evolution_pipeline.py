@@ -142,81 +142,15 @@ def test_insufficient_sources_block_preflight_before_any_paid_phase(monkeypatch)
     assert fake.calls == 0
 
 
-def test_unusable_fundamentals_model_stops_after_research_before_red_team_and_capo(
-        migrated, tmp_path, monkeypatch):
-    from bellomberg.agents import chat_tools
-    from bellomberg.agents.specialists import base as specialist_base
-    from bellomberg.core import llm_client, mandato_pm
-    from bellomberg.core.llm_client import Usage
-    from test_trade_idea_economic import qualified, _operating_plan
-    qualification, basis_plan = qualified(tmp_path), _operating_plan()
+def test_excel_model_run_is_refused_before_research_or_paid_work(migrated, tmp_path):
+    # Il test del modello Fundamentals inutilizzabile e' in archive/private/attic/tests_excel_archiviato_20261005/
+    # test_trade_idea_evolution_pipeline_legacy.py; qui il contratto attuale della stessa run.
+    from test_trade_idea_pipeline import _assert_excel_run_refused_before_work
     s = store(migrated)
     payload = qualified_request()
-    payload.update(ticker="SYNTH-EXT", currency="EUR", language="en", source_qualification=qualification)
-    payload["authorization"]["source_fingerprint"] = qualification["fingerprint"]
+    payload.update(ticker="SYNTH-EXT", currency="EUR", language="en")
     run_id = s.create_run(payload, idempotency_key="model-after-independent-research")["run"]["id"]
-    provider_calls, prepared, streams = [], [], []
-
-    class Messages:
-        def create(self, **kwargs):
-            provider_calls.append(kwargs)
-            blocks = model_build_tool_blocks(kwargs, basis_plan,
-                [row["id"] for row in qualification["source_report"]["documents"]])
-            tool_done = any(isinstance(row.get("content"), list)
-                and any(isinstance(block, dict) and block.get("type") == "tool_result" for block in row["content"])
-                for row in kwargs["messages"])
-            market = [row["name"] for row in kwargs.get("tools") or [] if row["name"] not in MODEL_META_TOOLS]
-            if not blocks and market and not tool_done and kwargs.get("tool_choice") != {"type": "none"}:
-                blocks = [{"name": market[0], "input": {"ticker": "SYNTH-EXT"}}]
-            content = ([SimpleNamespace(type="tool_use", id=f"offline-{len(provider_calls)}-{i}", **block)
-                        for i, block in enumerate(blocks)] if blocks else [SimpleNamespace(type="text",
-                        text="Independent fictional analysis; capital bridge and downside remain unresolved. " * 20)])
-            return SimpleNamespace(id=f"offline-{len(provider_calls)}", model=kwargs["model"],
-                stop_reason="tool_use" if blocks else "end_turn", content=content,
-                usage=Usage(input_tokens=120, output_tokens=180,
-                            cache_read_input_tokens=0, cache_creation_input_tokens=0, cost_usd=.001))
-        def stream(self, **kwargs):
-            streams.append(kwargs)
-            raise AssertionError("Capo must not receive an unusable model")
-    class Client:
-        def __init__(self, **kwargs):
-            import httpx
-            self.messages = Messages()
-            self._http = SimpleNamespace(timeout=httpx.Timeout(450.0))
-    for owner in (specialist_base, llm_client, trade_idea):
-        monkeypatch.setattr(owner, "OpenRouterClient", Client)
-    monkeypatch.setattr(chat_tools, "dispatch", lambda *_a, **_k: {
-        "ok": True, "data": {"status": "synthetic", "as_of": qualification["as_of"]}})
-    monkeypatch.setattr(chat_tools, "_compatta_portfolio_live", lambda *_: {"positions": []})
-    monkeypatch.setattr(mandato_pm, "carica", mandato_pm.profilo_esempio)
-
-    def initial_model(board):
-        assert board.current_round == 1 and board.model_phase == "building"
-        assert all(board.read(desk, 0) for desk in DESKS)
-        assert all(board.read(desk, 1) for desk in DESKS if desk != "fundamentals")
-        assert len(board.data["_model_consultations"]) == 5
-        assert all(row["status"] == "complete" and row["fundamentals_decision"]
-                   for row in board.data["_model_consultations"])
-        prepared.append("initial-model")
-        board.record_valuation("SYNTH-EXT", {"ok": False,
-            "valuation_usability": {"usable": False}, "error": "capital bridge is incomplete"},
-            "trade-idea-orchestrator")
-
-    detail = trade_idea.execute_trade_idea(run_id, store=s, lock_path=tmp_path / "paid.lock",
-        output_dir=tmp_path / "report",
-        portfolio_loader=lambda: {"positions": [], "cash_disponibile_eur": 0},
-        mandate_loader=mandato_pm.profilo_esempio,
-        preparer_binder=lambda *_: (None, {"status": "deterministic"}),
-        risk_loader=lambda: {}, stress_loader=lambda: {}, candidate_metrics_loader=lambda *_: {},
-        valuation_evaluator=initial_model, source_qualifier=lambda *args, **kwargs: qualification,
-        catalog_fetcher=lambda: payload["catalog_snapshot"], isolated_tool_dispatcher=chat_tools.dispatch,
-        isolated_facts_loader=lambda: "Offline facts")
-    assert prepared == ["initial-model"]
-    assert not streams
-    assert not any(call["max_tokens"] == 12000 or "Round 2." in str(call["messages"][0]["content"])
-                   for call in provider_calls)
-    assert detail["run"]["technical_status"] in {"failed", "incomplete"}
-    assert detail["cost"]["requests"] == len(provider_calls) > 0
+    _assert_excel_run_refused_before_work(s, run_id, tmp_path)
 
 
 def test_revision_tool_never_mutates_or_regenerates_the_model(tmp_path, monkeypatch):

@@ -21,28 +21,50 @@ def _tracking_rows(db):
                 conn.execute("SELECT count(*) FROM favorite_companies").fetchone()[0])
 
 
-def test_disabled_installation_and_notification_do_not_open_db_or_start_thread(tmp_path, monkeypatch):
+ARCHIVED = {"status": "archived", "reason": "excel_generation_archived_by_research_contract"}
+
+
+def test_archived_installation_and_notification_do_not_read_policy_open_db_or_start_thread(tmp_path, monkeypatch):
+    # ZR 05/10 (Z4): contratto attuale (1326312, valuation_automation_installation.py:71-78, 221-223).
+    # Garanzia conservata: avvio e notifica non aprono DB, manager o thread. Garanzia NON piu' provabile
+    # qui: lo stato 'disabled/configuration_absent' della policy assente vive solo in
+    # _start_legacy_installation/_notify_legacy_tracking, senza chiamanti (codice morto, censimento Z4).
     from bellomberg.valuation import valuation_automation_installation as install
-    from bellomberg.valuation.preparation_runtime import PreparationRuntime
     from bellomberg.api import bellomberg_api as api
-    runtime = PreparationRuntime(tmp_path / "absent-policy.json", data_root=tmp_path / "data",
-        archive_root=tmp_path / "sources", output_dir=tmp_path / "models")
-    monkeypatch.setattr(install, "installation_runtime", lambda: runtime)
-    monkeypatch.setattr(install, "build_manager", lambda *_: pytest.fail("disabled installation opened manager"))
-    monkeypatch.setattr(install, "Thread", lambda *_a, **_k: pytest.fail("disabled installation started thread"))
+    monkeypatch.setattr(install, "installation_runtime", lambda: pytest.fail("archived installation read the policy"))
+    monkeypatch.setattr(install, "build_manager", lambda *_: pytest.fail("archived installation opened manager"))
+    monkeypatch.setattr(install, "Thread", lambda *_a, **_k: pytest.fail("archived installation started thread"))
     db_path = tmp_path / "absent.db"
     monkeypatch.setattr(api, "SQLITE_PATH", str(db_path))
-    assert install.start_installation(db_path) == {
-        "runner": None, "state": {"status": "disabled", "reason": "configuration_absent"}}
+    assert install.start_installation(db_path) == {"runner": None, "state": ARCHIVED}
     app = SimpleNamespace(state=SimpleNamespace())
     async def start_and_stop():
         async with api.lifespan(app):
             assert app.state.valuation_automation["runner"] is None
-            assert app.state.valuation_automation["state"]["status"] == "disabled"
+            assert app.state.valuation_automation["state"] == ARCHIVED
     asyncio.run(start_and_stop())
-    assert install.notify_tracking(db_path, "SYNTH-A", "portfolio") == {
-        "status": "disabled", "reason": "configuration_absent"}
+    assert install.notify_tracking(db_path, "SYNTH-A", "portfolio") == ARCHIVED
     assert not db_path.exists() and not (tmp_path / "data").exists()
+
+
+def test_archived_notification_never_enqueues_or_acquires_for_tracked_tickers(automation, monkeypatch):
+    # Il corpo storico (accodamento e deduplica) e' in
+    # archive/private/attic/tests_excel_archiviato_20261005/test_valuation_automation_installation_legacy.py.
+    from bellomberg.valuation import valuation_automation_installation as install
+    manager, observed, _, _ = automation
+    db = manager.versions.db
+    with db._conn() as conn:
+        conn.execute("INSERT INTO positions(ticker,quantita,is_active) VALUES('SYNTH-A',10,1)")
+        conn.execute("INSERT INTO favorite_companies(ticker,name) VALUES('SYNTH-A','Synthetic issuer')")
+    monkeypatch.setattr(install, "installation_runtime", lambda: manager.runtime)
+    monkeypatch.setattr(install, "build_manager", lambda *_: manager)
+    before = _tracking_rows(db)
+    for ticker, trigger in (("synth-a", "portfolio"), ("SYNTH-A", "watchlist"), ("SYNTH-N", "portfolio")):
+        assert install.notify_tracking(db.db_path, ticker, trigger) == ARCHIVED
+    assert _tracking_rows(db) == before
+    with sqlite3.connect(manager.jobs.db_path) as conn:
+        assert conn.execute("SELECT count(*) FROM valuation_jobs").fetchone()[0] == 0
+    assert not observed["acquire"] and not observed["collect"] and not observed["paid"]
 
 
 def test_build_manager_reads_existing_schema_without_memorydb_init_or_migration(automation, monkeypatch):
@@ -59,27 +81,6 @@ def test_build_manager_reads_existing_schema_without_memorydb_init_or_migration(
     assert built.versions.current("SYNTH-A") is None
     with sqlite3.connect(path) as conn:
         assert conn.execute("SELECT type,name,sql FROM sqlite_master ORDER BY type,name").fetchall() == before
-
-
-def test_notification_reads_tracking_state_and_deduplicates_without_acquisition(automation, monkeypatch):
-    from bellomberg.valuation import valuation_automation_installation as install
-    manager, observed, _, _ = automation
-    db = manager.versions.db
-    with db._conn() as conn:
-        conn.execute("INSERT INTO positions(ticker,quantita,is_active) VALUES('SYNTH-A',10,1)")
-        conn.execute("INSERT INTO positions(ticker,quantita,is_active) VALUES('SYNTH-Z',10,0)")
-        conn.execute("INSERT INTO favorite_companies(ticker,name) VALUES('SYNTH-A','Synthetic issuer')")
-    monkeypatch.setattr(install, "installation_runtime", lambda: manager.runtime)
-    monkeypatch.setattr(install, "build_manager", lambda *_: manager)
-    before = _tracking_rows(db)
-    portfolio = install.notify_tracking(db.db_path, "synth-a", "portfolio")
-    watchlist = install.notify_tracking(db.db_path, "SYNTH-A", "watchlist")
-    assert portfolio["status"] == watchlist["status"] == "queued"
-    assert portfolio["id"] == watchlist["id"] and watchlist["reused"] is True
-    assert install.notify_tracking(db.db_path, "SYNTH-N", "portfolio")["status"] == "not_tracked"
-    assert install.notify_tracking(db.db_path, "SYNTH-Z", "portfolio")["status"] == "not_tracked"
-    assert _tracking_rows(db) == before
-    assert not observed["acquire"] and not observed["collect"] and not observed["paid"]
 
 
 def test_startup_reconciles_union_of_active_portfolio_and_watchlist(automation):

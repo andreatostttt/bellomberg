@@ -381,6 +381,8 @@ def risolvi(ambiente, monkeypatch):
     ambiente["risposte"].update({
         LISTINO_A: (200, _fixture("bi_listino_A_p1.html")),
         LISTINO_A + "&page=2": (200, _fixture("bi_listino_A_p2.html")),
+        # lettera di ripiego della seconda parola («Sintetica»): una pagina senza righe utili
+        bi.URL_LISTINO.format(iniziale="S"): (200, _fixture("bi_listino_A_p2.html")),
         SCHEDA_ACME: (200, _fixture("bi_scheda_acme.html")),
         SCHEDA_HOLDING: (200, _fixture("bi_scheda_acme_holding.html")),
         bi.URL_MENU_EMARKET: (200, _fixture("em_lista_vuota.html")),
@@ -443,9 +445,11 @@ def test_risolvi_senza_nome_non_trovato_dichiarato(risolvi, nome):
 
 
 def test_risolvi_nome_assente_dal_listino(risolvi):
-    r = bi.risolvi_isin("ACME.MI", nome="Acqua Inesistente")
+    # una parola sola: nessuna altra lettera da provare (il ripiego sulle altre iniziali e'
+    # provato in test_borsa_italiana_risolvi.py)
+    r = bi.risolvi_isin("ACME.MI", nome="Acquario")
     assert r["stato"] == "non_trovato" and r["errore"] == "nome_non_nel_listino" and not risolvi["auto"].exists()
-    assert len(r["verifica"]["pagine_listino"]) == 2
+    assert len(r["verifica"]["pagine_listino"]) == 2 and r["verifica"]["iniziali_lette"] == ["A"]
 
 
 def test_risolvi_listino_letto_finche_serve(risolvi):
@@ -576,3 +580,14 @@ def test_eventi_dichiarano_da_quale_negozio(risolvi):
     assert bi.get_eventi_societari("ACME.MI")["voce_da"] == "automatico"
     risolvi["risposte"][_url(ISIN_TEST)] = (200, _fixture("bi_eventi_vuoto.html"))
     assert bi.get_eventi_societari("ZZTEST.MI")["voce_da"] == "confermato"
+
+def test_url_vietato_eventi_motivo_controllato_senza_il_testo_dell_eccezione(monkeypatch):
+    """VF 05/10 (regola 16): il messaggio di URLVietato puo' contenere l'URL del redirect; nel motivo va un
+    testo controllato (tipo dell'eccezione + motivo fisso), lo stato resta KO/url_vietato."""
+    def vietato(url):
+        raise bi.URLVietato("redirect verso https://zz-host-finto.example/x?token=QQSEGRETO: host non previsto")
+    monkeypatch.setattr(bi, "_scarica", vietato)
+    out = bi._leggi_eventi("ACME.MI", "ITZZACME0007")
+    assert (out["stato"], out["errore"]) == ("KO", "url_vietato")
+    assert "QQSEGRETO" not in out["motivo"] and "zz-host-finto" not in out["motivo"]
+    assert "URLVietato" in out["motivo"]

@@ -759,11 +759,93 @@ def test_budget_piccolo_resta_la_base_tagliata():
     assert len(testo) <= 2_000
 
 
-def test_riempimento_veloce_su_portafoglio_grande():
-    import time
+class _CambiamentiContati(list):
+    """Lista dei cambiamenti che conta gli elementi letti da impagina: un indice vale 1, una fetta
+    vale la sua lunghezza (l'iterazione e len() non passano di qui)."""
+
+    def __init__(self, voci, contatore):
+        super().__init__(voci)
+        self._contatore = contatore
+
+    def __getitem__(self, k):
+        r = super().__getitem__(k)
+        self._contatore["letture"] += len(r) if isinstance(k, slice) else 1
+        return r
+
+
+def _lavoro_impagina(monkeypatch, n_titoli, n_cambi, max_caratteri):
+    """Lavoro di impagina CONTATO, non cronometrato: righe dei cambiamenti lette e chiamate a
+    text() (una per rinvio/piede/cifra calcolati: misura quante volte si ricostruisce testo)."""
+    from bellomberg.core import language
+    contatore = {"letture": 0, "text": 0}
+    vera = language.text
+
+    def text(*a, **k):
+        contatore["text"] += 1
+        return vera(*a, **k)
+    monkeypatch.setattr(language, "text", text)
+    schede = [_scheda_punteggi(f"T{i:03d}.MI", i % 3, [((i * 7 + j * 13) % 97) / 10 for j in range(n_cambi)],
+                               lunghezza=40) for i in range(n_titoli)]
+    for s in schede:
+        s["cambiamenti"] = _CambiamentiContati(s["cambiamenti"], contatore)
+    try:
+        with language.language_context("it"):   # niente lettura delle preferenze a ogni text()
+            out = fc.impagina(schede, max_caratteri=max_caratteri, intestazione=INTESTAZIONE)
+    finally:
+        monkeypatch.setattr(language, "text", vera)
+    return contatore, out
+
+
+def test_riempimento_veloce_su_portafoglio_grande(monkeypatch):
+    # Cantiere zero rossi 05/10 (TIMING): prima `perf_counter() < 1.0`, rosso sotto carico (1,68 s
+    # con 6 pezzi paralleli; l'85% del tempo era text() che apre il file delle preferenze). La
+    # garanzia vera e' la COMPLESSITA': il lavoro cresce in modo lineare coi titoli (nessun blocco
+    # o coda ricostruiti a ogni passo, cioe' niente quadratico) e non dipende da quanti cambiamenti
+    # ha ogni titolo oltre a quelli mostrati. Si CONTA il lavoro invece dei secondi: deterministico.
+    # Mutazioni su copia (rapporto TIMING): blocchi ricostruiti a ogni taglio, a ogni riempimento,
+    # coda rifatta a ogni passo -> rapporto 13-16 a 4x titoli, qui il tetto e' 5 (lineare = 4).
     schede = [_scheda_punteggi(f"T{i:02d}.MI", i % 3, [((i * 7 + j * 13) % 97) / 10 for j in range(700)],
                                lunghezza=40) for i in range(80)]
-    inizio = time.perf_counter()
     out = fc.impagina(schede, intestazione=INTESTAZIONE)
-    assert time.perf_counter() - inizio < 1.0
     assert out["caratteri"] == len(out["testo"]) <= 14_000
+    # due regimi: base oltre il budget (si taglia dal fondo, come lo scenario sopra con 175
+    # caratteri per titolo) e base entro il budget (si riempie a giri)
+    for per_titolo in (175, 1_500):
+        piccolo, out_p = _lavoro_impagina(monkeypatch, 20, 700, per_titolo * 20)
+        grande, out_g = _lavoro_impagina(monkeypatch, 80, 700, per_titolo * 80)
+        assert out_p["caratteri"] <= per_titolo * 20 and out_g["caratteri"] <= per_titolo * 80
+        for chiave in ("letture", "text"):
+            assert piccolo[chiave] > 0
+            assert grande[chiave] <= 5 * piccolo[chiave], (per_titolo, chiave, piccolo, grande)
+        if per_titolo == 1_500:   # il riempimento c'e' davvero: piu' righe della base (<= 4 per titolo)
+            righe = sum(r.startswith("+ rischi") for r in out_g["testo"].splitlines())
+            assert righe > 4 * 80, righe
+    # 10 volte i cambiamenti per titolo: il lavoro non cresce (si leggono solo quelli mostrati)
+    base, _ = _lavoro_impagina(monkeypatch, 80, 700, 14_000)
+    dieci, _ = _lavoro_impagina(monkeypatch, 80, 7_000, 14_000)
+    for chiave in ("letture", "text"):
+        assert dieci[chiave] <= 1.1 * base[chiave], (chiave, base, dieci)
+
+
+def test_impagina_legge_la_preferenza_lingua_una_volta(monkeypatch):
+    # Cantiere zero rossi 05/10 (TIMING): ogni text() senza contesto rileggeva preferences.json
+    # (~3.500 letture su 80 titoli). Ora una lettura per chiamata, zero dentro un language_context;
+    # i testi sono quelli della lingua salvata (IT ed EN), identici al contesto esplicito.
+    import json
+    from bellomberg.core import language
+    from bellomberg.storage import preferences
+    letture = []
+    vera = preferences._read_document
+    monkeypatch.setattr(preferences, "_read_document", lambda: letture.append(1) or vera())
+    schede = [_scheda_punteggi(f"T{i:02d}.MI", i % 3, [((i * 7 + j * 13) % 97) / 10 for j in range(50)],
+                               lunghezza=40) for i in range(20)]
+    for lingua, piede in (("it", "TRONCAMENTI:"), ("en", "TRUNCATIONS:")):
+        preferences.PREFERENCES_PATH.write_text(json.dumps({"language": lingua}), encoding="utf-8")
+        letture.clear()
+        out = fc.impagina(schede, max_caratteri=3_000, intestazione=INTESTAZIONE)
+        assert len(letture) == 1, (lingua, len(letture))
+        with language.language_context(lingua):
+            atteso = fc.impagina(schede, max_caratteri=3_000, intestazione=INTESTAZIONE)
+        assert len(letture) == 1, lingua                      # dentro il contesto: nessuna lettura
+        assert out == atteso
+        assert out["testo"].splitlines()[-1].startswith(piede), lingua

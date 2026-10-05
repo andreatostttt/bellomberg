@@ -353,96 +353,65 @@ async function run(q) {
       '/decisions': { body: { decisions: [decision(880, 'RESEARCH', 'PENDING')] } },
     } });
     await q.toggle('classic'); await q.visit('/memos');
-    await q.waitFor(() => !!document.querySelector('main [data-page="memos"] .qcall'), 'memo semantic search launcher', 10000);
+    const field = 'main [data-page="memos"] [data-qa="memo-search"]';
+    const panel = 'main [data-page="memos"] [data-qa="memo-search-panel"]';
+    await q.waitFor(sel => !!document.querySelector(sel), 'memo semantic search field', 10000, field);
     const before = await q.pageState(); await q.toggle('modern');
     assert.equal((await q.pageState()).id, before.id, 'memo archive controller remounted on mode switch');
-    await q.click('main [data-page="memos"] .qcall');
-    await q.waitFor(() => !!document.querySelector('body .f9b-modal input'), 'memo search overlay');
-    const dialog = await q.js(() => {
-      const modal = document.querySelector('body .f9b-modal');
-      const close = modal?.querySelector('button.f9b-close');
-      const rect = close?.getBoundingClientRect();
-      return { role: modal?.getAttribute('role'), modal: modal?.getAttribute('aria-modal'), labelledBy: modal?.getAttribute('aria-labelledby'),
-        title: modal?.querySelector('#f9b-search-title')?.textContent?.trim() || '',
-        closeButton: !!close, closeWidth: rect?.width || 0, closeHeight: rect?.height || 0 };
-    });
-    assert.equal(dialog.role, 'dialog'); assert.equal(dialog.modal, 'true');
-    assert.equal(dialog.labelledBy, 'f9b-search-title'); assert.ok(dialog.title);
-    assert.ok(dialog.closeButton, 'semantic search close affordance must be a native button');
-    assert.ok(dialog.closeWidth >= 32 && dialog.closeHeight >= 32,
-      `modern close target should be at least 32px: ${JSON.stringify(dialog)}`);
-    await q.capture('memo-search-close-accessible-modern');
+    const combo = await q.js(sel => { const i = document.querySelector(sel); const l = i?.closest('label');
+      return { role: i?.getAttribute('role'), expanded: i?.getAttribute('aria-expanded'), name: l?.innerText?.trim() || '', type: i?.type }; }, field);
+    assert.equal(combo.role, 'combobox'); assert.equal(combo.expanded, 'false'); assert.ok(combo.name, 'search field needs an accessible name');
+    // Ctrl+Shift+F focuses the field and opens the results panel (Ctrl+K stays the global command palette)
+    await q.key('F', ['Control', 'Shift']);
+    await q.waitFor(sel => !!document.querySelector(sel), 'shortcut opens memo search panel', 5000, panel);
+    assert.equal(await q.js(sel => document.activeElement === document.querySelector(sel), field), true, 'shortcut focuses the search field');
     await q.key('Escape');
-    await q.waitFor(() => !document.querySelector('body .f9b-modal'), 'Escape closes semantic search');
-    assert.equal(await q.js(() => document.activeElement === document.querySelector('main [data-page="memos"] .qcall')),
-      true, 'Escape should restore focus to the search launcher');
+    await q.waitFor(sel => !document.querySelector(sel), 'Escape closes the memo search panel', 5000, panel);
+    assert.equal(await q.js(sel => document.activeElement === document.querySelector(sel), field), true, 'Escape keeps focus in the field');
+    await q.capture('memo-search-field-modern');
 
-    await q.click('main [data-page="memos"] .qcall');
-    await q.waitFor(() => !!document.querySelector('body .f9b-modal input'), 'semantic search reopens for close-button keyboard test');
-    await q.key('Tab', ['Shift']);
-    assert.equal(await q.js(() => document.activeElement === document.querySelector('body .f9b-modal .f9b-close')),
-      true, 'the native close button should be keyboard reachable from the search input');
-    await q.key('Enter');
-    await q.waitFor(() => !document.querySelector('body .f9b-modal'), 'Enter activates the semantic search close button');
-    assert.equal(await q.js(() => document.activeElement === document.querySelector('main [data-page="memos"] .qcall')),
-      true, 'close-button activation should restore focus to the search launcher');
-
-    await q.click('main [data-page="memos"] .qcall');
-    await q.waitFor(() => !!document.querySelector('body .f9b-modal input'), 'semantic search opens for fixture query');
-    const searchInput = await markInput(q, 'body .f9b-modal .mq input');
+    const searchInput = await markInput(q, field);
     await q.typeText(searchInput, 'alpha');
     const beforeSearch = await q.counts();
     await q.key('Enter');
     await waitForCount(q, 'GET /memos/search/alpha', (beforeSearch['GET /memos/search/alpha'] || 0) + 1);
-    assert.equal(await q.js(() => document.querySelectorAll('body .f9b-modal .mhit').length), 0,
+    assert.equal(await q.js(() => document.querySelectorAll('main [data-page="memos"] .mm-hit').length), 0,
       'the delayed search must still be unresolved when presentation changes');
-    const closeGeometry = () => q.js(() => {
-      const close = document.querySelector('body .f9b-modal button.f9b-close');
-      const rect = close?.getBoundingClientRect(); return { button: !!close, width: rect?.width || 0, height: rect?.height || 0 };
-    });
-    const darkDialog = await closeGeometry();
     await q.toggle('classic');
-    assert.ok(await q.js(() => !!document.querySelector('body .f9b-modal')), 'memo search overlay should remain open after presentation switch');
-    // Light and Dark share one dialog: the close target keeps its size (the 13px Classic glyph is gone).
-    const lightDialog = await closeGeometry();
-    assert.ok(lightDialog.button && lightDialog.width >= 24 && lightDialog.height >= 24
-      && lightDialog.width === darkDialog.width && lightDialog.height === darkDialog.height,
-      `memo search close target is the same usable size in Light and Dark: ${JSON.stringify({ darkDialog, lightDialog })}`);
-    await q.waitFor(() => !!document.querySelector('body .f9b-modal .mhit'), 'synthetic semantic search result', 8000);
+    // a click outside the field closes the panel; the question and the pending search stay in the page controller
+    assert.equal(await q.js(sel => document.querySelector(sel)?.value, field), 'alpha', 'the search question survives the presentation switch');
+    await q.click(searchInput);
+    await q.waitFor(() => !!document.querySelector('main [data-page="memos"] .mm-hit'), 'synthetic semantic search result', 8000);
     const afterSearch = await q.snapshot();
     const searchReads = afterSearch.requests.filter(item => item.method === 'GET' && item.route === '/memos/search/alpha');
     assert.equal(searchReads.length, 1, 'mode switch must not repeat the semantic search');
     await q.capture('memo-semantic-search-result-classic');
     await q.key('ArrowDown');
-    const selected = await q.js(() => document.querySelector('body .f9b-modal .mhit.on')?.innerText || '');
-    assert.ok(selected.includes('MEMO 812') && selected.includes('SYNQ'), 'arrow-key selection should retain the second synthetic hit');
-    await q.click(searchInput);
+    const selected = await q.js(() => document.querySelector('main [data-page="memos"] .mm-hit[aria-selected="true"]')?.innerText || '');
+    assert.ok(selected.includes('Memo 812') && selected.includes('SYNQ'), `arrow-key selection should retain the second synthetic hit: ${selected}`);
     await q.key('Enter');
-    await q.waitFor(() => !document.querySelector('body .f9b-modal')
-      && (document.querySelector('main [data-page="memos"]')?.innerText || '').toUpperCase().includes('SYNTHETIC EARLIER INVESTMENT MEMO')
-      && (document.querySelector('main [data-page="memos"] .doc')?.innerText || '').includes('Fixture-only thesis for SYNQ.'),
+    await q.waitFor(() => !document.querySelector('main [data-page="memos"] [data-qa="memo-search-panel"]')
+      && (document.querySelector('main [data-page="memos"] [data-qa="memo-reader"]')?.innerText || '').includes('Synthetic earlier investment memo')
+      && (document.querySelector('main [data-page="memos"] [data-qa="memo-doc"]')?.innerText || '').includes('Fixture-only thesis for SYNQ.'),
       'search result opens memo detail', 9000);
-    const links = await q.js(() => [...document.querySelectorAll('main [data-page="memos"] .apri a')].map(a => ({ href: a.href, target: a.target })));
+    const links = await q.js(() => [...document.querySelectorAll('main [data-page="memos"] [data-qa="memo-files"] a')].map(a => ({ href: a.href, target: a.target })));
     assert.ok(links.some(link => link.href.endsWith('/memos/812/pdf') && link.target === '_blank'));
     assert.ok(links.some(link => link.href.endsWith('/memos/812/appendix') && link.target === '_blank'));
     const snap = await q.snapshot();
     assert.equal(snap.requests.filter(item => item.method === 'GET' && item.route === '/memos/search/alpha').length, 1);
     assert.equal(snap.requests.filter(item => item.method === 'GET' && item.route === '/memos/812').length, 1,
       'opening a different search hit should fetch that memo detail once');
-    return { assertionResults: { searchModalOpens: true, dialogHasAccessibleName: true, modernCloseTargetMeetsMinimum: true,
-      escapeClosesAndRestoresFocus: true, keyboardCloseButtonClosesAndRestoresFocus: true, classicCloseGeometryUnchanged: true,
-      delayedQueryRemainsOpenAcrossModeSwitch: true, oneSemanticSearchRequest: true, keyboardSelectionOpensMemo: true,
+    return { assertionResults: { searchFieldIsCombobox: true, shortcutOpensAndFocuses: true, escapeClosesKeepingFocus: true,
+      delayedQuerySurvivesModeSwitch: true, oneSemanticSearchRequest: true, keyboardSelectionOpensMemo: true,
       detailRendered: true, localPdfAndAppendixLinksVisible: true },
       downloads: 'PDF/appendix links verified against fixture-local URLs; not clicked because new-window/download effects are denied by the isolated harness.',
       fixture: 'synthetic memo, search hits, and decision joins only' };
     } finally {
-      await dismissPortal(q, 'body .f9b-modal');
       await dismissPortal(q, 'body .cfm-modal');
     }
   });
 
   await q.executeScenario('decisions', 'research-note-close-reopen-and-trade-link-use-explicit-fixture-writes', async () => {
-    await dismissPortal(q, 'body .f9b-modal');
     await dismissPortal(q, 'body .cfm-modal');
     const initial = { decisions: [decision(880, 'RESEARCH', 'PENDING'), decision(881, 'RESEARCH', 'EXPIRED', true), decision(882, 'BUY', 'PENDING')] };
     await q.fixture({ setRead: { '/decisions': { body: initial, delayMs: 1200 }, '/trades': { body: { count: 0, trades: [] } } }, setWrite: {
@@ -450,109 +419,98 @@ async function run(q) {
       '/decisions/880/update': { body: { ok: true }, delayMs: 1200 },
       '/decisions/881/update': { body: { ok: true } },
     } });
+    // Pagina Nuova (05/10/2026): viste a segmenti, elenco + dettaglio; selettori data-dc-*.
+    const D = 'main [data-page="decisions"]';
     await q.toggle('classic'); await q.visit('/decisions');
     await q.waitFor(() => (document.querySelector('main [data-page="decisions"]')?.innerText || '').includes('SYNQ'), 'decision board delayed read', 7000);
     const before = await q.pageState(); await q.toggle('modern');
     assert.equal((await q.pageState()).id, before.id, 'decision controller remounted during load');
-    const filter = await markButton(q, { root: 'main [data-page="decisions"] .space-y-4 > div:first-child', pattern: 'pending' });
-    await q.click(filter);
-    await q.waitFor(() => !!document.querySelector('main [data-page="decisions"] .grid-cols-2'), 'filtered decision cards');
+    await q.click(await markButton(q, { root: `${D} .dc-top`, pattern: 'in ricerca|in research' }));
+    await q.waitFor(() => !!document.querySelector('main [data-page="decisions"] [data-dc-conv="880"]'), 'research view opens the pending research', 5000);
     await q.capture('decisions-research-pending-modern');
-    const researchCard = 'main [data-page="decisions"] .grid-cols-2 > div:nth-child(2) .p-3';
-    const noteInput = await markInput(q, `${researchCard} input`);
+    const noteInput = await markInput(q, `${D} [data-dc-campo="nota"]`);
     await q.setValue(noteInput, 'Synthetic committee note.');
-    const noteButton = await markButton(q, { root: researchCard, pattern: 'send|invia' });
-    const beforeNote = await q.counts(); await q.click(noteButton);
+    const beforeNote = await q.counts(); await q.click(`${D} [data-dc-azione="invia"]`);
     await waitForCount(q, 'POST /decisions/880/note', (beforeNote['POST /decisions/880/note'] || 0) + 1);
     await q.toggle('classic');
-    assert.equal(await q.js(() => !!document.querySelector('main [data-page="decisions"] .grid-cols-2')), true,
-      'research board should remain mounted while note saves');
-    assert.ok(await q.js(() => [...document.querySelectorAll('main [data-page="decisions"] button')].some(button => /send|invia/i.test(button.innerText) && button.disabled)),
+    assert.equal(await q.js(() => !!document.querySelector('main [data-page="decisions"] [data-dc-conv="880"]')), true,
+      'research detail should remain mounted while note saves');
+    assert.ok(await q.js(() => !!document.querySelector('main [data-page="decisions"] [data-dc-azione="invia"]')?.disabled),
       'committee note busy state should survive the presentation switch');
-    await q.waitFor(cardSelector => {
-      const input = document.querySelector(`${cardSelector} input`);
-      return !!input && input.value === '';
-    }, 'saved committee note clears its controlled draft', 8000, researchCard);
+    await q.waitFor(() => document.querySelector('main [data-page="decisions"] [data-dc-campo="nota"]')?.value === '',
+      'saved committee note clears its controlled draft', 8000);
     const notePost = (await q.snapshot()).requests.filter(item => item.method === 'POST' && item.route === '/decisions/880/note');
     assert.equal(notePost.length, 1); assert.equal(notePost[0].input.testo, 'Synthetic committee note.');
 
-    const closeButton = await markButton(q, { root: researchCard, pattern: 'archive.*close|close.*research|archivia' });
-    const beforeClose = await q.counts(); await q.click(closeButton);
+    // la pagina resta occupata finché non ha riletto le decisioni dopo la nota: poi la chiusura si abilita
+    await q.waitFor(() => document.querySelector('main [data-page="decisions"] [data-dc-azione="ricerca-chiudi"]')?.disabled === false,
+      'note write and reload settle', 9000);
+    const beforeClose = await q.counts(); await q.click(`${D} [data-dc-azione="ricerca-chiudi"]`);
     await waitForCount(q, 'POST /decisions/880/update', (beforeClose['POST /decisions/880/update'] || 0) + 1);
     await q.toggle('modern');
-    assert.ok(await q.js(() => [...document.querySelectorAll('main [data-page="decisions"] button')].some(button => /archive|close|archivia/i.test(button.innerText) && button.disabled)),
+    assert.ok(await q.js(() => !!document.querySelector('main [data-page="decisions"] [data-dc-azione="ricerca-chiudi"]')?.disabled),
       'research close remains pending across a presentation switch');
     const closePost = (await q.snapshot()).requests.filter(item => item.method === 'POST' && item.route === '/decisions/880/update').at(-1);
     assert.equal(closePost.input.status, 'EXPIRED', 'close research must send terminal status');
-    await q.waitFor(() => [...document.querySelectorAll('main [data-page="decisions"] .grid-cols-2 > div:nth-child(2) button')]
-      .some(button => /archive|close|archivia/i.test(button.innerText) && !button.disabled), 'research close write settles', 9000);
+    await q.waitFor(() => document.querySelector('main [data-page="decisions"] [data-dc-azione="ricerca-chiudi"]')?.disabled === false,
+      'research close write settles', 9000);
     await waitForStableCount(q, 'GET /decisions', (beforeClose['GET /decisions'] || 0) + 1);
 
-    const archiveToggle = await markButton(q, { root: 'main [data-page="decisions"] .grid-cols-2 > div:nth-child(2)', pattern: 'research archive' });
-    await q.click(archiveToggle);
-    await q.waitFor(() => (document.querySelector('main [data-page="decisions"] .grid-cols-2 > div:nth-child(2)')?.innerText || '').includes('#881'), 'archived research card');
-    await q.waitFor(() => [...document.querySelectorAll('main [data-page="decisions"] .grid-cols-2 > div:nth-child(2) button')]
-      .some(button => /restore and reopen|riporta.*riapri/i.test(button.innerText) && !button.disabled), 'archived research restore action enabled', 7000);
-    const reopenButton = await markButton(q, { root: 'main [data-page="decisions"] .grid-cols-2 > div:nth-child(2)', pattern: 'restore and reopen|riporta.*riapri' });
-    const beforeReopen = await q.counts(); await q.click(reopenButton);
+    await q.click(await markButton(q, { root: `${D} .dc-top`, pattern: 'archivio|archive' }));
+    await q.click(await markButton(q, { root: `${D} .dc-list .dc-head-row`, pattern: 'ricerche|research' }));
+    await q.waitFor(() => !!document.querySelector('main [data-page="decisions"] [data-dc-dettaglio="881"]'), 'archived research detail');
+    await q.waitFor(() => document.querySelector('main [data-page="decisions"] [data-dc-azione="ricerca-ripristina"]')?.disabled === false,
+      'archived research restore action enabled', 7000);
+    const beforeReopen = await q.counts(); await q.click(`${D} [data-dc-azione="ricerca-ripristina"]`);
     await waitForCount(q, 'POST /decisions/881/update', (beforeReopen['POST /decisions/881/update'] || 0) + 1);
     const reopenPost = (await q.snapshot()).requests.filter(item => item.method === 'POST' && item.route === '/decisions/881/update').at(-1);
     assert.equal(reopenPost.input.status, 'PENDING');
     await waitForStableCount(q, 'GET /decisions', (beforeReopen['GET /decisions'] || 0) + 1);
 
-    const opRow = await q.js(() => {
-      const rows = [...document.querySelectorAll('main [data-page="decisions"] tbody tr')];
-      const row = rows.find(el => /SYNQ/.test(el.innerText) && /BUY/.test(el.innerText));
-      if (!row) return null; row.setAttribute('data-qa-committee-op', 'target'); return '[data-qa-committee-op="target"]';
-    });
-    assert.ok(opRow, 'synthetic operational BUY row should remain available after status filtering');
-    await q.click(opRow);
-    const expandedRowStyle = [];
+    await q.click(await markButton(q, { root: `${D} .dc-top`, pattern: 'da decidere|to decide' }));
+    await q.waitFor(() => !!document.querySelector('main [data-page="decisions"] [data-dc-sel="882"]'), 'operational BUY row');
+    await q.click(`${D} [data-dc-sel="882"]`);
+    await q.waitFor(() => !!document.querySelector('main [data-page="decisions"] [data-dc-dettaglio="882"]'), 'operational detail');
+    const detailStyle = [];
     for (const [width, height] of [[1920, 1080], [2560, 1440], [3440, 1440], [5120, 1440],
       [1440, 1000], [1280, 900], [900, 700]]) {
       const style = await q.withViewport(width, height, async () => {
-        await q.toggle('modern'); // Move the native pointer off the expanded row before checking its base surface.
+        await q.toggle('modern');
         const result = await q.js(() => {
-          const row = [...document.querySelectorAll('main [data-page="decisions"] tr')]
-            .find(element => element.classList.contains('bg-[#0a0a0a]'));
-          const rationale = row?.querySelector('p.whitespace-pre-wrap');
-          const background = row ? getComputedStyle(row).backgroundColor : '';
+          const card = document.querySelector('main [data-page="decisions"] .dc-det');
+          const rationale = card?.querySelector('.dc-prose');
+          const background = card ? getComputedStyle(card).backgroundColor : '';
           const foreground = rationale ? getComputedStyle(rationale).color : '';
           const channels = value => (value.match(/[\d.]+/g) || []).slice(0, 3).map(Number).map(channel => {
             const normalized = channel / 255;
             return normalized <= 0.04045 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4;
           });
-          const luminance = value => {
-            const [red, green, blue] = channels(value);
-            return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
-          };
+          const luminance = value => { const [red, green, blue] = channels(value); return 0.2126 * red + 0.7152 * green + 0.0722 * blue; };
           const bgLuminance = luminance(background), fgLuminance = luminance(foreground);
           const contrast = (Math.max(bgLuminance, fgLuminance) + 0.05) / (Math.min(bgLuminance, fgLuminance) + 0.05);
-          return { exists: !!row && !!rationale, background, foreground, contrast,
-            hovered: !!row?.matches(':hover'), rationale: rationale?.textContent?.trim() || '' };
+          return { exists: !!card && !!rationale, background, foreground, contrast, overflowX: document.documentElement.scrollWidth > innerWidth,
+            rationale: rationale?.textContent?.trim() || '' };
         });
-        assert.ok(result.exists, `expanded operational detail row missing at ${width}x${height}`);
-        assert.equal(result.hovered, false, `expanded detail row should be checked outside hover at ${width}x${height}`);
-        assert.ok(result.contrast >= 4.5, `expanded detail text contrast below 4.5:1 at ${width}x${height}: ${JSON.stringify(result)}`);
-        assert.notEqual(result.background, 'rgb(10, 10, 10)', `expanded detail row retained the legacy dark fill at ${width}x${height}`);
-        await q.capture('decisions-operational-row-expanded-modern', { viewports: [[width, height]] });
+        assert.ok(result.exists, `operational detail missing at ${width}x${height}`);
+        assert.ok(result.contrast >= 4.5, `detail text contrast below 4.5:1 at ${width}x${height}: ${JSON.stringify(result)}`);
+        assert.equal(result.overflowX, false, `horizontal page overflow at ${width}x${height}`);
+        await q.capture('decisions-operational-detail-modern', { viewports: [[width, height]] });
         return result;
       });
-      expandedRowStyle.push({ viewport: `${width}x${height}`, ...style });
+      detailStyle.push({ viewport: `${width}x${height}`, ...style });
     }
-    const tradeLink = await markButton(q, { root: 'main [data-page="decisions"]', pattern: 'record.*trade|trade|registra.*operazione' });
-    await q.click(tradeLink);
+    await q.click(`${D} [data-dc-azione="collega"]`);
     await q.waitFor(expected => location.hash === expected, 'trade-entry navigation from linked decision', 5000, '#/trades?decision=882');
     const tradeHash = await q.js(() => location.hash);
     const snapshot = await q.snapshot();
     const writes = snapshot.requests.filter(item => item.method === 'POST' && /^\/decisions\/(880\/(note|update)|881\/update)$/.test(item.route));
     assert.equal(writes.length, 3, 'the explicit note, close, and reopen actions should each write once');
-    return { assertionResults: { filterActionWorksInModern: true, notePayloadExactAndOnce: true,
+    return { assertionResults: { viewSegmentsWorkInModern: true, notePayloadExactAndOnce: true,
       researchCloseSendsExpired: closePost.input.status === 'EXPIRED', archivedResearchCanReopen: reopenPost.input.status === 'PENDING',
       operationalDecisionOpensTradeEntry: tradeHash === '#/trades?decision=882',
-      expandedOperationalRowHasReadableBaseSurfaceAtSevenViewports: expandedRowStyle.length === 7,
+      operationalDetailReadableAtSevenViewports: detailStyle.length === 7,
       noTradeOrderSubmitted: true },
-      expandedRowStyle, writeRoutes: writes.map(item => item.route), tradeHash,
+      detailStyle, writeRoutes: writes.map(item => item.route), tradeHash,
       safety: 'GET /decisions remained fixture-only because the real route may auto-expire stale decisions.' };
   });
 
@@ -659,14 +617,16 @@ async function run(q) {
     await q.visit('/memos');
     await waitForCount(q, 'GET /memos', (beforeReads['GET /memos'] || 0) + 2);
     await q.waitFor(() => {
-      const text = document.querySelector('main [data-page="memos"] .f9b .scroll p')?.innerText || '';
+      const text = document.querySelector('main [data-page="memos"] [data-qa="memo-runs-empty"]')?.innerText || '';
       return !!text && !/loading|reading|…|\.\.\./i.test(text);
     }, 'empty memo-index declaration');
     const before = await q.pageState(); await q.toggle('modern');
     const modern = await q.pageState();
-    const view = await q.js(() => ({ cards: document.querySelectorAll('main [data-page="memos"] .f9b .mr').length,
-      emptyText: document.querySelector('main [data-page="memos"] .f9b .scroll p')?.innerText || '',
-      loading: !!document.querySelector('main [data-page="memos"] .f9b .scroll [role="status"]') }));
+    const view = await q.js(() => ({ cards: document.querySelectorAll('main [data-page="memos"] .mm-run').length,
+      emptyText: document.querySelector('main [data-page="memos"] [data-qa="memo-runs-empty"]')?.innerText || '',
+      loading: !!document.querySelector('main [data-page="memos"] [data-qa="memo-runs"] [role="status"]'),
+      error: !!document.querySelector('main [data-page="memos"] [data-qa="memo-archive-error"]') }));
+    assert.equal(view.error, false, 'an empty archive is not a read error');
     assert.equal(view.cards, 0); assert.ok(view.emptyText.length > 0); assert.equal(modern.id, before.id);
     await q.capture('memos-index-empty-modern');
     return { assertionResults: { emptyMemoIndexHasExplicitMessage: view.emptyText.length > 0, noMemoCards: view.cards === 0,
@@ -680,12 +640,14 @@ async function run(q) {
       '/decisions': { body: { decisions: [] } } } });
     await q.visit('/memos');
     await waitForCount(q, 'GET /memos', (beforeReads['GET /memos'] || 0) + 2);
-    await q.waitFor(() => !!document.querySelector('main [data-page="memos"] .f9b .p3 button'), 'memo error retry action');
+    await q.waitFor(() => !!document.querySelector('main [data-page="memos"] [data-qa="memo-archive-error"] button'), 'memo error retry action');
     await q.toggle('modern');
-    const state = await q.js(() => ({ message: document.querySelector('main [data-page="memos"] .f9b .p-3')?.innerText || '',
-      retry: [...document.querySelectorAll('main [data-page="memos"] .f9b button')].some(button => /retry|riprova/i.test(button.innerText)) }));
+    const state = await q.js(() => ({ message: document.querySelector('main [data-page="memos"] [data-qa="memo-archive-error"]')?.innerText || '',
+      retry: [...document.querySelectorAll('main [data-page="memos"] [data-qa="memo-archive-error"] button')].some(button => /retry|riprova/i.test(button.innerText)),
+      emptyClaim: !!document.querySelector('main [data-page="memos"] [data-qa="memo-runs-empty"]') }));
     assert.ok(state.message.includes('Synthetic memo index unavailable.'), `memo error should retain endpoint detail: ${state.message}`);
-    assert.equal(state.retry, true); assert.equal(await q.js(() => document.querySelectorAll('main [data-page="memos"] .f9b .mr').length), 0);
+    assert.equal(state.retry, true); assert.equal(state.emptyClaim, false, 'a failed read must not claim an empty archive');
+    assert.equal(await q.js(() => document.querySelectorAll('main [data-page="memos"] .mm-run').length), 0);
     await q.capture('memos-index-read-error-modern');
     return { assertionResults: { indexFailureIsDeclared: true, notFalseEmpty: true, retryAvailable: state.retry }, state,
       fixture: 'memo index 503 and empty decisions were explicit fixture responses' };
@@ -700,12 +662,12 @@ async function run(q) {
       '/decisions': { body: { decisions: [] } } } });
     await q.visit('/memos');
     await waitForCount(q, 'GET /memos', (beforeReads['GET /memos'] || 0) + 2);
-    await q.waitFor(() => (document.querySelector('main [data-page="memos"] .f9b .cMid')?.innerText || '').includes('full_markdown'),
+    await q.waitFor(() => (document.querySelector('main [data-page="memos"] [data-qa="memo-reader"]')?.innerText || '').includes('full_markdown'),
       'absent memo body explanation');
     const before = await q.pageState(); await q.toggle('modern');
     const modern = await q.pageState();
-    const bodyState = await q.js(() => document.querySelector('main [data-page="memos"] .f9b .cMid')?.innerText || '');
-    const bodyAlert = await q.js(() => !!document.querySelector('main [data-page="memos"] .f9b .cMid [role="alert"]'));
+    const bodyState = await q.js(() => document.querySelector('main [data-page="memos"] [data-qa="memo-reader"]')?.innerText || '');
+    const bodyAlert = await q.js(() => !!document.querySelector('main [data-page="memos"] [data-qa="memo-reader"] [role="alert"]'));
     assert.ok(bodyState.includes('full_markdown'), `absent memo body needs a specific explanation: ${bodyState}`);
     assert.equal(modern.id, before.id); assert.equal(bodyAlert, false, 'metadata-only memo should not be mislabeled as a failed read');
     assert.equal((await q.counts())['GET /memos/814'] - (beforeReads['GET /memos/814'] || 0), 1);
@@ -721,19 +683,16 @@ async function run(q) {
     await q.fixture({ setRead: { '/decisions': { body: { decisions: [] } } } });
     await q.visit('/decisions');
     await waitForCount(q, 'GET /decisions', (beforeEmpty['GET /decisions'] || 0) + 1);
-    await q.waitFor(() => !!document.querySelector('main [data-page="decisions"] .grid-cols-2'), 'decision board empty state');
-    await q.waitFor(() => {
-      const panes = [...document.querySelectorAll('main [data-page="decisions"] .grid-cols-2 p')].map(el => el.innerText.trim());
-      return panes.length >= 2 && panes.every(text => !/loading|caricamento|…|\.\.\./i.test(text));
-    }, 'both decision queues finish loading into the explicit empty state');
+    await q.waitFor(() => !!document.querySelector('main [data-page="decisions"] .dc-list .dc-empty'), 'decision board empty state');
     const before = await q.pageState(); await q.toggle('modern');
     const modern = await q.pageState();
-    const empty = await q.js(() => ({ loading: document.querySelector('main [data-page="decisions"]')?.innerText.includes('…') || false,
-      operationalRows: document.querySelectorAll('main [data-page="decisions"] .grid-cols-2 > div:first-child tbody tr').length,
-      researchCards: document.querySelectorAll('main [data-page="decisions"] .grid-cols-2 > div:nth-child(2) > div.p-3 > div.mb-3').length,
-      emptyPanes: [...document.querySelectorAll('main [data-page="decisions"] .grid-cols-2 p')].map(el => el.innerText).filter(Boolean) }));
-    assert.equal(empty.operationalRows, 0); assert.equal(empty.researchCards, 0);
-    assert.ok(empty.emptyPanes.length >= 2, `both empty queues should be declared: ${JSON.stringify(empty)}`);
+    const empty = await q.js(() => ({ loading: !!document.querySelector('main [data-page="decisions"] .dc-skel'),
+      rows: document.querySelectorAll('main [data-page="decisions"] [data-dc-sel]').length,
+      counts: [...document.querySelectorAll('main [data-page="decisions"] [data-dc-conta]')].map(el => el.textContent.trim()),
+      emptyPanes: [...document.querySelectorAll('main [data-page="decisions"] .dc-empty')].map(el => el.innerText).filter(Boolean) }));
+    assert.equal(empty.loading, false); assert.equal(empty.rows, 0);
+    assert.deepEqual(empty.counts, ['0', '0', '0', '0'], `all four views declare zero: ${JSON.stringify(empty)}`);
+    assert.ok(empty.emptyPanes.length >= 1, `the empty queue should be declared: ${JSON.stringify(empty)}`);
     assert.equal(modern.id, before.id);
     assert.equal((await q.counts())['GET /decisions'] - (beforeEmpty['GET /decisions'] || 0), 1);
     await q.capture('decisions-board-empty-modern');
@@ -743,14 +702,16 @@ async function run(q) {
     await q.fixture({ setRead: { '/decisions': { body: { detail: 'Synthetic decisions store unavailable.' }, status: 503 } } });
     await q.visit('/decisions');
     await waitForCount(q, 'GET /decisions', (beforeError['GET /decisions'] || 0) + 1);
-    await q.waitFor(() => !!document.querySelector('main [data-page="decisions"] p.text-crimson'), 'decisions error banner');
+    await q.waitFor(() => !!document.querySelector('main [data-page="decisions"] [data-dc-errore="lettura"]'), 'decisions error banner');
     await q.toggle('modern');
-    const error = await q.js(() => document.querySelector('main [data-page="decisions"] p.text-crimson')?.innerText || '');
+    const error = await q.js(() => document.querySelector('main [data-page="decisions"] [data-dc-errore="lettura"]')?.innerText || '');
+    assert.ok(await q.js(() => [...document.querySelectorAll('main [data-page="decisions"] [data-dc-conta]')].every(el => /^n[./]/.test(el.textContent.trim()))),
+      'a failed read never shows zero counters');
     assert.ok(error.includes('Synthetic decisions store unavailable.'), `decision API error not shown: ${error}`);
     assert.equal((await q.counts())['GET /decisions'] - (beforeError['GET /decisions'] || 0), 1,
       'exactly one fixture read for the failed board load');
     await q.capture('decisions-board-read-error-modern');
-    return { assertionResults: { emptyQueuesExplicitlyDeclared: empty.emptyPanes.length >= 2,
+    return { assertionResults: { emptyQueuesExplicitlyDeclared: empty.emptyPanes.length >= 1,
       apiReadFailureIsNotReportedAsEmpty: error.includes('Synthetic decisions store unavailable.'),
       oneFixtureReadPerLoad: true, noLiveDecisionReadOrAutoExpiry: true }, empty, error,
       safety: 'both GET /decisions responses were served by fixtures; the real auto-expiring route was not touched' };

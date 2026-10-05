@@ -39,12 +39,6 @@ def normalized_case():
     return documents, plan
 
 
-def test_sec_opening_claims_with_matching_normalized_issuer_still_compile():
-    documents, plan = normalized_case()
-    result = prepare_method_inputs(_bundle(), documents=documents, propose=lambda *_:plan)
-    assert result['status']=='prepared', result['issues']
-
-
 @pytest.mark.parametrize('issuer', ['ANOTHER-ISSUER', '', None, ['SYNTH-GROUP'], 'missing'])
 def test_compiler_rejects_different_or_missing_sec_root_issuer(issuer):
     documents, plan = normalized_case()

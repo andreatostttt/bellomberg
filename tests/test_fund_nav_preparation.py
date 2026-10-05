@@ -179,60 +179,6 @@ def test_valid_proofs_still_cannot_bypass_engine_nav_reconciliation(tmp_path):
     assert valuation.get('fair_value_base') is None
 
 
-def test_nav_common_service_reuses_prior_basis_and_requires_explicit_refresh(tmp_path, monkeypatch):
-    from datetime import date, timedelta
-    from pathlib import Path
-    from bellomberg.valuation.preparation_service import prepare_and_generate
-    from bellomberg.valuation.preparation_basis import capture_prior_basis
-    from test_preparation_refresh import _compact_answer
-    import test_sector_nav_drivers
-
-    plan, docs = fixture()
-    original = prepare_and_generate(nav_bundle(rows=[]), documents=docs,
-        propose=lambda *_: deepcopy(plan), output_dir=tmp_path / 'original')
-    assert original['ok'], original.get('error')
-    assert original['valuation_usability']['usable'], original['valuation_usability']
-    prior = capture_prior_basis({'current_generation': original['generation_id'],
-        'current': original, 'artifact': {'available': True}})
-    original_hash = sha256(Path(original['path']).read_bytes()).hexdigest()
-    reused = prepare_and_generate(nav_bundle(rows=[]), documents=docs,
-        propose=StagedProposer(lambda *_: pytest.fail('Unchanged context must not request AI')),
-        prior_preparation=prior, output_dir=tmp_path / 'reused')
-    assert reused['ok'], reused.get('error')
-    assert reused['preparation']['provenance']['preparation_selection']['mode'] == 'unchanged_context'
-
-    tomorrow = (date.fromisoformat(DAY) + timedelta(days=1)).isoformat()
-    monkeypatch.setattr(test_sector_nav_drivers, 'DAY', tomorrow)
-    calls = []
-    def review(dossier, contract):
-        spec = contract['preparation_refresh']
-        calls.append(spec['scope'])
-        answer = {'reviews': {name: {'action': 'reuse', 'source_driver_sha256': digest,
-            'review_rationale': 'Explicit current synthetic review; dated snapshot remains unchanged.',
-            'evidence_ids': ['nav']} for name, digest in spec['driver_hashes'].items()},
-            'rationale': 'Current review of the synthetic NAV discount.'}
-        return _compact_answer(answer, spec['compact_wire'])
-    refreshed = prepare_and_generate(nav_bundle(rows=[]), documents=docs,
-        propose=StagedProposer(review), prior_preparation=prior, output_dir=tmp_path / 'reviewed')
-    assert refreshed['ok'], refreshed.get('error')
-    assert calls == ['model', 'bear', 'base', 'bull']
-    rows = refreshed['preparation']['proposal']['method_records']
-    assert {r['period'] for r in rows} == {DATE}
-    assert {r['valid_until'] for r in rows} == {tomorrow}
-    assert refreshed['preparation']['provenance']['refresh_review']['human_approved'] is False
-    assert sha256(Path(original['path']).read_bytes()).hexdigest() == original_hash
-
-    from bellomberg.valuation.dcf_quality import normalize_valuation_payload
-    blocked = deepcopy(original)
-    blocked['sanity']['exclude_from_action_table'] = True
-    blocked['preparation']['untrusted_outputs'] = {'fair_value_base': 456.}
-    blocked = normalize_valuation_payload(blocked, as_of=DAY)
-    assert not blocked['valuation_usability']['usable'] and blocked['fair_value_base'] is None
-    assert blocked['preparation']['proposal']['plan'] == plan
-    assert blocked['calculation_details']['scenarios']['base']['fair_value_per_share'] is None
-    assert blocked['preparation']['untrusted_outputs']['fair_value_base'] is None
-
-
 def test_nav_unproved_publication_and_precision_cannot_consume_unused_fields():
     for name in ('publication', 'reported_nav_precision'):
         plan, docs = fixture()

@@ -192,7 +192,14 @@ def test_committee_first_start_records_failure_when_data_dir_does_not_exist(tmp_
         encoding="utf-8", errors="replace",
     )
 
-    assert run.returncode == 2
+    # ZR 05/10: dal commit 1326312 il DB configurato assente ferma la run PRIMA del mandato
+    # (require_existing_database -> WeeklyRunBlocked, codice 1); il 2 veniva dal mandato
+    # mancante, controllato dopo. Garanzia invariata: uscita non zero per il watchdog, heartbeat
+    # onesto con la causa, e nessun DB vuoto creato al primo avvio.
+    assert run.returncode != 0, run.stderr
+    assert "DB configurato assente" in run.stderr
     heartbeat = json.loads((data / "current_run.json").read_text(encoding="utf-8"))
     assert heartbeat["running"] is False
     assert heartbeat["message"].startswith("Run TERMINATA con errore")
+    assert "DB configurato assente" in heartbeat["message"]
+    assert not (data / "consigliere.db").exists()

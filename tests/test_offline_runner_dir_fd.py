@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 import pytest
@@ -9,7 +10,32 @@ import pytest
 from tools.testing import offline_pytest as runner
 
 
+def _rilancia_sotto_runner_offline(tmp_path, nome_test):
+    """Rilancia UN test di questo file sotto tools/testing/offline_pytest.py ed esige che
+    li' passi. Vale per i test della guardia di audit, che solo il runner installa."""
+    root = Path(__file__).resolve().parent.parent
+    nodo = Path(__file__).resolve().as_posix() + "::" + nome_test
+    esito = subprocess.run(
+        [sys.executable, "-I", str(root / "tools" / "testing" / "offline_pytest.py"),
+         "--output-root", str(tmp_path / "offline-evidence"), nodo,
+         "-q", "-p", "no:cacheprovider"],
+        cwd=root, capture_output=True, encoding="utf-8", errors="replace", timeout=600)
+    uscita = esito.stdout + esito.stderr
+    assert esito.returncode == 0 and "1 passed" in uscita, uscita[-3000:]
+
+
 def test_pending_open_target_cannot_authorize_a_second_audit_event(tmp_path):
+    # Questo test prova la guardia di audit che SOLO tools/testing/offline_pytest.py
+    # installa (sys.addaudithook prima di ogni import). Nel pytest nudo della suite la
+    # guardia non c'e': il test cadeva con KeyError su BELLOMBERG_PROJECT_ROOT o con
+    # 'unexpectedly_allowed' — rosso d'ambiente, non della guardia (ZR 05/10, classe A).
+    # Niente skip: fuori dal sandbox il test RILANCIA se stesso sotto il runner offline
+    # (un hook di audit non si rimuove, installarlo qui avvelenerebbe il resto della
+    # suite) ed esige che li' passi. La garanzia si misura in ogni modo in cui si lancia.
+    if not os.environ.get("BELLOMBERG_OFFLINE_TEST_SANDBOX"):
+        _rilancia_sotto_runner_offline(
+            tmp_path, "test_pending_open_target_cannot_authorize_a_second_audit_event")
+        return
     allowed = tmp_path / "allowed-canary.txt"
     outside = Path(os.environ["BELLOMBERG_PROJECT_ROOT"]) / "__audit_only_outside_canary__"
     outcomes = []
@@ -94,6 +120,12 @@ def test_real_posix_relative_mutations_and_recursive_cleanup(tmp_path):
 def test_outside_directory_descriptor_cannot_delete_or_rename(tmp_path):
     if os.name != "posix":
         pytest.skip("Native directory descriptors require a POSIX runner")
+    # Stessa guardia di audit del test sopra: nel pytest nudo (CI suite-linux) nessun hook
+    # nega la scrittura e il test cadeva con «DID NOT RAISE» (LINUX 05/10, classe A).
+    # Fuori dal sandbox si rilancia sotto il runner offline ed esige che li' passi.
+    if not os.environ.get("BELLOMBERG_OFFLINE_TEST_SANDBOX"):
+        _rilancia_sotto_runner_offline(tmp_path, "test_outside_directory_descriptor_cannot_delete_or_rename")
+        return
     outside = Path(__file__).resolve().parent
     descriptor = os.open(outside, os.O_RDONLY)
     local = os.open(tmp_path, os.O_RDONLY)

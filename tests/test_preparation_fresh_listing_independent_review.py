@@ -27,9 +27,14 @@ def transports(monkeypatch):
     monkeypatch.setattr(socket, 'getaddrinfo', block('network'))
     monkeypatch.setattr(socket.socket, 'connect', block('network'))
     monkeypatch.setattr(sqlite3, 'connect', block('sqlite'))
-    import anthropic
-    monkeypatch.setattr(anthropic, 'Anthropic', block('paid'))
-    monkeypatch.setattr(anthropic, 'AsyncAnthropic', block('paid'))
+    # Paid LLM calls go through the project facade (OpenRouter via llm_client), not the
+    # anthropic SDK, which is not a dependency: block the facade clients and the HTTP
+    # builders every client (also one imported by name elsewhere) is constructed through.
+    from bellomberg.core import llm_client
+    monkeypatch.setattr(llm_client, 'OpenRouterClient', block('paid'))
+    monkeypatch.setattr(llm_client, 'AsyncOpenRouterClient', block('paid'))
+    monkeypatch.setattr(llm_client, '_nuovo_client_http', block('paid'))
+    monkeypatch.setattr(llm_client, '_nuovo_client_http_async', block('paid'))
     yield
     assert counts == {'network': 0, 'sqlite': 0, 'paid': 0}
 

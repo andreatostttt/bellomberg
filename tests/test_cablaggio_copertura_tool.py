@@ -31,9 +31,10 @@ def _book_finto(monkeypatch, tmp_path):
     db = tmp_path / "book_finto.db"
     con = sqlite3.connect(str(db))
     con.execute("PRAGMA journal_mode=WAL")   # come il DB vero: connect_sqlite non lo riconverte
-    con.execute("CREATE TABLE positions (ticker TEXT, valuta TEXT, is_active INTEGER)")
-    con.executemany("INSERT INTO positions VALUES (?,?,?)",
-                    [("ZZEUR", "EUR", 1), ("ZZUSD", "USD", 1), ("ZZCHIUSA", "EUR", 0)])
+    con.execute("CREATE TABLE positions (ticker TEXT, valuta TEXT, is_active INTEGER, nome TEXT)")
+    con.executemany("INSERT INTO positions VALUES (?,?,?,?)",
+                    [("ZZEUR", "EUR", 1, None), ("ZZUSD", "USD", 1, None), ("ZZCHIUSA", "EUR", 0, None),
+                     ("QQNOMEDB.MI", "EUR", 1, "Societa Sintetica Spa")])
     con.commit()
     con.close()
     monkeypatch.setattr(memory_db, "SQLITE_PATH", str(db))
@@ -75,8 +76,25 @@ def rete(monkeypatch, tmp_path):
                         spia("polygon_chain", lambda t: {"ticker": t, "contracts": []}))
     monkeypatch.setattr(at, "_get_ibkr_options", spia("ibkr", None))
     monkeypatch.setattr(at, "YFINANCE_AVAILABLE", True)
-    monkeypatch.setattr(at, "yf", types.SimpleNamespace(
-        Ticker=spia("yfinance", lambda t: types.SimpleNamespace(options=[]))))
+    info_finte = {}
+
+    class TickerFinto:
+        """`.options` = fornitore di OPZIONI (contato come USA); `.get_info()` = nome
+        dell'emittente (contato a parte: non e' una chiamata di dato USA)."""
+        def __init__(self, t):
+            self.t = t
+
+        @property
+        def options(self):
+            conta["yfinance"] += 1
+            simboli["yfinance"].append(self.t)
+            return []
+
+        def get_info(self):
+            conta["yfinance_info"] += 1
+            simboli["yfinance_info"].append(self.t)
+            return info_finte.get(self.t, {})
+    monkeypatch.setattr(at, "yf", types.SimpleNamespace(Ticker=TickerFinto))
     monkeypatch.setattr(finnhub_news, "fetch_insider_trades", spia("finnhub_insider", []))
     monkeypatch.setattr(sec_edgar, "get_insider_trades", spia("sec_insider", []))
     monkeypatch.setattr(quiver_data, "quiver_available", lambda: True)
@@ -86,8 +104,11 @@ def rete(monkeypatch, tmp_path):
                         spia("quiver_lobbying", lambda t: {"ticker": t, "n": 1}))
     monkeypatch.setattr(quiver_data, "get_gov_contracts",
                         spia("quiver_gov", lambda t: {"ticker": t, "n": 1}))
-    originali = {"emarket": emarket_sdir.get_internal_dealing}
-    monkeypatch.setattr(emarket_sdir, "get_internal_dealing", spia("emarket", None))
+    # handoff-3: l'internal dealing passa dall'instradatore sdir.py (eMarket / 1INFO): la spia
+    # "emarket" sta li' (nome storico del contatore)
+    from bellomberg.market_data import sdir as _sdir
+    originali = {"emarket": _sdir.get_internal_dealing}
+    monkeypatch.setattr(_sdir, "get_internal_dealing", spia("emarket", None))
     # negozio dei gemelli: assente di default (le prove che lo vogliono lo scrivono)
     monkeypatch.setattr(np_, "PERCORSO_GEMELLI", str(tmp_path / "gemelli_assente.json"))
     # book finto per la valuta delle posizioni (valuta_dal_book): mai il DB vero
@@ -95,7 +116,28 @@ def rete(monkeypatch, tmp_path):
     # negozio dei veicoli (natura ETF/societa'): mai quello vero in data/
     from bellomberg.storage import classificazione as _cl
     monkeypatch.setattr(_cl, "PERCORSO_VEICOLI", str(tmp_path / "veicoli_assente.json"))
-    return types.SimpleNamespace(conta=conta, simboli=simboli, risposte=risposte,
+    # negozi ISIN in tmp_path (assenti) e risoluzione ISIN: spia con contatore, mai rete
+    from bellomberg.market_data import borsa_italiana as _bi
+    monkeypatch.setattr(_bi, "PERCORSO_ISIN", str(tmp_path / "isin_assente.json"))
+    monkeypatch.setattr(_bi, "PERCORSO_ISIN_AUTO", str(tmp_path / "isin_auto_assente.json"))
+    monkeypatch.setattr(_bi, "CACHE_DIR", str(tmp_path / "cache_it"))
+    risposte["risolvi"] = lambda t, nome: {"ticker": t, "stato": "non_trovato", "errore": "nome_non_nel_listino",
+                                           "motivo": "finto: %r non nel listino" % nome, "isin": None,
+                                           "salvato": False, "negozio": None}
+
+    def risolvi_spia(ticker, *, nome=None):
+        conta["risolvi"] += 1
+        simboli["risolvi"].append((ticker, nome))
+        return risposte["risolvi"](ticker, nome)
+    monkeypatch.setattr(_bi, "risolvi_isin", risolvi_spia)
+    # orchestratore VERO (isin_automatico): i finti autouse di conftest si tolgono, cosi' si
+    # prova anche il cablaggio _risolvi -> borsa_italiana.risolvi_isin (qui la spia) e il nome
+    # dal fornitore prezzi passa dal yfinance FINTO sopra (get_info contato a parte)
+    from bellomberg.market_data import isin_automatico as _ia
+    monkeypatch.setattr(_ia, "_risolvi", _ia._risolvi_vero)
+    monkeypatch.setattr(_ia, "_nome_dal_fornitore", _ia._nome_dal_fornitore_vero)
+    monkeypatch.setattr(_ia, "_yf_ticker", TickerFinto)
+    return types.SimpleNamespace(conta=conta, simboli=simboli, risposte=risposte, info=info_finte,
                                  tmp=tmp_path, mp=monkeypatch, originali=originali)
 
 
@@ -174,16 +216,19 @@ def test_crypto_non_coperta_e_nessun_gemello(rete):
     assert _usa_zero(rete.conta) == {}
 
 
-# ---------------------------------------------------------------- insider: .MI -> eMarket SDIR
+# ---------------------------------------------------------------- insider: .MI -> SDIR (eMarket / 1INFO)
 
 def test_insider_mi_va_su_emarket_e_mai_su_finnhub_sec(rete):
     rete.risposte["emarket"] = lambda t: {
         "ticker": t, "stato": "ok", "comunicazioni": [{"data": "2026-09-30", "soggetto": "Zeno Fittizio",
                                                        "operazioni": [{"prezzo": 1.23}]}],
-        "letto_il": "2026-10-01T10:00:00+00:00", "isin": "ITZZ00000000"}
+        "letto_il": "2026-10-01T10:00:00+00:00", "isin": "ITZZ00000000", "sdir": "1INFO-SDIR",
+        "instradamento": {"regola": "finta", "scelta": "oneinfo"}, "oneinfo_ndg": 99}
     for out in (at.tool_get_insider_trades("QQSYN.MI", days=60),
                 ct.dispatch("get_insider_trades", {"ticker": "QQSYN.MI", "days": 60})["data"]):
-        assert out["source"].startswith("emarket_sdir"), out
+        assert out["source"] == "sdir (internal dealing): 1INFO-SDIR", out
+        assert out["sdir"] == "1INFO-SDIR" and out["instradamento"]["scelta"] == "oneinfo"
+        assert out["oneinfo_ndg"] == 99
         assert out["count"] == 1 and out["comunicazioni"][0]["soggetto"] == "Zeno Fittizio"
         assert "error" not in out
         assert "NON interrogate" in out["fonti_usa"]
@@ -210,8 +255,8 @@ def test_insider_mi_dichiara_gli_stati_della_fonte(rete, stato, errore_atteso):
 
 def test_insider_mi_tabella_isin_mancante_e_errore_dichiarato_col_lettore_vero(rete, monkeypatch):
     """Senza stub su eMarket: il lettore VERO, col negozio ticker->ISIN assente, dice KO."""
-    from bellomberg.market_data import borsa_italiana, emarket_sdir
-    monkeypatch.setattr(emarket_sdir, "get_internal_dealing", rete.originali["emarket"])  # lettore vero
+    from bellomberg.market_data import borsa_italiana, sdir
+    monkeypatch.setattr(sdir, "get_internal_dealing", rete.originali["emarket"])  # instradatore vero
     monkeypatch.setattr(borsa_italiana, "PERCORSO_ISIN", str(rete.tmp / "isin_assente.json"))
     monkeypatch.setattr(borsa_italiana, "PERCORSO_ISIN_AUTO", str(rete.tmp / "isin_auto_assente.json"))
     monkeypatch.setattr(borsa_italiana, "CACHE_DIR", str(rete.tmp / "cache_it"))
@@ -303,7 +348,7 @@ def test_proxy_usa_per_un_uso_non_ammesso_resta_sulla_fonte_italiana(rete):
     """ZZIDX.MI e' confermato per opzioni/notizie, NON per insider: niente gemello, eMarket."""
     _negozio_esempio(rete)
     out = at.tool_get_insider_trades("ZZIDX.MI", proxy_usa=True)
-    assert out["source"].startswith("emarket_sdir")
+    assert out["source"].startswith("sdir (internal dealing)")
     assert out["gemello_usa"]["stato"] == "uso_non_ammesso", out
     assert rete.conta["finnhub_insider"] == rete.conta["sec_insider"] == 0
 
@@ -599,14 +644,29 @@ def test_societa_mi_interroga_borsa_e_natura_ignota_e_dichiarata(veicoli_finti):
 
 def test_internal_dealing_vuoto_misurato_dice_la_categoria_non_gli_insider(rete):
     rete.risposte["emarket"] = lambda t: {"ticker": t, "stato": "vuoto_misurato", "comunicazioni": [],
-                                          "letto_il": "2026-10-01T10:00:00+00:00"}
+                                          "letto_il": "2026-10-01T10:00:00+00:00", "sdir": "1INFO-SDIR"}
     out = at.tool_get_insider_trades("QQSYN.MI", days=45)
-    assert out["esito"].startswith("nessuna comunicazione nella categoria internal dealing di eMarket")
+    # handoff-3: la categoria e' quella dello SDIR scelto (qui 1INFO), non sempre eMarket
+    assert out["esito"].startswith("nessuna comunicazione nella categoria internal dealing di 1INFO-SDIR")
+    rete.risposte["emarket"] = lambda t: {"ticker": t, "stato": "vuoto_misurato", "comunicazioni": []}
+    assert "SDIR non dichiarato" in at.tool_get_insider_trades("QQSYN.MI", days=45)["esito"]
+    out = at.tool_get_insider_trades("QQSYN.MI", days=45)
     assert "45 giorni" in out["esito"]
     testo = json.dumps(out, ensure_ascii=False).lower()
     assert "nessuna operazione degli insider" not in testo
     descr = next(t for t in ct.TOOL_DEFINITIONS if t["name"] == "get_insider_trades")["description"]
     assert "nessuna operazione degli insider" not in descr.lower()
+
+
+def test_descrizioni_dei_tool_mi_dicono_il_vero():
+    """handoff-3: insider .MI = SDIR scelto dall'instradatore (eMarket o 1INFO), ISIN risolto in
+    automatico e dichiarato; calendario .MI = niente piu' «tabella mancante = errore» secco."""
+    for schema in (ct.TOOL_DEFINITIONS, at.TOOLS_SCHEMA):
+        d = next(t for t in schema if t["name"] == "get_insider_trades")["description"]
+        assert "1INFO-SDIR" in d and "eMarket SDIR" in d and "risoluzione_isin" in d, d
+        assert "instradamento" in d
+    cal = next(t for t in ct.TOOL_DEFINITIONS if t["name"] == "get_earnings_calendar")["description"]
+    assert "risoluzione_isin" in cal and "tabella ticker->ISIN mancante" not in cal
 
 
 # ---------------------------------------------------------------- IT1: ISIN dal negozio automatico
@@ -631,3 +691,129 @@ def test_isin_automatico_e_detto_all_agente(rete, monkeypatch):
     rete.risposte["emarket"] = lambda t: {"ticker": t, "stato": "ok", "comunicazioni": [],
                                           "voce_da": "confermato"}
     assert "voce_da_nota" not in at.tool_get_insider_trades("QQSYN.MI")
+
+
+# ---------------------------------------------------------------- ISIN dei .MI risolto in automatico (PM 05/10)
+
+def _voce_auto_dopo_ok(rete, isin="ITZZ00000001"):
+    """La risoluzione 'ok' finta scrive la voce nel negozio automatico finto, come la vera."""
+    from bellomberg.market_data import borsa_italiana as _bi
+    salvate = {}
+
+    def ok(t, nome):
+        salvate[t] = isin
+        return {"ticker": t, "stato": "ok", "errore": None, "motivo": "verificato sulla scheda (finto)",
+                "isin": isin, "salvato": True, "negozio": "automatico"}
+    rete.risposte["risolvi"] = ok
+    vera = _bi.voce_ticker_o_auto
+
+    def voce(t):
+        if t in salvate:
+            return {"isin": salvate[t], "emarket": None, "negozio": "automatico"}, None, None
+        return vera(t)
+    rete.mp.setattr(_bi, "voce_ticker_o_auto", voce)
+    return salvate
+
+
+def test_mi_senza_voce_usa_il_nome_della_posizione_nel_db(rete):
+    out = at.tool_get_insider_trades("QQNOMEDB.MI")
+    assert rete.simboli["risolvi"] == [("QQNOMEDB.MI", "Societa Sintetica Spa")]
+    r = out["risoluzione_isin"]
+    assert r["fonte_nome"] == "nome della posizione nel book (DB)" and r["nome_usato"] == "Societa Sintetica Spa"
+    assert rete.conta["yfinance_info"] == 0   # il DB basta: il fornitore prezzi non si chiede
+
+
+def test_mi_senza_voce_ne_db_usa_il_nome_del_fornitore_prezzi(rete):
+    rete.risposte["emarket"] = lambda t: {"ticker": t, "stato": "KO", "errore": "ticker_non_mappato",
+                                          "motivo": "ISIN mancante (finto)", "comunicazioni": []}
+    rete.info["QQSYN.MI"] = {"longName": "Sintetica Industrie S.p.A."}
+    out = at.tool_get_insider_trades("QQSYN.MI")
+    assert rete.simboli["risolvi"] == [("QQSYN.MI", "Sintetica Industrie S.p.A.")]
+    assert out["risoluzione_isin"]["fonte_nome"] == "nome dal fornitore prezzi (yfinance longName)"
+    # risoluzione fallita: dichiarata nell'errore, non un «nessun dato»
+    assert "risoluzione ISIN non_trovato" in out["error"] and "non nel listino" in out["error"]
+    assert rete.conta["yfinance"] == 0   # nessuna chiamata di OPZIONI
+
+
+def test_mi_nome_assente_non_trovato_dichiarato_senza_rete(rete):
+    rete.risposte["emarket"] = lambda t: {"ticker": t, "stato": "KO", "errore": "ticker_non_mappato",
+                                          "motivo": "ISIN mancante (finto)", "comunicazioni": []}
+    out = at.tool_get_insider_trades("QQSYN.MI")
+    r = out["risoluzione_isin"]
+    assert r["stato"] == "non_trovato" and r["errore"] == "nome_assente"
+    assert "nome dell'emittente non disponibile" in r["motivo"] and r["nome_usato"] is None
+    assert rete.conta["risolvi"] == 0
+    assert "risoluzione ISIN non_trovato" in out["error"]
+
+
+def test_mi_risolto_procede_e_dichiara_voce_automatica(rete):
+    salvate = _voce_auto_dopo_ok(rete)
+    rete.risposte["emarket"] = lambda t: {"ticker": t, "stato": "ok", "comunicazioni": [],
+                                          "voce_da": "automatico"}
+    out = at.tool_get_insider_trades("QQNOMEDB.MI")
+    assert salvate == {"QQNOMEDB.MI": "ITZZ00000001"}
+    assert out["risoluzione_isin"]["stato"] == "ok" and "error" not in out
+    assert out["voce_da"] == "automatico" and "AUTOMATICAMENTE" in out["voce_da_nota"]
+    # secondo uso: la voce e' nel negozio automatico -> nessuna nuova risoluzione (niente rete)
+    out2 = at.tool_get_insider_trades("QQNOMEDB.MI")
+    assert rete.conta["risolvi"] == 1 and "risoluzione_isin" not in out2
+
+
+def test_mi_risoluzione_cablata_su_calendario_eventi_e_scadenza(rete, monkeypatch):
+    import datetime as dt
+    from bellomberg.market_data import borsa_italiana, finnhub_news, sec_edgar
+    monkeypatch.setattr(borsa_italiana, "oggi_roma", lambda: dt.date(2026, 10, 4))
+    monkeypatch.setattr(borsa_italiana, "get_eventi_societari", lambda t, **k: {
+        "stato": "KO", "errore": "ticker_non_mappato", "motivo": "ISIN mancante", "eventi": []})
+    monkeypatch.setattr(finnhub_news, "fetch_company_news", lambda *a, **k: [])
+    monkeypatch.setattr(sec_edgar, "ticker_ambiguo_per_cik", lambda t: "suffisso estero finto")
+    from bellomberg.market_data import isin_automatico as _ia
+    import os
+
+    def dimentica():   # ogni percorso si prova da solo: memoria dei tentativi vuota
+        if os.path.exists(_ia.PERCORSO_TENTATIVI):
+            os.remove(_ia.PERCORSO_TENTATIVI)
+    r = ct.dispatch("get_earnings_calendar", {"ticker": "QQNOMEDB.MI"})
+    assert r["data"]["risoluzione_isin"]["nome_usato"] == "Societa Sintetica Spa"
+    assert "risoluzione ISIN non_trovato" in r["error"]
+    assert rete.conta["risolvi"] == 1
+    dimentica()
+    d = ct.dispatch("get_corporate_events_for_ticker", {"ticker": "QQNOMEDB.MI"})["data"]
+    assert "risoluzione ISIN non_trovato" in d["fonti"]["borsa_italiana"]
+    assert rete.conta["risolvi"] == 2
+    dimentica()
+    vu, fonte, nota = ct._prossima_trimestrale("QQNOMEDB.MI")
+    assert vu is None and "risoluzione ISIN non_trovato" in nota
+    assert rete.conta["risolvi"] == 3
+    # senza dimenticare: il quarto uso legge la memoria negativa, nessuna rete, e lo DICE
+    vu, fonte, nota = ct._prossima_trimestrale("QQNOMEDB.MI")
+    assert rete.conta["risolvi"] == 3 and "risoluzione gia' tentata il" in nota
+
+
+def test_voce_gia_nel_negozio_nessuna_risoluzione(rete):
+    import json as _json
+    from bellomberg.market_data import borsa_italiana as _bi
+    p = rete.tmp / "isin_conf.json"
+    # ISIN INVENTATO con cifra di controllo valida (dall'esempio tracciato isin_it.example.json)
+    p.write_text(_json.dumps({"ZZTEST.MI": {"isin": "ITZZTEST0001", "emarket": None}}), encoding="utf-8")
+    rete.mp.setattr(_bi, "PERCORSO_ISIN", str(p))
+    voce, err, mot = _bi.voce_ticker_o_auto("ZZTEST.MI")
+    assert voce is not None and voce["negozio"] == "confermato", (err, mot)
+    at.tool_get_insider_trades("ZZTEST.MI")
+    assert rete.conta["risolvi"] == 0
+
+
+def test_nei_test_risoluzione_isin_e_nome_non_fanno_rete(monkeypatch, tmp_path):
+    """Senza la fixture `rete`: il finto di conftest neutralizza i DUE punti di rete
+    dell'orchestratore (nome dal fornitore, _risolvi), NON borsa_italiana.risolvi_isin."""
+    from bellomberg.market_data import borsa_italiana as _bi
+    from bellomberg.market_data import isin_automatico as _ia
+    monkeypatch.setattr(_bi, "PERCORSO_ISIN", str(tmp_path / "a.json"))
+    monkeypatch.setattr(_bi, "PERCORSO_ISIN_AUTO", str(tmp_path / "b.json"))
+    nome, fonte, perche = at.nome_emittente_it("QQSYN.MI")
+    assert (nome, fonte) == (None, None) and "non chiesto" in perche and "book" in perche
+    assert _bi.risolvi_isin.__module__ == "bellomberg.market_data.borsa_italiana"   # intatta
+    assert _ia._risolvi("QQSYN.MI", "X")["motivo"] == "test: risoluzione ISIN non eseguita"
+    r = at.assicura_isin_it("QQSYN.MI")
+    assert r["errore"] == "nome_assente" and "non chiesto" in r["motivo"]
+    assert str(tmp_path) in r["memoria"]["percorso"]   # memoria dei tentativi mai in data/

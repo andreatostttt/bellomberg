@@ -65,6 +65,29 @@ ESEMPIO_GEMELLI = "gemelli_usa.example.json"
 # ============================================================
 # IL CARICATORE COMUNE
 # ============================================================
+# Lettore concorrente su Windows (handoff-3, 05/10, Opus 5.5): mentre uno scrittore fa
+# os.replace sul negozio (borsa_italiana.aggiorna_json_bloccato), l'apertura in lettura puo'
+# fallire con PermissionError per un istante. Si riprova TENTATIVI_LETTURA volte a distanza di
+# PAUSA_LETTURA_S (~0,5 s in tutto) prima di dichiarare 'illeggibile'. Solo PermissionError:
+# JSON rotto o altri errori si dichiarano subito, come prima.
+TENTATIVI_LETTURA = 5
+PAUSA_LETTURA_S = 0.1
+
+
+def _leggi_json_con_tentativi(path: str) -> Any:
+    import time
+    # Stessa regola del negozio veicoli, anche sugli oggetti annidati.
+    from bellomberg.storage.classificazione import _senza_doppie
+    for tentativo in range(1, TENTATIVI_LETTURA + 1):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh, object_pairs_hook=_senza_doppie)
+        except PermissionError:
+            if tentativo == TENTATIVI_LETTURA:
+                raise
+            time.sleep(PAUSA_LETTURA_S)
+
+
 def carica(path: str, esempio: str, valida: Callable[[Dict[str, Any]], Any],
            nome: str = "voci", vuoto: Any = None) -> Dict[str, Any]:
     """Legge un negozio privato. Torna {nome: voci, "origine": path | 'assente' |
@@ -78,10 +101,7 @@ def carica(path: str, esempio: str, valida: Callable[[Dict[str, Any]], Any],
         return {nome: vuoto, "origine": "assente",
                 "motivo": _message('negozio non trovato: {v0} (copia {v1} in data/ e mettici i TUOI dati)', 'Store not found: {v0} (copy {v1} into data/ and enter YOUR data)', v0=path, v1=esempio)}
     try:
-        with open(path, encoding="utf-8") as fh:
-            # Stessa regola del negozio veicoli, anche sugli oggetti annidati.
-            from bellomberg.storage.classificazione import _senza_doppie
-            grezzo = json.load(fh, object_pairs_hook=_senza_doppie)
+        grezzo = _leggi_json_con_tentativi(path)
     except Exception as e:
         return {nome: vuoto, "origine": "illeggibile",
                 "motivo": _message('{v0}: {v1}', '{v0}: {v1}', v0=type(e).__name__, v1=error_text(e))}

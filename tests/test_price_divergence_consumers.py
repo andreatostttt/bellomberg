@@ -12,22 +12,26 @@ from test_sector_valuation_integration import (
 )
 
 
-def test_flagged_valuation_names_actual_failure_without_inventing_price_gap(isolated_tools, monkeypatch):
+# Contratto ATTUALE (ZR 05/10, Z1): la nota [VAL FLAGGED] del ramo get_valuation e' in
+# archive/private/attic/tests_excel_archiviato_20261005/test_price_divergence_consumers_legacy.py (dispatch archiviato dal 1326312,
+# censimento Z4). Anche con un motore che produrrebbe una valutazione FLAGGED, il tool risponde il contratto
+# dichiarato: nessuna nota, nessun fair value, nessuno scarto di prezzo inventato.
+from _contratto_excel_archiviato import blinda_ramo_archiviato, file_in, verifica_archiviato
+
+
+def test_flagged_engine_output_never_surfaces_through_the_archived_tool(isolated_tools, monkeypatch):
     tools = isolated_tools
     bundle = synthetic_bundle()
     path = tools.directory / 'broken-contract.xlsx'
     path.write_bytes(b'synthetic unavailable workbook')
     payload = documented_payload(bundle, path)
     payload.update(valuation_flagged=True, error='Share count and quotation units do not reconcile')
-    monkeypatch.setattr(tools.engine, 'generate_valuation', lambda *args, **kwargs: deepcopy(payload))
-
-    result = tools.chat.dispatch('get_valuation', {'ticker': SYMBOL}, prepared_bundle=bundle)['data']
-
-    assert result['valuation_usability']['usable'] is False
-    assert result['valuation_flagged'] is True
-    assert payload['error'] in result['_analyst_note']
-    assert 'Fair value molto distante dal prezzo' not in result['_analyst_note']
-    assert result['fair_value_weighted'] is None
+    prima = file_in(tools.directory)
+    chiamate = blinda_ramo_archiviato(monkeypatch)
+    risposta = tools.chat.dispatch('get_valuation', {'ticker': SYMBOL}, prepared_bundle=bundle)
+    verifica_archiviato(risposta, chiamate, cartella=tools.directory, prima=prima)
+    assert 'Fair value molto distante dal prezzo' not in str(risposta)
+    assert tools.memory.saved == []
 
 
 def test_get_valuation_instructions_cover_every_scenario_and_preserve_real_gates():

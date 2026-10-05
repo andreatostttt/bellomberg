@@ -79,207 +79,57 @@ def _worker_options(tmp_path):
         "isolated_facts_loader": lambda: "Synthetic offline facts only"}
 
 
-def test_http_preflight_admits_historical_work_but_requires_preparation_grant(historical_runtime):
+def test_http_historical_preparation_admission_is_archived(historical_runtime):
+    # Contratto attuale (Excel archiviato, commit 1326312): una qualificazione storica non di
+    # ricerca puo' essere mostrata dal preflight, ma l'avvio a pagamento e' rifiutato prima di
+    # creare run o worker. I test storici del percorso Excel sono in quarantena:
+    # archive/private/attic/tests_excel_archiviato_20261005/test_trade_idea_historical_runtime_legacy.py
     client, current, qualification, _plan, body, workers = historical_runtime
     checked = client.post("/trade-ideas/preflight", json=body)
-    assert checked.status_code == 200, checked.text
-    public = checked.json()
-    assert public["ok"] is True and public["source_qualification"]["status"] == "preparation_required"
-    assert public["preparation"] == {"required": True, "paid": True, "status": "historical_required"}
-    assert public["source_qualification"]["fingerprint"] == qualification["fingerprint"]
-    assert "source_report" not in checked.text and current.list_runs()["total"] == 0
-
-    without_preparation = {"accepted": True, "source_fingerprint": qualification["fingerprint"],
-        "activities": ["committee"], "max_revision_rounds": 0}
-    denied = client.post("/trade-ideas/runs", json={**body,
-        "authorization": without_preparation, "cost_acknowledged": True,
-        "idempotency_key": "historical-without-preparation"})
-    assert denied.status_code == 428
+    assert checked.status_code == 200 and checked.json()["ok"], checked.text
+    assert checked.json()["source_qualification"]["status"] == "preparation_required"
+    assert "source_report" not in checked.text
+    for activities in (["model_preparation", "committee"], ["committee"]):
+        grant = {"accepted": True, "source_fingerprint": qualification["fingerprint"],
+                 "activities": activities, "max_revision_rounds": 0}
+        denied = client.post("/trade-ideas/runs", json={**body, "authorization": grant,
+            "cost_acknowledged": True, "idempotency_key": "historical-" + "-".join(activities)})
+        assert denied.status_code == 428 and "Nuove analisi senza Excel" in denied.text, denied.text
     assert current.list_runs()["total"] == 0 and workers == []
 
-    run_id, grant = _accept(client, qualification, body)
-    stored = current.get_run(run_id)
-    assert workers == [run_id]
-    assert stored["run"]["authorization"] == grant
-    assert stored["run"]["source_qualification"]["status"] == "preparation_required"
-    assert stored["cost"]["requests"] == 0
-    detail = client.get("/trade-ideas/runs/" + run_id)
-    assert detail.status_code == 200
-    assert detail.json()["run"]["source_qualification"]["status"] == "preparation_required"
-    assert "source_report" not in detail.text
 
-
-def test_worker_checks_history_and_common_excel_at_r1_before_model_review(
-        historical_runtime, tmp_path, monkeypatch):
-    client, current, qualification, plan, body, _workers = historical_runtime
-    run_id, _grant = _accept(client, qualification, body)
-    stages, rounds = [], []
-    checkpoint_path = tmp_path / "worker" / "model" / "historical-preparation.json"
-
-    def offline_stage(_dossier, contract):
-        stage = contract["preparation_stage"]
-        scope, names = stage["scope"], stage["drivers"]
-        stages.append((scope, tuple(names)))
-        if "capdev_amortization_years" in names or "revenue_growth" in names:
-            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-            assert checkpoint["status"] == "historical_qualified"
-            assert checkpoint["admission_fingerprint"] == qualification["fingerprint"]
-        values = plan["model"] if scope == "model" else plan["scenarios"][scope]
-        return {"drivers": {name: deepcopy(values[name]) for name in names},
-                "rationale": "Offline synthetic source-linked economic reasoning"}
-
-    def first_round(board, number):
-        rounds.append(number)
-        if number == 0:
-            assert not board.valuation_results
-            return
-        assert number == 1
-        from bellomberg.valuation.trade_idea_model import prepare
-        model = prepare(board.source_qualification, board.valuation_preparer, checkpoint_path.parent)
-        trade_idea._record_candidate_model(board, model)
-        assert trade_idea._verified_candidate_valuations(board)
-        model = board.valuation_results[body["ticker"]]
-        assert model["valuation_usability"]["usable"] is True
-        assert Path(model["path"]).is_file() and checkpoint_path.is_file()
-        current.request_stop(run_id)
-        raise RuntimeError("Intentional offline stop after the historical R1 compiler boundary")
-
-    monkeypatch.setattr(trade_idea, "deliver_trade_idea",
-                        lambda *_args, **_kwargs: pytest.fail("cancelled worker delivered"))
-    detail = trade_idea.execute_trade_idea(run_id, store=current, **_worker_options(tmp_path),
-        source_qualifier=lambda *_args, **_kwargs: deepcopy(qualification),
-        preparer_binder=lambda *_args, **_kwargs: (offline_stage, {"status": "offline"}),
-        round_runner=first_round,
-        catalog_fetcher=lambda: _priced_request(budget="30")["catalog_snapshot"])
-    assert detail["run"]["technical_status"] == "cancelled", detail["run"]["reason"]
-    assert rounds == [0, 1] and stages
-    assert checkpoint_path.is_file() and detail["cost"]["requests"] == 0
-
-
-def test_worker_missing_historical_balance_never_starts_model_review_or_writes_excel(
-        historical_runtime, tmp_path, monkeypatch):
-    client, current, qualification, plan, body, _workers = historical_runtime
-    run_id, _grant = _accept(client, qualification, body)
-    stages, rounds = [], []
-
-    def incomplete_stage(_dossier, contract):
-        stage = contract["preparation_stage"]
-        scope, names = stage["scope"], stage["drivers"]
-        stages.extend(names)
-        values = plan["model"] if scope == "model" else plan["scenarios"][scope]
-        return {"drivers": {name: None if name == "equity_adjustments" else deepcopy(values[name])
-                            for name in names}, "rationale": "Historical balance not proven"}
-
-    monkeypatch.setattr(trade_idea, "deliver_trade_idea", lambda *_args, **_kwargs: None)
-    def historical_boundary(board, number):
-        rounds.append(number)
-        if number == 1:
-            from bellomberg.valuation.trade_idea_model import prepare
-            model = prepare(board.source_qualification, board.valuation_preparer, tmp_path / "worker" / "model")
-            trade_idea._record_candidate_model(board, model)
-    detail = trade_idea.execute_trade_idea(run_id, store=current, **_worker_options(tmp_path),
-        source_qualifier=lambda *_args, **_kwargs: deepcopy(qualification),
-        preparer_binder=lambda *_args, **_kwargs: (incomplete_stage, {"status": "offline"}),
-        round_runner=historical_boundary,
-        red_runner=lambda *_args, **_kwargs: pytest.fail("Unverified history reached model review"),
-        catalog_fetcher=lambda: _priced_request(budget="30")["catalog_snapshot"])
-    assert detail["run"]["technical_status"] == "incomplete", detail["run"]["reason"]
-    assert "equity_adjustments" in stages
-    assert "capdev_amortization_years" in stages and "revenue_growth" in stages
-    assert stages.index("equity_adjustments") > stages.index("revenue_growth")
-    assert rounds == [0, 1] and detail["cost"]["requests"] == 0
-    assert not list((tmp_path / "worker").rglob("*.xlsx"))
-    checkpoint = json.loads((tmp_path / "worker" / "model" / "historical-preparation.json").read_text())
-    assert checkpoint['status'] == 'historical_qualified'
-    assert all('net_debt' in values and 'equity_adjustments' not in values
-               for values in checkpoint['candidate']['plan']['scenarios'].values())
-
-
-def test_worker_rechecks_accepted_document_pin_before_preparation(
-        historical_runtime, tmp_path):
-    client, current, qualification, _plan, body, _workers = historical_runtime
-    run_id, _grant = _accept(client, qualification, body)
-    changed = deepcopy(qualification)
-    changed["source_report"]["documents"][0]["text"] += " Changed after acceptance."
+def test_worker_rechecks_accepted_research_pin_before_any_paid_work(migrated, tmp_path):
+    # Portato in modalita' ricerca: garanzia conservata = se le fonti ricontrollate dal worker
+    # non sono quelle del grant accettato, la run fallisce prima di sessione fonti, comitato e
+    # qualunque chiamata pagata.
+    from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE
+    from bellomberg.valuation import trade_idea_model as model
+    from test_trade_idea_pm_sources import IDENTITY, _profile_providers
+    day = datetime.now(timezone.utc).date().isoformat()
+    admission = model.research_admission(IDENTITY["ticker"], deepcopy(IDENTITY), day,
+        archive_root=tmp_path, providers=_profile_providers(day), analysis_mode=RESEARCH_ANALYSIS_MODE)
+    assert admission["status"] == "research_required", admission["reasons"]
+    priced = _priced_request(budget="30")
+    current = store(migrated)
+    request = {**priced, "analysis_mode": RESEARCH_ANALYSIS_MODE, "ticker": IDENTITY["ticker"],
+        "company_name": IDENTITY["name"], "exchange": IDENTITY["exchange"],
+        "currency": IDENTITY["currency"], "source_qualification": admission,
+        "authorization": {"accepted": True, "source_fingerprint": admission["fingerprint"],
+                          "activities": ["committee"], "max_revision_rounds": 0}}
+    run_id = current.create_run(request, idempotency_key="research-pin")["run"]["id"]
+    changed = deepcopy(admission)
+    changed["source_report"]["documents"] = [{"id": "changed-after-acceptance",
+        "text": "Changed after acceptance.", "sha256": "d" * 64}]
+    changed["fingerprint"] = model.source_fingerprint(changed)
+    assert changed["fingerprint"] != admission["fingerprint"]
 
     detail = trade_idea.execute_trade_idea(run_id, store=current, **_worker_options(tmp_path),
-        source_qualifier=lambda *_args, **_kwargs: changed,
-        preparer_binder=lambda *_args, **_kwargs: pytest.fail("changed source reached preparer"),
+        source_qualifier=lambda *_args, **_kwargs: deepcopy(changed),
+        source_session_factory=lambda **_kwargs: pytest.fail("changed source reached the source session"),
+        preparer_binder=lambda *_args, **_kwargs: pytest.fail("research run reached a preparer"),
         round_runner=lambda *_args: pytest.fail("changed source reached committee"),
-        catalog_fetcher=lambda: _priced_request(budget="30")["catalog_snapshot"])
+        catalog_fetcher=lambda: priced["catalog_snapshot"])
     assert detail["run"]["technical_status"] == "failed", detail["run"]["reason"]
+    assert "fingerprint" in detail["run"]["reason"], detail["run"]["reason"]
     assert detail["cost"]["requests"] == 0
-
-
-def test_fundamentals_can_revise_verified_historical_candidate_with_exact_grant(
-        historical_runtime, migrated, tmp_path, monkeypatch):
-    from bellomberg.agents.specialists.base import Blackboard
-    from bellomberg.valuation.trade_idea_model import prepare
-
-    client, current, qualification, plan, body, _workers = historical_runtime
-    run_id, grant = _accept(client, qualification, body, revision=True)
-    assert grant["activities"] == ["model_preparation", "committee", "model_revision"]
-    token = current.claim_run(run_id)
-    catalog = current.get_run(run_id)["run"]["catalog_snapshot"]
-    gate = trade_idea.TradeIdeaBudgetGate(current, run_id, token, catalog,
-        catalog_fetcher=lambda: catalog)
-
-    def stage_from(values):
-        def propose(_dossier, contract):
-            stage = contract["preparation_stage"]
-            scope, names = stage["scope"], stage["drivers"]
-            source = values["model"] if scope == "model" else values["scenarios"][scope]
-            return {"drivers": {name: deepcopy(source[name]) for name in names},
-                    "rationale": "Synthetic source-linked analyst review"}
-        return propose
-
-    initial = prepare(qualification, stage_from(plan), tmp_path / "worker" / "initial")
-    assert initial["valuation_usability"]["usable"] is True
-    assert initial["historical_preparation"]["status"] == "historical_qualified"
-    board = Blackboard(memory_db=None, memo_id=None, heartbeat_path=tmp_path / "review-heartbeat.json",
-        run_scope="trade_idea", run_id=run_id, target_ticker=body["ticker"], budget_gate=gate)
-    board.model_registry = trade_idea._model_registry(migrated)
-    board.model_roots = [tmp_path / "worker"]
-    board.source_qualification = deepcopy(qualification)
-    trade_idea._record_candidate_model(board, initial)
-    refs = trade_idea._verified_candidate_valuations(board)
-    assert refs and refs[0]["generation_id"] == initial["generation_id"]
-    board.data["_model_review"] = {"initial_refs": refs, "final_refs": refs,
-        "revision_log": [], "objections": []}
-    board.current_round = 2
-
-    requested = [deepcopy(row) for row in initial["acquisition_snapshot"]["case"]["records"]
-                 if row["driver"] == "wacc"]
-    assert requested
-    for row in requested:
-        row["value"] = .12
-    document_id = qualification["source_report"]["documents"][0]["id"]
-    response = trade_idea.handle_trade_idea_review_tool(board, "fundamentals",
-        "review_candidate_model", {"generation_id": initial["generation_id"],
-        "action": "revise", "rationale": "Raise the documented synthetic discount rate",
-        "evidence_refs": [document_id], "changes": {"method_records": requested},
-        "needs_paid_preparation": True})
-    assert response["ok"] is True and response["status"] == "queued", response
-
-    revised_plan = deepcopy(plan)
-    for scenario in revised_plan["scenarios"].values():
-        scenario["wacc"]["value"] = .12
-    calls = []
-    def fake_revision_provider(_gate, _ticker, *, output_dir, phase):
-        calls.append((phase, Path(output_dir)))
-        assert phase == "revision"
-        return stage_from(revised_plan), {"status": "offline"}
-    monkeypatch.setattr(trade_idea, "bind_trade_idea_preparer", fake_revision_provider)
-
-    audit = trade_idea._finalize_model_review(board, gate,
-        output_dir=tmp_path / "worker" / "revision")
-    final = board.valuation_results[body["ticker"]]
-    assert calls and len(calls) == 1
-    assert final["valuation_usability"]["usable"] is True
-    assert final["generation_id"] != initial["generation_id"]
-    assert final["fair_value_base"] != initial["fair_value_base"]
-    assert Path(final["path"]).is_file()
-    assert final["preparation"]["provenance"]["trade_idea_revision"]["previous_generation_id"] == initial["generation_id"]
-    assert audit["revision_log"][0]["status"] == "applied"
-    assert audit["final_refs"][0]["generation_id"] == final["generation_id"]
-    assert current.get_run(run_id)["cost"]["requests"] == 0
+    assert not list(tmp_path.rglob("*.xlsx"))

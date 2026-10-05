@@ -41,6 +41,12 @@ PASSI_RICHIESTI = (
 # rewrite of history they already published, never for an ordinary push.
 VERSIONI_MANIFEST = (2,)
 VERSIONI_RISCRITTURA = (1, 2)
+# PM 05/10: a sync whose only changes since the previous public commit sit under `app/` may skip
+# the pytest step, and only that step. The manifest names the measured base commit and the number
+# of changed files in `verifica.pytest_saltato`; certificate and push re-measure it on Git objects
+# (the deposit's parent is that base, every changed path starts with `app/`, as many as declared).
+PASSO_SALTABILE = "pytest"
+PREFISSO_SOLO_APP = "app/"
 
 
 def _git(repo, *args, input=None):
@@ -55,12 +61,40 @@ def _sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def _passi_ok(steps):
-    """Every required CI step ran on the verified copy, in order, and exited 0."""
-    return (isinstance(steps, list)
-            and [s["nome"] for s in steps] == list(PASSI_RICHIESTI)
-            and all(s["esito"] == "OK" and type(s["exit"]) is int and s["exit"] == 0
-                    for s in steps))
+def _salto_valido(salto):
+    """The declared pytest skip names a full base commit and a positive count of changed files."""
+    return (isinstance(salto, dict) and isinstance(salto.get("base"), str)
+            and re.fullmatch(r"[0-9a-f]{40}", salto["base"]) is not None
+            and type(salto.get("file")) is int and salto["file"] > 0)
+
+
+def _passi_ok(steps, salto=None):
+    """Every required CI step ran on the verified copy, in order, and exited 0. With a declared
+    app-only skip, the pytest step alone must be NON ESEGUITO (and the skip well formed)."""
+    if not (isinstance(steps, list) and [s["nome"] for s in steps] == list(PASSI_RICHIESTI)):
+        return False
+    for s in steps:
+        if salto is not None and s["nome"] == PASSO_SALTABILE:
+            if not (_salto_valido(salto) and s["esito"] == "NON ESEGUITO" and s["exit"] is None):
+                return False
+        elif not (s["esito"] == "OK" and type(s["exit"]) is int and s["exit"] == 0):
+            return False
+    return True
+
+
+def _verifica_salto_pytest(repo, manifest, head):
+    """A declared app-only skip holds on Git objects: the certified commit's parent is the base the
+    export measured, and every path changed between them starts with `app/`, as many as declared."""
+    salto = manifest["verifica"].get("pytest_saltato")
+    if salto is None:
+        return
+    if _git(repo, "rev-parse", head + "^").decode().strip() != salto["base"]:
+        raise ValueError("Salto di pytest: il commit certificato non discende dalla base misurata")
+    nomi = [n for n in _git(repo, "diff-tree", "-r", "-z", "--no-renames", "--name-only",
+                            salto["base"], head).decode("utf-8").split("\0") if n]
+    if (not nomi or len(nomi) != salto["file"]
+            or any(not n.startswith(PREFISSO_SOLO_APP) for n in nomi)):
+        raise ValueError("Salto di pytest: il commit cambia file fuori da app/ o un numero diverso")
 
 
 def valida_manifest(doc, versioni=VERSIONI_MANIFEST):
@@ -72,7 +106,8 @@ def valida_manifest(doc, versioni=VERSIONI_MANIFEST):
         version = doc["versione"]
         valid = (
             type(version) is int and version in versioni
-            and (version < 2 or _passi_ok(v["suite_passi"]))
+            and (version < 2 or _passi_ok(v["suite_passi"], v.get("pytest_saltato")))
+            and (version >= 2 or v.get("pytest_saltato") is None)
             and v["stato"] == "OK"
             and v["rigoroso"] is True
             and type(v["cancello_exit"]) is int and v["cancello_exit"] == 0
@@ -164,8 +199,10 @@ def _atomic_json(path, value):
             os.unlink(tmp)
 
 
-def certifica_deposito(repo, manifest, artifact, versioni=VERSIONI_MANIFEST):
-    """Bind checked content to Git objects, preserve evidence and install guard."""
+def certifica_deposito(repo, manifest, artifact, versioni=VERSIONI_MANIFEST, ricontrolla_salto=True):
+    """Bind checked content to Git objects, preserve evidence and install guard. The metadata-only
+    rewrite path passes ricontrolla_salto=False: its rewritten HEAD^ is no longer the measured base,
+    and verifica_push skips the same re-measure on that path (it publishes no new content)."""
     valida_manifest(manifest, versioni)
     expected, digest = _files_artifact(artifact)
     if digest != manifest["artefatto"]["sha256"] or len(expected) != manifest["artefatto"]["file"]:
@@ -176,7 +213,9 @@ def certifica_deposito(repo, manifest, artifact, versioni=VERSIONI_MANIFEST):
         raise ValueError("Il commit non contiene i file controllati (contenuti/filtri Git)")
     if _git(repo, "status", "--porcelain", "--untracked-files=all").strip():
         raise ValueError("Clone pubblico sporco dopo il deposito")
-    branch = _git(repo, "symbolic-ref", "HEAD").decode().strip()
+    if ricontrolla_salto:
+        _verifica_salto_pytest(repo, manifest, _git(repo, "rev-parse", "HEAD").decode().strip())
+    branch =_git(repo, "symbolic-ref", "HEAD").decode().strip()
     remote = _git(repo, "remote", "get-url", "--push", "origin").decode().strip()
     if not remote:
         raise ValueError("Destinazione origin assente")
@@ -247,7 +286,8 @@ def certifica_riscrittura_messaggi(repo, precedente, artifact):
         _verifica_riscrittura_messaggi(repo, old_history, history)
     except (KeyError, TypeError, AttributeError) as exc:
         raise ValueError("Riscrittura messaggi: certificato precedente illeggibile") from exc
-    path = certifica_deposito(repo, precedente["manifest"], artifact, VERSIONI_RISCRITTURA)
+    path = certifica_deposito(repo, precedente["manifest"], artifact, VERSIONI_RISCRITTURA,
+                              ricontrolla_salto=False)
     certificate = json.loads(path.read_text(encoding="utf-8"))
     certificate["riscrittura_messaggi"] = {"precedente_head": precedente["head"],
                                           "precedente_history": old_history}
@@ -293,6 +333,8 @@ def verifica_push(repo, refs, remote_url):
                 or _git(repo, "rev-parse", "HEAD^{tree}").decode().strip() != certificate["tree"]
                 or _git(repo, "rev-list", "HEAD").decode().split() != certificate["history"]):
             raise ValueError("Commit/storia non certificati: eseguire un nuovo export completo")
+        if rewrite is None:
+            _verifica_salto_pytest(repo, certificate["manifest"], head)
         branch = _git(repo, "symbolic-ref", "HEAD").decode().strip()
         if branch != certificate["branch"]:
             raise ValueError("Ramo diverso da quello certificato")
@@ -314,6 +356,12 @@ def verifica_push(repo, refs, remote_url):
             _verifica_riscrittura_messaggi(repo, rewrite["precedente_history"], certificate["history"])
         elif remote_oid != "0" * len(head) and remote_oid not in certificate["history"]:
             raise ValueError("Storia remota estranea: rifiutato anche un force-push")
+        else:
+            # Review 05/10 (D1): an app-only skip is measured against ONE base; any other commit
+            # between the server and HEAD (a rejected, never-pushed sync) would ride along untested.
+            salto = certificate["manifest"]["verifica"].get("pytest_saltato")
+            if salto is not None and remote_oid != salto["base"]:
+                raise ValueError("Salto di pytest: la base del salto non e' il commit gia' sul server")
     except (OSError, KeyError, TypeError, AttributeError, json.JSONDecodeError) as error:
         raise ValueError("Certificato locale assente o illeggibile") from error
 

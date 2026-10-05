@@ -1386,6 +1386,65 @@ def test_gitleaks_e_verde_se_i_byte_mancanti_sono_quelli_dichiarati_fuori_dal_ra
     assert e.ok and fuori in e.note and "6/706" in e.note
 
 
+# PM 05/10 (Opus 5.5): PDF fuori dal raggio del motore, dichiarati SOLO col pin SHA-256 giusto.
+PDF_SINTETICO = b"%PDF-1.4 sintetico, nessun dato\n"
+
+
+def _tree_con_pdf(tmp_path, contenuto=PDF_SINTETICO):
+    tree = tmp_path / "tree"
+    (tree / "fx").mkdir(parents=True)
+    (tree / "fx" / "doc.pdf").write_bytes(contenuto)
+    (tree / "visto.py").write_bytes(b"x = 1\n")
+    # come il motore vero: percorso assoluto con i separatori escapati da zerolog
+    salto = 'DBG skipping file: global allowlist path="%s"' % str(tree / "fx" / "doc.pdf").replace("\\", "\\\\")
+    return tree, salto + "\nINF scanned ~6 bytes (6 bytes) in 3ms"
+
+
+def test_pdf_saltato_col_pin_giusto_e_dichiarato_fuori_raggio_col_conteggio(tmp_path):
+    tree, stderr = _tree_con_pdf(tmp_path)
+    pin = {"fx/doc.pdf": hashlib.sha256(PDF_SINTETICO).hexdigest()}
+    e = vp.controllo_gitleaks(str(tree), exe=_exe_finto(tmp_path), esegui=_gitleaks_finto(stderr=stderr),
+                              pin_fuori_raggio=pin)
+    assert e.ok, e.errore
+    assert "1 file fuori dal raggio del motore pinnati per SHA-256 (%d byte" % len(PDF_SINTETICO) in e.note
+
+
+def test_pdf_pinnato_con_un_byte_cambiato_e_un_ko(tmp_path):
+    tree, stderr = _tree_con_pdf(tmp_path, PDF_SINTETICO[:-2] + b"X\n")
+    pin = {"fx/doc.pdf": hashlib.sha256(PDF_SINTETICO).hexdigest()}
+    e = vp.controllo_gitleaks(str(tree), exe=_exe_finto(tmp_path), esegui=_gitleaks_finto(stderr=stderr),
+                              pin_fuori_raggio=pin)
+    assert not e.ok and "fx/doc.pdf" in e.errore and "diverso dal pin" in e.errore
+    assert "%d byte NON scansionati" % len(PDF_SINTETICO) in e.errore
+
+
+def test_pdf_non_pinnato_che_il_motore_non_legge_e_un_ko(tmp_path):
+    tree, stderr = _tree_con_pdf(tmp_path)
+    e = vp.controllo_gitleaks(str(tree), exe=_exe_finto(tmp_path), esegui=_gitleaks_finto(stderr=stderr),
+                              pin_fuori_raggio={})
+    assert not e.ok and "NON scansionati: fx/doc.pdf" in e.errore and "pinnati" not in e.note
+
+
+def test_pdf_pinnato_che_il_motore_non_dichiara_saltato_non_riceve_credito(tmp_path):
+    """Il pin non e' un'esclusione: senza la riga di salto del motore i byte restano attesi."""
+    tree, _ = _tree_con_pdf(tmp_path)
+    pin = {"fx/doc.pdf": hashlib.sha256(PDF_SINTETICO).hexdigest()}
+    e = vp.controllo_gitleaks(str(tree), exe=_exe_finto(tmp_path), esegui=_gitleaks_finto(letti=6),
+                              pin_fuori_raggio=pin)
+    assert not e.ok and "NON scansionati" in e.errore
+
+
+def test_i_pin_dei_pdf_sono_i_byte_delle_fixture_e_coprono_ogni_pdf_di_fonti_it():
+    """Il pin vive nel codice: deve combaciare con le fixture vere (gitattributes *.pdf -text) e
+    ogni PDF nuovo in tests/fixtures/fonti_it va ri-provato e pinnato, non ereditato."""
+    from pathlib import Path
+    radice = Path(vp.REPO)
+    pdf = sorted(p.relative_to(radice).as_posix() for p in (radice / "tests" / "fixtures" / "fonti_it").glob("*.pdf"))
+    assert pdf == sorted(vp.GITLEAKS_FUORI_RAGGIO_PIN)
+    for rel, atteso in vp.GITLEAKS_FUORI_RAGGIO_PIN.items():
+        assert hashlib.sha256((radice / rel).read_bytes()).hexdigest() == atteso, rel
+
+
 def test_gitleaks_che_non_dice_quanti_byte_ha_letto_e_un_ko(tmp_path):
     e = vp.controllo_gitleaks(str(tmp_path), exe=_exe_finto(tmp_path),
                               esegui=_gitleaks_finto(stderr="INF no leaks found"))

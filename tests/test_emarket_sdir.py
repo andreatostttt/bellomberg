@@ -46,6 +46,13 @@ def ambiente(monkeypatch, tmp_path):
     monkeypatch.setattr(bi, "CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setattr(bi, "oggi_roma", lambda: date(2026, 10, 4))
     monkeypatch.setattr(em, "PAUSA_S", 0)
+    # IT2b 05/10: la sezione DOCUMENTI (emarket_documenti, IT3) e' l'ancora primaria del deposito.
+    # Qui si provano le regole dei COMUNICATI: la sezione Documenti risponde «nessun documento»
+    # (vuoto_misurato), quindi vale il comunicato. Il cablaggio vero e' in test_emarket_deposito_documenti.py.
+    from bellomberg.market_data import emarket_documenti as ed
+    monkeypatch.setattr(ed, "leggi_documenti", lambda id_em, **k: {
+        "stato": "vuoto_misurato", "errore": None, "motivo": None, "righe": [], "url_liste": [],
+        "sha256_liste": {}, "pagine_lette": 0, "limiti": []})
     risposte, chieste = {}, []
 
     def finto(url):
@@ -392,7 +399,9 @@ def test_deposito_semestrale_ok_coppia_it_en_non_ambigua(ambiente):
     assert [c["protocollo"] for c in r["conferme"]] == ["700105"]
     # il comunicato dei RISULTATI del semestre (29/07) non e' il deposito
     assert all(c["protocollo"] != "700103" for c in r["candidati"] + r["conferme"])
-    assert r["categorie_cercate"] == [101, 150] and r["url_liste"] == [_cat(101), _cat(150)]
+    # IT2b 05/10: la semestrale cerca anche 109 e 100 (misura M1 su 59 emittenti)
+    assert r["categorie_cercate"] == [101, 150, 109, 100]
+    assert r["url_liste"] == [_cat(101), _cat(150), _cat(109), _cat(100)]
     assert set(r["sha256_liste"]) == set(r["url_liste"]) and all(len(h) == 64 for h in r["sha256_liste"].values())
     assert r["letto_il"] and r["isin"] == ISIN_ACME and r["emarket_id"] == 4242
 
@@ -562,10 +571,16 @@ def test_deposito_generico_solo_pdf_inglese(ambiente):
     assert r["stato"] == "ok" and r["protocollo"] == "710204" and r["lingua"] == "en"
 
 
-def test_deposito_generico_due_pdf_italiani_ambiguo(ambiente):
+def test_deposito_generico_due_pdf_italiani_stesso_giorno(ambiente):
+    """IT2b 05/10: due PDF italiani dello STESSO giorno (12:16 e 12:18) danno una data univoca:
+    si tiene il primo per ora (regola fissa), l'altro va fra le conferme e il limite lo dice.
+    Giorni diversi restano ambigui (test_deposito_ambiguo_mai_il_primo_a_caso)."""
     _generici(ambiente, en="dep_generico_it.pdf")
     r = em.get_data_deposito("ACME.MI", tipo="semestrale", periodo_fine="2026-06-30")
-    assert r["stato"] == "ambiguo" and r["data_deposito"] is None and r["prova"] == "testo_pdf"
+    assert r["stato"] == "ok" and r["prova"] == "testo_pdf"
+    assert (r["data_deposito"], r["ora_deposito"], r["protocollo"]) == ("2026-08-13", "12:16", "710203")
+    assert [c["protocollo"] for c in r["conferme"]] == ["710204"]
+    assert any("stesso giorno 2026-08-13" in l for l in r["limiti"])
 
 
 def test_deposito_generico_pdf_non_letto_KO(ambiente):
@@ -579,7 +594,7 @@ def test_deposito_generico_tetto_dei_pdf_dichiarato(ambiente, monkeypatch):
     _generici(ambiente, it="dep_generico_lontano.pdf")
     r = em.get_data_deposito("ACME.MI", tipo="semestrale", periodo_fine="2026-06-30")
     assert r["stato"] == "non_trovato" and _pdf_dep("710204") not in ambiente["chieste"]
-    assert any("piu' vicini" in l for l in r["limiti"])
+    assert any("letti i PDF dei primi 1 (prima i titoli italiani" in l for l in r["limiti"])
 
 
 def test_deposito_titolo_solo_inglese_con_data_americana(ambiente):
@@ -623,3 +638,21 @@ def test_voce_automatica_senza_emarket_non_coperto_con_la_sua_frase(ambiente):
     assert r["stato"] == "non_coperto" and r["errore"] == "emarket_non_risolto"
     r = em.get_internal_dealing("ZZTEST.MI")
     assert r["errore"] == "dichiarato_non_su_emarket" and r["voce_da"] == "confermato"
+
+
+def test_documenti_deposito_e_lo_stesso_oggetto_di_doc():
+    """Contratto con D4 (trade_idea_sources): nome pubblico, stesse chiavi, coppie (IT, EN)."""
+    assert em.DOCUMENTI_DEPOSITO is em._DOC
+    assert set(em.DOCUMENTI_DEPOSITO) == {"semestrale", "annuale", "trimestrale"}
+    assert all(isinstance(v, tuple) and len(v) == 2 for v in em.DOCUMENTI_DEPOSITO.values())
+
+def test_url_vietato_internal_dealing_motivo_controllato_senza_il_testo_dell_eccezione(monkeypatch):
+    """VF 05/10 (regola 16): il messaggio di URLVietato puo' contenere l'URL del redirect; nel motivo va un
+    testo controllato (tipo dell'eccezione + motivo fisso), lo stato resta KO/url_vietato."""
+    def vietato(url):
+        raise bi.URLVietato("redirect verso https://zz-host-finto.example/x?token=QQSEGRETO: host non previsto")
+    monkeypatch.setattr(bi, "_scarica", vietato)
+    out = em._leggi("ACME.MI", "ITZZACME0007", 4242, 30)
+    assert (out["stato"], out["errore"]) == ("KO", "url_vietato")
+    assert "QQSEGRETO" not in out["motivo"] and "zz-host-finto" not in out["motivo"]
+    assert "URLVietato" in out["motivo"] and "pagina 1" in out["motivo"]

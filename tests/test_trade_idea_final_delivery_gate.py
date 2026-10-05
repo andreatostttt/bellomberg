@@ -6,7 +6,7 @@ import pytest
 
 from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE, RESEARCH_COMPLETION_CONTRACT
 from bellomberg.reporting import trade_idea_delivery as delivery
-from test_trade_idea_delivery import smtp
+from _smtp_cattura import smtp
 from test_trade_idea_store import db_path, migrated, store, request, result, finish, all_checks
 
 
@@ -54,8 +54,9 @@ def test_qualified_nonpositive_research_still_sends_exact_mime(tmp_path, smtp, j
 def test_native_partial_package_is_archived_blocked_without_even_claiming_smtp(migrated, tmp_path, smtp, judgment):
     from bellomberg.agents.trade_idea import deliver_trade_idea
     current, accepted = store(migrated), request()
-    accepted['analysis_mode'] = accepted['source_qualification']['analysis_mode'] = RESEARCH_ANALYSIS_MODE
-    accepted['authorization'].update(activities=['committee'], max_revision_rounds=0)
+    # Z3b 05/10: qualificazione di ricerca VERA (research_required), non piu' il finto 'qualified'.
+    from _trade_idea_research_request import research_request
+    accepted = research_request(accepted, archive_root=tmp_path / 'research-archive')
     run_id = current.create_run(accepted, idempotency_key='native-partial')['run']['id']
     finish(current, run_id, result(judgment=judgment, proposal=False), status='incomplete')
     current.route_result(run_id, {**all_checks(), 'capo_valid': judgment != 'incomplete'})

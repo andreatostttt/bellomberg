@@ -14,6 +14,8 @@ dist-electron/
 app/dist/
 report/
 *.pdf
+# fixture SINTETICHE dei test fonti italiane (emittenti inventati): senza, un clone pulito ha 32 rossi (handoff-3, Opus 5.5)
+!tests/fixtures/fonti_it/*.pdf
 
 portfolio.json
 nodejs/

@@ -117,7 +117,8 @@ def preparation_price_ceiling(metadata, *, model, max_tokens):
     Request fees are explicitly capped at zero; no media/search/tools are sent.
     https://openrouter.ai/docs/guides/routing/provider-selection#max-price
     """
-    if metadata.get("id") != model:
+    base_dichiarata = bool(metadata.get("pricing_basis")) and metadata.get("id") == str(model).partition(":")[0]
+    if metadata.get("id") != model and not base_dichiarata:   # :exacto & co. = listino base dichiarato
         raise ValueError("pricing model mismatch")
     context = metadata.get("context_length")
     if type(context) is not int or type(max_tokens) is not int or not 0 < max_tokens < context:

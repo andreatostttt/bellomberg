@@ -258,7 +258,8 @@ def research_admission(ticker, identity, as_of, *, archive_root, providers=None,
             (research_gaps if research_only else reasons).append(problem)
         supplied = list(documents)
         if (document_sources or accepted_document_receipt is not None) and not reasons:
-            from bellomberg.agents.trade_idea_sources import ingest_document_sources, verify_document_receipt
+            from bellomberg.agents.trade_idea_sources import (ingest_document_sources, verify_document_receipt,
+                fiscal_year_end_from_provider)
             website = (bundle['case'].get('info') or {}).get('website')
             admitted = (verify_document_receipt(accepted_document_receipt, ticker, identity, as_of,
                         archive_root=archive_root, issuer_website=website,
@@ -266,6 +267,8 @@ def research_admission(ticker, identity, as_of, *, archive_root, providers=None,
                 if accepted_document_receipt is not None else
                 ingest_document_sources(ticker, identity, as_of, document_sources,
                         archive_root=archive_root, issuer_website=website,
+                        # trimestrali non solari: fine esercizio del profilo del fornitore, PROXY dichiarato (D4b)
+                        fiscal_year_end_sources=fiscal_year_end_from_provider(bundle['case'].get('info')),
                         **({'allow_partial': True} if research_only else {})))
             receipt = admitted['receipt']
             supplied.extend(admitted['documents'])

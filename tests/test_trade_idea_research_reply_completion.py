@@ -18,7 +18,7 @@ from bellomberg.core.llm_client import Usage
 from test_trade_idea_no_workbook_e2e import (
     no_workbook_case, _assert_complete, _native_rows,
 )
-from test_trade_idea_delivery import smtp
+from _smtp_cattura import smtp
 from test_trade_idea_source_research import frozen_clock
 from test_trade_idea_store import db_path, migrated
 
@@ -78,15 +78,24 @@ def test_native_missing_reply_recovery_keeps_all_paid_reports_and_delivers_once(
             return {'ok': False, 'error': 'Frozen omitted formal reply before forced report'}
         return native_handler(board, desk, name, inputs)
 
+    # research/3 (PM 03/10): una risposta formale mancante non ferma piu' la run (resta
+    # obiezione aperta e dichiarata dopo il turno di completamento). Lo stato osservato
+    # -- R2 pagato, risposta assente, completamento non ancora eseguito -- si riproduce
+    # con un'interruzione PRIMA del turno di sola risposta; la garanzia provata resta la
+    # stessa: il recupero paga solo il turno di risposta, conserva i report e consegna una volta.
+    def crash_before_closeout(_board):
+        raise RuntimeError('Offline crash before the reply-only completion task')
+
     with monkeypatch.context() as patch:
         patch.setattr(trade_idea, 'handle_trade_idea_review_tool', omitted_reply)
-        if native_closeout is not None:
-            patch.setattr(trade_idea, '_complete_research_objection_replies', lambda _board: None)
+        patch.setattr(trade_idea, '_complete_research_objection_replies', crash_before_closeout)
         stopped = case.execute(ident, 'original')
     assert stopped['run']['technical_status'] == 'incomplete'
-    assert 'material objections without addressed desk reply' in stopped['run']['reason']
+    assert 'before the reply-only completion task' in stopped['run']['reason']
     assert case.state['capo_calls'] == 0 and not case.smtp[0]
     cp = deepcopy(stopped['progress']['checkpoint'])
+    assert [row['objection']['id'] for row in cp['data']['_objections']
+            if row['objection']['material'] and not row.get('response')] == ['challenge-eventdesk']
     originals = {desk: deepcopy(cp['data'][desk]) for desk in trade_idea.TRADE_IDEA_DESKS}
     seal = deepcopy(cp['data']['_research_thesis'])
     original_rows = _native_rows(case.database, ident)
@@ -97,7 +106,7 @@ def test_native_missing_reply_recovery_keeps_all_paid_reports_and_delivers_once(
         objection_ids=['challenge-eventdesk']))
     child = current.create_continuation(ident, idempotency_key='reply-closeout-first',
         authorize_new_requests=True)['run']['id']
-    if crash_after_closeout and native_closeout is not None:
+    if crash_after_closeout:
         def closeout_then_crash(board):
             native_closeout(board)
             raise RuntimeError('Offline crash after durable reply-only task completion')

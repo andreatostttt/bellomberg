@@ -36,6 +36,7 @@ def _client(send, cls=llm_client.OpenRouterClient):
 
 
 # ------------------------------------------------------------------------------------ R1
+@pytest.mark.skip(reason="regola PM 05/10/2026: il ragionamento non si spegne mai; il recupero dal 400 su {enabled:false} non e' piu' raggiungibile")
 def test_r1_glm_disabled_diventa_minimal_ma_adaptive_ed_effort_restano_senza_effort(monkeypatch):
     """Decisione del coordinatore (04/10): su z-ai/ «minimal» e' AMMESSO solo come modo misurato
     (05/09) di SPEGNERE la deliberazione quando il modello rifiuta {"enabled":false}; una

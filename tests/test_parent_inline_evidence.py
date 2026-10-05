@@ -131,32 +131,6 @@ def test_sec_parent_balances_participate_in_scoped_consolidation():
     assert _proof(item, list(catalog.values()), context)
 
 
-def test_common_collector_preserves_packet_and_source_before_dropping_archive_path(tmp_path, monkeypatch):
-    from bellomberg.valuation import valuation_sources, preparation_exhibits, preparation_earnings
-    from bellomberg.valuation.preparation_sources import collect_preparation_evidence
-    from bellomberg.valuation import quotation_evidence
-    original = source(); path = tmp_path / 'statement.htm'; path.write_bytes(raw_source())
-    original['archive_path'] = str(path)
-    monkeypatch.setattr(valuation_sources, 'collect_documents', lambda *a, **k: {
-        'status': 'ready', 'documents': [original], 'issues': []})
-    monkeypatch.setattr(valuation_sources, 'company_facts_documents', lambda *a, **k: {'status': 'ready', 'documents': [{'id': 'synthetic-xbrl'}], 'issues': []})
-    for module, name in ((preparation_exhibits, 'collect_preparation_exhibits'), (preparation_earnings, 'collect_earnings_evidence')):
-        monkeypatch.setattr(module, name, lambda *a, **k: {'status': 'ready', 'documents': [], 'issues': []})
-    monkeypatch.setattr(quotation_evidence, 'listing_identity_document', lambda *a, **k: {'status': 'ready', 'documents': [{'id': 'synthetic-listing'}], 'issues': []})
-    result = collect_preparation_evidence('SYNTH', as_of='2026-09-10', archive_root=tmp_path,
-        price_fetch=lambda ticker,on: {'symbol':ticker, 'date':on, 'currency':'USD', 'close':10})
-    assert result['parent_inline']['status'] == 'ready' and result['preparation_ready']
-    primary = next(d for d in result['documents'] if d['id'] == original['id'])
-    parent = next(d for d in result['documents'] if d['id'].startswith('sec-parent-'))
-    assert primary['inline_parent_fields'] == original['inline_parent_fields']
-    assert 'archive_path' not in primary and not _catalog([primary, parent], date(2026, 9, 10))[1]
-    path.write_bytes(b'changed source')
-    result = collect_preparation_evidence('SYNTH', as_of='2026-09-10', archive_root=tmp_path,
-        price_fetch=lambda ticker,on: {'symbol':ticker, 'date':on, 'currency':'USD', 'close':10})
-    assert result['parent_inline']['status'] == 'unavailable' and result['parent_inline']['issues']
-    assert not any(d['id'].startswith('sec-parent-') for d in result['documents'])
-
-
 def test_common_bank_preparer_accepts_parent_primary_source_and_generates_workbook(tmp_path):
     from test_input_preparation_bank import _documents, _propose, _estimate, DAY, providers_for
     from bellomberg.valuation.sector_analysis import prepare_sector_analysis

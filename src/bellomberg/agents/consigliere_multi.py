@@ -1557,7 +1557,9 @@ def _run_multi_agent(store, db, *, send_email=True):
             _log("  [!] sonda modelli non eseguita (proseguo): " + type(e).__name__ + ": " + str(e)[:120])
         _request_summary = store.request_journal.summary()
         if _request_summary["unknown_requests"]:
-            raise RuntimeError("Sonda con richiesta o costo incerto: nessun nuovo dispatch; riconciliare il journal")
+            # Regola PM 05/10/2026: un costo incerto si dichiara, non ferma la run.
+            _log("  [!] sonda: %d richieste con costo/esito incerto, DICHIARATE (da riconciliare); la run prosegue"
+                 % _request_summary["unknown_requests"])
         bb.data["_tool_health"] = tool_health
 
         # FRESHNESS CHECK (audit/07 §2-3, P1 + regola PM "mai fallback, precisione"):

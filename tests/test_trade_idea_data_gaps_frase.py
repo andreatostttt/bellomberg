@@ -5,7 +5,7 @@ qui si prova solo la voce che il PM legge nel memo.
 """
 from bellomberg.agents import trade_idea
 from test_trade_idea_no_workbook_e2e import no_workbook_case  # noqa: F401
-from test_trade_idea_delivery import smtp  # noqa: F401
+from _smtp_cattura import smtp  # noqa: F401
 from test_trade_idea_source_research import frozen_clock  # noqa: F401
 from test_trade_idea_store import db_path, migrated  # noqa: F401
 

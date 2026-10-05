@@ -356,18 +356,6 @@ def test_cablaggio_archivio_approvato_fino_al_fv(archivio, tmp_path):
     assert row["valuation_date_age_days"] == 253
 
 
-def test_desk_chiama_get_valuation_col_solo_ticker(archivio, contract_tools):  # noqa: F811
-    chat_tools, _, _ = contract_tools
-    archivio.crea()
-    archivio.approvato()
-    providers = {"profile": _profile, "method_inputs": _provider()}
-    result = chat_tools.dispatch("get_valuation", {"ticker": TICKER}, sector_providers=providers, as_of=DAY)["data"]
-    assert result["valuation_usability"]["usable"], result["valuation_usability"]
-    assert result["fair_value_base"] == pytest.approx(14.13)
-    assert result["acquisition_snapshot"]["case"]["sources"]["method_inputs"]["source_id"] == "method_records_archive"
-    assert "thesis_id" in result["_thesis_saved"], result["_thesis_saved"]
-
-
 def test_coda_di_revisione_non_cambia_lo_snapshot(archivio):
     archivio.crea()
     archivio.approvato()
@@ -621,3 +609,26 @@ def test_lettura_chiude_la_connessione_e_dichiara_la_causa(archivio, monkeypatch
         assert "sha256 discordante" not in result["message"]
     else:
         assert result["status"] == "ok"
+
+
+# ------------------------------------------------- contratto ATTUALE di get_valuation (ZR 05/10, Z1)
+# «Il desk chiama get_valuation col solo ticker e il set approvato entra nel calcolo» provava il ramo
+# get_valuation, archiviato dal 1326312 (censimento Z4): corpo in
+# archive/private/attic/tests_excel_archiviato_20261005/test_method_records_provider_legacy.py. Il provider dell'archivio resta
+# provato dai test qui sopra via prepare_sector_analysis. Qui: col set approvato presente, la chiamata del
+# desk riceve il contratto dichiarato e non legge l'archivio ne' scrive tesi.
+def test_desk_get_valuation_col_set_approvato_risponde_archiviato(archivio, contract_tools, tmp_path,
+                                                                  monkeypatch):  # noqa: F811
+    from _contratto_excel_archiviato import blinda_ramo_archiviato, file_in, spia_chiamante, verifica_archiviato
+    chat_tools, _, _ = contract_tools
+    archivio.crea()
+    archivio.approvato()
+    usati = []
+    providers = {"profile": spia_chiamante(usati, "provider profile"),
+                 "method_inputs": spia_chiamante(usati, "provider archivio method_inputs")}
+    letture_prima = len(archivio.read_paths)
+    prima = file_in(tmp_path)
+    chiamate = blinda_ramo_archiviato(monkeypatch)
+    risposta = chat_tools.dispatch("get_valuation", {"ticker": TICKER}, sector_providers=providers, as_of=DAY)
+    verifica_archiviato(risposta, chiamate + usati, cartella=tmp_path, prima=prima)
+    assert len(archivio.read_paths) == letture_prima

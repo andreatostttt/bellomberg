@@ -6,6 +6,7 @@ Run only with tools/testing/offline_pytest.py under Python -I.
 """
 from collections import Counter
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 import json
@@ -20,7 +21,7 @@ from bellomberg.agents.company_source_research import ResearchSession
 from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE
 from bellomberg.valuation import trade_idea_model as model
 from test_company_source_research import FrozenTransport, html, SITE, PAGE
-from test_trade_idea_delivery import smtp
+from _smtp_cattura import smtp
 from test_trade_idea_economic import IDENTITY, providers_for
 from test_trade_idea_pipeline import _priced_request
 from test_trade_idea_pm_sources import TEXT
@@ -183,7 +184,7 @@ def no_workbook_case(migrated, tmp_path, monkeypatch, smtp):
     monkeypatch.setattr(llm_pricing, '_fx_usd_to_eur', lambda: (0.9, 'frozen_test_fx'))
     monkeypatch.setattr(chat_tools, '_compatta_portfolio_live', lambda value: deepcopy(value))
     state = {'judgment': 'rejected', 'stop_after': None, 'source_gaps': True, 'capo_calls': 0,
-             'truncate': None, 'no_reply': None}
+             'truncate': None, 'no_reply': None, 'provider_failure': None, 'capo_failure': None}
 
     def dossier_payload():
         result = research_result(state['judgment'])
@@ -285,12 +286,20 @@ def no_workbook_case(migrated, tmp_path, monkeypatch, smtp):
         def __exit__(self, *_args): return False
         def get_final_message(self):
             state['capo_calls'] += 1
-            return response(self.kwargs, [SimpleNamespace(type='text', text=json.dumps(dossier_payload()))], self.serial)
+            if state['capo_failure'] == 'stream_disconnected':
+                raise RuntimeError('Provider stream disconnected after partial output')
+            text = '{broken' if state['capo_failure'] == 'malformed' else json.dumps(dossier_payload())
+            return response(self.kwargs, [SimpleNamespace(type='text', text=text)], self.serial)
 
     class Messages:
         def create(self, **kwargs):
             provider_calls.append(deepcopy(kwargs))
             serial = len(provider_calls)
+            if state['provider_failure'] == 'incomplete_response':
+                return response(kwargs, [SimpleNamespace(type='text', text='Partial visible output')],
+                                serial, 'max_tokens')
+            if state['provider_failure']:
+                raise RuntimeError(state['provider_failure'])
             available = {row['name'] for row in kwargs.get('tools') or []}
             assert not available.intersection(FORBIDDEN_TOOLS), available.intersection(FORBIDDEN_TOOLS)
             context = str(kwargs['messages'][0].get('content'))
@@ -390,11 +399,12 @@ def no_workbook_case(migrated, tmp_path, monkeypatch, smtp):
         if number == state['stop_after']:
             raise RuntimeError('Intentional offline crash after native R' + str(number) + ' checkpoint')
 
-    def execute(run_id, name):
+    def execute(run_id, name, *, risk_loader=None, stress_loader=None):
         return trade_idea.execute_trade_idea(run_id, store=current,
             lock_path=tmp_path / 'paid.lock', output_dir=tmp_path / name,
             portfolio_loader=lambda: deepcopy(book), mandate_loader=lambda: deepcopy(mandate),
-            risk_loader=lambda: deepcopy(risk), stress_loader=lambda: deepcopy(stress),
+            risk_loader=risk_loader or (lambda: deepcopy(risk)),
+            stress_loader=stress_loader or (lambda: deepcopy(stress)),
             candidate_metrics_loader=lambda *_args: {'status': 'not_applicable'},
             preparer_binder=forbidden('preparer_binder'),
             source_qualifier=lambda *_a, **_k: model.recheck_accepted_sources(admission,
@@ -405,7 +415,8 @@ def no_workbook_case(migrated, tmp_path, monkeypatch, smtp):
 
     yield SimpleNamespace(current=current, request=request, execute=execute, state=state,
         prohibited=prohibited, providers=provider_calls, tools=tool_calls, boards=boards,
-        transport=transport, smtp=smtp, root=tmp_path, database=migrated, admission=admission)
+        transport=transport, smtp=smtp, root=tmp_path, database=migrated, admission=admission,
+        book=book)
     assert not prohibited, dict(prohibited)
     assert not list(tmp_path.rglob('*.xlsx')), 'Research produced an Excel artifact'
 
@@ -553,7 +564,16 @@ def test_rejected_research_partial_sources_three_resumes_and_exact_delivery_reco
     with sqlite3.connect(case.database) as conn:
         decisions = conn.execute('SELECT * FROM decisions ORDER BY id').fetchall()
         assert decisions[:len(original_decisions)] == original_decisions
-        assert len(decisions) == len(original_decisions) + 1
+        # research/3 (PM 03/10, f6a837d): una ripresa interrotta che ha gia' report pagati chiude
+        # come pacchetto parziale instradato a research. Garanzia conservata: una sola decisione
+        # per run della catena, tutte RESEARCH (mai operative), nessuna riscrittura delle precedenti.
+        added = conn.execute('SELECT id, action FROM decisions WHERE id > ? ORDER BY id',
+                             (original_decisions[-1][0] if original_decisions else 0,)).fetchall()
+        chain = (parent, child, reviewed_id, final_id)
+        assert len(decisions) == len(original_decisions) + len(chain)
+        assert [action for _, action in added] == ['RESEARCH'] * len(chain)
+        assert [current.get_run(run_id)['run']['destination']['decision_id']
+                for run_id in chain] == [ident for ident, _ in added]
         assert conn.execute('SELECT count(*) FROM memos WHERE id=?', (final['run']['memo_id'],)).fetchone()[0] == 1
     (case.root / 'research-no-workbook-proof.json').write_text(json.dumps({
         'run_ids': [parent, child, reviewed_id, final_id], 'provider_requests': provider_count,
@@ -580,3 +600,185 @@ def test_favorable_research_reaches_decisions_without_workbook_or_bypassed_check
         assert row['ticker'] == IDENTITY['ticker'] and row['action'] == 'ADD'
         assert row['status'] == 'PENDING' and row['eur_amount'] == 100.0
         assert conn.execute('SELECT COUNT(*) FROM trade_history').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('foreign_book,missing_fx,crash_at', [
+    (True, False, None), (True, True, None), (False, False, 'first_tool'),
+    (False, False, 'macro_r2'), (False, False, 'capo'), (False, False, 'first_tool_prices')],
+    ids=['qualified_foreign_book', 'missing_foreign_fx', 'crash_after_tool',
+         'crash_after_macro_r2', 'crash_after_capo', 'updated_prices_reverified'])
+def test_favorable_research_operational_checks_fx_and_crash_resume(
+        no_workbook_case, monkeypatch, foreign_book, missing_fx, crash_at):
+    """Garanzie vive del vecchio test positivo col workbook (positive_replay, ora in quarantena):
+    controlli operativi reali con book estero (FX qualificata o assente), crash del processo
+    dopo un checkpoint durevole con ripresa che non ripaga tool, round o Capo, ripresa con
+    prezzi aggiornati autorizzata e riverificata, recupero della consegna senza nuove spese."""
+    from trade_idea_evolution_fixtures import historical_fx_engines
+    case = no_workbook_case
+    case.state.update(judgment='favorable', source_gaps=False)
+    current = case.current
+    loaders = {}
+    if foreign_book:
+        with sqlite3.connect(case.database) as conn:
+            conn.execute("UPDATE positions SET valuta='USD' WHERE ticker='SYNTH-PEER'")
+        case.book['positions'][1].update(valuta='USD', fx_to_eur=1 / 1.1, fx_source='live', peso_pct=99)
+        case.book['positions'][0]['peso_pct'] = 1
+        day = datetime.now(timezone.utc).date()
+        while day.weekday() >= 5:
+            day -= timedelta(days=1)
+        risk_loader, stress_loader, historical_calls, engine_outputs = historical_fx_engines(
+            monkeypatch, case.root, case.book, day.isoformat(), missing_fx=missing_fx)
+        loaders = {'risk_loader': risk_loader, 'stress_loader': stress_loader}
+    run_id = current.create_run(case.request, idempotency_key='favorable-checks')['run']['id']
+    if crash_at is None:
+        detail = case.execute(run_id, 'favorable', **loaders)
+    else:
+        class SimulatedProcessCrash(BaseException):
+            pass
+        update_progress = current.update_progress
+        crashes = []
+
+        def crash_after_durable_checkpoint(selected_id, token, phase, progress):
+            update_progress(selected_id, token, phase, progress)
+            checkpoint = progress.get('checkpoint') or {}
+            data = checkpoint.get('data') or {}
+            trigger = (bool(checkpoint.get('tool_receipts')) if crash_at in ('first_tool', 'first_tool_prices') else
+                'macro:2' in data.get('_completed_stages', {}) if crash_at == 'macro_r2' else
+                bool(data.get('_capo_completed')))
+            if trigger and not crashes:
+                crashes.append(len(case.providers))
+                raise SimulatedProcessCrash('Offline process loss after committed checkpoint')
+
+        with monkeypatch.context() as patch:
+            patch.setattr(current, 'update_progress', crash_after_durable_checkpoint)
+            with pytest.raises(SimulatedProcessCrash):
+                case.execute(run_id, 'crashed', **loaders)
+        assert len(crashes) == 1 and not case.smtp[0]
+        current.interrupt_run(run_id, reason='Offline owner process confirmed dead')
+        parent_detail = current.get_run(run_id)
+        parent_id = run_id
+        refresh_options = {}
+        if crash_at == 'first_tool_prices':
+            with sqlite3.connect(case.database) as conn:
+                for ticker in ('SYNTH-EXT', 'SYNTH-PEER'):
+                    conn.execute('INSERT INTO position_prices(ticker,prezzo,valuta,source,timestamp) '
+                                 'VALUES(?,?,?,?,?)', (ticker, 100, 'EUR', 'frozen current price',
+                                                       datetime.now(timezone.utc).isoformat()))
+            refresh_options['authorize_price_refresh'] = True
+        resumed = current.create_continuation(parent_id, idempotency_key='explicit-resume',
+            authorize_new_requests=True, **refresh_options)
+        run_id = resumed['run']['id']
+        assert resumed['cost']['requests'] == crashes[0]
+        detail = case.execute(run_id, 'resumed', **loaders)
+        repeated = current.create_continuation(parent_id, idempotency_key='second-resume',
+            authorize_new_requests=True)
+        assert repeated['created'] is False and repeated['run']['id'] == run_id
+        assert repeated['cost']['requests'] == len(case.providers)
+        original = current.get_run(parent_id)
+        for key in ('run', 'progress', 'result', 'cost'):
+            assert original[key] == parent_detail[key]
+        if crash_at == 'capo':
+            assert len(case.providers) == crashes[0], 'Resume must not buy another Capo'
+        if crash_at in ('first_tool', 'first_tool_prices'):
+            assert sum(row['tool'] == 'read_company_dossier' and row['specialist'] == 'macro'
+                       and row['round'] == 0 for row in detail['progress']['checkpoint']['tool_log']) == 1
+    _assert_complete(case, detail, judgment='favorable', destination='research' if missing_fx else 'dcn')
+    checks = detail['progress']['routing_checks']
+    if missing_fx:
+        assert checks['sizing_valid'] is False
+        assert 'sizing_valid' in detail['run']['destination']['reason']
+    else:
+        for name in ('identity_verified', 'evidence_sufficient', 'red_team_complete', 'capo_valid',
+                     'mandate_valid', 'sizing_valid', 'history_context_sent',
+                     'candidate_price_revalidated', 'fx_revalidated'):
+            assert checks[name] is True, (name, checks)
+    if crash_at == 'first_tool_prices':
+        refreshed = checks['price_refresh_verification']
+        assert all(value is True for value in refreshed['measurements'].values())
+        assert refreshed['evidence']['proposal'] == detail['result']['proposal']
+        assert refreshed['before']['current_context_sha256'] == refreshed['after']['current_context_sha256']
+        assert (refreshed['before']['price_inputs_sha256'] !=
+                detail['run']['continuation']['price_refresh']['accepted_price_inputs_sha256'])
+    directory = case.root / ('resumed' if crash_at else 'favorable')
+    before_calls, extra_sends = len(case.providers), []
+    trade_idea.deliver_trade_idea(current, run_id, output_dir=directory, send_email=False,
+        send=lambda *_a, **_k: extra_sends.append('unexpected'))
+    from bellomberg.storage.trade_idea_store import RunConflict
+    with trade_idea.exclusive_paid_run(directory / '.delivery.lock'):
+        with pytest.raises(RunConflict, match='delivery recovery'):
+            trade_idea.deliver_trade_idea(current, run_id, output_dir=directory, send_email=False)
+    assert len(case.providers) == before_calls and extra_sends == [] and len(case.smtp[0]) == 1
+    assert current.get_run(run_id)['artifacts'] == detail['artifacts']
+    if foreign_book:
+        assert engine_outputs['risk']['fx_conversion']['qualified'] is (not missing_fx)
+        assert engine_outputs['stress']['fx_conversion']['qualified'] is (not missing_fx)
+        assert any(symbols == ['EURUSD=X'] for symbols, _ in historical_calls)
+        if missing_fx:
+            assert engine_outputs['simulations'] == 0
+        else:
+            assert engine_outputs['stress']['stress_meta']['fx_conversion']['qualified'] is True
+            assert any(str(options.get('start', '')).startswith('2008') for _, options in historical_calls)
+            assert engine_outputs['simulations'] == 1
+
+
+
+@pytest.mark.parametrize('provider_failure', ['HTTP 503 service unavailable', 'HTTP 504 provider timeout',
+    'provider disconnected after dispatch', 'incomplete_response'])
+def test_research_provider_failure_classes_stop_without_result_or_email(no_workbook_case, provider_failure):
+    """Garanzie vive del vecchio replay del comitato col workbook (pipeline, ora in quarantena):
+    un guasto del provider non diventa mai un giudizio, non si ritenta a pagamento, il costo
+    incerto resta trattenuto e dichiarato, nessuna email parte."""
+    case = no_workbook_case
+    case.state['provider_failure'] = provider_failure
+    run_id = case.current.create_run(case.request, idempotency_key='provider-failure')['run']['id']
+    detail = case.execute(run_id, 'failure')
+    assert detail['run']['technical_status'] == 'incomplete'
+    assert detail['states']['analysis'] == 'incomplete'
+    assert detail['email']['status'] == 'blocked' and detail['email']['attempts'] == 0
+    assert not case.smtp[0] and case.state['capo_calls'] == 0
+    assert detail['cost']['requests'] == len(case.providers)
+    assert detail['run']['destination']['kind'] in ('none', 'research')
+    assert not detail['result'] or (detail['result']['judgment'] == 'incomplete'
+                                    and detail['result']['proposal'] is None)
+    if provider_failure == 'incomplete_response':
+        # Troncamento a costo noto (research/3, PM 03/10): ogni desk diventa lacuna
+        # dichiarata, il comitato va sotto quorum e si ferma prima di Red Team e Capo.
+        assert 'below quorum' in detail['run']['reason']
+        assert len(case.providers) == len(trade_idea.TRADE_IDEA_DESKS)
+        assert detail['cost']['unknown_requests'] == 0
+        assert Decimal(detail['cost']['charged_usd']) == Decimal('0.001') * len(case.providers)
+    else:
+        assert detail['result'] is None
+        assert provider_failure in detail['run']['reason']
+        assert len(case.providers) == 1, 'an ambiguous paid failure is never retried'
+        assert detail['cost']['unknown_requests'] == 1
+        assert Decimal(detail['cost']['unknown_reserved_usd']) > 0
+        assert detail['cost']['remaining_known_usd'] is None
+
+
+@pytest.mark.parametrize('capo_failure', ['malformed', 'stream_disconnected'])
+def test_research_capo_failure_keeps_desk_work_but_never_a_judgment_or_email(no_workbook_case, capo_failure):
+    """Capo malformato o stream interrotto (CONTEXT 03/10 punto 4): giudizio incomplete,
+    proposta nulla, causa nei data_gaps, instradamento research, email bloccata."""
+    case = no_workbook_case
+    case.state['capo_failure'] = capo_failure
+    run_id = case.current.create_run(case.request, idempotency_key='capo-failure')['run']['id']
+    detail = case.execute(run_id, 'capo-failure')
+    assert case.state['capo_calls'] == 1
+    assert detail['run']['technical_status'] == 'incomplete'
+    assert detail['result']['judgment'] == 'incomplete' and detail['result']['proposal'] is None
+    assert detail['result']['data_gaps'][0].startswith('Capo output invalid or unavailable')
+    assert detail['run']['destination']['kind'] == 'research'
+    assert detail['email']['status'] == 'blocked' and detail['email']['attempts'] == 0
+    assert not case.smtp[0]
+    reports = detail['progress']['reports']
+    assert {row['specialist'] for row in reports} == set(trade_idea.TRADE_IDEA_DESKS)
+    assert detail['progress']['red_team']['report']
+    assert detail['cost']['requests'] == len(case.providers)
+    if capo_failure == 'malformed':
+        assert detail['progress']['routing_checks']['capo_valid'] is False
+        assert detail['cost']['unknown_requests'] == 0
+    else:
+        assert 'stream disconnected' in detail['run']['reason']
+        assert detail['cost']['unknown_requests'] == 1
+        assert detail['cost']['remaining_known_usd'] is None

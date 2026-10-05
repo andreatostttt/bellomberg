@@ -5,6 +5,7 @@ All data is synthetic: ticker ZZTEST.MI, an invented company and invented number
 The /2-/3 output is frozen against the renderer measured BEFORE the /4 branches.
 """
 import hashlib
+import re
 
 import pytest
 from pypdf import PdfReader
@@ -314,10 +315,27 @@ def _legacy(tmp_path, policy, language, judgment):
     return _text(artifact["path"])
 
 
+# Page furniture drawn on every page by the canvas (running header from page 2, footer,
+# page number): where the page break falls depends on the installed fonts (Georgia/Arial
+# on Windows, DejaVu on a Linux runner), so it is not part of the frozen section text.
+# Only WHOLE lines equal to the furniture are dropped; the section prose is compared intact.
+_PAGE_FURNITURE = {"ANTEPRIMA · DATI SINTETICI", "PREVIEW · SYNTHETIC DATA",
+                   "Bellomberg | Documento interno riservato al Comitato d'investimento",
+                   "Bellomberg | Internal document reserved to the Investment Committee"}
+
+
+def _without_page_furniture(text):
+    return "\n".join(line for line in text.splitlines()
+                     if line.strip() not in _PAGE_FURNITURE
+                     and not re.fullmatch(r"(?:Pagina|Page) \d+", line.strip())
+                     and not re.fullmatch(r"(?:Memo d'investimento|Investment memo) \| .+ \| \d{2}/\d{2}/\d{4}",
+                                          line.strip()))
+
+
 @pytest.mark.parametrize("policy", ["trade-idea-research/2", "trade-idea-research/3"])
 @pytest.mark.parametrize("language, judgment", sorted(FROZEN_SECTIONS_1_3))
 def test_legacy_sections_1_to_3_are_unchanged(tmp_path, policy, language, judgment):
-    text = " ".join(_legacy(tmp_path, policy, language, judgment).split())
+    text = " ".join(_without_page_furniture(_legacy(tmp_path, policy, language, judgment)).split())
     start = text.find("1. Raccomandazione" if language == "it" else "1. Recommendation")
     assert text[start:text.find("4. Sintesi e giudizio")].strip() == FROZEN_SECTIONS_1_3[(language, judgment)]
 

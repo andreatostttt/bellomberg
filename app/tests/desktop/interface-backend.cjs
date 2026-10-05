@@ -107,7 +107,7 @@ async function main() {
         w.setSize(size[0],size[1]); await new Promise(resolve=>setTimeout(resolve,500)); await screenshot('modern-real-'+size[0]);
       }
       await evaluate('Array.from(document.querySelectorAll(".bb-modern-nav-scroll a")).find(a=>a.getAttribute("href")==="#/decisions")?.click()');
-      await waitFor('location.hash==="#/decisions" && /DECISIONS TRACKER|REGISTRO DECISIONI/i.test(document.querySelector("h1")?.innerText||"")', 'real Decisions route remains reachable from the sidebar');
+      await waitFor('location.hash==="#/decisions" && /^(Decisions|Decisioni)$/i.test(document.querySelector("h1")?.innerText.trim()||"")', 'real Decisions route remains reachable from the sidebar');
       await waitFor('!!document.querySelector(".space-y-4 .grid")', 'real Decisions page content');
       const decisionRoute = await evaluate('({route:location.hash,heading:document.querySelector("h1")?.innerText.trim()||"",tableRows:document.querySelectorAll(".space-y-4 .grid table tbody tr").length,modernDashboardVisible:!!document.querySelector(".dashboard-modern")})');
       await screenshot('decisions-real-1920');
@@ -151,7 +151,7 @@ async function main() {
   assert.ok(result.classic.decisionCards > 0, 'Classic displays its pending decision rows');
   assert.equal(result.modern.decisionPanelPresent, false, 'Modern omits its pending-decisions dashboard panel');
   assert.equal(result.modern.dashboardDecisionCards, 0, 'Modern has no pending-decision rows in its dashboard DOM');
-  assert.match(result.decisionRoute.heading, /DECISIONS TRACKER|REGISTRO DECISIONI/i, 'the standalone Decisions route remains navigable');
+  assert.match(result.decisionRoute.heading.trim(), /^(Decisions|Decisioni)$/i, 'the standalone Decisions route remains navigable');
   assert.equal(result.decisionRoute.route, '#/decisions');
   assert.equal(result.decisionRoute.modernDashboardVisible, false,
     'the standalone Decisions route renders independently of the dashboard');

@@ -1,0 +1,150 @@
+{
+ "meta": {
+  "goldenCopy": {
+   "publishDate": "2026-10-05T00:00:00Z"
+  },
+  "pagination": {
+   "currentPage": 1,
+   "perPage": 15,
+   "from": 1,
+   "to": 4,
+   "total": 4,
+   "lastPage": 1
+  }
+ },
+ "links": {},
+ "data": [
+  {
+   "type": "lei-records",
+   "id": "ZZTEST0000000000C325",
+   "attributes": {
+    "lei": "ZZTEST0000000000C325",
+    "entity": {
+     "legalName": {
+      "name": "ACME SINTETICA SA",
+      "language": "en"
+     },
+     "otherNames": [],
+     "transliteratedOtherNames": [],
+     "legalAddress": {
+      "language": "en",
+      "addressLines": [
+       "Via Sintetica 1"
+      ],
+      "city": "Zetaville",
+      "country": "ES",
+      "postalCode": "00000"
+     },
+     "jurisdiction": "ES",
+     "status": "ACTIVE",
+     "legalForm": {
+      "id": "ZZSA",
+      "other": null
+     }
+    },
+    "registration": {
+     "status": "ISSUED"
+    }
+   }
+  },
+  {
+   "type": "lei-records",
+   "id": "ZZTEST0000000000B258",
+   "attributes": {
+    "lei": "ZZTEST0000000000B258",
+    "entity": {
+     "legalName": {
+      "name": "ACME SINTETICA FINANZAS SA",
+      "language": "en"
+     },
+     "otherNames": [],
+     "transliteratedOtherNames": [],
+     "legalAddress": {
+      "language": "en",
+      "addressLines": [
+       "Via Sintetica 1"
+      ],
+      "city": "Zetaville",
+      "country": "ES",
+      "postalCode": "00000"
+     },
+     "jurisdiction": "ES",
+     "status": "ACTIVE",
+     "legalForm": {
+      "id": "ZZSA",
+      "other": null
+     }
+    },
+    "registration": {
+     "status": "ISSUED"
+    }
+   }
+  },
+  {
+   "type": "lei-records",
+   "id": "ZZTEST0000000000A191",
+   "attributes": {
+    "lei": "ZZTEST0000000000A191",
+    "entity": {
+     "legalName": {
+      "name": "ACME SINTETICA SL",
+      "language": "en"
+     },
+     "otherNames": [],
+     "transliteratedOtherNames": [],
+     "legalAddress": {
+      "language": "en",
+      "addressLines": [
+       "Via Sintetica 1"
+      ],
+      "city": "Zetaville",
+      "country": "ES",
+      "postalCode": "00000"
+     },
+     "jurisdiction": "ES",
+     "status": "ACTIVE",
+     "legalForm": {
+      "id": "ZZSL",
+      "other": null
+     }
+    },
+    "registration": {
+     "status": "ISSUED"
+    }
+   }
+  },
+  {
+   "type": "lei-records",
+   "id": "ZZTEST0000000000D489",
+   "attributes": {
+    "lei": "ZZTEST0000000000D489",
+    "entity": {
+     "legalName": {
+      "name": "ACME SINTETICA, S.A.",
+      "language": "en"
+     },
+     "otherNames": [],
+     "transliteratedOtherNames": [],
+     "legalAddress": {
+      "language": "en",
+      "addressLines": [
+       "Via Sintetica 1"
+      ],
+      "city": "Zetaville",
+      "country": "ES",
+      "postalCode": "00000"
+     },
+     "jurisdiction": "ES",
+     "status": "INACTIVE",
+     "legalForm": {
+      "id": "ZZSA",
+      "other": null
+     }
+    },
+    "registration": {
+     "status": "RETIRED"
+    }
+   }
+  }
+ ]
+}

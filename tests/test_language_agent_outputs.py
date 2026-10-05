@@ -12,7 +12,7 @@ from test_core_audit_regressions import _chat, _chunk
 
 
 @pytest.mark.parametrize("selected", ["it", "en"])
-def test_complete_replay_captures_one_language_for_all_new_agent_calls(replay, monkeypatch, selected):
+def test_complete_replay_captures_one_language_for_all_new_agent_calls(replay, run_offline, monkeypatch, selected):
     from bellomberg.storage import preferences
     current = [selected]
     monkeypatch.setattr(preferences, "get_language_preference", lambda: current[0])
@@ -21,6 +21,9 @@ def test_complete_replay_captures_one_language_for_all_new_agent_calls(replay, m
         current[0] = "en" if selected == "it" else "it"
         return original_news(*args, **kwargs)
     monkeypatch.setattr(agent_tools, "tool_search_news", change_preference)
+    # ZR 05/10: una run NUOVA nasce research (fundamentals_research_v1); il contratto legacy
+    # con workbook e' archiviato (1326312) e si fermava a «Workbook richiesto non consegnabile».
+    monkeypatch.setattr(cm, "_weekly_contract", run_offline.native_weekly_contract)
     cm.run_multi_agent(language=selected)
     assert replay.blackboard.language == selected
     needle = "NEW OUTPUT LANGUAGE: professional English" if selected == "en" else "LINGUA DEL NUOVO OUTPUT: italiano professionale"
