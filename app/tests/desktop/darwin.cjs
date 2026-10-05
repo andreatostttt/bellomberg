@@ -57,10 +57,16 @@ const VENV = '/synthetic/backend/.venv/bin/python';
 
 // Il launcher .command si esegue davvero con /bin/bash: ha senso solo su macOS. Altrove il test e'
 // SALTATO e lo dichiara (prima falliva su Windows per lo spawn di /bin/bash, mascherando il resto).
-const SOLO_MACOS = process.platform === 'darwin' ? false : `launcher macOS: piattaforma ${process.platform}, /bin/bash e .command non applicabili`;
+// 05/10: tools/macos/ non e' nell'ALLOWLIST dell'export, quindi nel repo pubblico il launcher non
+// esiste e su macos-source lo spawn usciva 127 («No such file or directory»). Senza il file il test
+// e' SALTATO e lo dichiara, come vol-atlas.cjs per tools/qa/vol_browser.py.
+const LAUNCHER_MACOS = path.resolve(root, '../tools/macos/Avvia Bellomberg.command');
+const SOLO_MACOS = process.platform !== 'darwin'
+  ? `launcher macOS: piattaforma ${process.platform}, /bin/bash e .command non applicabili`
+  : (fs.existsSync(LAUNCHER_MACOS) ? false : 'tools/macos/Avvia Bellomberg.command is not in this tree (not published)');
 test('Avvia Bellomberg.command uses this checkout venv despite an inherited Python setting', { skip: SOLO_MACOS }, () => {
   const tempBin = fs.mkdtempSync(path.join(os.tmpdir(), 'bellomberg-launcher-'));
-  const launcher = path.resolve(root, '../tools/macos/Avvia Bellomberg.command');
+  const launcher = LAUNCHER_MACOS;
   const fakeNpm = path.join(tempBin, 'npm');
   fs.writeFileSync(fakeNpm, '#!/bin/sh\nprintf "%s\\n" "$BELLOMBERG_PYTHON"\n');
   fs.chmodSync(fakeNpm, 0o755);

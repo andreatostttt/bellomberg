@@ -1,0 +1,68 @@
+# Frontend checks on every pull request that touches app/ (PM decision 05/10/2026).
+# Fast feedback for contributors: only the Node checks of app/, no Python suite, no DB, no .env,
+# no secrets, no Electron window. Network use is limited to npm ci (registry) and the actions.
+# `pull_request` (NOT `pull_request_target`): fork PRs run with a read-only token and no repository secrets at all.
+# Every check after `npm ci` runs even if a previous one failed, so one push shows ALL the reds.
+# The full matrix (Python suite, Windows installer, macOS smoke) stays in ci.yml.
+name: Frontend PR checks
+
+on:
+  pull_request:
+    paths:
+      - "app/**"
+      - ".github/workflows/frontend-pr.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.23.2"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies (npm ci)
+        id: deps
+        run: npm ci --no-audit --no-fund
+
+      - name: TypeScript (tsc --noEmit)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: npx tsc --noEmit
+
+      - name: i18n tests
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: npm run test:i18n
+
+      - name: Product tests
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: npm run test:product
+
+      - name: Desktop contracts (pure Node, no Electron)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: node tests/desktop/contratti.cjs
+
+      - name: macOS launcher and backend wiring (pure Node, no Electron)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: node --test tests/desktop/darwin.cjs
+
+      # tsconfig.json has noEmit: true, so build:bundles (= tsc && vite build) would only repeat
+      # the TypeScript step above: the production bundle is built directly.
+      - name: Production bundle (vite build)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: npx vite build

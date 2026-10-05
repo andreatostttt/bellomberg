@@ -51,7 +51,7 @@ async function runner() {
   assert.ok(server.address().port>=8766);let output='';
   try{
     const env={...process.env};delete env.ELECTRON_RUN_AS_NODE;
-    const child=spawn(require('electron'),[__filename,'--renderer',JSON.stringify({temporary,origin})],{cwd:root,env,windowsHide:true,stdio:['ignore','pipe','pipe']});
+    const child=spawn(require('electron'),[__filename,'--renderer',JSON.stringify({temporary,origin,campi:Object.keys(fixture._campi).length})],{cwd:root,env,windowsHide:true,stdio:['ignore','pipe','pipe']});
     child.stdout.on('data',c=>output+=c);child.stderr.on('data',c=>output+=c);const timer=setTimeout(()=>child.kill(),55000);
     const code=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',resolve);});clearTimeout(timer);
     const line=output.split(/\r?\n/).find(x=>x.startsWith(MARK));assert.ok(line,output);const result=JSON.parse(line.slice(MARK.length));
@@ -76,10 +76,13 @@ async function renderer(config){
     w.webContents.session.webRequest.onBeforeRequest({urls:['http://*/*','https://*/*','ws://*/*','wss://*/*']},(d,c)=>c({cancel:!d.url.startsWith(config.origin+'/')}));
     await w.loadFile(path.join(root,'dist/index.html'),{hash:'/mandato'});await js(()=>{localStorage.setItem('bellomberg_token_v1','synthetic');localStorage.setItem('bellomberg_unlocked_v1',JSON.stringify({ts:Date.now()}));localStorage.setItem('bellomberg_last_launch_id','synthetic-f18');});
     await new Promise(r=>{w.webContents.once('did-finish-load',r);w.webContents.reload();});await wait(()=>document.querySelector('#m-orizzonte_anni'));
-    assert.equal(await js(()=>document.querySelectorAll('.mandato-grid article').length),47);
+    // One article per schema field. The expected count is the schema this fixture serves to the page
+    // (48 since 79fe8e9 added sizing.tolleranza_sforo_sizing_pct), not a literal that lags behind the schema.
+    assert.ok(config.campi>=48,'fixture schema lost fields: '+config.campi);
+    assert.equal(await js(()=>document.querySelectorAll('.mandato-grid article').length),config.campi);
     assert.equal(await js(()=>document.querySelectorAll('.mandato-form section:not([hidden])').length),1);
     await field('#m-orizzonte_anni','7');await click('#tab-diario');await wait(()=>document.querySelector('.journal-title-input'));await click('#tab-mandato');assert.equal(await js(()=>document.querySelector('#m-orizzonte_anni').value),'7');
-    scenarios.push('47 fields, one active section, tab draft preserved');
+    scenarios.push(config.campi+' fields, one active section, tab draft preserved');
     await click('.mandato-index a[href="#mandato-rischio"]');await wait(()=>document.activeElement?.id==='mandato-heading-rischio');
     assert.equal(await js(()=>location.hash),'#/mandato');assert.equal(await js(()=>document.querySelectorAll('.mandato-choice button[aria-pressed]').length>0),true);
     scenarios.push('keyboard focus and section navigation preserve route; boolean pressed state exposed');

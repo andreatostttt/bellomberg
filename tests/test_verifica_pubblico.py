@@ -2175,6 +2175,63 @@ def test_valori_estesi_applica_eccezione_solo_a_controllo_file_e_token(tmp_path,
     assert errore.nome == "valori_estesi" and errore.errore
 
 
+def _gate_prezzi_fissati(tmp_path, monkeypatch, vendor=b"A = 987.65; B = 876.54\n", pin=None):
+    """05/10 (decisione PM): tree con un file fissato per SHA-256 (vendor.js) e uno libero
+    (other.js), DB sintetico: 987.65 solo prezzo di mercato, 876.54 prezzo E guidance."""
+    import sqlite3
+    tree, liste = tmp_path / "tree", tmp_path / "liste"
+    tree.mkdir(); liste.mkdir()
+    (tree / "vendor.js").write_bytes(vendor)
+    (tree / "other.js").write_bytes(b"X = 987.65\n")
+    digest = pin or hashlib.sha256(b"A = 987.65; B = 876.54\n").hexdigest()
+    (liste / "ECCEZIONI.txt").write_text(
+        "vendor.js@sha256=%s\tvalori_estesi\t111.22\tbundle sintetico fissato\n" % digest, encoding="utf-8")
+    db = str(tmp_path / "zz.db")
+    with sqlite3.connect(db) as c:
+        c.executescript("""
+        CREATE TABLE company_guidance(ticker TEXT, metric TEXT, unit TEXT, value_low REAL, value_mid REAL, value_high REAL);
+        INSERT INTO company_guidance VALUES ('ZZTEST','ricavi','musd',NULL,NULL,876.54);
+        CREATE TABLE position_prices(ticker TEXT, prezzo REAL);
+        INSERT INTO position_prices VALUES ('ZZTEST',987.65);
+        INSERT INTO position_prices VALUES ('ZZTESTB',876.54);
+        """)
+    monkeypatch.setattr(vp, "_importa_memory_db", lambda: types.SimpleNamespace(SQLITE_PATH=db))
+    return tree, liste
+
+
+def test_valori_estesi_prezzo_di_mercato_non_cercato_nel_file_fissato_e_dichiarato(tmp_path, monkeypatch):
+    """(1)+(2)+(3): il prezzo SOLO position_prices nel file fissato e verificato non da' riscontro
+    e la nota lo conta; lo stesso prezzo in un file non fissato resta riscontro; il valore che e'
+    anche guidance resta riscontro anche nel file fissato."""
+    tree, liste = _gate_prezzi_fissati(tmp_path, monkeypatch)
+    esiti, _ = vp.esegui_controlli(str(tree), solo=["valori_estesi"], pubblico=str(liste))
+    e = esiti[0]
+    assert e.nome == "valori_estesi" and not e.errore, e.errore
+    per_file = sorted((h.file, h.token) for h in e.hit)
+    assert per_file == [("other.js", "position_prices.prezzo…(6)"),
+                        ("vendor.js", "company_guidance.value_high/position_prices.prezzo…(6)")], per_file
+    assert ("prezzi di mercato (position_prices.prezzo) non cercati in 1 file fissati per "
+            "SHA-256: 1 riscontro scartato") in e.note, e.note
+
+
+def test_valori_estesi_senza_file_fissati_il_prezzo_resta_riscontro_ovunque(tmp_path):
+    """Senza pin verificati nulla si scarta e la nota non dichiara esclusioni."""
+    tree = {"vendor.js": b"A = 987.65\n"}
+    e = vp.controllo_valori_db(tree, {987.65: "position_prices.prezzo"}, nome_controllo="valori_estesi")
+    assert [h.file for h in e.hit] == ["vendor.js"] and "non cercati" not in e.note
+    e = vp.controllo_valori_db(tree, {987.65: "position_prices.prezzo"}, nome_controllo="valori_estesi",
+                               file_fissati={"vendor.js": "0" * 64})
+    assert e.hit == [] and "1 riscontro scartato" in e.note
+
+
+def test_valori_estesi_file_fissato_con_sha_sbagliato_resta_errore(tmp_path, monkeypatch):
+    """(4): un file fissato i cui byte non tornano col pin e' errore del cancello, non esenzione."""
+    tree, liste = _gate_prezzi_fissati(tmp_path, monkeypatch, vendor=b"A = 987.65; B = 876.54 \n")
+    esiti, _ = vp.esegui_controlli(str(tree), solo=["valori_estesi"], pubblico=str(liste))
+    assert any(e.errore and "SHA-256" in e.errore for e in esiti), [(e.nome, e.errore) for e in esiti]
+    assert not any(e.nome == "valori_estesi" and not e.errore for e in esiti)
+
+
 def test_vietate_forme_e_cablato_e_nasce_in_osservazione(tmp_path, monkeypatch):
     tree = tmp_path / "tree"
     tree.mkdir()

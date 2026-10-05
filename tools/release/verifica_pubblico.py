@@ -907,13 +907,18 @@ def _etichette(origini, forme):
     return {f: "/".join(o) for f, o in etich.items()}
 
 
+ORIGINE_MERCATO = "position_prices.prezzo"
+
+
 def controllo_valori_db(tree, valori, eccezioni=(), percentuali=None, *,
-                        nome_controllo="valori_db"):
+                        nome_controllo="valori_db", file_fissati=None):
     """Controllo A: ogni valore vivo del DB, nelle sue forme, cercato con confini numerici
     in ogni file del tree. `valori` = dict valore -> origine (valori_db) o un set;
     `percentuali` = dict valore -> origine delle guidance in percentuale (percentuali_db),
     cercate con le forme col % e senza filtro di lunghezza (buco D5, 05/09). I token si
-    cercano solo se stanno fra i numeri del tree (`_candidati_numerici`: un sovrainsieme)."""
+    cercano solo se stanno fra i numeri del tree (`_candidati_numerici`: un sovrainsieme).
+    `file_fissati` = {rel: sha} dei pin verificati (_risolvi_deroghe_upstream): i riscontri
+    dei token con origine SOLO ORIGINE_MERCATO in quei file si scartano e si contano in nota."""
     origini = valori if isinstance(valori, dict) else {v: None for v in valori}
     percentuali = percentuali or {}
     if not origini:   # review T4 F1: un DB con lo schema e 0 righe e' un path sbagliato, non un verde
@@ -946,7 +951,21 @@ def controllo_valori_db(tree, valori, eccezioni=(), percentuali=None, *,
     if percentuali:
         note += "; %s (%d token col %%)" % (_plurale(len(percentuali), "percentuale", "percentuali"), len(token_pct))
     etichette = _etichette(origini, forme_numero)
-    etichette.update(_etichette(percentuali, forme_percentuale))
+    etichette_pct = _etichette(percentuali, forme_percentuale)
+    if file_fissati:
+        # 05/10 (decisione PM): un prezzo di MERCATO pubblico (solo position_prices.prezzo) in un
+        # file fissato per percorso+SHA-256 verificato sui byte (bundle ufficiale, fixture
+        # ratificata) e' una coincidenza che cambia ogni giorno, non un dato del book. Il token
+        # con ANCHE un'altra origine resta cercato; gli altri file restano controllati. Lo
+        # scarto si DICHIARA col conteggio: nessun buco silenzioso.
+        solo_mercato = {t for t, o in etichette.items()
+                        if set(o.split("/")) == {ORIGINE_MERCATO} and t not in etichette_pct}
+        tenuti = [g for g in grezzi if not (g[0] in file_fissati and g[2] in solo_mercato)]
+        note += "; prezzi di mercato (%s) non cercati in %s fissati per SHA-256: %s" % (
+            ORIGINE_MERCATO, _plurale(len(file_fissati), "file", "file"),
+            _plurale(len(grezzi) - len(tenuti), "riscontro scartato", "riscontri scartati"))
+        grezzi = tenuti
+    etichette.update(etichette_pct)
     return _esito(nome_controllo, grezzi, eccezioni, note=note, etichette=etichette)
 
 
@@ -2525,7 +2544,7 @@ def esegui_controlli(tree_dir, solo=None, blocca_osservazione=False, pubblico=No
                     ecc,
                     percentuali=fonte(
                         "percentuali", lambda: percentuali_db(memoria.SQLITE_PATH)),
-                    nome_controllo="valori_estesi")
+                    nome_controllo="valori_estesi", file_fissati=upstream)
                 return e
             prova(nome, _estesi)
         elif nome == "vietate_forme":

@@ -169,3 +169,49 @@ jobs:
         run: |
           npm run desktop:install
           npm run test:desktop
+
+  # 05/10 (decisione PM): la suite INTERA su Linux. Il job `test` esegue solo l'elenco esplicito
+  # di tools/testing/research_ci.py (~38 file su ~714): i test node/React dentro la suite Python
+  # in CI non giravano mai. Qui `pytest tests/` completo sul checkout pulito (niente DB, niente
+  # .env: conftest.py mette la chiave fittizia, blocca la rete e la spia delle scritture).
+  # `npm ci` PRIMA di pytest: i test node/React della suite Python leggono app/node_modules (la
+  # chat backend li sta facendo FALLIRE, non saltare, se manca). Durata stimata 45-60 min (test_trade_idea_no_workbook_e2e ~32 min sotto carico).
+  # QUANDO: push su main e a comando, mai sulle pull_request (il feedback delle PR resta quello
+  # dei job veloci). COSTO: Linux gratuito sui repo pubblici; sul privato (minuti limitati) gira
+  # SOLO a comando (Actions -> CI -> Run workflow), stessa regola del job macos-source.
+  suite-linux:
+    runs-on: ubuntu-latest
+    if: ${{ (github.event_name == 'push' && github.event.repository.private == false) || github.event_name == 'workflow_dispatch' }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    concurrency:
+      group: suite-linux-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      ANTHROPIC_API_KEY: dummy-ci-offline
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Dipendenze
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . pytest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.23.2"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Frontend dependencies for the node tests inside the Python suite
+        working-directory: app
+        run: npm ci
+
+      - name: Suite intera (pytest tests/)
+        run: python -m pytest tests/ -q -rfE -p no:cacheprovider --durations=25

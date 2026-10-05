@@ -13,6 +13,8 @@ const root = path.resolve(__dirname, '../..');
 const MARK = 'INTERFACE_MODES_RESULT ';
 const HANDSHAKE = 'INTERFACE_MODES_FIXTURE ';
 const TRACE = 'INTERFACE_MODES_TRACE ';
+// Page destinations in src/lib/navigation.ts (CONFIG excluded): 19 since fbdfc40 added Filings (F20).
+const SIDEBAR_PAGES = 19;
 const LOGO_PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
 
 function fixtureData() {
@@ -533,7 +535,7 @@ const { app, BrowserWindow } = require('electron');
       `${tag}: the events card shows every row that fits, not a fixed minimum: ${JSON.stringify(d.events)}`);
     if (width >= 901 && d.sidebar) {
       assert.ok(d.sidebar.width >= 220 && d.sidebar.width <= 240, `${tag}: sidebar 220–240px: ${d.sidebar.width}`);
-      assert.equal(d.sidebar.navLinks.length, 18, `${tag}: all 18 sidebar links`);
+      assert.equal(d.sidebar.navLinks.length, SIDEBAR_PAGES, `${tag}: all ${SIDEBAR_PAGES} sidebar links`);
       assert.ok(d.sidebar.navLinks.every(link => link.text && link.fontSize >= 14 && link.labelScrollWidth <= link.labelWidth + 1),
         `${tag}: sidebar labels readable without truncation: ${JSON.stringify(d.sidebar.navLinks.filter(l => l.labelScrollWidth > l.labelWidth + 1))}`);
     }
@@ -543,7 +545,10 @@ const { app, BrowserWindow } = require('electron');
     // The external fixture calls renderer only after app.whenReady(). Avoid a
     // second await so Electron creates its hidden window before it can auto-quit.
     trace('renderer-before-window');
-    window = new BrowserWindow({ show: false, width: 1440, height: 1100,
+    // useContentSize: width/height and every setContentSize below are the renderer viewport. Without it, on
+    // Windows at 125% scaling with the default menu bar, setContentSize(1920, 1080) gave innerHeight 1082
+    // (measured 05/10: content 1081, inner 1082 at every size); same option as pages-modern and dark-mode-switch.
+    window = new BrowserWindow({ show: false, width: 1440, height: 1100, useContentSize: true,
       webPreferences: { preload: path.join(root, 'dist-electron/preload.mjs'), contextIsolation: true,
         nodeIntegration: false, sandbox: true, backgroundThrottling: false,
         additionalArguments: ['--bellomberg-launch-id=synthetic-interface-mode', '--bellomberg-api-port=' + new URL(config.origin).port] } });
@@ -847,7 +852,7 @@ const { app, BrowserWindow } = require('electron');
     scenarios.push('Dashboard measured and captured at 1920×1080, 2560×1440, 3440×1440 and 5120×1440 in Dark and Light; 2560×1080, 1280 and 1024 measured');
 
     const routePairs = await js(() => [...document.querySelectorAll('.bb-modern-nav-scroll a[href^="#/"]')].map(a => [a.getAttribute('href'), a.textContent.trim()]));
-    assert.equal(routePairs.length, 18, 'Modern sidebar exposes all 18 page destinations');
+    assert.equal(routePairs.length, SIDEBAR_PAGES, `Modern sidebar exposes all ${SIDEBAR_PAGES} page destinations`);
     for (const [href] of routePairs) {
       activeStage = `navigation ${href}`;
       await click(`a[href="${href}"]`);
@@ -875,7 +880,7 @@ const { app, BrowserWindow } = require('electron');
           return e.top >= s.top && e.bottom <= s.bottom; })() },
     }));
     const englishSidebarLabels = await inspectSidebarLabels();
-    assert.equal(englishSidebarLabels.labels.length, 18);
+    assert.equal(englishSidebarLabels.labels.length, SIDEBAR_PAGES);
     assert.ok(englishSidebarLabels.labels.every(label => label.text && label.fontSize >= 14
       && label.width > 0 && label.scrollWidth <= label.width + 1),
     `English sidebar labels remain fully readable: ${JSON.stringify(englishSidebarLabels)}`);
@@ -893,7 +898,7 @@ const { app, BrowserWindow } = require('electron');
     await wait(() => document.querySelector('.bb-modern-nav-link span')?.textContent.trim() === 'Centro di comando',
       'Italian sidebar labels after verified language preference write');
     const italianSidebarLabels = await inspectSidebarLabels();
-    assert.equal(italianSidebarLabels.labels.length, 18);
+    assert.equal(italianSidebarLabels.labels.length, SIDEBAR_PAGES);
     assert.ok(italianSidebarLabels.labels.every(label => label.text && label.fontSize >= 14
       && label.width > 0 && label.scrollWidth <= label.width + 1),
     `Italian sidebar labels remain fully readable: ${JSON.stringify(italianSidebarLabels)}`);
@@ -923,7 +928,7 @@ const { app, BrowserWindow } = require('electron');
     await wait(() => !!document.querySelector('[role="combobox"]'), 'Ctrl+K opens command palette');
     await keyboard('Escape');
     await wait(() => !document.querySelector('[role="combobox"]'), 'Escape closes command palette');
-    scenarios.push('18 sidebar routes track active page; F1/F19 and Ctrl+K remain available');
+    scenarios.push(`${SIDEBAR_PAGES} sidebar routes track active page; F1/F19 and Ctrl+K remain available`);
 
 
     const runDialogBoundsEvidence = { notTested: 'user-request' };

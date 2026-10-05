@@ -3,7 +3,8 @@
 job attesi (Linux con matrice 3.12+3.14, desktop Windows, sorgente macOS), i passi che il
 mandato 12/09 chiede al job macOS, nessun segreto nel file (la ANTHROPIC_API_KEY e' un dummy
 DICHIARATO) e il job macOS che non spende minuti a pagamento sul repo privato senza un ordine
-esplicito (i runner macOS costano ~10x Linux; gratuiti solo sui repo pubblici).
+esplicito (i runner macOS costano ~10x Linux; gratuiti solo sui repo pubblici). Dal 05/10 anche
+il job `suite-linux`: `pytest tests/` intero, `npm ci` prima, mai sulle PR, sul privato a comando.
 
 Batteria OFFLINE: legge un file del repo, non chiama GitHub. `yaml` arriva con chromadb e
 uvicorn[standard] (requirements.txt): se manca, il test cade con la causa, non salta.
@@ -131,6 +132,62 @@ def test_il_job_macos_non_spende_minuti_sul_repo_privato_senza_ordine():
 
 def test_i_job_linux_e_windows_restano_senza_condizione_di_costo():
     assert "if" not in _job("test") and "if" not in _job("desktop-windows")
+
+
+# ---------------------------------------------------------------------------------------------
+# suite intera su Linux (decisione PM 05/10): pytest tests/ completo, npm ci prima, mai sulle PR,
+# sul privato solo a comando
+# ---------------------------------------------------------------------------------------------
+def test_la_suite_intera_gira_su_linux_con_pytest_completo():
+    job = _job("suite-linux")
+    assert job["runs-on"] == "ubuntu-latest"
+    pytest_run = [str(s.get("run", "")) for s in job["steps"] if "pytest tests/" in str(s.get("run", ""))]
+    assert len(pytest_run) == 1, pytest_run
+    comando = pytest_run[0]
+    # completa: nessun elenco di file, nessuna selezione -k/-m, non il runner ristretto
+    assert re.match(r"python -m pytest tests/ ", comando), comando
+    opzioni = comando[len("python -m pytest tests/ "):]
+    assert not re.search(r"(^|\s)(-k|-m)\s", opzioni) and "tests/" not in opzioni, comando
+    assert "research_ci" not in comando, comando
+
+
+def test_la_suite_intera_installa_npm_prima_di_pytest():
+    passi = _job("suite-linux")["steps"]
+    indice = {}
+    for i, s in enumerate(passi):
+        run = str(s.get("run", ""))
+        if "npm ci" in run:
+            assert s.get("working-directory") == "app", s
+            indice.setdefault("npm", i)
+        if "pytest tests/" in run:
+            indice.setdefault("pytest", i)
+    assert "npm" in indice and "pytest" in indice and indice["npm"] < indice["pytest"], indice
+
+
+def test_la_suite_intera_usa_le_versioni_del_job_test():
+    job, base = _job("suite-linux"), _job("test")
+    py = [s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/setup-python")]
+    assert py and str(py[0]["with"]["python-version"]) in [str(v) for v in base["strategy"]["matrix"]["python-version"]]
+
+    def node(j):
+        return [s["with"]["node-version"] for s in j["steps"] if str(s.get("uses", "")).startswith("actions/setup-node")]
+    assert node(job) == node(base), (node(job), node(base))
+    # stesse action, stessi tag del job test
+    assert {s["uses"] for s in job["steps"] if "uses" in s} <= {s["uses"] for s in base["steps"] if "uses" in s}
+
+
+def test_la_suite_intera_ha_un_tetto_e_permessi_minimi():
+    job = _job("suite-linux")
+    assert 60 <= int(job["timeout-minutes"]) <= 120, job["timeout-minutes"]
+    assert job["permissions"] == {"contents": "read"}, job["permissions"]
+
+
+def test_la_suite_intera_non_gira_sulle_pr_e_sul_privato_solo_a_comando():
+    condizione = str(_job("suite-linux").get("if", ""))
+    assert "github.event.repository.private == false" in condizione, condizione
+    assert "github.event_name == 'push'" in condizione, condizione
+    assert "workflow_dispatch" in condizione and "workflow_dispatch" in _trigger(), condizione
+    assert "pull_request" not in condizione, condizione
 
 
 _SONDA_HOOK_EXCEL = r"""
