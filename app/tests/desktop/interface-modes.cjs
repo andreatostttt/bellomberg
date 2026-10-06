@@ -46,8 +46,12 @@ function fixtureData() {
       cash_disponibile_eur: Math.round((nav - invested) * 100) / 100, cash_source: 'sqlite:cash_state', nav_total_eur: nav,
       timestamp: '2026-09-29T12:00:00Z', as_of: '2026-09-29T12:00:00Z', stale_positions: ['SYN15'],
     },
+    // Decision timestamps are relative to the run, like the calendar below: the Decisions
+    // page auto-archives a PENDING non-research proposal older than 7 days (logica.ts
+    // isArchived), so fixed dates emptied «To decide» once the newest HOLD turned 8 days old.
+    // 20 h apart keeps the oldest at ~5.8 days, inside the window and below GIORNI_FERMA.
     decisions: Array.from({ length: 8 }, (_, i) => ({
-      id: 700 + i, memo_id: null, timestamp: `2026-09-${String(29 - i).padStart(2, '0')}T10:00:00Z`,
+      id: 700 + i, memo_id: null, timestamp: new Date(Date.now() - i * 20 * 3600_000).toISOString().replace(/\.\d{3}Z$/, 'Z'),
       action: i % 2 ? 'HOLD' : 'RESEARCH', ticker: `SYN${String(i + 1).padStart(2, '0')}`,
       eur_amount: 1000 + i, timing: 'synthetic fixture', confidence: 'MEDIUM', status: 'PENDING',
       pm_feedback: null, outcome_pct: null,
