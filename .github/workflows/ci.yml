@@ -18,6 +18,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # 06/10 (PM): sul privato i minuti Actions sono a pagamento oltre i 2000 gratuiti: qui gira solo a
+    # comando; sul pubblico (gratis) a ogni push e PR, come prima.
+    if: ${{ github.event.repository.private == false || github.event_name == 'workflow_dispatch' }}
     # 12/09 (mandato Fable, sez. 4): 3.12 per la copertura dei wheel binari (chromadb/arch/
     # scipy) E 3.14, la versione con cui il PM lavora davvero (3.14.5). Matrice dichiarata.
     strategy:
@@ -87,6 +90,9 @@ jobs:
 
   desktop-windows:
     runs-on: windows-latest
+    # 06/10 (PM): sul privato i minuti Actions sono a pagamento oltre i 2000 gratuiti: qui gira solo a
+    # comando; sul pubblico (gratis) a ogni push e PR, come prima.
+    if: ${{ github.event.repository.private == false || github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v4

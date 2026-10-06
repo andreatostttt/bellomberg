@@ -85,7 +85,7 @@ def test_comunicati_della_sezione_stampa_esclusi_col_motivo():
     e = esef_sito.classifica_pdf(_voce("2026-03-11-Zztest-presents-Annual-Report-for-2025.pdf",
                                        base="https://ir.zztest.example/Zztest Group/Presse/News/Documents/2026/03/"))
     assert not e["ammesso"] and "sezione stampa" in e["motivo"]
-    e = _classe("2026-08-06-Zztest-News-Half-Yearly-Financial-Report-H1.pdf")
+    e = _classe("2026-08-06-Zztest-News-Interim-Report-H1-H1.pdf")
     assert not e["ammesso"] and "news" in e["motivo"].lower()
 
 
@@ -94,7 +94,7 @@ def test_data_di_pubblicazione_non_e_il_periodo():
     e = _classe("QQSYN_bilanciointegrato2024_ENG_23.05.2025.pdf")
     assert (e["ammesso"], e["periodo"]) == (True, "2024-12-31")
     # solo la data di pubblicazione: periodo ignoto -> non ammesso, motivo scritto, serve la prima pagina
-    e = _classe("2026-08-06-Zztest-Half-Yearly-Financial-Report.pdf")
+    e = _classe("2026-08-06-Zztest-Interim-Report-H1.pdf")
     assert not e["ammesso"] and e["periodo"] is None and "periodo di riferimento non dichiarato" in e["motivo"]
     assert e["serve_prima_pagina"]
 
@@ -125,12 +125,12 @@ def test_nome_generico_deciso_dalla_prima_pagina():
 
 def test_scelta_con_etichetta_scarti_e_inglese_preferito():
     link = [_voce(n) for n in (
-        "Zztest-Halbjahresfinanzbericht-2026.pdf", "Zztest-Half-Yearly-Financial-Report-2026.pdf",
-        "Zztest-Half-Yearly-Financial-Report-2025.pdf", "Zztest-Investor-Presentation-2026-September.pdf",
+        "Zztest-Halbjahresfinanzbericht-2026.pdf", "Zztest-Interim-Report-H1-2026.pdf",
+        "Zztest-Interim-Report-H1-2025.pdf", "Zztest-Investor-Presentation-2026-September.pdf",
         "Zztest-Annual-Report-2025.pdf", "Zztest-Annual-Report-2027.pdf")]
     s = esef_sito.scegli_pdf(link, oggi=OGGI)
     assert (s["tipo"], s["ultimo"]["url"], s["precedente"]["url"]) == (
-        "semestrale", FILE + "Zztest-Half-Yearly-Financial-Report-2026.pdf", FILE + "Zztest-Half-Yearly-Financial-Report-2025.pdf")
+        "semestrale", FILE + "Zztest-Interim-Report-H1-2026.pdf", FILE + "Zztest-Interim-Report-H1-2025.pdf")
     assert s["origine"] == "sito_emittente" and s["deposito_ufficiale"] is False
     assert s["etichetta"] == "sito dell'emittente, non archivio ufficiale (OAM)" and s["etichetta_en"]
     assert s["ultimo"]["etichetta"] == s["precedente"]["etichetta"] == s["etichetta"]

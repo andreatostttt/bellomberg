@@ -1743,7 +1743,8 @@ def parole_testo(testo):
 CHIAVI_TECNICHE_PROFILO_FILING = frozenset({
     "tipo", "sezioni", "fonti", "lingua", "perimetro", "ticker", "emittente_id", "verifica",
     "cik", "lei", "sec_ticker", "forme_sec", "esef_modo", "origine_collegamento",
-    "sezioni_salta_indice", "varianti"})
+    "sezioni_salta_indice", "varianti",
+    "origine_documenti"})   # 06/10 (decisione PM): etichetta fissa della fonte scritta dal programma
 
 
 def _stringhe_profilo_filing(raw):

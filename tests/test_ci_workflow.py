@@ -130,8 +130,13 @@ def test_il_job_macos_non_spende_minuti_sul_repo_privato_senza_ordine():
     assert "workflow_dispatch" in _trigger(), _trigger()
 
 
-def test_i_job_linux_e_windows_restano_senza_condizione_di_costo():
-    assert "if" not in _job("test") and "if" not in _job("desktop-windows")
+def test_i_job_linux_e_windows_sul_privato_solo_a_comando():
+    """06/10 (decisione PM, sostituisce la regola del 12/09): i 2000 minuti gratuiti del privato sono
+    finiti; sul pubblico (gratis) test e desktop-windows girano a ogni push e PR, sul privato solo
+    a comando. Stessa condizione di macos-source."""
+    atteso = "${{ github.event.repository.private == false || github.event_name == 'workflow_dispatch' }}"
+    for nome in ("test", "desktop-windows"):
+        assert _job(nome).get("if") == atteso, (nome, _job(nome).get("if"))
 
 
 # ---------------------------------------------------------------------------------------------

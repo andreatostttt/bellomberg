@@ -234,10 +234,10 @@ def test_semestrale_col_periodo_solo_numerico_si_attiva(store, rete, tmp_path):
                     "The group and the management of the company report on the results of the half-year.",
                     "Demand for the products of the group is growing and the order book is larger.")
     rete.update({SITO: _pagina((REPORTS, "Financial reports")),
-                 REPORTS: _pagina((FILE + "Zztest-Half-Yearly-Financial-Report-2026.pdf", ""),
-                                  (FILE + "Zztest-Half-Yearly-Financial-Report-2025.pdf", "")),
-                 FILE + "Zztest-Half-Yearly-Financial-Report-2026.pdf": h1(2026),
-                 FILE + "Zztest-Half-Yearly-Financial-Report-2025.pdf": h1(2025)})
+                 REPORTS: _pagina((FILE + "Zztest-Halbjahresbericht-2026.pdf", ""),
+                                  (FILE + "Zztest-Halbjahresbericht-2025.pdf", "")),
+                 FILE + "Zztest-Halbjahresbericht-2026.pdf": h1(2026),
+                 FILE + "Zztest-Halbjahresbericht-2025.pdf": h1(2025)})
     esito = _attiva(store, tmp_path)
     assert esito["esito"] == "attivato", esito
     assert store.get_profile(TICKER)["profile"]["verifica"]["periodo"] == fa._PERIODI_SITO["semestrale"][0]

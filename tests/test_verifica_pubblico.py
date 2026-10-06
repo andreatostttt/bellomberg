@@ -2868,6 +2868,17 @@ def test_chiavi_dei_profili_filing_automatici_fuori_ma_nome_resta_controllato():
                                 "origine_collegamento", "sezioni_salta_indice"}
 
 
+def test_origine_documenti_e_chiave_tecnica_nome_resta_controllato():
+    """06/10 (decisione PM): «origine_documenti» la scrive il programma (etichetta fissa della fonte
+    dei documenti), quindi esce dal controllo; «nome» resta testo del PM."""
+    etichetta = "sito sintetico della societa inventata non archivio ufficiale di prova"
+    nome = "la societa sintetica delle idee viola e del lunedi"
+    stringhe = list(vp._stringhe_profilo_filing(json.dumps(
+        {"ticker": "SYNTH", "origine_documenti": etichetta, "nome": nome})))
+    assert nome in stringhe
+    assert etichetta not in stringhe and "origine_documenti" not in stringhe
+
+
 def test_filing_reason_tecnico_non_diventa_prosa_pm_e_json_malformato_fa_ko(synthetic_policy, tmp_path, monkeypatch):
     import sqlite3
     from bellomberg.storage.filing_store import FilingStore
