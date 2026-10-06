@@ -4157,11 +4157,15 @@ if FASTAPI_OK:
             import psutil
             for p in psutil.process_iter(["pid", "name", "cmdline"]):
                 try:
-                    name = (p.info.get("name") or "").lower()
-                    if "python" not in name:
-                        continue
-                    cmdline = " ".join(p.info.get("cmdline") or [])
-                    if "consigliere_multi.py" in cmdline:
+                    # R-8 C6 (06/10, Opus 5.5): riconoscimento sulla FORMA del comando. Prima
+                    # cercava «consigliere_multi.py» nei soli processi python, ma la run parte
+                    # con `-m bellomberg.agents.consigliere_multi` (qui sopra, /consigliere/run):
+                    # dopo un riavvio del backend l'orfano non veniva MAI trovato e lo STOP non
+                    # fermava la run; veniva ucciso invece un py_compile/pytest che nominava il file.
+                    from bellomberg.core.processi_run import e_run_consigliere
+                    argv = p.info.get("cmdline") or []
+                    cmdline = " ".join(argv)
+                    if e_run_consigliere(argv):
                         p.kill()
                         killed.append({"pid": p.info["pid"], "source": "psutil_scan",
                                        "cmdline": cmdline[:120]})
@@ -4248,15 +4252,82 @@ if FASTAPI_OK:
     # mostrata su Agents Live). DEVE combaciare con Blackboard.HEARTBEAT_PATH.
     AGENTS_LIVE_PATH = os.path.join(DB_DIR, "current_run.json")   # B4: stessa costante del heartbeat
 
+    def _fatti_processo(state):
+        """R-2 F3/F4 (06/10, Opus 5.5): fatti sul processo della run per `esito_run`.
+        - heartbeat_precede_processo: un processo consigliere avviato da questo backend e'
+          vivo e il file e' piu' vecchio di lui (mtime < avvio del processo; avvio da psutil,
+          o dal run_state se il pid non c'e'; se non si sa quando e' partito si assume che il
+          file sia della run precedente, salvo che il file dica running=true);
+        - pid_vivo: il pid scritto nel heartbeat esiste ED e' nato prima dell'avvio dichiarato
+          della run (un pid riusato da un altro processo non conta come vivo); None se il
+          heartbeat non dichiara il pid o psutil non risponde;
+        - processi_backend_vivi, annullata_da_utente (ultima run di questo backend fermata)."""
+        out = {"heartbeat_precede_processo": None, "pid_vivo": None,
+               "processi_backend_vivi": None, "annullata_da_utente": False}
+        try:
+            vivi = [(tid, p) for tid, p in list(_CONSIGLIERE_PROCS.items()) if p.poll() is None]
+            out["processi_backend_vivi"] = len(vivi)
+            if vivi:
+                try:
+                    mtime = os.path.getmtime(AGENTS_LIVE_PATH)
+                except OSError:
+                    mtime = None
+                avvii = []
+                for tid, p in vivi:
+                    t0 = None
+                    try:
+                        import psutil
+                        if not isinstance(getattr(p, "pid", None), int):
+                            raise ValueError("pid assente")   # psutil.Process(None) = SE STESSO
+                        t0 = psutil.Process(p.pid).create_time()
+                    except Exception:
+                        st = run_state.get(tid) or {}
+                        try:
+                            t0 = datetime.fromisoformat(str(st.get("started"))).timestamp()
+                        except Exception:
+                            t0 = None
+                    avvii.append(t0)
+                if any(t0 is None for t0 in avvii):
+                    out["heartbeat_precede_processo"] = state.get("running") is not True
+                else:
+                    out["heartbeat_precede_processo"] = mtime is None or mtime < max(avvii)
+            runs = sorted(run_state.runs.values(), key=lambda st: str(st.get("started") or ""))
+            out["annullata_da_utente"] = bool(runs) and runs[-1].get("status") == "cancelled"
+            pid = state.get("pid")
+            if isinstance(pid, int) and not isinstance(pid, bool):
+                try:
+                    import psutil
+                    if not psutil.pid_exists(pid):
+                        out["pid_vivo"] = False
+                    else:
+                        nato = psutil.Process(pid).create_time()
+                        avvio = datetime.fromisoformat(str(state.get("start_time"))).timestamp()
+                        out["pid_vivo"] = nato <= avvio + 5
+                except Exception:
+                    out["pid_vivo"] = None
+        except Exception:
+            pass
+        return out
+
     @app.get("/agents/live")
     def get_agents_live():
         """Stato live del consigliere multi-agent (specialist_status, tool_log, reports).
         Hardening #32 (watchdog): aggiunge stale_seconds + stale_warning se l'heartbeat
-        (updated_at scritto da specialists/base.py) e' fermo da >600s con run running."""
+        (updated_at scritto da specialists/base.py) e' fermo da >600s con run running.
+
+        handoff-4 voce 2 (05/10, Opus 5.5): ogni risposta porta `esito_run`, l'esito VERO
+        della run per la pagina (specialists/base.py: esito_run, valori in ESITI_RUN), letto
+        dal registro della run / technical_status e incrociato col memo nel DB in sola
+        lettura. La pagina NON deve piu' dedurre «completata» da running=false + memo_id."""
+        from bellomberg.agents.specialists.base import esito_run as _esito_run, stato_memo_nel_db as _stato_memo
+        _nessuna = {"stato": "nessuna_run", "memo_consegnato": False, "motivo": None,
+                    "ripresa_disponibile": None, "ripresa": None, "fonte": "nessun_heartbeat",
+                    "stato_memo_db": "non_letto"}
         try:
             import json as _json
             if not os.path.exists(AGENTS_LIVE_PATH):
-                return {"running": False, "message": _api_text('Nessuna run attiva.', 'No active run.')}
+                return {"running": False, "message": _api_text('Nessuna run attiva.', 'No active run.'),
+                        "esito_run": _nessuna}
             # 27/08 (review del lotto heartbeat, changelog (90)): il consigliere
             # scrive il file con temporaneo + os.replace, e su Windows nella
             # finestra del replace (stimata ~0,01-0,3 ms secondo la cadenza) una
@@ -4283,17 +4354,21 @@ if FASTAPI_OK:
                 if isinstance(_ultimo, FileNotFoundError) and not os.path.exists(AGENTS_LIVE_PATH):
                     # sparito fra exists() e open(): un reset legittimo
                     # (POST /agents/live/reset), non un guasto
-                    return {"running": False, "message": _api_text('Nessuna run attiva.', 'No active run.')}
+                    return {"running": False, "message": _api_text('Nessuna run attiva.', 'No active run.'),
+                            "esito_run": _nessuna}
                 return {"running": False, "heartbeat": "illeggibile",
                         "message": _api_text('errore lettura: heartbeat illeggibile dopo 3 letture (%s: %s)', 'Read error: heartbeat unreadable after 3 reads (%s: %s)')
-                                   % (type(_ultimo).__name__, str(_ultimo)[:160])}
+                                   % (type(_ultimo).__name__, str(_ultimo)[:160]),
+                        "esito_run": {**_esito_run(None), "fonte": "heartbeat_illeggibile",
+                                      "motivo": "heartbeat illeggibile dopo 3 letture (" + type(_ultimo).__name__ + ")"}}
             if not isinstance(state, dict):
                 # JSON valido ma non un oggetto: prima usciva com'era (il try
                 # sotto inghiottiva l'AttributeError) e il frontend riceveva una
                 # lista al posto dello stato (review 27/08, seconda passata)
                 return {"running": False, "heartbeat": "illeggibile",
                         "message": _api_text("errore lettura: heartbeat non e' un oggetto JSON (%s)", 'Read error: heartbeat is not a JSON object (%s)')
-                                   % type(state).__name__}
+                                   % type(state).__name__,
+                        "esito_run": {**_esito_run(state), "fonte": "heartbeat_illeggibile"}}
             try:
                 upd = state.get("updated_at")
                 if upd:
@@ -4302,6 +4377,15 @@ if FASTAPI_OK:
                     state["stale_warning"] = bool(state.get("running")) and stale_s > 600
             except Exception:
                 pass
+            # Esito vero (dopo stale_warning, che lo informa). Il memo si legge nel DB solo
+            # a run chiusa: a run viva e' '[IN PROGRESS]' per definizione.
+            try:
+                _memo = ("non_letto" if state.get("running") is True
+                         else _stato_memo(state.get("memo_id"), SQLITE_PATH))
+                state["esito_run"] = _esito_run(state, _memo, _fatti_processo(state))
+            except Exception as _e:
+                state["esito_run"] = {**_esito_run(None), "fonte": "errore_calcolo",
+                                      "motivo": "esito non calcolabile: " + type(_e).__name__}
             return state
         except Exception as e:
             # qualunque altro guasto (es. un OSError fuori dalla tupla del
@@ -4309,7 +4393,9 @@ if FASTAPI_OK:
             # sempre «illeggibile» da «nessuna run» (review 27/08, seconda
             # passata; raggiunto dal test con OSError(22))
             return {"running": False, "heartbeat": "illeggibile",
-                    "message": _api_text(f'Errore lettura: {e}', f'read error: {e}')}
+                    "message": _api_text(f'Errore lettura: {e}', f'read error: {e}'),
+                    "esito_run": {**_esito_run(None), "fonte": "heartbeat_illeggibile",
+                                  "motivo": "heartbeat illeggibile (" + type(e).__name__ + ")"}}
 
     # ============================================================
     # MANDATO DEL PM (criterio (5), lotto B) — la pagina Mandato e Diario (F18).

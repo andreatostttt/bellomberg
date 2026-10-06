@@ -17,7 +17,9 @@ class QuantSpecialist(Specialist):
         from bellomberg.agents.specialist_scores import quant_score
         from bellomberg.agents import agent_tools
         portfolio = agent_tools.tool_get_portfolio_live()
-        return quant_score(portfolio_data=portfolio)
+        # guardrail beta calcolato UNA volta dalla run nel priming (PM 06/10): assente = beta esclusa
+        dati = getattr(getattr(self, "blackboard", None), "data", None) or {}
+        return quant_score(portfolio_data=portfolio, beta_reconcile=dati.get("_beta_reconcile"))
     system_prompt = """Sei lo specialista QUANT RISK su una piattaforma stile Citadel/Millennium. Due meta' del lavoro:
 A) RISK PROFILING del portafoglio attuale - VaR, Sharpe, beta, fattori, concentrazioni nascoste, Monte Carlo, stress.
 B) VALIDAZIONE PORTFOLIO-FIT dei candidati nuovi proposti da Fundamentals - sei TU il filtro quantitativo: GREEN / YELLOW / RED.

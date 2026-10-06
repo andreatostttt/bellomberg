@@ -30,12 +30,20 @@ def _negozio_istituzioni_finto(monkeypatch):
     monkeypatch.setattr(sec_edgar, "istituzioni_13f", lambda: _ISTITUZIONI_FINTE)
 
 
-@pytest.mark.parametrize("modulo", [sec_edgar, esef])
-def test_senza_contatto_errore_dichiarato(monkeypatch, modulo):
+def test_senza_contatto_errore_dichiarato(monkeypatch):
     monkeypatch.delenv("SEC_CONTACT_EMAIL", raising=False)
-    with pytest.raises(modulo.ContattoMancante) as e:
-        modulo._headers()
+    with pytest.raises(sec_edgar.ContattoMancante) as e:
+        sec_edgar._headers()
     assert "SEC_CONTACT_EMAIL" in str(e.value)
+
+
+def test_esef_senza_contatto_user_agent_generico(monkeypatch):
+    """Decisione PM 05/10 sera (riscrive il verso ESEF del test sopra): filings.xbrl.org non
+    esige la mail; senza contatto parte con lo User-Agent generico del progetto, nessun dato
+    personale e nessun contatto finto. La SEC resta dichiarata (test sopra)."""
+    monkeypatch.delenv("SEC_CONTACT_EMAIL", raising=False)
+    assert esef._headers() == {"User-Agent": esef.UA_GENERICO}
+    assert "@" not in esef.UA_GENERICO
 
 
 @pytest.mark.parametrize("modulo", [sec_edgar, esef])
@@ -183,12 +191,25 @@ def test_13f_senza_contatto_risale_al_chiamante(monkeypatch):
         sec_edgar.get_13f_holdings("esempiofondo")
 
 
-def test_esef_senza_contatto_dice_cosa_fare(monkeypatch):
-    """Finding 5: esef conservava solo type(e).__name__ («ContattoMancante»), che a
-    uno sconosciuto non dice nulla. La nota deve portare l'istruzione."""
+def test_esef_senza_contatto_risolve_lo_stesso(monkeypatch):
+    """Riscritto sulla decisione PM 05/10 sera: prima (Finding 5, 02/09) senza contatto la nota
+    doveva portare l'istruzione SEC_CONTACT_EMAIL; ora l'ESEF non la esige e la ricerca PARTE
+    (rete finta) con lo User-Agent generico."""
+    from bellomberg.storage import negozi_privati
     monkeypatch.delenv("SEC_CONTACT_EMAIL", raising=False)
+    monkeypatch.setattr(negozi_privati, "carica_lei", lambda: {"lei": {}, "origine": "test", "motivo": ""})
+    monkeypatch.setattr(esef, "attendi_esef", lambda *a, **k: None)
+    visti = []
+
+    def _get(url, **k):
+        visti.append(k.get("headers"))
+        return _Risposta({"data": [{"id": "1", "attributes": {"identifier": "ZZLEI0000000000000009",
+                                                               "name": "Xyzq Spa"}}]})
+
+    monkeypatch.setattr("requests.get", _get)
     lei, nota = esef.resolve_lei("XYZQ.MI", company_name="Xyzq Spa")
-    assert lei is None and "SEC_CONTACT_EMAIL" in nota, nota
+    assert lei == "ZZLEI0000000000000009", nota
+    assert visti and visti[0]["User-Agent"] == esef.UA_GENERICO
 
 
 def test_dispatcher_chat_13f_senza_contatto_dichiara_nel_payload(monkeypatch):

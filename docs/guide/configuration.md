@@ -45,7 +45,7 @@ explicit repair preserves a verified copy of the unreadable file.
 | Web research | `TAVILY_API_KEY` | Web-search tools cannot provide their results |
 | News feeds | `NEWS_API_KEY`, `MARKETAUX_API_KEY`, `THENEWSAPI_API_KEY`, `GNEWS_API_KEY`, `TIINGO_API_KEY` as needed | Individual sources may be absent; some legacy feeds appear empty |
 | News automatic refresh | `NEWS_REFRESH_INTERVAL_MINUTES` (default `15`) and `NEWS_AUTO_REFRESH_ENABLED` (default `true`) | Backend refresh is disabled only when explicitly set to false; the manual refresh remains available |
-| US filings / European reports | `SEC_CONTACT_EMAIL` | Requests needing a contact User-Agent fail |
+| US filings (SEC) | `SEC_CONTACT_EMAIL` | SEC requests are refused and stated as "SEC not configured"; European reports (ESEF) still work with a generic User-Agent |
 | Congress, lobbying and government-contract data | `QUIVER_API_KEY` | Those tools cannot provide data |
 | Optional email output | `EMAIL_FROM`, `EMAIL_PASSWORD`, `EMAIL_TO` | No configured delivery |
 | Optional IBKR source | Separate broker application and setup | Other available price sources remain separate |

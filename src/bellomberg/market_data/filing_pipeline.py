@@ -46,6 +46,7 @@ def _scarica(url, archivio, hosts):
 
 
 INDICE_ESEF = "esef_indice.json"
+ORIGINE_IR = "sito_emittente"  # righe IR del run: «sito dell'emittente, non archivio ufficiale (OAM)»
 
 
 def _scarica_esef(url, archivio, hosts):
@@ -252,17 +253,42 @@ def _raccogli(profilo, archivio, oggi=None):
         if urls:
             limiti.append("IR: copertura della singola pagina osservata e dei suoi link candidati, non dell'intero sito.")
         from bellomberg.market_data.lettore_trimestrali import candidati_comunicato, estrai_testo
+        dal_sito = profilo.get("origine_collegamento") == ORIGINE_IR
+        nav_sito = {}
         for url in dict.fromkeys(urls):
             fonte = {"nome": "IR", "url": url, "stato": "ok", "motivi": []}
             fonti.append(fonte)
+            if dal_sito:
+                # Revisione R-8 C4: profili creati dal sito dell'emittente (PDF diretti): robots.txt
+                # riletto a ogni run (5xx/irraggiungibile = vietato, 401/403 = sito che blocca i bot)
+                # e una sola GET per PDF (niente snapshot preliminare: la scarica la verifica sotto).
+                from bellomberg.market_data import esef_sito
+                dominio = esef_sito.dominio_registrabile(_host(url)) or _host(url)
+                nav = nav_sito.setdefault(dominio, esef_sito.Navigatore(dominio))
+                try:
+                    consentito = nav.consentito(url)
+                except Exception as exc:
+                    consentito = False
+                    nav.robots_ignoto[_host(url)] = esef_sito.motivo_eccezione(exc, 100)
+                if not consentito:
+                    stato, ignoto = nav.bloccato.get(_host(url)), nav.robots_ignoto.get(_host(url))
+                    fonte.update(stato="non_disponibile")
+                    fonte["motivi"].append(f"{esef_sito.frase_blocco(stato)} su robots.txt" if stato else
+                                           f"robots.txt non leggibile ({ignoto}): documento non scaricato" if ignoto
+                                           else f"robots.txt vieta {urlsplit(url).path[:80]}: documento non scaricato")
+                    continue
+                aggiungi("IR", {"origine": ORIGINE_IR}, url, hosts_ir)
+                continue
             try:
                 snapshot = _scarica(url, archivio, hosts_ir)
                 fonte["snapshot"] = snapshot
                 estratto = estrai_testo(snapshot["path"])
                 if estratto.get("stato") != "ok":
                     raise ValueError(estratto.get("motivo", "pagina IR illeggibile"))
+                # V8B 05/10 (decisione PM): ogni documento IR viene dal sito dell'emittente, non da un
+                # archivio ufficiale: l'origine arriva dichiarata nella riga del run (chiave «origine»)
                 if estratto.get("formato") == "pdf":
-                    aggiungi("IR", {}, url, hosts_ir)
+                    aggiungi("IR", {"origine": ORIGINE_IR}, url, hosts_ir)
                     continue
                 html = Path(snapshot["path"]).read_bytes().decode(estratto.get("codifica", "utf-8-sig"))
                 links = candidati_comunicato(html, snapshot.get("url_finale") or url)
@@ -270,7 +296,8 @@ def _raccogli(profilo, archivio, oggi=None):
                     fonte.update(stato="parziale")
                     fonte["motivi"].append("nessun link candidato nella pagina IR osservata")
                 for link in links:
-                    aggiungi("IR", {"pagina_ir": url, "testo_link": link.get("testo")}, link["url"], hosts_ir)
+                    aggiungi("IR", {"pagina_ir": url, "testo_link": link.get("testo"), "origine": ORIGINE_IR},
+                             link["url"], hosts_ir)
             except Exception as exc:
                 fonte.update(stato="errore")
                 fonte["motivi"].append(f"{type(exc).__name__}: {exc}")

@@ -110,11 +110,16 @@ def test_errore_http_e_errore(monkeypatch, tmp_path):
     assert r["stato"] == "errore" and "503" in r["motivo"]
 
 
-def test_contatto_mancante_e_errore(monkeypatch, tmp_path):
-    _repo(monkeypatch, tmp_path, {})
+def test_contatto_mancante_la_ricerca_parte_lo_stesso(monkeypatch, tmp_path):
+    # Riscritto sulla decisione PM 05/10 sera: prima senza SEC_CONTACT_EMAIL era «errore»;
+    # ora filings.xbrl.org si interroga con lo User-Agent generico (la mail la esige solo la SEC).
+    query = _repo(monkeypatch, tmp_path, {"%Kore S.p.A.%": [_entita("KORE S.P.A.", LEI_KORE)]})
     monkeypatch.delenv("SEC_CONTACT_EMAIL")
+    get_finto, visti = requests.get, []
+    monkeypatch.setattr(requests, "get", lambda url, **k: visti.append(k.get("headers")) or get_finto(url, **k))
     r = esef.candidati_lei("KORE.MI", "Kore S.p.A.", ritmo=_niente_ritmo)
-    assert r["stato"] == "errore" and "SEC_CONTACT_EMAIL" in r["motivo"]
+    assert r["stato"] == "univoco" and r["candidati"][0]["lei"] == LEI_KORE, r
+    assert query and visti and visti[0]["User-Agent"] == esef.UA_GENERICO
 
 
 def test_senza_nome_nessuna_ricerca(monkeypatch, tmp_path):

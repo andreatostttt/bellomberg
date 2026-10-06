@@ -164,8 +164,13 @@ class WeeklyRunStore:
             book_compatible = current_book_identity(self.db) == self.context["book_identity"]
         except Exception:
             book_compatible = False
+        # REGOLA PM 05/10 (decisione main 06/10, V0-REDTEAM): un costo incerto NON blocca la
+        # ripresa: si dichiara nel motivo (`reason`, sotto) e la ripresa resta disponibile (il
+        # registro non reinvia la richiesta incerta). Blocca solo il registro NON verificabile:
+        # consigliere_multi rifiuta la ripresa senza registro («Registro richieste mancante»).
         reason = ("Worker ancora attivo" if active else
-                  "Richieste o costi incerti: riconciliazione necessaria" if uncertain else
+                  "Registro richieste non verificabile: ripresa non disponibile ("
+                  + str(costs.get("error") or "n.d.") + ")" if costs.get("unavailable") else
                   # Comitato sotto quorum (PM 04/10): run CHIUSA. I desk in lacuna restano fuori
                   # anche in ripresa, quindi una ripresa ricadrebbe nello stesso stop.
                   "Comitato sotto quorum: run chiusa senza memo di decisione, i desk in lacuna restano "
@@ -191,7 +196,16 @@ class WeeklyRunStore:
         if artifact_issues:
             result.update(status="incomplete", artifact_status="recovery_needed", artifact_issues=artifact_issues)
         if uncertain and result.get("status") == "completed":
-            result.update(status="incomplete", operational_status="blocked")
+            # costo da riconciliare: run «incompleta» dichiarata, non bloccata (regola PM 05/10)
+            result.update(status="incomplete", operational_status="requires_pm_review")
+        # Motivo NON bloccante dichiarato (lo legge esito_run di specialists/base.py dopo
+        # last_error/first_error/blocked_reason): decisioni non ammesse e costo incerto.
+        motivi = [m for m in (result.get("incomplete_reason"),
+                              ("Richieste o costi incerti DICHIARATI ("
+                               + str(costs.get("unknown_requests") or 0) + " a costo/esito incerto, da "
+                               "riconciliare): ripresa disponibile, nessun reinvio della richiesta incerta")
+                              if uncertain and not costs.get("unavailable") else None) if m]
+        result["reason"] = "; ".join(motivi) if motivi else None
         result["resume_available"] = research and result.get("status") != "completed" and reason is None
         if not research:
             result["blocked_reason"] = 'Run Excel in archivio: disponibile solo il recupero dei risultati gia prodotti' + (

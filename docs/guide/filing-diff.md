@@ -252,8 +252,9 @@ Confirmation is done with `POST /filings/{ticker}/activate` and `{"lei": "…"}`
 More than 5 similar results with no identical name: no proposal, the LEI is
 needed in the store. If the LEI store is unreadable, activation stops with an
 error: it might contain a different LEI from the one found by name. If the SEC
-is in error (network, `SEC_CONTACT_EMAIL` missing), there is no fallback to
-ESEF: the security might have a SEC link. If the SEC result is ambiguous, the
+is in error (network), there is no fallback to ESEF: the security might have a
+SEC link. Without `SEC_CONTACT_EMAIL` the SEC is stated as "not configured" and
+foreign listings are still searched on ESEF. If the SEC result is ambiguous, the
 CIK is confirmed first. The profile stays saved under the portfolio ticker and
 keeps the LEI and the origin of the link.
 
@@ -309,7 +310,8 @@ present are kept.
 **Pacing and cache.** filings.xbrl.org does not publish a limit. At most one
 request per second is made, with the pacing shared between the backend and the
 Advisor (`.esef_ritmo` in `data/`). Every request carries the contact
-`SEC_CONTACT_EMAIL`. The index of a LEI's filings stays cached for 6 hours in
+`SEC_CONTACT_EMAIL` when it is set, otherwise a generic project User-Agent
+(filings.xbrl.org does not require a contact; the SEC does). The index of a LEI's filings stays cached for 6 hours in
 `data/esef_cache/`. An unreadable cache is re-read immediately. With the network
 down, the previous copy is used and this is stated: the run is "partial" and
 should be retried.

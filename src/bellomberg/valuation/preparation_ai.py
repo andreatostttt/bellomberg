@@ -274,7 +274,12 @@ def live_metadata(model):
     import requests
     response = requests.get("https://openrouter.ai/api/v1/models", timeout=30)
     response.raise_for_status()
-    data = response.json()["data"]
+    body = response.json()
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list) or not all(isinstance(row, dict) for row in data):
+        # R-0RT F-C (06/10): risposta del fornitore malformata = ValueError dichiarabile, non
+        # KeyError/TypeError (che sembrerebbero errori di programmazione).
+        raise ValueError("live pricing catalog malformed (no list of model objects in 'data')")
     matches = [row for row in data if row.get("id") == model]
     base, _, variant = str(model).partition(":")
     if not matches and variant in _ROUTING_VARIANTS:

@@ -11,8 +11,11 @@ Riferimenti: Sharpe (1966), Sortino (1994), Calmar (Young 1991),
 Omega (Keating-Shadwick 2002), Ulcer Index (Martin 1989), Cornish-Fisher (1937).
 """
 
+import math
+import numbers
+
 from bellomberg.core.language import scoped_language
-from bellomberg.core.presentation import error_text, message
+from bellomberg.core.presentation import error_text, join_messages, message
 
 try:
     import numpy as np
@@ -21,6 +24,12 @@ except ImportError:
     NP_OK = False
 
 TRADING_DAYS = 252
+# Osservazioni minime perche' un beta entri nella riconciliazione (05/10, misura su serie
+# del book: a 60 date l'errore standard del beta e' ~0,15 e nessuna finestra di 60 si
+# allontana da sola dalla stima piena oltre la soglia di scarto 0,35; a 40 si', a 20 di
+# ~0,6-0,7). Stessa soglia di portfolio_risk.BETA_OBS_AFFIDABILE e
+# portfolio_factors.MIN_OBSERVATIONS.
+BETA_MIN_OBS = 60
 
 
 def _clean(returns):
@@ -159,6 +168,9 @@ def compute_metrics(returns, rf_annual=0.0, benchmark=None):
                 "correlation": _round(corr, 2),
                 "information_ratio": _round(info_ratio, 2),
                 "treynor_ratio": _round(treynor, 2),
+                # osservazioni su cui e' stimato il beta (guardrail 05/10: sotto
+                # BETA_MIN_OBS la fonte e' insufficiente in reconcile_betas)
+                "n_obs": int(m),
             }
     return out
 
@@ -283,6 +295,7 @@ def portfolio_metrics(benchmark_ticker="SPY"):
     # TWR (25/07, fonte unica: benchmark_series — la STESSA serie che consuma F2;
     # prima qui c'era un builder yfinance duplicato e diverso da quello di F2)
     bench_pair, bench_note = None, message("benchmark non disponibile", "benchmark unavailable")
+    allineamento_posizionale = False   # review R-4 05/10: tail-align legacy = coppie NON per data
     try:
         from bellomberg.market_data.benchmark_series import compute_benchmark_series
         bs = compute_benchmark_series(ticker=benchmark_ticker, twr_payload=twr_p)
@@ -321,6 +334,7 @@ def portfolio_metrics(benchmark_ticker="SPY"):
             elif b_rets:
                 b_arr = np.array(bs["ret_daily"], dtype=float)
                 bench_pair = (rets, b_arr)
+                allineamento_posizionale = True
                 bench_note = message("date portafoglio non disponibili: tail-align legacy (benchmark ufficiale EUR total-return)",
                                      "portfolio dates unavailable: legacy tail alignment (official EUR total-return benchmark)")
     except Exception as e:
@@ -345,6 +359,12 @@ def portfolio_metrics(benchmark_ticker="SPY"):
         mb = compute_metrics(bench_pair[0], rf_annual=_rf, benchmark=bench_pair[1])
         if isinstance(mb, dict) and mb.get("benchmark"):
             m["benchmark"] = mb["benchmark"]
+            if allineamento_posizionale:
+                # le coppie sono code allineate per POSIZIONE, non date comuni: il conteggio
+                # non e' un numero di osservazioni verificabile (classe "beta artefatto 0,04").
+                # n_obs None + allineamento dichiarato: reconcile_betas la tratta da insufficiente
+                m["benchmark"]["n_obs"] = None
+                m["benchmark"]["allineamento"] = "posizionale"
     m["risk_free_used"] = _rf
     m["risk_free_status"] = rf_status
     m["risk_free_source"] = rf_source
@@ -356,7 +376,7 @@ def portfolio_metrics(benchmark_ticker="SPY"):
 
 
 @scoped_language
-def reconcile_betas(threshold=0.35):
+def reconcile_betas(threshold=0.35, min_obs=None):
     """Guardrail di riconciliazione (voce 13/07, da audit memo #42): confronta il
     beta del book dai 3 motori — advanced_metrics (serie TWR vs SPY in EUR),
     portfolio_risk (beta_vs_spy) e factor model (beta_market FF regionale).
@@ -364,15 +384,35 @@ def reconcile_betas(threshold=0.35):
     divergenza moderata e' fisiologica; oltre soglia il verdetto e' UNRELIABLE
     e il beta NON va usato come argomento decisionale (nel memo #42 un beta
     artefatto 0,04 ha deciso da solo il "no hedge"). Ogni fonte e' opzionale:
-    chi fallisce finisce in sources_failed, non abbatte il guardrail."""
+    chi fallisce finisce in sources_failed, non abbatte il guardrail.
+    05/10 (opzioni 2+3 autorizzate dal PM): ogni motore dichiara le osservazioni;
+    sotto min_obs (default BETA_MIN_OBS) la fonte e' insufficiente e resta fuori
+    dallo scarto; con UNRELIABLE il payload porta `indicative` (non per decisioni)."""
+    if min_obs is None:
+        min_obs = BETA_MIN_OBS
     if not NP_OK:
         return {"error": message("numpy non disponibile", "numpy unavailable")}
-    betas, failed = {}, {}
+    # raccolti: chiave -> (beta, osservazioni dichiarate dal motore o None, motivo se non verificabili)
+    raccolti, failed = {}, {}
+
+    def _raccogli(k, b, n, motivo_n=None):
+        # review R-4 05/10 (C3): un beta NaN/inf non entra mai (min/max con NaN dipendono
+        # dall'ordine e il consenso diventerebbe nan): dichiarato in sources_failed
+        b = float(b)
+        if not math.isfinite(b):
+            failed[k] = message("beta non finito ({value}): scartato", "non-finite beta ({value}): discarded", value=str(b))
+        else:
+            raccolti[k] = (b, n, motivo_n)
+
     try:
         m = portfolio_metrics()
-        b = (m.get("benchmark") or {}).get("beta") if isinstance(m, dict) else None
+        bench = (m.get("benchmark") or {}) if isinstance(m, dict) else {}
+        b = bench.get("beta")
         if b is not None:
-            betas["advanced_metrics_twr"] = float(b)
+            _raccogli("advanced_metrics_twr", b, bench.get("n_obs"),
+                      message("allineamento posizionale col benchmark (date del portafoglio non disponibili): osservazioni non verificabili",
+                              "positional alignment with the benchmark (portfolio dates unavailable): observations cannot be verified")
+                      if bench.get("allineamento") == "posizionale" else None)
         else:
             failed["advanced_metrics_twr"] = ((m or {}).get("error")
                                                  or message("beta assente (benchmark non disponibile)", "beta missing (benchmark unavailable)"))
@@ -383,7 +423,7 @@ def reconcile_betas(threshold=0.35):
         r = compute_portfolio_risk()
         b = (r.get("portfolio") or {}).get("beta_vs_spy") if isinstance(r, dict) else None
         if b is not None:
-            betas["portfolio_risk_spy"] = float(b)
+            _raccogli("portfolio_risk_spy", b, r.get("beta_obs"))
         else:
             failed["portfolio_risk_spy"] = ((r or {}).get("error") or message("beta_vs_spy assente", "beta_vs_spy missing"))
     except Exception as e:
@@ -393,36 +433,139 @@ def reconcile_betas(threshold=0.35):
         f = compute_portfolio_factors()
         b = (f.get("portfolio_aggregate") or {}).get("beta_market") if isinstance(f, dict) else None
         if b is not None:
-            betas["factor_model_mkt"] = float(b)
+            # il composito e' una media pesata di regressioni per titolo: vale quanto il
+            # titolo con MENO osservazioni (scelta prudente); un titolo senza n_obs = non dichiarato
+            per_tit = [h.get("n_obs") for h in (f.get("per_holding") or {}).values()]
+            n_f = min(per_tit) if per_tit and all(_n_dichiarato(x) for x in per_tit) else None
+            _raccogli("factor_model_mkt", b, n_f)
         else:
             failed["factor_model_mkt"] = ((f or {}).get("error") or message("beta_market assente", "beta_market missing"))
     except Exception as e:
         failed["factor_model_mkt"] = error_text(e)
 
+    # Opzione 2 (PM 05/10): sotto min_obs la fonte e' INSUFFICIENTE: resta visibile con
+    # beta, osservazioni e motivo, ma NON entra nello scarto (un beta su poche date non
+    # puo' ne' certificare ne' far cadere la riconciliazione degli altri motori).
+    betas, insufficienti, n_obs = {}, {}, {}
+    for k, (b, n, motivo_n) in raccolti.items():
+        n_ok = int(n) if (motivo_n is None and _n_dichiarato(n)) else None
+        n_obs[k] = n_ok
+        if n_ok is None:
+            insufficienti[k] = {"beta": round(b, 3), "n_obs": None, "min_obs": min_obs,
+                                "reason": motivo_n or message("osservazioni non dichiarate dal motore: beta non verificabile",
+                                                              "observations not declared by the engine: beta cannot be verified")}
+        elif n_ok < min_obs:
+            insufficienti[k] = {"beta": round(b, 3), "n_obs": n_ok, "min_obs": min_obs,
+                                "reason": message("solo {n} date comuni col benchmark (minimo {soglia})",
+                                                  "only {n} common dates with the benchmark (minimum {soglia})",
+                                                  n=n_ok, soglia=min_obs)}
+        else:
+            betas[k] = b
+
     out = {"betas": {k: round(v, 3) for k, v in betas.items()},
+           "n_obs": n_obs,
+           "min_obs": min_obs,
+           "sources_insufficient": insufficienti,
            "sources_failed": failed,
            "threshold": threshold,
+           # unico interruttore per chi decide: True SOLO con RECONCILED
+           "beta_per_decisioni": False,
            "definitions": {
                "advanced_metrics_twr": message("serie TWR ufficiale vs benchmark ufficiale EUR total-return (benchmark_series), allineati per data", "official TWR series vs official EUR total-return benchmark (benchmark_series), aligned by date"),
                "portfolio_risk_spy": message("rendimenti book in EUR vs SPY convertito in EUR, ~1y", "book returns in EUR vs SPY converted to EUR, ~1y"),
                "factor_model_mkt": message("loading Mkt-RF composito FF regionale, ~3y", "regional FF composite Mkt-RF loading, ~3y"),
            },
-           "_source": "advanced_metrics.reconcile_betas (guardrail 13/07)"}
+           "_source": "advanced_metrics.reconcile_betas (guardrail 13/07, osservazioni minime 05/10)"}
+    # review R-4 05/10 (C1): la pagina di oggi legge solo betas/sources_failed/note: una fonte
+    # esclusa senza nota sparirebbe in silenzio. Con esclusioni la nota le nomina SEMPRE.
+    esclusi = None
+    if insufficienti:
+        esclusi = message("esclusi per osservazioni insufficienti: {elenco}",
+                          "excluded for insufficient observations: {elenco}",
+                          elenco=", ".join(k + " (" + ("n.d." if v["n_obs"] is None else str(v["n_obs"]))
+                                           + "/" + str(min_obs) + ")" for k, v in sorted(insufficienti.items())))
+
+    def _nota(principale):
+        return join_messages(" — ", [principale, esclusi]) if esclusi is not None else principale
+
     if len(betas) < 2:
+        # mai RECONCILED con una sola fonte: un motore non si riconcilia con niente
         out["verdict"] = "INSUFFICIENT_SOURCES"
-        out["note"] = message("servono almeno 2 motori per riconciliare", "at least 2 engines are needed for reconciliation")
+        out["note"] = _nota(message("servono almeno 2 motori con osservazioni sufficienti per riconciliare (ne risultano {n})",
+                                    "at least 2 engines with sufficient observations are needed for reconciliation ({n} available)",
+                                    n=len(betas)))
         return out
     vals = list(betas.values())
     out["max_spread"] = round(max(vals) - min(vals), 3)
     if out["max_spread"] > threshold:
         out["verdict"] = "UNRELIABLE"
-        out["note"] = message("i beta divergono oltre soglia: NON usare il beta come argomento decisionale finche' non riconciliato",
-                               "betas diverge beyond the threshold: DO NOT use beta for decisions until reconciled")
+        out["note"] = _nota(message("i beta divergono oltre soglia: NON usare il beta come argomento decisionale finche' non riconciliato",
+                                    "betas diverge beyond the threshold: DO NOT use beta for decisions until reconciled"))
+        # Opzione 3 (PM 05/10): intervallo e mediana DESCRITTIVI per la pagina, mai per
+        # decidere: testo_guardrail_beta_capo non li passa al Capo
+        out["indicative"] = {
+            "range": [round(min(vals), 3), round(max(vals), 3)],
+            "median": round(float(np.median(vals)), 2),
+            "basis": sorted(betas),
+            "uso": "non_per_decisioni",
+            "note": message("intervallo e mediana dei motori con osservazioni sufficienti: solo descrittivi, NON per decisioni ne' coperture",
+                            "range and median of the engines with sufficient observations: descriptive only, NOT for decisions or hedging"),
+        }
     else:
         out["verdict"] = "RECONCILED"
         out["beta_consensus"] = round(float(np.median(vals)), 2)
+        out["beta_per_decisioni"] = True
+        if esclusi is not None:
+            out["note"] = _nota(message("riconciliati {n} motori su {tot}", "{n} of {tot} engines reconciled",
+                                        n=len(betas), tot=len(betas) + len(insufficienti) + len(failed)))
     return out
 
+
+def _n_dichiarato(n):
+    """Osservazioni dichiarate = intero non negativo di tipo NUMERICO (bool, stringhe,
+    float non interi, NaN/inf esclusi)."""
+    if isinstance(n, bool) or not isinstance(n, numbers.Real):
+        return False
+    try:
+        return float(n) == int(n) and int(n) >= 0
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def testo_guardrail_beta_capo(rb):
+    """Blocco del prompt del Capo per il guardrail beta (regola memo #42).
+    Il beta e' un argomento decisionale SOLO con verdetto RECONCILED. Per ogni altro
+    verdetto (UNRELIABLE, INSUFFICIENT_SOURCES, ignoti) le coperture basate sul beta sono
+    vietate e al Capo arrivano SOLO verdetto, motivo e divieto: nessun valore per fonte,
+    nessun intervallo/mediana (review R-4 05/10: tre valori grezzi = range leggibile).
+    Payload assente o senza verdetto: il blocco c'e' lo stesso e dichiara il guardrail
+    non disponibile (mai riga assente)."""
+    titolo = "\n\n=== GUARDRAIL BETA (riconciliazione 3 motori) ===\n"
+    divieto = ("il beta NON e' un argomento decisionale valido (vietati verdetti di hedge "
+               "basati sul beta) finche' non riconciliato.")
+    if not isinstance(rb, dict) or not rb.get("verdict"):
+        motivo = (rb.get("error") if isinstance(rb, dict) else None) or "verdetto assente"
+        return titolo + "GUARDRAIL BETA non disponibile (" + str(motivo) + "): " + divieto
+    verdetto = str(rb.get("verdict"))
+    ins = rb.get("sources_insufficient") or {}
+    esclusi = ("\nfonti escluse per osservazioni insufficienti: "
+               + ", ".join(k + " (" + ("n.d." if v.get("n_obs") is None else str(v.get("n_obs"))) + " oss.)"
+                           for k, v in sorted(ins.items()))) if ins else ""
+    if verdetto == "RECONCILED" and rb.get("beta_per_decisioni") is True:
+        return (titolo + "verdetto: RECONCILED | beta: " + str(rb.get("betas"))
+                + (" | consenso: " + str(rb["beta_consensus"]) if rb.get("beta_consensus") is not None else "")
+                + esclusi
+                + "\nREGOLA: beta riconciliato, utilizzabile come argomento decisionale; "
+                  "con un verdetto diverso da RECONCILED il beta non lo sarebbe.")
+    if verdetto == "UNRELIABLE":
+        motivo = "i motori divergono oltre la soglia di scarto " + str(rb.get("threshold"))
+    elif verdetto == "INSUFFICIENT_SOURCES":
+        motivo = ("motori con osservazioni sufficienti: " + str(len(rb.get("betas") or {}))
+                  + " (ne servono almeno 2)")
+    else:
+        motivo = "verdetto non riconosciuto"
+    return (titolo + "verdetto: " + verdetto + "\nmotivo: " + motivo + esclusi
+            + "\nREGOLA: verdetto diverso da RECONCILED: " + divieto)
 
 if __name__ == "__main__":
     import json

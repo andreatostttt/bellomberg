@@ -273,17 +273,27 @@ class RequestJournal:
                 **({"cost_status": manual} if manual else {})})
         return result
 
-    def _quote(self, body):
-        from bellomberg.core.llm_pricing import preparation_price_ceiling
-        model = body.get("model")
+    def metadati_modello(self, model):
+        """Listino del modello (Models API) letto UNA volta per run e memorizzato: lo usano il
+        controllo prezzi e chi deve conoscere i limiti prima dell'invio (tetto del Red Team,
+        V0-REDTEAM 05/10). Restituisce (copia, gia_letto); un errore di lettura si propaga e
+        non si memorizza (il controllo prezzi successivo riprova e decide)."""
         with self._lock:
-            if model not in self._quotes:
+            gia_letto = model in self._quotes
+            if not gia_letto:
                 if self.metadata is None:
                     from bellomberg.valuation.preparation_ai import live_metadata
                     metadata = live_metadata(model)
                 else:
                     metadata = self.metadata(model)
                 self._quotes[model] = deepcopy(metadata)
+            return deepcopy(self._quotes[model]), gia_letto
+
+    def _quote(self, body):
+        from bellomberg.core.llm_pricing import preparation_price_ceiling
+        model = body.get("model")
+        with self._lock:
+            self.metadati_modello(model)
             return preparation_price_ceiling(self._quotes[model], model=model,
                                               max_tokens=body.get("max_tokens"))
 

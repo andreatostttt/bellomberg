@@ -269,11 +269,15 @@ def test_v4_placeholder_in_a_pillar_blocks_delivery(tmp_path):
 # ------------------------------------------------------------------ /2-/3 frozen output
 # Measured on the renderer BEFORE the /4 branches (HEAD e3d2622 + working tree of 04/10/2026),
 # with tests/test_trade_idea_report_v2.editorial_fixture. Whitespace-insensitive.
+# Rimisurati il 05/10/2026 (voce 9, impianto A): la fixture ha UNA lacuna, che ora apre la prima pagina
+# («LIMITI DI QUESTA ANALISI») e in §14 lascia un rinvio. Confronto vecchio/nuovo codice sulla stessa
+# fixture: le sole differenze sono il blocco, il rinvio e le righe di pagina spostate (sezioni 1-3 invariate,
+# v. FROZEN_SECTIONS_1_3 qui sotto, che resta identico).
 FROZEN_FULL_TEXT_SHA256 = {
-    ("it", "watch"): "d71d3d2056f2df6e62feabbc9cb113af1eefd44db8731871149e891f91702890",
-    ("it", "favorable"): "473cb57d46f2be470a98cf3b1d14734cb0a85806d63392495a15d455af7e480a",
-    ("en", "watch"): "2f4646137d482a931fc322b37f0c5a27efe78ffe6a2c5b77bf1bedef4a865fda",
-    ("en", "favorable"): "f35cdf2838f7970f4c3029e0df207a3bcbe0b504f748c9d205ad46eaa0dcb2de",
+    ("it", "watch"): "20a4e90c4427560b796c515438b97a1dbd9dedfea2bdad62c53e3b249949dc61",
+    ("it", "favorable"): "c8142eecfee22994cd5aeef22eb2595a78ae7e76b30db4f73b864e18da158b6a",
+    ("en", "watch"): "3dbac1ca07a6c9860ae880d8e148dffa771d97ab94f184779f9d091657349cc1",
+    ("en", "favorable"): "96939fc26ab539420d2f2250d67fbe6e41cc1e04d0fea05ee9d5f4658f731aff",
 }
 FROZEN_SECTIONS_1_3 = {
     ("it", "favorable"): (

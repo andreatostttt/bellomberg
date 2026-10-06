@@ -166,9 +166,9 @@ def preferita(proposta):
 
 MAX_SONDATI = 3  # candidati SEC di un listino estero di cui si legge il catalogo (rete)
 # Frase unica per la SEC non configurata: proposta, attivazione e card di Agents Live (Opus 5.5, 05/10).
-SEC_NON_CONFIGURATA = "SEC non configurata: imposta SEC_CONTACT_EMAIL nel .env"
-# filings.xbrl.org vuole lo stesso contatto nello User-Agent (esef._headers): stessa causa, detta per ESEF.
-ESEF_NON_CONFIGURATO = "ESEF non configurato: imposta SEC_CONTACT_EMAIL nel .env (filings.xbrl.org vuole un contatto)"
+# Decisione PM 05/10 sera: la mail la esige solo la SEC; l'ESEF parte comunque con uno
+# User-Agent generico del progetto (esef._headers), quindi la frase lo dice.
+SEC_NON_CONFIGURATA = "SEC non configurata: manca SEC_CONTACT_EMAIL nel .env — ESEF attivo"
 
 
 def _forme_utili(ticker, cik, catalogo_fn):
@@ -251,8 +251,6 @@ def proponi_esef(ticker, nome, *, rifiutati=frozenset(), rifiutati_lei=frozenset
     from bellomberg.market_data import esef
     try:
         esito = esef.candidati_lei(ticker, nome)
-    except esef.ContattoMancante:
-        return {"stato": "errore", "candidati": [], "motivo": ESEF_NON_CONFIGURATO}
     except Exception as exc:
         return {"stato": "errore", "candidati": [], "motivo": f"{type(exc).__name__}: {exc}"}
     candidati = [c for c in esito["candidati"] if c["lei"] not in rifiutati]

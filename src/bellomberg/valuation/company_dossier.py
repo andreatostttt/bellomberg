@@ -142,7 +142,8 @@ def _research_dossier_for_board(blackboard, ticker):
     """Verified source memory; never reconstruct a model or compile assumptions."""
     from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE
     qualification = getattr(blackboard, 'source_qualification', None)
-    snapshot = None
+    snapshot = bridge = None
+    bridge_refs = []
     if qualification is not None:
         from .trade_idea_model import source_fingerprint
         if (qualification.get('ticker') != ticker or not qualification.get('fingerprint')
@@ -173,19 +174,38 @@ def _research_dossier_for_board(blackboard, ticker):
             if expected_catalog != admitted_catalog:
                 raise ValueError('Research document revision differs from the admitted source dossier')
     else:
+        # V1-PONTE: documenti gia' verificati dall'archivio Filing, ammessi prima di R0 con ricevuta.
+        # None = run senza ponte (codice precedente) o titolo fuori perimetro: dossier di prima.
+        from bellomberg.agents.ponte_filing_dossier import documenti_ponte
+        bridge = documenti_ponte(blackboard, ticker)
         resolver = getattr(blackboard, 'company_source_session_if_known', None)
-        if not callable(resolver):
+        if not callable(resolver) and bridge is None:
             raise DossierUnavailable('No admitted company research is available for this ticker in the run')
-        session = resolver(ticker)
-        if session is None:
+        session = resolver(ticker) if callable(resolver) else None
+        if session is None and bridge is None:
             raise DossierUnavailable('No company documents were acquired for this ticker; coverage is unavailable')
-        pin = ((blackboard.data.get('_company_research') or {}).get(ticker) or {}).get('revision_id')
-        snapshot = session.snapshot(**({'expected_revision_id': pin} if pin is not None else {}))
-        if snapshot.get('ticker') != ticker:
-            raise ValueError('Company research snapshot belongs to a different ticker')
-        documents, as_of = snapshot.get('documents') or [], snapshot['as_of']
-        fingerprint = snapshot.get('revision_sha256')
+        if session is not None:
+            pin = ((blackboard.data.get('_company_research') or {}).get(ticker) or {}).get('revision_id')
+            snapshot = session.snapshot(**({'expected_revision_id': pin} if pin is not None else {}))
+            if snapshot.get('ticker') != ticker:
+                raise ValueError('Company research snapshot belongs to a different ticker')
+            documents, as_of = snapshot.get('documents') or [], snapshot['as_of']
+            fingerprint = snapshot.get('revision_sha256')
+        else:
+            documents, as_of, fingerprint = [], blackboard.data['_filing_bridge']['as_of'], None
+        if bridge is not None:
+            bridge_documents, bridge_declaration = bridge
+            if bridge_documents and as_of != blackboard.data['_filing_bridge']['as_of']:
+                raise ValueError('Filing bridge cutoff differs from the company research session')
+            # Stessi byte gia' acquisiti dal desk: resta il documento del desk, nessun duplicato.
+            acquired = {doc.get('id') for doc in documents}
+            bridge_declaration['gia_acquisiti_dal_desk'] = [doc['id'] for doc in bridge_documents if doc['id'] in acquired]
+            # Riferimenti SENZA testo dalla sola ricevuta: il sigillo non rilegge mai l'archivio vivo.
+            bridge_refs = [doc for doc in bridge_documents if doc['id'] not in acquired]
+            fingerprint = fingerprint or bridge_declaration['entry_sha256']
     catalog = _catalog(documents, as_of) if documents else {}
+    if bridge is not None:
+        catalog.update({doc['id']: deepcopy(doc) for doc in bridge_refs})
     result = {'contract': 'company_dossier/1', 'analysis_mode': RESEARCH_ANALYSIS_MODE,
         'ticker': ticker, 'research_as_of': as_of, 'method_id': None,
         'source_fingerprint': fingerprint, 'generation_id': None,
@@ -200,6 +220,48 @@ def _research_dossier_for_board(blackboard, ticker):
         result['research_revision'] = {key: deepcopy(snapshot.get(key)) for key in
             ('revision_id', 'revision_sha256', 'parent_grant_fingerprint')}
         result = _with_acquisition_diagnostics(result, snapshot)
+    if qualification is None and bridge is not None:
+        result['filing_bridge'] = bridge_declaration
+        if not catalog and bridge_declaration['esito'] == 'non_applicabile':
+            # Decisione PM 06/10: ETF/ETN/fondi non hanno un bilancio societario: non e' una ricerca mancante.
+            result['status'] = 'non_applicabile'
+            result['issues'] = [{'field': 'documents', 'code': 'non_applicabile',
+                                 'reason': '; '.join(bridge_declaration['motivi'])}]
+            non_usati = bridge_declaration.get('verificati_non_usati') or {}
+            if non_usati.get('conteggio') != 0 and 'conteggio' in non_usati:
+                # Documenti verificati di uno strumento non societario: non ammessi ma mai persi in silenzio.
+                result['issues'].append({'field': 'documents', 'code': 'filing_archive_verificati_non_usati',
+                    'reason': ("%s documenti verificati dall'archivio Filing ma non usati: strumento %s (scelta PM)"
+                               % ('n.d.' if non_usati['conteggio'] is None else non_usati['conteggio'],
+                                  bridge_declaration.get('tipo_strumento'))
+                               + ('' if non_usati['conteggio'] is not None else '; ' + non_usati['motivo']))})
+        elif not catalog:
+            result['issues'].append({'field': 'documents', 'code': 'filing_archive_' + str(bridge_declaration['esito']),
+                'reason': 'Archivio Filing: ' + ('; '.join(bridge_declaration['motivi']) or str(bridge_declaration['esito']))})
+        elif bridge_declaration['motivi']:
+            # Archivio non aggiornato / run in errore / repository fermo: dichiarato accanto ai documenti.
+            result['issues'].append({'field': 'documents', 'code': 'filing_archive_limitation',
+                'reason': 'Archivio Filing: ' + '; '.join(bridge_declaration['motivi'])
+                          + ' (periodo piu\' recente ammesso: ' + str(bridge_declaration['periodo_piu_recente']) + ')'})
+        for doc in bridge_refs:
+            eta = doc['metadata']['filing_bridge']
+            if eta['esercizio_successivo_chiuso']:
+                # Fatto di calendario, nessuna soglia di giudizio: la soglia di obsolescenza la decide il PM.
+                result['issues'].append({'field': 'documents', 'code': 'filing_archive_esercizio_successivo_chiuso',
+                    'document_id': doc['id'], 'reason': ('Documento del periodo %s: al cutoff %s (eta %d giorni) '
+                    "si e' gia' chiuso il periodo omologo successivo (%s); NON e' il periodo piu' recente chiuso."
+                    % (eta['periodo_fine'], as_of, eta['eta_giorni_al_cutoff'], eta['fine_esercizio_successivo']))})
+            if eta.get('corrente') is False:
+                # Soglia PM 06/10 (nella ricevuta): il documento resta ammesso ma e' dichiarato non corrente.
+                result['issues'].append({'field': 'documents', 'code': 'filing_archive_documento_non_corrente',
+                    'document_id': doc['id'], 'reason': ('Documento %s del periodo %s NON corrente al cutoff %s: '
+                    'corrente fino al %s (%d mesi, soglia PM 06/10); ammesso e dichiarato.'
+                    % (eta['tipo_periodo'], eta['periodo_fine'], as_of, eta['corrente_fino_al'], eta['soglia_mesi']))})
+            elif 'corrente' in eta and eta['corrente'] is None:
+                result['issues'].append({'field': 'documents', 'code': 'filing_archive_eta_non_valutabile',
+                    'document_id': doc['id'], 'reason': ('Documento del periodo %s: tipo di periodo non noto, '
+                    'soglia di eta\' PM 06/10 non applicabile (eta %d giorni).'
+                    % (eta['periodo_fine'], eta['eta_giorni_al_cutoff']))})
     if qualification is not None:
         # PM-supplied unreadable documents precede the ResearchSession journal.
         # Keep their source and rejection beside later successful acquisitions;
@@ -334,8 +396,18 @@ def read_company_dossier(blackboard, input_, max_chars):
         dossier = dossier_for_board(blackboard, ticker)
         section = input_.get('section', 'catalog')
         if section == 'document':
-            return _read_document({doc['id']: doc for doc in dossier['documents']}, input_, max_chars,
-                                  dossier['source_fingerprint'])
+            documents = {doc['id']: doc for doc in dossier['documents']}
+            chosen = documents.get(input_.get('document_id'))
+            if chosen is not None and 'text' not in chosen and (chosen.get('metadata') or {}).get('filing_bridge'):
+                # V1-PONTE: il sigillo tiene il documento per riferimento; byte e testo si riverificano ORA.
+                from bellomberg.agents.ponte_filing_dossier import testo_documento, DocumentoPonteNonDisponibile
+                try:
+                    documents[chosen['id']] = {**chosen, 'text': testo_documento(blackboard, chosen)}
+                except DocumentoPonteNonDisponibile as exc:
+                    return {'ok': False, 'status': 'unavailable', 'declared_gap': True, 'requires_acquisition': False,
+                            'document_id': chosen['id'], 'expected_sha256': chosen['document_sha256'],
+                            'reason': str(exc) + '. Dichiara la lacuna di questo documento; la run prosegue.'}
+            return _read_document(documents, input_, max_chars, dossier['source_fingerprint'])
         if section not in ('catalog', 'records'):
             raise ValueError('section must be catalog, records or document')
         body = dossier['records'] if section == 'records' else {

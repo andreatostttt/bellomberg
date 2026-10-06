@@ -60,11 +60,30 @@ def test_impostazioni_citano_tradingview_col_link():
     """L'ancora VISIBILE, non un commento: href richiesto dalla licenza di Lightweight
     Charts, apertura esterna (`target`/`rel` come gli altri link dell'app) e il nome
     del creatore nel testo del link (README di LWC: «specifying TradingView as the
-    product creator»)."""
-    t = _testo("app/src/components/SettingsPanel.tsx")
+    product creator»).
+
+    Dal pannello Nuova (PR #9 di Andrea, 05/10) la riga sta nella sezione Generale,
+    `SezioneGenerale` in `impostazioni/Viste.tsx`: il test segue la riga dov'e', e
+    pretende in piu' che il pannello importi e MONTI quella sezione (un'ancora in un
+    componente che nessuno rende non e' un'attribuzione) e che l'etichetta abbia la
+    chiave nei due cataloghi."""
+    pannello = _testo("app/src/components/SettingsPanel.tsx")
+    assert re.search(r"import\s*\{[^}]*\bSezioneGenerale\b[^}]*\}\s*from\s*'\./impostazioni/Viste'", pannello), \
+        "SettingsPanel non importa SezioneGenerale da ./impostazioni/Viste"
+    assert re.search(r"<SezioneGenerale\b", pannello), "SettingsPanel non monta SezioneGenerale"
+    viste = _testo("app/src/components/impostazioni/Viste.tsx")
+    inizio = viste.index("export function SezioneGenerale(")
+    fine = viste.find("\nexport function ", inizio + 1)
+    t = viste[inizio:fine if fine != -1 else len(viste)]
     assert "https://www.tradingview.com/" in t, "manca il link richiesto dalla licenza di Lightweight Charts"
-    ancora = re.search(r'<a\b[^>]*href="https://www\.tradingview\.com/"[^>]*>([^<]*)</a>', t)
+    ancora = re.search(r'<a\b[^>]*href="https://www\.tradingview\.com/"[^>]*>(.*?)</a>', t, re.S)
     assert ancora, "il link a tradingview.com non e' un'ancora <a> visibile"
     tag = ancora.group(0)
     assert 'target="_blank"' in tag and 'rel="noreferrer"' in tag, tag
-    assert "TradingView" in ancora.group(1) and "Lightweight Charts" in ancora.group(1), ancora.group(1)
+    # il testo del link senza i tag interni (l'icona ExternalLink): deve DIRE il creatore
+    testo = re.sub(r"<[^>]*>", "", ancora.group(1))
+    assert "TradingView" in testo and "Lightweight Charts" in testo, testo
+    assert "tr('settingsPage.charts')" in t, "l'etichetta della riga non passa dal catalogo"
+    for lingua in ("it", "en"):
+        catalogo = _testo("app/src/i18n/%s/settingsPage.ts" % lingua)
+        assert re.search(r'"charts"\s*:\s*"[^"]+"', catalogo), "manca settingsPage.charts in %s" % lingua

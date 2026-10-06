@@ -32,7 +32,7 @@ from bellomberg.agents.specialists import base
 from bellomberg.core import llm_client, llm_pricing
 from bellomberg.reporting import pdf_institutional, charts_institutional
 from bellomberg.storage import memory_db
-from bellomberg.valuation import dcf_engine
+from bellomberg.valuation import dcf_engine, preparation_ai
 
 # Capture real functions before the reused fixture replaces their module bindings.
 REAL_ROSTER = tuple(cm.SPECIALIST_ORDER)
@@ -81,7 +81,12 @@ def replay(run_offline, db, tmp_path, monkeypatch, replay_loop):
     llm_pricing.reset_fx_memo()
     state = SimpleNamespace(db=db, clients={}, news=[], prepared=[], capo_calls=[],
                             side_calls=[], extractor_calls=[], network=attempted_network,
-                            smtp=run_offline.inviati, loop=replay_loop)
+                            smtp=run_offline.inviati, loop=replay_loop, catalog_reads=[])
+    # Models API (listino/limiti OpenRouter): dato di rete come il cambio FX, sintetico nel
+    # replay. Il Red Team lo legge dal registro richieste della run (V0-REDTEAM 05/10).
+    monkeypatch.setattr(preparation_ai, "live_metadata", lambda model: state.catalog_reads.append(model) or {
+        "id": model, "context_length": 1_000_000, "top_provider": {"max_completion_tokens": 65536},
+        "pricing": {"prompt": "0.000001", "completion": "0.000002"}})
 
     def research_block(*, sector_bundles, decision_links):
         # Actual prepare_sector_analysis via the shared fixture, on explicit synthetic

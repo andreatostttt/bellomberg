@@ -858,8 +858,17 @@ def _render(path, run, result, valuations, language, partial_reasons):
     destination = result.get("destination") or run.get("destination") or {}
     route_key = {"dcn": "dcn", "research": "research_route"}.get(destination.get("kind"), "none")
     story = [_DecisionCover(run, result, valuations, language, styles, partial_reasons),
-             NextPageTemplate("body"), PageBreak(), _Section("contents", _label("contents", language)),
-             _SectionTitle(_label("contents", language), styles["h1"], width), Spacer(1, 15)]
+             NextPageTemplate("body"), PageBreak()]
+    # Voce 9, impianto A: la copertina e' un disegno a misura fissa, quindi il blocco delle lacune
+    # apre la prima pagina di testo, prima del sommario; qui non c'e' un altro elenco: tutte le righe.
+    gap_rows = _gap_rows(result.get("data_gaps"))
+    if gap_rows:
+        story.extend(_limits_block(
+            gap_rows, _text, ParagraphStyle("tiGapHead", parent=styles["cell"], fontName=bold, textColor=OBSIDIAN),
+            ParagraphStyle("tiGapItem", parent=styles["cell"], leftIndent=20, bulletIndent=0, bulletFontName=reg,
+                           bulletFontSize=8.6, spaceAfter=1.5), width, language))
+    story += [_Section("contents", _label("contents", language)),
+              _SectionTitle(_label("contents", language), styles["h1"], width), Spacer(1, 15)]
     for index, section in enumerate(result.get("dossier", []), 1):
         story.append(Paragraph(f'<link href="#{escape(section["key"], quote=True)}" color="#050608">'
                                f'{index:02}  {_text(section["title"])}</link>', styles["body"]))
@@ -1251,6 +1260,86 @@ def _clean(value, sources, language, *, cell=False, plain=False, localize_cells=
 def _shown(value, sources, language, *, cell=False, localize_cells=True):
     """Reportlab markup of the display transform."""
     return _text(_clean(value, sources, language, cell=cell, localize_cells=localize_cells))
+
+
+# Voce 9, impianto A (05/10/2026): le lacune dichiarate (data_gaps) si leggono in prima pagina.
+# Il Capo spesso le numera da se' («1. Semestrale ...»): accanto alla lettera (a) diventava
+# «(a) 1. Semestrale». La numerazione si toglie qui, UNA trasformazione usata dal renderer
+# e dall'ispettore d'integrita' (che altrimenti cercherebbe «1.» nel PDF e non lo troverebbe).
+_GAP_NUMBER = re.compile(r"^\s*(\d{1,2})[.)]\s+")
+_GAPS_FIRST_PAGE = 15  # oltre, le prime 15 + una riga dichiarata che rinvia all'elenco completo
+_GAPS_FIRST_PAGE_CHARS = 2000  # e non oltre ~2.000 caratteri: «1. Raccomandazione» resta a pagina 1
+
+
+def _gap_texts(values):
+    """Le lacune come le stampa il memo. La numerazione iniziale («1. », «2) ») si toglie SOLO se le
+    voci numerate lo sono in sequenza 1, 2, 3...: «12. dicembre 2025: ...» o «3) trimestre» da soli
+    sono testo e restano interi."""
+    texts = [str(value if value is not None else "") for value in values or []]
+    numbers = [int(m.group(1)) for m in map(_GAP_NUMBER.match, texts) if m]
+    if numbers and numbers == list(range(1, len(numbers) + 1)):
+        texts = [_GAP_NUMBER.sub("", text, count=1) for text in texts]
+    return [text.strip() for text in texts]
+
+
+def _gap_rows(values):
+    """(testo, volte) in ordine di prima comparsa: la stessa frase ripetuta si accorpa e si
+    dichiara con «(×n)», non si perde."""
+    rows = {}
+    for text in _gap_texts(values):
+        rows[text] = rows.get(text, 0) + 1
+    return list(rows.items())
+
+
+def _gaps_on_first_page(rows):
+    """Quante righe entrano nel blocco di prima pagina: al massimo 15 e ~2.000 caratteri (almeno una)."""
+    count = chars = 0
+    for text, _ in rows:
+        if count == _GAPS_FIRST_PAGE or (count and chars + len(text) > _GAPS_FIRST_PAGE_CHARS):
+            break
+        count, chars = count + 1, chars + len(text)
+    return count
+
+
+def _gap_items(rows, show, style, language="it"):
+    """Paragrafi (a), (b)... delle lacune, con «(×n)» per le ripetute; una voce vuota e' DICHIARATA."""
+    empty = _text("(lacuna senza testo nel risultato)" if language == "it" else "(gap with no text in the result)")
+    return [Paragraph((show(text) if text else empty) + (_text(f" (×{count})") if count > 1 else ""), style,
+                      bulletText=f"({chr(97 + i) if i < 26 else i + 1})")
+            for i, (text, count) in enumerate(rows)]
+
+
+def _limits_block(rows, show, head_style, item_style, width, language, *, limit=None, overflow_ref=None,
+                  pipeline=0, pipeline_ref=None):
+    """Blocco «LIMITI DI QUESTA ANALISI — N lacune dichiarate» (impianto A): filetti navy, niente
+    fondo colorato. ``limit``: righe mostrate; le altre sono DICHIARATE con il rinvio all'elenco
+    completo (mai un taglio silenzioso). ``pipeline``: lacune della pipeline dati, solo contate qui."""
+    it = language == "it"
+    total = sum(count for _, count in rows)
+    head = ("LIMITI DI QUESTA ANALISI" if it else "LIMITS OF THIS ANALYSIS") + f" — {len(rows)} " + (
+        ("lacuna dichiarata" if len(rows) == 1 else "lacune dichiarate") if it else
+        ("declared gap" if len(rows) == 1 else "declared gaps"))
+    if total != len(rows):
+        head += (f" ({total} voci; le ripetute sono accorpate e contate con ×n)" if it else
+                 f" ({total} entries; repeats are merged and counted with ×n)")
+    shown = rows if limit is None else rows[:limit]
+    cells = [[Paragraph(_text(head), head_style)]]
+    cells += [[item] for item in _gap_items(shown, show, item_style, language)]
+    rest = len(rows) - len(shown)
+    if rest:
+        cells.append([Paragraph(_text(((f"… e altre {rest} lacune" if rest > 1 else "… e un'altra lacuna") + f": elenco completo in §{overflow_ref}." if it else
+                                       f"… and {rest} more gaps: full list in §{overflow_ref}.")), item_style)])
+    if pipeline:
+        cells.append([Paragraph(_text((f"+ {pipeline} " + ("lacune" if pipeline > 1 else "lacuna") + " della pipeline dati (dati che la run non ha "
+                                       f"procurato): §{pipeline_ref}." if it else
+                                       f"+ {pipeline} data-pipeline gaps (data the run did not obtain): "
+                                       f"§{pipeline_ref}.")), item_style)])
+    box = Table(cells, colWidths=[width])
+    box.setStyle(TableStyle([("LINEABOVE", (0, 0), (-1, 0), .8, _M_NAVY), ("LINEBELOW", (0, 0), (-1, 0), .3, _M_RULE),
+                             ("LINEBELOW", (0, -1), (-1, -1), .8, _M_NAVY), ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                             ("RIGHTPADDING", (0, 0), (-1, -1), 0), ("TOPPADDING", (0, 0), (-1, -1), 1.5),
+                             ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5), ("BOTTOMPADDING", (0, 0), (-1, 0), 4)]))
+    return [Spacer(1, 10), box]
 
 
 def _fmt(value, decimals=0, language="it", *, suffix="", scale=1.0):
@@ -1870,7 +1959,6 @@ def _render_company_memo(path, run, result, language, partial_reasons, *, locali
             story.append(Paragraph(_text(unit), st["unit"]))
 
     charts, missing = {}, []
-    title_gaps = []
 
     def exhibit(key, chart_dir):
         if key == "table:history":
@@ -1959,6 +2047,37 @@ def _render_company_memo(path, run, result, language, partial_reasons, *, locali
             story.append(Paragraph(_text(_label("partial", language) + ": " + "; ".join(partial_reasons)), st["note"]))
         if run.get("preview"):
             story.append(Paragraph(_text("ANTEPRIMA · DATI SINTETICI" if it else "PREVIEW · SYNTHETIC DATA"), st["note"]))
+
+        # Voce 9, impianto A (05/10/2026): le lacune dichiarate PRIMA della raccomandazione, SEMPRE
+        # (anche nel risultato incompleto del Capo caduto, che non ha la sezione «decision»).
+        # Numeri di paragrafo calcolati come li assegna il ciclo qui sotto: sezioni 1-3 fisse, poi
+        # il dossier in ordine; in «decision» il paragrafo delle lacune segue quelli del Capo.
+        gap_rows = _gap_rows(result.get("data_gaps"))
+        dossier_keys = [d["key"] for d in result.get("dossier", [])]
+        notes_number = 4 + len(dossier_keys)  # «Nota sui dati della run», dopo l'ultima sezione del dossier
+        # Le lacune della pipeline (Nota sui dati) si costruiscono QUI, una volta: la prima pagina ne stampa
+        # il conteggio e la Nota stampa la stessa lista. I titoli /4 scritti dal Capo passano da un _Sources
+        # usa-e-getta: la numerazione delle fonti del documento resta quella della prima comparsa.
+        scratch = _Sources(result, annex_data, language, facts)
+        title_gaps = [declared for d in (result.get("dossier", []) if v4 else [])
+                      for declared in [_m_section_title(d["key"], _clean(d["title"], scratch, language, plain=True),
+                                                        language)[1]] if declared]
+        gaps = [*((facts or {}).get("gaps") or []), *(f"{c['title']}: {c['missing']}" for c in missing), *market_gaps,
+                *title_gaps]
+        pipeline_count = len(gaps)
+        first_page = _gaps_on_first_page(gap_rows)
+        gaps_overflow = first_page < len(gap_rows)
+        if "decision" in dossier_keys:
+            index = dossier_keys.index("decision")
+            gaps_ref = f"{4 + index}.{len(result['dossier'][index].get('paragraphs', [])) + 1}"
+        else:  # nessuna Decisione: l'elenco completo va nella Nota sui dati, dopo le lacune della pipeline
+            gaps_ref = f"{notes_number}.{2 if pipeline_count else 1}"
+        gap_item = ParagraphStyle("mGapItem", parent=st["cell"], fontSize=8.8, leading=11.6, leftIndent=20,
+                                  bulletIndent=0, bulletFontName=reg, bulletFontSize=8.8, spaceAfter=1.5)
+        if gap_rows:
+            story.extend(_limits_block(gap_rows, show_sans, st["head"], gap_item, width, language,
+                                       limit=first_page, overflow_ref=gaps_ref,
+                                       pipeline=pipeline_count, pipeline_ref=f"{notes_number}.1"))
 
         # 1. Raccomandazione.
         section("recommendation", label("Raccomandazione", "Recommendation"))
@@ -2059,9 +2178,7 @@ def _render_company_memo(path, run, result, language, partial_reasons, *, locali
             key = dossier["key"]
             capo_title = _clean(dossier["title"], sources, language, plain=True)
             if v4:  # fixed heading from the key (PM 04/10); /2-/3 keep the Capo's title (frozen output)
-                capo_title, declared = _m_section_title(key, capo_title, language)
-                if declared:
-                    title_gaps.append(declared)
+                capo_title, _ = _m_section_title(key, capo_title, language)  # la riga dichiarata e' gia' in «gaps»
             number = section(key, capo_title)
             sub, texts = 0, list(dossier.get("paragraphs", []))
             if key == "pm_view":
@@ -2108,13 +2225,24 @@ def _render_company_memo(path, run, result, language, partial_reasons, *, locali
                 table.setStyle(TableStyle(_M_TABLE))
                 story.append(table)
             elif key == "decision":
-                for title, values in ((label("Dati mancanti e limiti", "Data gaps and limitations"), result.get("data_gaps")),
-                                      (label("Domande decisive", "Decisive questions"), result.get("decisive_questions"))):
-                    if values:
-                        sub += 1
-                        story.append(Paragraph(_text(f"{number}.{sub} {title}"), st["h2"]))
-                        items(values)
-                        texts.extend(values)
+                if gap_rows:  # impianto A: rinvio alla prima pagina; oltre il tetto, l'elenco completo
+                    sub += 1
+                    story.append(Paragraph(_text(f"{number}.{sub} " + label("Dati mancanti e limiti",
+                                                                            "Data gaps and limitations")), st["h2"]))
+                    if gaps_overflow:
+                        story.extend(_gap_items(gap_rows, show, st["item"], language))
+                    else:
+                        story.append(Paragraph(_text(label("Elencate in prima pagina, «Limiti di questa analisi».",
+                                                           "Listed on page one, «Limits of this analysis».")),
+                                               st["body"]))
+                    texts.extend(result["data_gaps"])
+                values = result.get("decisive_questions")
+                if values:
+                    sub += 1
+                    story.append(Paragraph(_text(f"{number}.{sub} " + label("Domande decisive", "Decisive questions")),
+                                           st["h2"]))
+                    items(values)
+                    texts.extend(values)
                 destination = result.get("destination") or run.get("destination") or {}
                 if destination.get("reason"):
                     sub += 1
@@ -2158,11 +2286,12 @@ def _render_company_memo(path, run, result, language, partial_reasons, *, locali
         leftovers = [k for keys in _M_EXHIBITS.values() for k in keys
                      if k in charts or (k.startswith("table:") and not any(
                          d["key"] in [s for s, ks in _M_EXHIBITS.items() if k in ks] for d in result.get("dossier", [])))]
-        gaps = [*((facts or {}).get("gaps") or []), *(f"{c['title']}: {c['missing']}" for c in missing), *market_gaps, *title_gaps]
-        if leftovers or gaps or not facts:
+        full_list_here = gaps_overflow and "decision" not in dossier_keys
+        if leftovers or gaps or not facts or full_list_here:
             number = section("data_notes", label("Nota sui dati della run", "Note on the run data"))
             for exhibit_key in leftovers:
-                exhibit(exhibit_key, chart_dir)
+                if facts or not exhibit_key.startswith("table:"):  # come nel dossier: senza facts lo dice la riga sotto
+                    exhibit(exhibit_key, chart_dir)
             if not facts:
                 story.append(Paragraph(_text(label("Dati numerici della run non disponibili: tabelle e figure deterministiche "
                                                    "non prodotte.", "Run numeric data not available: no deterministic "
@@ -2172,6 +2301,11 @@ def _render_company_memo(path, run, result, language, partial_reasons, *, locali
                                                                     "Data the run did not obtain")), st["h2"]))
                 for index, gap in enumerate(gaps):
                     story.append(Paragraph(_text(gap), st["item"], bulletText=f"({chr(97 + index) if index < 26 else index + 1})"))
+            if full_list_here:  # Capo caduto con piu' lacune del tetto: l'elenco completo cui rinvia la prima pagina
+                story.append(Paragraph(_text(f"{gaps_ref} " + label("Dati mancanti e limiti — elenco completo",
+                                                                    "Data gaps and limitations — full list")), st["h2"]))
+                story.extend(_gap_items(gap_rows, show, st["item"], language))
+                sources_line(result["data_gaps"])
 
         # Allegati.
         annex = _annex_blocks(annex_data, language)
@@ -2544,8 +2678,11 @@ def _inspect_company_memo(path, result, section_pages, language, execution_polic
     # The PDF shows the single display transform (numbered sources, no hashes, localized
     # cells): the original is compared through the SAME transform, never loosened.
     localize_cells = execution_policy != EXECUTION_POLICY_V4
-    shown = lambda name, value: _clean(value, sources, language, cell=".table." in name, plain=True,
-                                       localize_cells=localize_cells)
+    # Le lacune si stampano senza la numerazione del Capo in sequenza (_gap_texts): stessa trasformazione qui.
+    gap_texts = _gap_texts(result.get("data_gaps"))
+    shown = lambda name, value: _clean(gap_texts[int(name.split(".")[1])] if name.startswith("data_gaps.") else value,
+                                       sources, language,
+                                       cell=".table." in name, plain=True, localize_cells=localize_cells)
     furniture = {"BELLOMBERG", "Ricerca Bellomberg · Documento interno", "Bellomberg Research · Internal document",
                  "ANTEPRIMA · DATI SINTETICI", "PREVIEW · SYNTHETIC DATA", *_M_FOOTER}
     table_heads = {shown(".table.", cell).strip() for section in result.get("dossier", [])

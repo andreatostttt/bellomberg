@@ -275,7 +275,11 @@ def test_lettore_illeggibile_tre_volte_lo_dice_col_suo_nome(tmp_path, monkeypatc
 def test_lettore_senza_file_resta_nessuna_run(tmp_path, monkeypatch, language, message):
     api, p = _api_su(tmp_path, monkeypatch, None)
     with language_context(language):
-        assert api.get_agents_live() == {"running": False, "message": message}
+        r = api.get_agents_live()
+        # handoff-4 voce 2: anche «nessuna run» porta l'esito di pagina esplicito
+        assert {k: r[k] for k in ("running", "message")} == {"running": False, "message": message}
+        assert set(r) == {"running", "message", "esito_run"}
+        assert r["esito_run"]["stato"] == "nessuna_run" and "heartbeat" not in r
 
 
 @pytest.mark.parametrize('language,message', [('it', 'Nessuna run attiva.'), ('en', 'No active run.')])
@@ -295,7 +299,11 @@ def test_lettore_file_sparito_dopo_un_reset_e_nessuna_run_non_un_guasto(tmp_path
 
     monkeypatch.setattr(builtins, "open", finto)
     with language_context(language):
-        assert api.get_agents_live() == {"running": False, "message": message}
+        r = api.get_agents_live()
+        # handoff-4 voce 2: anche «nessuna run» porta l'esito di pagina esplicito
+        assert {k: r[k] for k in ("running", "message")} == {"running": False, "message": message}
+        assert set(r) == {"running", "message", "esito_run"}
+        assert r["esito_run"]["stato"] == "nessuna_run" and "heartbeat" not in r
 
 
 @pytest.mark.parametrize('language,prefix,object_word', [('it', 'errore lettura', 'oggetto'), ('en', 'Read error', 'object')])

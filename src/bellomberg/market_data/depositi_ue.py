@@ -10,7 +10,8 @@ INTERFACCIA DICHIARATA (chi la cambia avvisa D4):
     paese_di_instradamento(ticker, isin=None, dopo_sdir_italiano=False) -> {paese, regola, paese_listino, paese_isin,
                                                                              discordanza, perche, errore}
     nomi_documento(paese, tipo) -> (lista di regex_str | None, motivo)      # AGGIUNTA 2
-    COPERTURA_UE: {paese: {"modulo", "fonte", "natura_data", "canale", "motivo_limite", "motivo_limite_en"}}
+    COPERTURA_UE: {paese: {"modulo", "fonte", "natura_data", "canale", "motivo_limite", "motivo_limite_en",
+                           "ripiego_documenti"}}   # ripiego_documenti: AGGIUNTA V8B 05/10 (None se coperto)
     get_data_deposito(ticker, *, tipo, periodo_fine, isin=None, lei=None, nome=None) -> dict
     riverifica_ricevuta(ricevuta, *, ticker, tipo, periodo_fine) -> (ok: bool, motivo: str)
 
@@ -84,12 +85,19 @@ _LIMITE_AT_PT_EN = ("national OAM without a queryable interface found (survey of
 
 def _coperto(modulo: str, fonte: str, natura: str, canale: str = "OAM") -> Dict[str, Any]:
     return {"modulo": modulo, "fonte": fonte, "natura_data": natura, "canale": canale,
-            "motivo_limite": None, "motivo_limite_en": None}
+            "motivo_limite": None, "motivo_limite_en": None, "ripiego_documenti": None}
+
+
+# Decisione PM 05/10 (opzione B): dove l'archivio ufficiale non da' documenti, le relazioni periodiche in
+# PDF si cercano sul sito dell'emittente (esef_sito), DICHIARATE come tali. Solo i documenti: il sito non
+# da' una data di deposito, che resta da fornire dal PM.
+RIPIEGO_SITO = ("documenti: relazioni periodiche in PDF dal sito dell'emittente (esef_sito), etichettate "
+                "«sito dell'emittente, non archivio ufficiale (OAM)»; nessuna data di deposito da li'")
 
 
 def _scoperto(it: str, en: str) -> Dict[str, Any]:
     return {"modulo": None, "fonte": None, "natura_data": None, "canale": None,
-            "motivo_limite": it, "motivo_limite_en": en}
+            "motivo_limite": it, "motivo_limite_en": en, "ripiego_documenti": RIPIEGO_SITO}
 
 
 COPERTURA_UE: Dict[str, Dict[str, Any]] = {
@@ -106,9 +114,14 @@ COPERTURA_UE: Dict[str, Dict[str, Any]] = {
     "ES": _coperto("ue_cnmv", "CNMV (registro ufficiale Spagna)", "diffusione"),   # annuale: v. sotto
     "DE": _scoperto(
         "Germania: nessuna fonte ufficiale gratuita interrogabile. Il Unternehmensregister vieta la ricerca "
-        "automatica (robots.txt) e filings.xbrl.org non ha depositi tedeschi (0 misurati il 05/10/2026). " + _PM,
-        "Germany: no free official source that can be queried. The Unternehmensregister forbids automated "
-        "search (robots.txt) and filings.xbrl.org has no German filings (0 measured on 05/10/2026). " + _PM_EN),
+        "e le pagine delle pubblicazioni ai bot (robots.txt: Disallow /de/suche, /de/veroeffentlichung) e mette "
+        "un captcha davanti a ogni relazione (FAQ ufficiale); filings.xbrl.org non ha depositi tedeschi (0 "
+        "misurati il 05/10/2026). Ripiego per i soli documenti: sito dell'emittente, non archivio ufficiale. "
+        + _PM,
+        # testo inglese corto: chi lo cita (trade_idea_sources) tronca la frase intera (test sdir)
+        "Germany: no free official source that can be queried. The Unternehmensregister bars bots "
+        "(robots.txt, captcha) and filings.xbrl.org has no German filings (0 measured on 05/10/2026). "
+        + _PM_EN),
     "UK": _scoperto(
         "Regno Unito: l'FCA non consente l'accesso automatico al National Storage Mechanism (FAQ FCA). " + _PM,
         "United Kingdom: the FCA does not allow automated access to the National Storage Mechanism "

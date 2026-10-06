@@ -316,7 +316,7 @@ def test_quant_score_dichiara_beta_nd_col_motivo_senza_punti():
 def test_quant_score_beta_misurato_resta_punteggiato():
     from bellomberg.agents.specialist_scores import quant_score
     risk = {**_RISK_SENZA_BETA, "portfolio": {**_RISK_SENZA_BETA["portfolio"], "beta_vs_spy": 1.18}}
-    s = quant_score({"positions": []}, risk)
+    s = quant_score({"positions": []}, risk, beta_reconcile=_GUARDRAIL_OK)
     beta = [r for r in s["lines"] if "Beta" in r[0]]
     assert beta and beta[0][1] == "1.18" and beta[0][2] is not None
     assert s["max_score"] == 5 * 3
@@ -333,6 +333,10 @@ def test_blocco_contesto_quant_porta_la_riga_nd_senza_typeerror():
 
 _PORT_PIENO = {"vol_annual_pct": 22.5, "sharpe": 0.78, "beta_vs_spy": 1.18,
                "var_95_1d_pct": -3.2, "max_dd_1y_pct": -17.4}
+# 06/10 (PM): la beta pesa nel punteggio quant SOLO con guardrail RECONCILED: questi test
+# misurano il rubric con la beta in gioco, quindi passano il verdetto esplicito
+_GUARDRAIL_OK = {"verdict": "RECONCILED", "beta_per_decisioni": True,
+                 "betas": {"portfolio_risk_spy": 1.18, "factor_model_mkt": 1.1}}  # R-SEG: il motore del rischio e' fra i riconciliati
 _POSIZIONI = {"positions": [{"ticker": "ZZTEST", "valore_mercato_eur": 600.0},
                             {"ticker": "QQSYN.MI", "valore_mercato_eur": 400.0}]}
 
@@ -344,7 +348,7 @@ def test_quant_score_metrica_mancante_dichiarata_senza_punti(chiave, etichetta):
     from bellomberg.agents.specialist_scores import quant_score, format_score_block
     from bellomberg.core.language import language_context
     with language_context("it"):
-        s = quant_score(_POSIZIONI, {"portfolio": {**_PORT_PIENO, chiave: None}})
+        s = quant_score(_POSIZIONI, {"portfolio": {**_PORT_PIENO, chiave: None}}, beta_reconcile=_GUARDRAIL_OK)
         blocco = format_score_block(s)
     riga = [r for r in s["lines"] if etichetta in r[0]]
     assert len(riga) == 1, s["lines"]
@@ -359,7 +363,7 @@ def test_quant_score_senza_pesi_top_e_hhi_dichiarati_col_motivo():
     from bellomberg.agents.specialist_scores import quant_score
     from bellomberg.core.language import language_context
     with language_context("it"):
-        s = quant_score({"positions": []}, {"portfolio": dict(_PORT_PIENO)})
+        s = quant_score({"positions": []}, {"portfolio": dict(_PORT_PIENO)}, beta_reconcile=_GUARDRAIL_OK)
     for etichetta in ("Posizione maggiore", "HHI"):   # «Top position» in italiano
         riga = [r for r in s["lines"] if etichetta in r[0]]
         assert len(riga) == 1 and riga[0][2] is None, s["lines"]
@@ -369,6 +373,6 @@ def test_quant_score_senza_pesi_top_e_hhi_dichiarati_col_motivo():
 
 def test_quant_score_tutto_misurato_niente_unscored():
     from bellomberg.agents.specialist_scores import quant_score, format_score_block
-    s = quant_score(_POSIZIONI, {"portfolio": dict(_PORT_PIENO)})
+    s = quant_score(_POSIZIONI, {"portfolio": dict(_PORT_PIENO)}, beta_reconcile=_GUARDRAIL_OK)
     assert s["unscored"] == [] and s["max_score"] == 7 * 3 and len(s["lines"]) == 7
     assert "ricalcolato" not in format_score_block(s)

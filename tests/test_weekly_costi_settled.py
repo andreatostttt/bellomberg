@@ -88,8 +88,10 @@ class _Db:
                 yield conn
 
 
-def test_store_status_unblocks_resume_after_settlement(tmp_path):
-    """Il cablaggio vero: status() rilegge il journal dal disco e decide la ripresa."""
+def test_store_status_declares_uncertain_cost_and_settlement_clears_it(tmp_path):
+    """Il cablaggio vero: status() rilegge il journal dal disco. RISCRITTO sulla regola PM 05/10
+    (decisione main 06/10, V0-REDTEAM): il costo incerto NON blocca la ripresa, si DICHIARA nel
+    motivo; il saldo lo toglie dal motivo."""
     from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE
     from bellomberg.storage.weekly_run_store import current_book_identity
     db = _Db(tmp_path / "consigliere.db")
@@ -100,12 +102,13 @@ def test_store_status_unblocks_resume_after_settlement(tmp_path):
     request_id = _unknown_request(_journal(path, store.run_id))
     store.update(request_journal_path=str(path), status="incomplete")
     before = store.status()
-    assert before["blocked_reason"] == "Richieste o costi incerti: riconciliazione necessaria"
-    assert before["resume_available"] is False
+    assert before["blocked_reason"] is None and before["resume_available"] is True
+    assert before["reason"].startswith("Richieste o costi incerti DICHIARATI (1 a costo/esito incerto")
     _settle(path, request_id)
     after = store.status()
     assert after["request_costs"]["requests"][0]["state"] == "settled"
     assert after["blocked_reason"] is None and after["resume_available"] is True
+    assert after["reason"] is None
 
 
 def test_released_with_its_zero_cost_does_not_block():

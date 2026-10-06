@@ -76,8 +76,17 @@ test('Avvia Bellomberg.command uses this checkout venv despite an inherited Pyth
       env: { ...process.env, PATH: tempBin + path.delimiter + process.env.PATH,
         BELLOMBERG_PYTHON: '/opt/homebrew/bin/python3' },
     });
+    // 06/10: sul runner di CI il checkout non ha .venv. Allora il launcher deve fermarsi e dire
+    // come crearla (mai ripiegare sul Python ereditato); con la venv deve usare quella.
+    const venvPython = path.resolve(root, '../.venv/bin/python');
+    if (!fs.existsSync(venvPython)) {
+      assert.notEqual(result.status, 0, 'senza .venv il launcher non deve partire');
+      assert.match(result.stderr, /Python virtuale assente/);
+      assert.equal(result.stdout.trim(), '', 'npm non deve partire col Python ereditato');
+      return;
+    }
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout.trim(), path.resolve(root, '../.venv/bin/python'));
+    assert.equal(result.stdout.trim(), venvPython);
   } finally {
     fs.rmSync(tempBin, { recursive: true, force: true });
   }

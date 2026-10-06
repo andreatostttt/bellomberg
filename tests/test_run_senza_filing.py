@@ -46,7 +46,7 @@ def test_proponi_sec_non_configurata_prova_l_esef_per_il_listino_estero(monkeypa
     monkeypatch.setattr(filing_identita, "proponi_esef", _esef("univoco"))
     r = filing_identita.proponi("QQSYN.MI", "QQSYN S.p.A.")
     assert r["sec"]["stato"] == "non_configurata"
-    assert r["sec"]["motivo"] == "SEC non configurata: imposta SEC_CONTACT_EMAIL nel .env"
+    assert r["sec"]["motivo"] == "SEC non configurata: manca SEC_CONTACT_EMAIL nel .env — ESEF attivo"
     assert r["esef"]["stato"] == "univoco" and r["preferita"] == "esef"
 
 
@@ -61,15 +61,19 @@ def test_proponi_sec_non_configurata_titolo_usa_non_interroga_l_esef(monkeypatch
     assert r["sec"]["stato"] == "non_configurata" and "esef" not in r and r["preferita"] is None
 
 
-def test_proponi_esef_senza_contatto_dichiara_la_configurazione(monkeypatch):
+def test_proponi_esef_senza_contatto_interroga_l_esef(monkeypatch):
+    """Riscritto sulla decisione PM 05/10 sera: prima senza contatto l'ESEF rispondeva «ESEF non
+    configurato»; ora esef._headers non solleva e proponi_esef riceve i candidati veri."""
     from bellomberg.market_data import esef
-
-    def manca(*a, **k):
-        raise esef.ContattoMancante("SEC_CONTACT_EMAIL assente nel .env: filings.xbrl.org")
-
-    monkeypatch.setattr(esef, "candidati_lei", manca)
+    monkeypatch.delenv("SEC_CONTACT_EMAIL", raising=False)
+    monkeypatch.setattr(esef, "_cerca_entita", lambda nome, ritmo=None: (
+        [{"id": "1", "attributes": {"identifier": "ZZLEI0000000000000007", "name": "QQSYN S.p.A."}}],
+        ["QQSYN S.p.A."], "QQSYN S.p.A.", None))
+    from bellomberg.storage import negozi_privati
+    monkeypatch.setattr(negozi_privati, "carica_lei", lambda: {"lei": {}, "origine": "test", "motivo": ""})
     r = filing_identita.proponi_esef("QQSYN.MI", "QQSYN S.p.A.")
-    assert r["stato"] == "errore" and r["motivo"].startswith("ESEF non configurato: imposta SEC_CONTACT_EMAIL")
+    assert r["stato"] == "univoco" and r["candidati"][0]["lei"] == "ZZLEI0000000000000007", r
+    assert not hasattr(filing_identita, "ESEF_NON_CONFIGURATO")
 
 
 # ---------------------------------------------------------------- attivazione

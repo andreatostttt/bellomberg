@@ -235,9 +235,10 @@ def extract_rows_structured(memo_markdown: str, usage_out: dict = None) -> dict:
             model=MODEL_SYNTHESIZER,
             # PM 02/10: 16k; JSON troncato resta un errore dichiarato.
             max_tokens=ACTION_EXTRACT_MAX_TOKENS,
-            # Sonnet 5 (26/07): omesso = adaptive acceso; SPENTO esplicito — qui
-            # c'e' tool_choice FORZATO (estrazione meccanica), il thinking non
-            # serve e col budget corto lo eroderebbe
+            # Regola PM 05/10: llm_client invia comunque il ragionamento ACCESO
+            # (disabled -> adaptive). Tool_choice forzato + ragionamento acceso
+            # provato dal vivo il 06/10 su ACTION_EXTRACTOR_MODEL (DeepSeek :exacto):
+            # accettato. Muse e' auto-only per tool_choice: non usarlo come estrattore.
             thinking={"type": "disabled"},
             system=prompt_for_language(_SYSTEM),
             tools=[EMIT_TOOL],

@@ -42,18 +42,24 @@ class EntitaEsefAssente(LookupError):
 
 
 class ContattoMancante(RuntimeError):
-    """SEC_CONTACT_EMAIL assente: filings.xbrl.org vuole un contatto nello User-Agent."""
+    """Storica (02/09): `_headers` non la solleva piu' dal 05/10 (ESEF senza contatto SEC).
+    Resta per i chiamanti che la intercettano ancora."""
+
+
+# User-Agent onesto del progetto per le fonti UE non-SEC (filings.xbrl.org, GLEIF) quando
+# SEC_CONTACT_EMAIL manca: nessun dato personale, nessun contatto finto.
+UA_GENERICO = "Bellomberg/1.0 (ricerca personale open source, basso volume)"
 
 
 def _headers() -> dict:
-    """Header per filings.xbrl.org, costruiti a ogni chiamata; senza contatto,
-    errore dichiarato (regola 14/07) — i chiamanti stanno in try/except.
+    """Header per filings.xbrl.org, costruiti a ogni chiamata.
+    Decisione PM 05/10 sera (Opus 5.5): l'ESEF si attiva SEMPRE. Con SEC_CONTACT_EMAIL il
+    contatto resta nello User-Agent (comportamento invariato); senza, UA_GENERICO: la mail
+    la esige solo la SEC (sec_edgar._headers), dove la mancanza resta dichiarata.
     02/09 (pubblicazione B2): prima c'era l'email del PM cablata."""
     c = (os.environ.get("SEC_CONTACT_EMAIL") or "").strip()
     if not c:
-        raise ContattoMancante(
-            "SEC_CONTACT_EMAIL assente nel .env: filings.xbrl.org (ESEF) vuole "
-            "un contatto nello User-Agent (SEC_CONTACT_EMAIL=tua@email nel .env)")
+        return {"User-Agent": UA_GENERICO}
     return {"User-Agent": f"Bellomberg research (contatto: {c})"}
 CACHE_DIR = str(DATA_DIR / "xbrl_cache")
 INDEX_TTL_S = 7 * 24 * 3600          # l'indice filing si rilegge ogni 7 giorni

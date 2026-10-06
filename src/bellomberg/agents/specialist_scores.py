@@ -44,8 +44,12 @@ def _band(value, thresholds, points, reverse=False):
 
 
 @scoped_language
-def quant_score(portfolio_data=None, risk_data=None):
-    """Rubric di rischio del portafoglio. Ritorna dict o None se dati insufficienti."""
+def quant_score(portfolio_data=None, risk_data=None, beta_reconcile=None):
+    """Rubric di rischio del portafoglio. Ritorna dict o None se dati insufficienti.
+    beta_reconcile: payload di advanced_metrics.reconcile_betas calcolato dal CHIAMANTE (la
+    run lo calcola una volta nel priming). Decisione PM 06/10: la beta pesa SOLO con verdetto
+    RECONCILED, via libera e motore portfolio_risk_spy fra i riconciliati; altrimenti ESCLUSA
+    dal punteggio e lo si dichiara («beta esclusa: guardrail <verdetto>»). Qui non si calcola."""
     if risk_data is None:
         try:
             from bellomberg.portfolio.portfolio_risk import compute_portfolio_risk
@@ -85,7 +89,55 @@ def quant_score(portfolio_data=None, risk_data=None):
     lines = []
     pts = []
     unscored = []
+    excluded = {}   # label -> motivo: misurate ma escluse per regola (non «dato mancante»)
     from bellomberg.core.presentation import message as _message
+
+    # GUARDRAIL BETA (PM 06/10): fuori da RECONCILED la beta del book non pesa
+    beta_guardrail = None        # testo localizzato (righe e blocco)
+    beta_guardrail_codice = None # codice stabile, identico in ogni lingua (metrics)
+    beta_esclusa = None
+    if beta is not None:
+        rb = beta_reconcile
+        # review R-SEG 06/10 (C1): la beta del punteggio e' QUELLA di portfolio_risk
+        # (motore portfolio_risk_spy): pesa solo se quel motore e' fra i riconciliati
+        _fonte = "portfolio_risk_spy"
+        _riconciliati = (rb.get("betas") or {}) if isinstance(rb, dict) else {}
+        if (isinstance(rb, dict) and rb.get("verdict") == "RECONCILED" and rb.get("beta_per_decisioni") is True
+                and _fonte in _riconciliati):
+            beta_guardrail = beta_guardrail_codice = "RECONCILED"
+        elif isinstance(rb, dict) and rb.get("verdict") == "RECONCILED" and rb.get("beta_per_decisioni") is True:
+            _ins = (rb.get("sources_insufficient") or {}).get(_fonte)
+            if _ins is not None:
+                _perche = _message("insufficiente: {n}/{m} osservazioni", "insufficient: {n}/{m} observations",
+                                   n=("n.d." if _ins.get("n_obs") is None else _ins.get("n_obs")),
+                                   m=_ins.get("min_obs"))
+            elif _fonte in (rb.get("sources_failed") or {}):
+                _perche = _message("fallita", "failed")
+            else:
+                _perche = _message("assente", "missing")
+            beta_guardrail_codice = "RECONCILED_SENZA_FONTE_RISCHIO"
+            beta_guardrail = _message("RECONCILED senza la fonte della beta di rischio ({fonte} {perche})",
+                                      "RECONCILED without the risk-beta source ({fonte} {perche})",
+                                      fonte=_fonte, perche=_perche)
+            beta_esclusa = _message("beta esclusa: guardrail {verdetto}", "beta excluded: guardrail {verdetto}",
+                                    verdetto=beta_guardrail)
+        else:
+            if rb is None:
+                # review R-SEG 06/10 (C2): nessun guasto, il chiamante non l'ha calcolato
+                beta_guardrail_codice = "NON_CALCOLATO"
+                beta_guardrail = _message("non calcolato da questo percorso", "not computed by this path")
+            elif isinstance(rb, dict) and rb.get("verdict") and not rb.get("error"):
+                beta_guardrail = beta_guardrail_codice = str(rb["verdict"])
+                if beta_guardrail == "RECONCILED":   # payload incoerente: verdetto senza via libera
+                    beta_guardrail_codice = "RECONCILED_SENZA_VIA_LIBERA"
+                    beta_guardrail = _message("RECONCILED senza via libera", "RECONCILED without clearance")
+            else:
+                errore = rb.get("error") if isinstance(rb, dict) else None
+                beta_guardrail_codice = "NON_DISPONIBILE"
+                beta_guardrail = (_message("non disponibile ({motivo})", "not available ({motivo})", motivo=str(errore))
+                                  if errore else _message("non disponibile", "not available"))
+            beta_esclusa = _message("beta esclusa: guardrail {verdetto}", "beta excluded: guardrail {verdetto}",
+                                    verdetto=beta_guardrail)
 
     # fix 04/10 (A7, Opus 5.5, review RV-R): una metrica mancante NON sparisce piu' dal
     # rubric — riga «n.d.: motivo» SENZA punti e massimo ricalcolato sulle sole misurate
@@ -107,9 +159,15 @@ def quant_score(portfolio_data=None, risk_data=None):
     # sul titolo invece che come fotografia storica (dottrina bilaterale PM 16/07)
     add(_t("Sharpe ratio (trailing 1a)"), sharpe, ("{:.2f}".format(sharpe) if sharpe is not None else "n/d"),
         _band(sharpe, [1.5, 1.0, 0.5], [0, 1, 2, 3], reverse=True))
-    add(_t("Beta vs S&P 500"), beta, ("{:.2f}".format(beta) if beta is not None else "n/d"),
-        _band(beta, [0.8, 1.1, 1.4], [0, 1, 2, 3]),
-        motivo=risk_data.get("beta_error"))   # perche' SPY manca / serie corta (portfolio_risk)
+    if beta_esclusa is not None:
+        # misurata ma esclusa per regola: niente valore (non e' un argomento decisionale),
+        # niente punti, motivo dichiarato; il massimo si ricalcola (format_score_block lo dice)
+        lines.append((_t("Beta vs S&P 500"), _message("n.d.: {motivo}", "n/a: {motivo}", motivo=beta_esclusa), None))
+        excluded[_t("Beta vs S&P 500")] = beta_esclusa
+    else:
+        add(_t("Beta vs S&P 500"), beta, ("{:.2f}".format(beta) if beta is not None else "n/d"),
+            _band(beta, [0.8, 1.1, 1.4], [0, 1, 2, 3]),
+            motivo=risk_data.get("beta_error"))   # perche' SPY manca / serie corta (portfolio_risk)
     add(_t("VaR 95% 1g"), var95, ("{:.2f}%".format(var95) if var95 is not None else "n/d"),
         _band(abs(var95) if var95 is not None else None, [2.0, 3.5, 5.0], [0, 1, 2, 3]))
     add(_t("Max Drawdown 1a"), maxdd, ("{:.1f}%".format(maxdd) if maxdd is not None else "n/d"),
@@ -144,7 +202,10 @@ def quant_score(portfolio_data=None, risk_data=None):
         "verdict": verdict,
         "lines": lines,  # (label, value_str, points) — points None = n.d., fuori punteggio
         "unscored": unscored,  # metriche n.d.: max_score = 3 x le sole misurate
-        "metrics": {"vol_annual_pct": vol, "sharpe": sharpe, "beta_vs_spy": beta,
+        "excluded": excluded,  # misurate ma escluse per regola (guardrail beta), col motivo
+        "metrics": {"vol_annual_pct": vol, "sharpe": sharpe,
+                    "beta_vs_spy": beta if beta_esclusa is None else None,
+                    "beta_guardrail": beta_guardrail_codice,
                     "var_95_1d_pct": var95, "max_dd_1y_pct": maxdd,
                     "top_position_pct": top_pct, "hhi": hhi},
     }
@@ -897,12 +958,24 @@ def format_score_block(score: dict) -> str:
     L.append(_t("Verdetto: {} ({}/{} punti rischio; piu' alto = piu' rischio).").format(
         score["verdict"], score["score"], score["max_score"]))
     from bellomberg.core.presentation import message as _message
+    _escluse_regola = score.get("excluded") or {}
+    _n_misurate = len(score["lines"]) - len(score.get("unscored") or []) - len(_escluse_regola)
     if score.get("unscored"):  # fix 04/10 (A7): il massimo ricalcolato si DICHIARA
         L.append(_message("Massimo ricalcolato su {n} metriche misurate: escluse perché n.d. {escluse}.",
                           "Maximum recomputed on {n} measured metrics: excluded as n/a {escluse}.",
-                          n=len(score["lines"]) - len(score["unscored"]),
+                          n=_n_misurate,
                           escluse=", ".join(str(x) for x in score["unscored"])))
+    if _escluse_regola:  # PM 06/10: esclusione per regola (guardrail beta), non dato mancante
+        L.append(_message("Massimo ricalcolato su {n} metriche: escluse dal punteggio per regola {escluse}.",
+                          "Maximum recomputed on {n} metrics: excluded from the score by rule {escluse}.",
+                          n=_n_misurate,
+                          escluse="; ".join(str(k) + " (" + str(v) + ")" for k, v in _escluse_regola.items())))
     for label, val, pt in score["lines"]:
+        if pt is None and label in _escluse_regola:
+            L.append(_message("  - {label:<26} {val}  -> esclusa dal punteggio (regola)",
+                              "  - {label:<26} {val}  -> excluded from the score (rule)",
+                              label=label, val=val))
+            continue
         if pt is None:  # fix 04/10 (A7): riga dichiarata n.d., fuori dal punteggio
             L.append(_message("  - {label:<26} {val}  -> non punteggiata (dato mancante)",
                               "  - {label:<26} {val}  -> not scored (missing data)",

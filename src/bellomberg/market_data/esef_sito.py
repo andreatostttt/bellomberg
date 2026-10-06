@@ -8,6 +8,7 @@ una richiesta esplicita, mai dalla run del Consigliere: pipeline e impronta legg
 (CACHE_GIORNI). Il pacchetto si scarica (max 80 MB) e si converte in locale (ixbrl_oim); LEI e
 periodo si verificano sui fatti come per il repository (filing_esef.documento_esef).
 """
+import calendar
 import hashlib
 import json
 import os
@@ -180,6 +181,10 @@ class _Link(HTMLParser):
 
 _FILE_NEL_TESTO = re.compile(
     r"""["'(=]((?:https?:)?(?:\\?/)[^"'\s()<>]{1,300}?\.(?:pdf|xbri|zip))(?:\?[^"'\s<>]{0,200})?["')]""", re.I)
+# Prova reale 05/10: dati della pagina in JSON con «/» al posto di «/» e percorsi con spazi
+# («/Gruppo/Investor Relations/…pdf») tra virgolette: l'espressione sopra non li vedeva.
+_FILE_TRA_VIRGOLETTE = re.compile(
+    r"""(["'])((?:https?:)?/[^"'<>\r\n]{1,300}?\.(?:pdf|xbri|zip))(?:\?[^"'\s<>]{0,200})?\1""", re.I)
 
 
 def estrai_link(html, base):
@@ -198,6 +203,12 @@ def estrai_link(html, base):
         if grezzo not in noti:
             noti.add(grezzo)
             p.link.append([grezzo, ""])
+    testo = re.sub(r"\\u002[fF]", "/", html).replace("\\/", "/")
+    for m in _FILE_TRA_VIRGOLETTE.finditer(testo):
+        grezzo = m.group(2).strip()
+        if grezzo not in noti:
+            noti.add(grezzo)
+            p.link.append([grezzo, ""])
     out = []
     for href, testo in p.link:
         href = href.strip()
@@ -211,6 +222,30 @@ def estrai_link(html, base):
     return out
 
 
+STATI_BLOCCO = (401, 403, 429)
+MAX_5XX_DI_FILA = 3  # pagine in errore del server di fila: il sito non sta bene, si riprova al giro dopo
+TOKEN_BOT = "Bellomberg"  # nome del nostro agente per le regole «User-agent: Bellomberg» di robots.txt
+_URL_NEL_TESTO = re.compile(r"""https?://[^\s'"<>]+|\?[^\s'"<>]*=[^\s'"<>]*""")
+
+
+def motivo_eccezione(exc, n=160):
+    """Tipo e testo dell'eccezione SENZA indirizzi ne' querystring (regola 6; revisione R-8 C7)."""
+    return f"{type(exc).__name__}: {_URL_NEL_TESTO.sub('<url>', str(exc))[:n]}"
+
+
+def frase_blocco(stato):
+    """401/403: il sito rifiuta il bot; 429: limite di ritmo (revisione R-8: non e' un rifiuto)."""
+    return f"sito limita il ritmo (HTTP {stato})" if stato == 429 else f"sito blocca i bot (HTTP {stato})"
+
+
+class SitoBloccato(ValueError):
+    """Il sito rifiuta il bot (HTTP 401/403) o limita il ritmo (429): esito dichiarato, ci si ferma."""
+
+    def __init__(self, stato, dove=""):
+        self.stato = stato
+        super().__init__(frase_blocco(stato) + (f" su {dove}" if dove else ""))
+
+
 class Navigatore:
     """GET di pagine HTML entro un dominio: redirect controllati, IP pubblici, tetto, pausa."""
 
@@ -222,6 +257,8 @@ class Navigatore:
         self._dormi = dormi or time.sleep
         self.richieste = 0
         self._robots = None
+        self.bloccato = {}  # host -> stato HTTP con cui il sito rifiuta il bot (dichiarato nell'esito)
+        self.robots_ignoto = {}  # host -> perche' robots.txt non si e' letto (RFC 9309: tutto vietato)
 
     def _http(self, url):
         import requests
@@ -249,16 +286,20 @@ class Navigatore:
         raise ValueError("troppi redirect")
 
     def _corpo(self, r):
+        return self._byte(r, MAX_PAGINA_BYTES, "pagina troppo grande").decode(r.encoding or "utf-8", errors="replace")
+
+    def _byte(self, r, massimo, troppo):
         dichiarato = r.headers.get("Content-Length")
-        if dichiarato and str(dichiarato).isdigit() and int(dichiarato) > MAX_PAGINA_BYTES:
-            raise ValueError("pagina troppo grande")
+        if dichiarato and str(dichiarato).isdigit() and int(dichiarato) > massimo:
+            raise ValueError(troppo)
         if getattr(r, "raw", None) is not None:
             pezzi, n = [], 0
             limite = min(self._orologio() + TEMPO_PAGINA_S, self._scadenza)
             for pezzo in r.iter_content(64 * 1024):
                 n += len(pezzo)
-                if n > MAX_PAGINA_BYTES:
-                    raise ValueError("pagina troppo grande")
+                if n > massimo:
+                    r.close()
+                    raise ValueError(troppo)
                 if self._orologio() > limite:  # server lento a gocce (revisione finale)
                     r.close()
                     raise TimeoutError("pagina troppo lenta")
@@ -267,12 +308,15 @@ class Navigatore:
             grezzo = b"".join(pezzi)
         else:
             grezzo = r.content or b""
-            if len(grezzo) > MAX_PAGINA_BYTES:
-                raise ValueError("pagina troppo grande")
-        return grezzo.decode(r.encoding or "utf-8", errors="replace")
+            if len(grezzo) > massimo:
+                raise ValueError(troppo)
+        return grezzo
 
     def consentito(self, url):
-        """robots.txt dell'host (letto una volta per host; assente o illeggibile: consentito)."""
+        """robots.txt dell'host, letto una volta per host (RFC 9309, revisione R-8 C4): 200 = regole;
+        404 e altri 4xx = consentito; 401/403 = sito che rifiuta i bot (tutto vietato); 5xx o
+        irraggiungibile = tutto vietato col motivo in `robots_ignoto`. Le regole valgono sia per il
+        nome del nostro agente («User-agent: Bellomberg») sia per lo UA completo."""
         host = urlsplit(url).hostname
         if self._robots is None:
             self._robots = {}
@@ -280,22 +324,58 @@ class Navigatore:
             rp = RobotFileParser()
             try:
                 _, r = self._http(f"https://{host}/robots.txt")
-                rp.parse(self._corpo(r).splitlines() if r.status_code == 200 else [])
-            except Exception:
+                if r.status_code in (401, 403):
+                    # convenzione di urllib.robotparser: robots.txt negato = tutto vietato (e dichiarato)
+                    self.bloccato[host] = r.status_code
+                    rp.parse([])
+                    rp.disallow_all = True
+                elif r.status_code >= 500:
+                    self.robots_ignoto[host] = f"HTTP {r.status_code}"
+                    rp.parse([])
+                    rp.disallow_all = True
+                else:
+                    rp.parse(self._corpo(r).splitlines() if r.status_code == 200 else [])
+            except Exception as exc:
+                self.robots_ignoto[host] = motivo_eccezione(exc, 100)
                 rp.parse([])
+                rp.disallow_all = True
             self._robots[host] = rp
         from bellomberg.market_data.lettore_trimestrali import UA
-        return self._robots[host].can_fetch(UA, url)
+        return self._robots[host].can_fetch(TOKEN_BOT, url) and self._robots[host].can_fetch(UA, url)
 
     def pagina(self, url):
         """(url finale, html) di una pagina HTML; eccezione se non e' HTML o va fuori dominio."""
         finale, r = self._http(url)
+        if r.status_code in STATI_BLOCCO:
+            self.bloccato[urlsplit(finale).hostname] = r.status_code
+            raise SitoBloccato(r.status_code, urlsplit(finale).path[:80] or "/")
         if r.status_code != 200:
             raise ValueError(f"HTTP {r.status_code}")
         tipo = (r.headers.get("Content-Type") or "").lower()
         if tipo and "html" not in tipo:
             raise ValueError(f"non HTML ({tipo[:40]})")
         return finale, self._corpo(r)
+
+    def prima_pagina_pdf(self, url, max_bytes=None):
+        """Testo della prima pagina di un PDF dello stesso dominio (robots.txt, pausa e redirect come
+        le pagine; tetto MAX_PDF_PRIMA_PAGINA). Eccezione dichiarata se vietato, bloccato o illeggibile."""
+        if not self.consentito(url):
+            raise PermissionError(f"robots.txt vieta {urlsplit(url).path[:80]}")
+        finale, r = self._http(url)
+        if r.status_code in STATI_BLOCCO:
+            self.bloccato[urlsplit(finale).hostname] = r.status_code
+            raise SitoBloccato(r.status_code, urlsplit(finale).path[:80])
+        if r.status_code != 200:
+            raise ValueError(f"HTTP {r.status_code}")
+        grezzo = self._byte(r, max_bytes or MAX_PDF_PRIMA_PAGINA, "PDF troppo grande")
+        if not grezzo.startswith(b"%PDF-"):
+            raise ValueError("non e' un PDF")
+        import io
+        from pypdf import PdfReader
+        lettore = PdfReader(io.BytesIO(grezzo))
+        if not lettore.pages:
+            raise ValueError("PDF senza pagine")
+        return (lettore.pages[0].extract_text() or "")[:4000]
 
 
 def _anni(testo):
@@ -335,6 +415,7 @@ def esplora(sito, *, navigatore=None, max_pagine=MAX_PAGINE, max_profondita=MAX_
         return {"pagine": [], "link": [], "motivi": ["sito della societa' non valido"]}
     nav = navigatore or Navigatore(dominio)
     coda, visti, pagine, link, motivi, noti = [(0, 99, sito)], set(), [], [], [], set()
+    errori_server = 0
     while coda and len(pagine) < max_pagine:
         coda.sort(key=lambda x: (-x[1], x[0]))
         prof, punti_pagina, url = coda.pop(0)
@@ -344,12 +425,29 @@ def esplora(sito, *, navigatore=None, max_pagine=MAX_PAGINE, max_profondita=MAX_
         visti.add(chiave)
         try:
             if not nav.consentito(url):
+                stato = getattr(nav, "bloccato", {}).get(urlsplit(url).hostname)
+                if stato:  # robots.txt stesso negato: il sito rifiuta i bot, ci si ferma
+                    motivi.append(f"{frase_blocco(stato)} su robots.txt")
+                    break
+                ignoto = getattr(nav, "robots_ignoto", {}).get(urlsplit(url).hostname)
+                if ignoto:  # RFC 9309: robots.txt non leggibile = nessuna pagina, si riprova al giro dopo
+                    motivi.append(f"robots.txt non leggibile ({ignoto}): esplorazione rinviata")
+                    break
                 motivi.append(f"robots.txt esclude {urlsplit(url).path[:80]}")
                 continue
             finale, html = nav.pagina(url)
+        except SitoBloccato as exc:
+            motivi.append(str(exc))
+            break  # mai insistere su un sito che rifiuta il bot
         except Exception as exc:
-            motivi.append(f"{urlsplit(url).path[:80] or '/'}: {type(exc).__name__}: {str(exc)[:120]}")
+            motivi.append(f"{urlsplit(url).path[:80] or '/'}: {motivo_eccezione(exc, 120)}")
+            errori_server = errori_server + 1 if str(exc).startswith("HTTP 5") else 0
+            if errori_server >= MAX_5XX_DI_FILA:
+                motivi.append(f"sito non disponibile (HTTP 5xx su {errori_server} pagine di fila): esplorazione "
+                              "rinviata")
+                break
             continue
+        errori_server = 0
         if _normalizza(finale) != chiave and _normalizza(finale) in visti:
             continue  # redirect verso una pagina gia' letta (prova reale)
         visti.add(_normalizza(finale))
@@ -381,7 +479,9 @@ def esplora(sito, *, navigatore=None, max_pagine=MAX_PAGINE, max_profondita=MAX_
                 coda.append((livello, punti + (2 if punti_pagina >= 3 and prof else 0), href))
     if coda and len(pagine) >= max_pagine:
         motivi.append(f"limite di {max_pagine} pagine raggiunto")
-    return {"pagine": pagine, "link": link, "motivi": motivi, "richieste": nav.richieste}
+    return {"pagine": pagine, "link": link, "motivi": motivi, "richieste": nav.richieste,
+            "bloccato": next(iter(getattr(nav, "bloccato", {}).values()), None),
+            "robots_ignoto": next(iter(getattr(nav, "robots_ignoto", {}).values()), None)}
 
 
 def pacchetti(link):
@@ -404,11 +504,14 @@ def pacchetti(link):
     return out
 
 
-def scopri(ticker, *, lei=None, oggi=None, forza=False, cache_dir=None, sito_fn=None, navigatore_fn=None):
+def scopri(ticker, *, lei=None, oggi=None, forza=False, cache_dir=None, sito_fn=None, navigatore_fn=None,
+           prima_pagina_fn=None):
     """Esplora il sito di `ticker` (cache CACHE_GIORNI) e salva pacchetti e link utili.
 
-    Esito: {"ticker", "at", "sito", "pagine", "pacchetti", "pdf", "motivi"}; `pdf` = link a
-    PDF con testo (per la ricerca dei PDF IR). Chiamare solo fuori dalla run del Consigliere."""
+    Esito: {"ticker", "at", "sito", "pagine", "pacchetti", "pdf", "prime_pagine", "accesso",
+    "motivi"}; `pdf` = link a PDF con testo (per la ricerca dei PDF IR), `prime_pagine` = testo
+    della prima pagina dei pochi PDF che senza non si decidono, `accesso` = {"stato", "motivo"}
+    (bloccato / robots_vieta dichiarati). Chiamare solo fuori dalla run del Consigliere."""
     oggi = oggi or date.today()
     path = _cache_dir(cache_dir) / _nome_file(ticker)
     voce = _leggi_json(path)
@@ -431,6 +534,7 @@ def scopri(ticker, *, lei=None, oggi=None, forza=False, cache_dir=None, sito_fn=
              "pagine": [], "pacchetti": [], "pdf": [], "motivi": []}
     if not sito:
         esito["motivi"].append("sito della societa' non noto (yfinance)")
+        esito["accesso"] = {"stato": "sito_ignoto", "motivo": "sito della societa' non noto (yfinance)"}
     else:
         dominio = dominio_registrabile(urlsplit(sito).hostname)
         nav = (navigatore_fn or (lambda d: Navigatore(d)))(dominio) if dominio else None
@@ -441,10 +545,50 @@ def scopri(ticker, *, lei=None, oggi=None, forza=False, cache_dir=None, sito_fn=
         esito["fallita"] = not visita["pagine"]
         esito["pdf"] = [v for v in visita["link"] if urlsplit(v["url"]).scheme == "https"
                         and urlsplit(v["url"]).path.lower().endswith(".pdf")][:300]
+        # PDF col nome generico o senza periodo: prima pagina letta (pochi, stesso dominio, robots.txt)
+        prime = {}
+        if nav is not None and not visita.get("bloccato"):
+            leggi = prima_pagina_fn or getattr(nav, "prima_pagina_pdf", None)
+            for url in (da_leggere_prima_pagina(esito["pdf"], dominio) if leggi else []):
+                try:
+                    prime[url] = {"testo": str(leggi(url))[:4000]}
+                except Exception as exc:
+                    prime[url] = {"errore": motivo_eccezione(exc)}
+                    if isinstance(exc, SitoBloccato):
+                        break
+        esito["prime_pagine"] = prime
+        esito["accesso"] = _accesso(visita)
         if lei and not any(p["lei"] == str(lei).upper() for p in esito["pacchetti"]):
             esito["motivi"].append(f"nessun pacchetto ESEF col LEI {str(lei).upper()} nelle pagine visitate")
+        # PDF delle relazioni (decisione PM 05/10): esito in testa ai motivi, origine dichiarata
+        scelta = scegli_pdf(esito["pdf"], oggi=oggi, prime_pagine=prime, dominio=dominio)
+        if scelta:
+            frase = (f"relazione {scelta['tipo']} al {scelta['ultimo']['periodo']} in PDF dal {ETICHETTA_SITO}"
+                     f" ({scelta['candidati']} PDF ammessi, {scelta['scartati_totale']} scartati col motivo)")
+        elif esito["pdf"]:
+            frase = riepilogo_scarti(esito["pdf"], oggi=oggi, prime_pagine=prime, dominio=dominio)
+        else:
+            frase = None
+        if frase:
+            esito["motivi"].insert(1 if esito["accesso"]["stato"] != "ok" else 0, frase)
     _scrivi_json(path, esito)
     return esito
+
+
+def _accesso(visita):
+    """Esito dell'accesso al sito, dichiarato: ok | bloccato (HTTP 401/403/429) | robots_illeggibile |
+    robots_vieta | non_raggiunto."""
+    if visita.get("bloccato"):
+        return {"stato": "bloccato", "motivo": frase_blocco(visita["bloccato"])}
+    if visita.get("robots_ignoto") and not visita.get("pagine"):
+        return {"stato": "robots_illeggibile",
+                "motivo": f"robots.txt non leggibile ({visita['robots_ignoto']}): esplorazione rinviata"}
+    motivi = visita.get("motivi") or []
+    if not visita.get("pagine") and any(m.startswith("robots.txt esclude") for m in motivi):
+        return {"stato": "robots_vieta", "motivo": "robots.txt vieta l'esplorazione delle pagine del sito"}
+    if not visita.get("pagine"):
+        return {"stato": "non_raggiunto", "motivo": "nessuna pagina letta" + (f": {motivi[0]}" if motivi else "")}
+    return {"stato": "ok", "motivo": None}
 
 
 def righe_da_cache(lei, *, cache_dir=None, preferita="en"):
@@ -640,11 +784,11 @@ def attendi_gleif(*, percorso=None):
 
 
 def _gleif_scarica(nome):
-    """GET GLEIF nel ritmo, UA con il contatto (SEC_CONTACT_EMAIL, come ESEF) e tetto di byte
+    """GET GLEIF nel ritmo, UA di esef._headers (contatto SEC_CONTACT_EMAIL se c'e', altrimenti UA generico del progetto) e tetto di byte
     letto a flusso (REV_G2a R-3/R14: prima nessun ritmo, UA senza contatto, corpo senza tetto)."""
     import requests
     from bellomberg.market_data import esef
-    ua = esef._headers()["User-Agent"]  # ContattoMancante se manca il contatto: dichiarato dal chiamante
+    ua = esef._headers()["User-Agent"]  # mai ContattoMancante: senza contatto UA generico (decisione PM 05/10)
     attendi_gleif()
     r = requests.get(GLEIF, params={"filter[fulltext]": nome, "page[size]": GLEIF_PAGINA},
                      headers={"Accept": "application/vnd.api+json", "User-Agent": ua},
@@ -675,10 +819,11 @@ def consigliere_in_corso():
         import psutil
     except ImportError:
         return False
+    from bellomberg.core.processi_run import e_run_consigliere
     for p in psutil.process_iter(["cmdline"]):
         try:
-            riga = " ".join(p.info.get("cmdline") or [])
-            if "consigliere_multi" in riga or "bellomberg-committee" in riga:
+            # revisione R-8 C6: la FORMA dell'argv, non la parola (una shell che la cita non e' una run)
+            if e_run_consigliere(p.info.get("cmdline") or []):
                 return True
         except Exception:
             continue
@@ -727,83 +872,279 @@ def scopri_profili(store, *, oggi=None, consigliere_fn=None, indice_fn=None, sco
                                                             if p.get("lei") == str(profilo["lei"]).upper()),
                           "motivi": (trovato.get("motivi") or [])[:5]})
         except Exception as exc:  # un sito non ferma gli altri
-            esiti.append({"ticker": ticker, "pacchetti": 0, "motivi": [f"{type(exc).__name__}: {str(exc)[:160]}"]})
+            esiti.append({"ticker": ticker, "pacchetti": 0, "motivi": [motivo_eccezione(exc)]})
     return esiti
 
 
 # ------------------------------------------------------------------ PDF IR (Task 5)
+# Decisione PM 05/10 (opzione B): per QUALUNQUE emittente senza documenti dall'archivio ufficiale
+# (OAM/ESEF/SEC) valgono le relazioni periodiche in PDF pubblicate sul suo sito, sempre con
+# l'origine dichiarata: mai presentate come deposito ufficiale. Nessun nome di societa' qui.
+ORIGINE_SITO = "sito_emittente"
+ETICHETTA_SITO = "sito dell'emittente, non archivio ufficiale (OAM)"
+ETICHETTA_SITO_EN = "issuer website, not the official archive (OAM)"
+MAX_PRIME_PAGINE = 3                     # PDF col nome generico o senza periodo: prima pagina letta, per esplorazione
+MAX_PDF_PRIMA_PAGINA = 40 * 1024 * 1024  # come download_sicuro.MAX_PDF
+MAX_SCARTATI = 25                        # scarti riportati col motivo (il totale resta contato)
+# Presentazioni, slide, conference call per investitori: mai una relazione (motivo dichiarato)
+_PRESENTAZIONE = re.compile(
+    r"presentation|pr[aä]e?sentation|pr[ée]sentation|presentazione|presentaci[oó]n|slides?\b|\bdeck\b|webcast"
+    r"|conference[\s_-]*call|telefonkonferenz|\bcall\b|recap|trans\w{0,3}ipt|roadshow|capital[\s_-]*markets?[\s_-]*day"
+    r"|\bcmd\b|analyst|investor[\s_-]*day|bilanzpressekonferenz", re.I)
 _ESCLUDI_PDF = re.compile(
     r"presentation|presentazione|slides?\b|press|comunicato|governance|remunerat|compensation|sustainab|esg\b"
     r"|csr\b|non[\s_-]*financial|proxy|agenda|minutes|verbale|notice|avviso|convocazione|factsheet|fact[\s_-]*sheet"
     r"|transcript|webcast|dividend|bylaws|statuto|code[\s_-]*of|policy|procedura|prospectus|prospetto|tax\b"
     r"|pillar|green[\s_-]*bond|rating|letter|lettera|glance|sintesi|piano|business[\s_-]*plan|climate|sdgs?\b"
     r"|slavery|informativa|codice|directions|ivass|scissione|buy[\s_-]*back|acquisto[\s_-]*azioni"
-    r"|trans\w{0,3}ipt|information[\s_-]*form|\baif\b|circular|labou?r[\s_-]*report", re.I)
+    r"|trans\w{0,3}ipt|information[\s_-]*form|\baif\b|circular|labou?r[\s_-]*report"
+    r"|\bnews\b|newsletter|ad[\s_-]*hoc|einladung|nutzungsbedingungen|terms[\s_-]*of[\s_-]*use|stimmrecht"
+    r"|voting[\s_-]*rights|key[\s_-]*figures|kennzahlen|summary|errata|corrigendum|auditor|pr[uü]fungsvermerk"
+    r"|pension", re.I)
+# Cartelle della sezione stampa: i PDF li' sono comunicati SULLA relazione, non la relazione
+# (prova reale 05/10: «/Presse/News/…-Half-Yearly-Financial-Report-H1.pdf»). Non «media»:
+# molti CMS tengono tutti i file sotto «/-/media/».
+_PERCORSO_STAMPA = re.compile(
+    r"/(?:presse?|press[\s_-]*releases?|pressemitteilungen|news(?:room)?|comunicati(?:[\s_-]*stampa)?|stampa"
+    r"|sala[\s_-]*stampa|notizie|actualit[eé]s|noticias|communiqu[eé]s)(?=/)", re.I)
 _TIPI_PDF = (
     ("trimestrale", re.compile(r"md\W?&?\W?a\b|mda\b|management.?s[\s_-]*discussion|quarter|trimestr|quartal"
                                r"|resoconto[\s_-]*intermedio|zwischenmitteilung"
                                r"|\bq[1-4]\b|[\s_-]q[1-4][\s_-]", re.I)),
-    ("semestrale", re.compile(r"half[\s_-]*year|semestr|halbjahr|first[\s_-]*half|\bh1\b|interim", re.I)),
-    ("annuale", re.compile(r"annual|annuale|bilancio|gesch[aä]ftsbericht|rapport[\s_-]*annuel|jahresfinanz"
+    ("semestrale", re.compile(r"half[\s_-]*year|semestr|halbjahr|first[\s_-]*half|\bh1\b|interim|semi[\s_-]*annual"
+                              r"|halfjaar", re.I)),
+    ("annuale", re.compile(r"annual|annuale|annuel|bilancio|gesch(?:a|ä|ae)ftsbericht|rapport[\s_-]*annuel|jahresfinanz"
                            r"|registration[\s_-]*document|document[\s_-]*d.enregistrement|integrated[\s_-]*report"
-                           r"|relazione[\s_-]*finanziaria", re.I)),
+                           r"|relazione[\s_-]*finanziaria|informe[\s_-]*anual|cuentas[\s_-]*anuales|jaarverslag"
+                           r"|konzernabschluss|[aå]rsredovisning|vuosikertomus", re.I)),
 )
+# Parola da documento: senza, il nome e' generico («First Half 2026 results») e serve la prima pagina
+_NOME_DOCUMENTO = re.compile(
+    r"report|bericht|mitteilung|statement|relazione|resoconto|rapport|informe|bilancio|md\W?&?\W?a\b|mda\b"
+    r"|management.?s[\s_-]*discussion|registration[\s_-]*document|document[\s_-]*d.enregistrement|jaarverslag"
+    r"|konzernabschluss|accounts|comptes|cuentas|[aå]rsredovisning|vuosikertomus|financial[\s_-]*statements", re.I)
+# (non «abschluss» da solo: il «Jahresabschluss» della sola capogruppo non e' la relazione consolidata;
+# prova reale 05/10: tre PDF scaricati per la prima pagina senza motivo)
+_INGLESE = re.compile(r"(?:^|[\W_])(?:en|eng|english)(?:[\W_]|$)", re.I)
+_TITOLO_INGLESE = re.compile(r"annual[\s_-]*report|half[\s_-]*year|quarterly|financial[\s_-]*report|interim[\s_-]*report"
+                             r"|financial[\s_-]*statements", re.I)
 _ANNO = re.compile(r"(?<!\d)(20[0-4]\d)(?!\d)")
 _DATA_DMY = re.compile(r"(?<!\d)(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])(20[0-4]\d)(?!\d)")  # 30062026
+_DATA_DMY_SEP = re.compile(r"(?<!\d)(0?[1-9]|[12]\d|3[01])[._-](0?[1-9]|1[0-2])[._-](20[0-4]\d)(?!\d)")  # 23.05.2025
 _DATA = re.compile(r"(?<!\d)(20[0-4]\d)[-_.]?(0[1-9]|1[0-2])[-_.]?(0[1-9]|[12]\d|3[01])(?!\d)")
 _MESI = {m: i + 1 for i, nomi in enumerate((
-    "january gennaio januar janvier", "february febbraio februar fevrier", "march marzo marz maerz mars",
-    "april aprile avril", "may maggio mai", "june giugno juni juin", "july luglio juli juillet",
-    "august agosto aout", "september settembre septembre", "october ottobre oktober octobre",
-    "november novembre", "december dicembre dezember decembre")) for m in nomi.split()}
-_DATA_MESE = re.compile(r"(?<!\d)([0-3]?\d)[\s_.-]*(" + "|".join(sorted(_MESI, key=len, reverse=True))
-                        + r")[\s_.-]*(20[0-4]\d)(?!\d)", re.I)  # anche «31march2026» (prova reale)
+    "january gennaio januar janvier enero", "february febbraio februar fevrier febrero",
+    "march marzo marz maerz mars", "april aprile avril abril", "may maggio mai mayo", "june giugno juni juin junio",
+    "july luglio juli juillet julio", "august agosto aout", "september settembre septembre septiembre",
+    "october ottobre oktober octobre octubre", "november novembre noviembre",
+    "december dicembre dezember decembre diciembre")) for m in nomi.split()}
+_ALTERNATIVA_MESI = "|".join(sorted(_MESI, key=len, reverse=True))
+_DATA_MESE = re.compile(r"(?<!\d)([0-3]?\d)[\s_.-]*(?:de[\s_]+)?(" + _ALTERNATIVA_MESI
+                        + r")[\s_.-]*(?:de[\s_]+)?(20[0-4]\d)(?!\d)", re.I)  # anche «31march2026» (prova reale)
+_DATA_MESE_US = re.compile(r"(?<![a-z])(" + _ALTERNATIVA_MESI + r")[\s_.-]*([0-3]?\d)(?:st|nd|rd|th)?,?[\s_.-]*"
+                           r"(20[0-4]\d)(?!\d)", re.I)  # «June 30, 2026»
 _TRIMESTRE_AA = re.compile(r"(?<![a-z0-9])q([1-4])[\s_-]?(\d{2})(?!\d)", re.I)  # «Q226» = Q2 2026 (prova reale)
 _TRIMESTRE = re.compile(r"\bq([1-4])\b|[\s_-]q([1-4])[\s_-]", re.I)
+_FINE_TRIMESTRE = ("03-31", "06-30", "09-30", "12-31")
 
 
-def _documento_pdf(voce):
-    """{"url", "testo", "tipo", "periodo"} di un link a PDF IR, None se non e' una relazione."""
-    nome = unquote(urlsplit(voce["url"]).path.rsplit("/", 1)[-1])
-    testo = f"{nome} {voce.get('testo') or ''}".replace("_", " ")
-    if _ESCLUDI_PDF.search(testo):
-        return None
-    tipo = next((t for t, rx in _TIPI_PDF if rx.search(testo)), None)
-    if tipo is None:
-        return None
-    # Prova reale («2026-05-06-…-report-31-march-2026»): la data in testa e' la
-    # pubblicazione; vale prima quella col mese scritto, poi GGMMAAAA, poi l'ultima AAAA-MM-GG.
-    mese = _DATA_MESE.search(nome.lower().replace("ä", "a").replace("é", "e").replace("û", "u"))
-    dmy, numeriche = _DATA_DMY.search(nome), list(_DATA.finditer(nome))
-    if mese:
-        periodo = f"{mese.group(3)}-{_MESI[mese.group(2)]:02d}-{int(mese.group(1)):02d}"
-    elif dmy and not numeriche:
-        periodo = f"{dmy.group(3)}-{dmy.group(2)}-{dmy.group(1)}"
-    elif numeriche:
-        data = numeriche[-1]
-        periodo = f"{data.group(1)}-{data.group(2)}-{data.group(3)}"
-    elif _TRIMESTRE_AA.search(nome) and not _ANNO.search(nome):
+def _senza_accenti(testo):
+    return (testo.lower().replace("ä", "a").replace("é", "e").replace("û", "u").replace("è", "e")
+            .replace("ü", "u").replace("ö", "o"))
+
+
+def _fine_mese(anno, mese, giorno):
+    try:
+        return int(giorno) == calendar.monthrange(int(anno), int(mese))[1]
+    except (ValueError, calendar.IllegalMonthError):
+        return False
+
+
+def _date_nel_testo(testo):
+    """[(anno, mese, giorno, inizio)] delle date scritte nel testo (mese a parole, AAAA-MM-GG,
+    GG.MM.AAAA, GGMMAAAA), nell'ordine di priorita' della prova reale."""
+    t = _senza_accenti(testo)
+    out = []
+    for m in _DATA_MESE.finditer(t):
+        out.append((int(m.group(3)), _MESI[m.group(2).lower()], int(m.group(1)), m.start()))
+    for m in _DATA_MESE_US.finditer(t):
+        out.append((int(m.group(3)), _MESI[m.group(1).lower()], int(m.group(2)), m.start()))
+    numeriche = list(_DATA.finditer(t))
+    for m in reversed(numeriche):  # l'ultima AAAA-MM-GG prima (in testa c'e' di solito la pubblicazione)
+        out.append((int(m.group(1)), int(m.group(2)), int(m.group(3)), m.start()))
+    for m in _DATA_DMY_SEP.finditer(t):
+        out.append((int(m.group(3)), int(m.group(2)), int(m.group(1)), m.start()))
+    if not numeriche:
+        for m in _DATA_DMY.finditer(t):
+            out.append((int(m.group(3)), int(m.group(2)), int(m.group(1)), m.start()))
+    return out
+
+
+def _periodo_dal_nome(nome, testo, tipo):
+    """(periodo, base, tipo) dal nome del file e dal testo del link; periodo None se non si capisce.
+
+    Una data a fine TRIMESTRE e' la chiusura del periodo, purche' il suo anno non superi gli altri anni
+    del nome; ogni altra data e' la pubblicazione (prova reale: «2026-07-02-…-Q2-…», «…_23.05.2025.pdf»
+    sul bilancio 2024; revisione R-8 C5: «…-2026_31.07.2026», «Annual-Report-2025_2026-03-31») e il
+    suo anno non conta come anno del periodo."""
+    date_nome = _date_nel_testo(nome)
+    anni_nome = [int(a) for a in _ANNO.findall(nome)]
+
+    def chiusura(d):
+        if not _fine_mese(*d[:3]) or d[1] not in (3, 6, 9, 12):
+            return False
+        altri = list(anni_nome)
+        if d[0] in altri:
+            altri.remove(d[0])
+        for x in date_nome:  # gli anni delle altre date (pubblicazioni) non contano
+            if x is not d and x[0] in altri:
+                altri.remove(x[0])
+        return not altri or d[0] <= max(altri)
+    chiusure = [d for d in date_nome if chiusura(d)]
+    if chiusure:
+        a, m, g, _ = chiusure[0]
+        return f"{a}-{m:02d}-{g:02d}", "data di chiusura nel nome del file", tipo
+    nota = (" (data a fine mese nel nome trattata come pubblicazione)"
+            if any(_fine_mese(*d[:3]) for d in date_nome) else "")
+    if _TRIMESTRE_AA.search(nome) and not _ANNO.search(nome):
         q = _TRIMESTRE_AA.search(nome)
-        periodo = f"20{q.group(2)}-{('03-31', '06-30', '09-30', '12-31')[int(q.group(1)) - 1]}"
         tipo = "trimestrale" if tipo != "annuale" or q.group(1) != "4" else tipo
+        return f"20{q.group(2)}-{_FINE_TRIMESTRE[int(q.group(1)) - 1]}", "trimestre e anno nel nome del file", tipo
+    anni = [int(a) for a in _ANNO.findall(testo)]
+    for a, _, _, _ in date_nome:  # anni delle date di pubblicazione: tolti una volta ciascuno
+        if a in anni:
+            anni.remove(a)
+    if not anni:
+        return None, None, tipo
+    anno = max(anni)
+    q = _TRIMESTRE.search(" " + testo + " ")
+    if tipo == "trimestrale" and q:
+        return (f"{anno}-{_FINE_TRIMESTRE[int(q.group(1) or q.group(2)) - 1]}",
+                "trimestre e anno nel nome o nel titolo", tipo)
+    if tipo == "trimestrale":
+        return None, None, tipo  # trimestre ignoto: l'anno da solo non basta
+    if tipo == "semestrale":
+        return f"{anno}-06-30", "anno nel nome o nel titolo (chiusura del semestre al 30/06 presunta)" + nota, tipo
+    return f"{anno}-12-31", "anno nel nome o nel titolo (chiusura dell'esercizio al 31/12 presunta)" + nota, tipo
+
+
+def _periodo_dalla_pagina(testa, tipo):
+    """(periodo, base) dal testo della prima pagina: la piu' recente data a fine mese, altrimenti
+    «<titolo del tipo> AAAA» / «AAAA <titolo>»; (None, None) se non si capisce."""
+    chiusure = [d for d in _date_nel_testo(testa) if _fine_mese(*d[:3])]
+    if chiusure:
+        a, m, g, _ = max(chiusure)
+        return f"{a}-{m:02d}-{g:02d}", "data di chiusura nella prima pagina"
+    rx = dict(_TIPI_PDF)[tipo]
+    for m in rx.finditer(testa):
+        dopo = _ANNO.search(testa[m.end():m.end() + 40])
+        prima = _ANNO.search(testa[max(0, m.start() - 8):m.start()])
+        trovato = dopo or prima
+        if trovato and not re.search(r"\d", testa[m.end():m.end() + dopo.start()] if dopo else ""):
+            anno = int(trovato.group(1))
+            if tipo == "trimestrale":
+                q = _TRIMESTRE.search(" " + testa + " ")
+                if not q:
+                    return None, None
+                return f"{anno}-{_FINE_TRIMESTRE[int(q.group(1) or q.group(2)) - 1]}", "trimestre e anno nella prima pagina"
+            fine = "06-30" if tipo == "semestrale" else "12-31"
+            return f"{anno}-{fine}", f"titolo e anno nella prima pagina (chiusura al {fine[3:]}/{fine[:2]} presunta)"
+    return None, None
+
+
+def classifica_pdf(voce, *, prima_pagina=None, dominio=None):
+    """Esito DICHIARATO di un link a PDF del sito: {"url", "testo", "ammesso", "tipo", "periodo",
+    "base_periodo", "motivo", "serve_prima_pagina", "origine", "etichetta"}.
+
+    Riconoscimento su nome del file, testo del link e (se letta) prima pagina: `prima_pagina` =
+    testo, oppure la voce di cache {"testo"} / {"errore"}. Presentazioni e slide per investitori
+    escluse col motivo; senza periodo di riferimento il documento non e' ammesso (motivo scritto)."""
+    url = voce["url"]
+    percorso = unquote(urlsplit(url).path)
+    nome = percorso.rsplit("/", 1)[-1]
+    testo = f"{nome} {voce.get('testo') or ''}".replace("_", " ")
+    out = {"url": url, "testo": (voce.get("testo") or nome)[:160], "ammesso": False, "tipo": None, "periodo": None,
+           "base_periodo": None, "motivo": None, "serve_prima_pagina": False,
+           "origine": ORIGINE_SITO, "etichetta": ETICHETTA_SITO}
+
+    def scarto(motivo, **altro):
+        out.update(motivo=motivo, **altro)
+        return out
+    if dominio and not stesso_dominio(url, dominio):
+        # revisione R-8 C2: solo PDF del dominio dell'emittente (sottodomini compresi)
+        return scarto(f"PDF su un altro dominio ({urlsplit(url).hostname}): non e' il sito dell'emittente")
+    m = _PRESENTAZIONE.search(testo)
+    if m:
+        return scarto(f"presentazione/slide per investitori («{m.group(0)}»): esclusa")
+    m = _ESCLUDI_PDF.search(testo)
+    if m:
+        return scarto(f"non e' una relazione periodica («{m.group(0)}»)")
+    m = _PERCORSO_STAMPA.search(percorso.rsplit("/", 1)[0] + "/")
+    if m:
+        return scarto(f"nella sezione stampa del sito («{m.group(0).strip('/')}»): comunicato, non la relazione")
+    tipo = next((t for t, rx in _TIPI_PDF if rx.search(testo)), None)
+    generico = not _NOME_DOCUMENTO.search(testo)
+    if tipo is None and generico:
+        return scarto("non riconosciuto come relazione periodica (nome del file e titolo)")
+    pagina = prima_pagina.get("testo") if isinstance(prima_pagina, dict) else prima_pagina
+    errore = prima_pagina.get("errore") if isinstance(prima_pagina, dict) else None
+    testa = " ".join(str(pagina).split())[:2000] if pagina is not None else None
+    if tipo is None:
+        # «Consolidated Financial Report 2026» (prova reale): documento, ma di che periodo? lo dice la copertina
+        perche = "nome da documento ma senza il tipo di relazione"
+        if testa is None:
+            if errore:
+                return scarto(f"{perche}; prima pagina non letta ({errore}): non ammesso")
+            return scarto(f"{perche}; prima pagina non letta: non ammesso", serve_prima_pagina=True)
+        m = _PRESENTAZIONE.search(testa)
+        if m:
+            return scarto(f"prima pagina: presentazione/slide per investitori («{m.group(0)}»): esclusa")
+        tipo = next((t for t, rx in _TIPI_PDF if rx.search(testa)), None)
+        if tipo is None:
+            return scarto("prima pagina senza il tipo di relazione periodica: non ammesso")
+        periodo, base = _periodo_dalla_pagina(testa, tipo)
+        if periodo is None:
+            return scarto("periodo di riferimento non dichiarato nel nome, nel titolo ne' nella prima pagina: "
+                          "non ammesso", tipo=tipo)
+        generico = False  # tipo e periodo vengono dalla copertina
     else:
-        anni = [int(a) for a in _ANNO.findall(testo)]
-        if not anni:
-            return None
-        anno = max(anni)
-        q = _TRIMESTRE.search(" " + testo + " ")
-        if tipo == "trimestrale" and q:
-            periodo = f"{anno}-{('03-31', '06-30', '09-30', '12-31')[int(q.group(1) or q.group(2)) - 1]}"
+        periodo, base, tipo = _periodo_dal_nome(nome, testo, tipo)
+    out["tipo"] = tipo
+    if generico or periodo is None:
+        perche = ("nome generico, senza una parola da relazione" if generico
+                  else "periodo di riferimento non dichiarato nel nome ne' nel titolo")
+        if testa is None:
+            if errore:
+                return scarto(f"{perche}; prima pagina non letta ({errore}): non ammesso")
+            return scarto(f"{perche}; prima pagina non letta: non ammesso", serve_prima_pagina=True)
+        m = _PRESENTAZIONE.search(testa)
+        if m:
+            return scarto(f"prima pagina: presentazione/slide per investitori («{m.group(0)}»): esclusa")
+        if generico and not (_NOME_DOCUMENTO.search(testa) and dict(_TIPI_PDF)[tipo].search(testa)):
+            return scarto("nome generico e prima pagina senza titolo da relazione periodica: non ammesso")
+        if periodo is None:
+            periodo, base = _periodo_dalla_pagina(testa, tipo)
+            if periodo is None:
+                return scarto("periodo di riferimento non dichiarato nel nome, nel titolo ne' nella prima pagina: "
+                              "non ammesso")
         else:
-            periodo = f"{anno}-06-30" if tipo == "semestrale" else f"{anno}-12-31"
+            base += "; titolo da relazione confermato dalla prima pagina"
     try:
         date.fromisoformat(periodo)
     except ValueError:
-        return None
+        return scarto(f"periodo di riferimento non valido ({periodo}): non ammesso")
     if (tipo == "semestrale" and periodo[5:7] in ("03", "09")
             and not re.search(r"half|semestr|halbjahr|\bh1\b", testo, re.I)):
         tipo = "trimestrale"  # «interim report at 31 March»: un trimestre (prova reale)
-    return {"url": voce["url"], "testo": (voce.get("testo") or nome)[:160], "tipo": tipo, "periodo": periodo}
+    out.update(ammesso=True, tipo=tipo, periodo=periodo, base_periodo=base)
+    return out
+
+
+def _documento_pdf(voce, prima_pagina=None):
+    """{"url", "testo", "tipo", "periodo", ...} di un link a PDF IR, None se non e' una relazione
+    ammessa (il motivo dello scarto lo da' classifica_pdf)."""
+    esito = classifica_pdf(voce, prima_pagina=prima_pagina)
+    return esito if esito["ammesso"] else None
 
 
 def _parole_nome(url):
@@ -811,16 +1152,31 @@ def _parole_nome(url):
     return {w for w in re.findall(r"[a-z]{2,}", nome) if w not in ("pdf", "final", "vf", "en", "de", "it", "fr", "v")}
 
 
-def scegli_pdf(pdf, *, oggi=None):
+def _in_inglese(url):
+    nome = unquote(urlsplit(url).path).rsplit("/", 1)[-1]
+    return bool(_INGLESE.search(nome) or _TITOLO_INGLESE.search(nome.replace("_", " ")))
+
+
+def scegli_pdf(pdf, *, oggi=None, prime_pagine=None, dominio=None, dopo=None):
     """Dai link a PDF trovati: il documento periodico piu' recente e l'omologo dell'anno prima
-    (stesso tipo, periodo un anno prima ±20 giorni). None se nessuno sembra una relazione."""
+    (stesso tipo, periodo un anno prima ±20 giorni). None se nessuno e' una relazione ammessa.
+    `dominio`: solo PDF del sito dell'emittente (gli altri scartati col motivo); `dopo`: solo
+    relazioni con periodo successivo a quella data come «ultimo» (None se non ce ne sono).
+
+    Ogni documento e la scelta portano l'origine dichiarata (ETICHETTA_SITO); `scartati` dice
+    perche' gli altri PDF non sono stati ammessi (presentazioni, periodo ignoto, ...)."""
     oggi = oggi or date.today()
-    docs = [d for d in (_documento_pdf(v) for v in pdf or [] if isinstance(v, dict) and v.get("url")) if d]
-    docs = [d for d in docs if date.fromisoformat(d["periodo"]) <= oggi]
+    prime_pagine = prime_pagine if isinstance(prime_pagine, dict) else {}
+    esiti = [classifica_pdf(v, prima_pagina=prime_pagine.get(v["url"]), dominio=dominio)
+             for v in pdf or [] if isinstance(v, dict) and v.get("url")]
+    docs, scartati = [], []
+    for e in esiti:
+        if e["ammesso"] and date.fromisoformat(e["periodo"]) > oggi:
+            e = {**e, "ammesso": False, "motivo": f"periodo {e['periodo']} nel futuro: non ammesso"}
+        (docs if e["ammesso"] else scartati).append(e)
     if not docs:
         return None
     ordine = {"annuale": 0, "semestrale": 1, "trimestrale": 2}  # a parita' di periodo: l'annuale
-    inglese = re.compile(r"(?:^|[\W_])(?:en|eng|english)(?:[\W_]|$)", re.I)
 
     def omologo(doc):
         fine = date.fromisoformat(doc["periodo"])
@@ -832,23 +1188,118 @@ def scegli_pdf(pdf, *, oggi=None):
                   and abs((date.fromisoformat(d["periodo"]) - attesa).days) <= 20]
         # stesso tipo di documento: il nome piu' simile (MD&A con MD&A, non col bilancio)
         return max(simili, key=lambda d: (len(_parole_nome(d["url"]) & _parole_nome(doc["url"])),
-                                          bool(inglese.search(d["url"])), d["periodo"])) if simili else None
+                                          _in_inglese(d["url"]), d["periodo"])) if simili else None
 
-    chiave = lambda d: (d["periodo"], -ordine[d["tipo"]], bool(inglese.search(unquote(d["url"]).rsplit("/", 1)[-1])))
+    chiave = lambda d: (d["periodo"], -ordine[d["tipo"]], _in_inglese(d["url"]))
     # prima un documento recente CON l'omologo dell'anno prima (serve la coppia), altrimenti il piu' recente
-    con_coppia = [d for d in docs if omologo(d) and date.fromisoformat(d["periodo"]) >= oggi - timedelta(days=550)]
-    ultimo = max(con_coppia or docs, key=chiave)
+    scelti = [d for d in docs if not dopo or d["periodo"] > str(dopo)]
+    if not scelti:
+        return None  # nessuna relazione piu' recente di `dopo`: il chiamante lo dichiara
+    con_coppia = [d for d in scelti if omologo(d) and date.fromisoformat(d["periodo"]) >= oggi - timedelta(days=550)]
+    ultimo = max(con_coppia or scelti, key=chiave)
     precedente = omologo(ultimo)
-    return {"tipo": ultimo["tipo"], "ultimo": ultimo, "precedente": precedente, "candidati": len(docs)}
+    return {"tipo": ultimo["tipo"], "ultimo": ultimo, "precedente": precedente, "candidati": len(docs),
+            "origine": ORIGINE_SITO, "etichetta": ETICHETTA_SITO, "etichetta_en": ETICHETTA_SITO_EN,
+            "deposito_ufficiale": False,
+            "scartati": [{"url": e["url"], "motivo": e["motivo"]} for e in scartati[:MAX_SCARTATI]],
+            "scartati_totale": len(scartati)}
+
+
+def riepilogo_scarti(pdf, *, oggi=None, prime_pagine=None, dominio=None):
+    """Frase dichiarata sui PDF del sito quando nessuno e' ammesso: quanti e perche' (motivi raggruppati)."""
+    prime_pagine = prime_pagine if isinstance(prime_pagine, dict) else {}
+    esiti = [classifica_pdf(v, prima_pagina=prime_pagine.get(v["url"]), dominio=dominio)
+             for v in pdf or [] if isinstance(v, dict) and v.get("url")]
+    conta = {}
+    for e in esiti:
+        if not e["ammesso"]:
+            gruppo = re.sub(r"\s*\(«[^»]*»\)|\s*\([^)]*\)", "", e["motivo"] or "")[:90]
+            conta[gruppo] = conta.get(gruppo, 0) + 1
+    gruppi = "; ".join(f"{n} {g}" for g, n in sorted(conta.items(), key=lambda x: -x[1])[:3])
+    return (f"nessuna relazione periodica ammessa tra {len(esiti)} PDF del {ETICHETTA_SITO}"
+            + (f": {gruppi}" if gruppi else ""))
+
+
+def da_leggere_prima_pagina(pdf, dominio, *, limite=MAX_PRIME_PAGINE):
+    """URL dei PDF (stesso dominio) a cui manca solo la prima pagina per decidere: i piu' recenti
+    per anno nel nome, al massimo `limite` (gli altri restano scartati col motivo)."""
+    candidati = []
+    for v in pdf or []:
+        if not isinstance(v, dict) or not v.get("url") or not stesso_dominio(v["url"], dominio):
+            continue
+        if classifica_pdf(v)["serve_prima_pagina"]:
+            anni = [int(a) for a in _ANNO.findall(unquote(v["url"]) + " " + str(v.get("testo") or ""))]
+            candidati.append((max(anni, default=0), v["url"]))
+    candidati.sort(key=lambda x: -x[0])
+    return [u for _, u in candidati[:limite]]
+
+
+def dominio_sito(sito):
+    """Dominio registrabile del sito dell'emittente, None se il sito non e' noto."""
+    return dominio_registrabile(urlsplit(str(sito or "")).hostname) if sito else None
 
 
 def pdf_trovati(ticker, *, cache_dir=None, oggi=None):
-    """PDF IR scelti dalla cache dell'ultima esplorazione (nessuna rete), con la data."""
+    """PDF IR scelti dalla cache dell'ultima esplorazione (nessuna rete), con la data e l'origine
+    dichiarata («sito dell'emittente, non archivio ufficiale»)."""
     voce = _leggi_json(_cache_dir(cache_dir) / _nome_file(ticker))
     if not voce:
         return None
-    scelta = scegli_pdf(voce.get("pdf"), oggi=oggi)
-    return {**scelta, "at": voce.get("at"), "sito": voce.get("sito")} if scelta else None
+    scelta = scegli_pdf(voce.get("pdf"), oggi=oggi, prime_pagine=voce.get("prime_pagine"),
+                        dominio=dominio_sito(voce.get("sito")))
+    return ({**scelta, "at": voce.get("at"), "sito": voce.get("sito"), "accesso": voce.get("accesso")}
+            if scelta else None)
+
+
+def impronta_sito(profilo, *, nav=None, head_fn=None):
+    """Impronta leggera dei PDF di un profilo «sito dell'emittente» (revisione R-8 C4): una HEAD per
+    ir_url, robots.txt rispettato, nel ritmo del Navigatore, nessun redirect seguito, IP pubblico.
+    Firma = ETag, Last-Modified, Content-Length. Se una HEAD e' vietata, bloccata, fallisce o il sito
+    non da' nessuna delle tre intestazioni: impronta NON confrontabile col motivo (run completo, mai un
+    controllo saltato in silenzio). Forma: {"fonte": "sito", "varianti": {tipo: {"relazione": firma}}}."""
+    tipo = profilo.get("tipo") or "?"
+    urls = [u for u in profilo.get("ir_urls") or [] if isinstance(u, str)]
+
+    def non_confrontabile(motivo):
+        return {"fonte": "sito", "non_confrontabile": True, "motivo": motivo, "varianti": {}}
+    if not urls:
+        return non_confrontabile("profilo senza documenti del sito")
+    firme = []
+    for url in urls:
+        host = (urlsplit(url).hostname or "").lower()
+        if nav is None:
+            nav = Navigatore(dominio_registrabile(host) or host)
+        try:
+            if not nav.consentito(url):
+                stato, ignoto = nav.bloccato.get(host), nav.robots_ignoto.get(host)
+                return non_confrontabile(f"{frase_blocco(stato)} su robots.txt" if stato else
+                                         f"robots.txt non leggibile ({ignoto})" if ignoto else
+                                         f"robots.txt vieta {urlsplit(url).path[:80]}")
+            if nav.richieste:
+                nav._dormi(nav.pausa)
+            nav.richieste += 1
+            if head_fn is None:
+                import requests
+                from bellomberg.market_data.lettore_trimestrali import UA, _richiedi_indirizzi_pubblici
+                if urlsplit(url).scheme != "https" or not stesso_dominio(url, nav.dominio):
+                    return non_confrontabile(f"documento fuori dal dominio del sito ({host})")
+                _richiedi_indirizzi_pubblici(host, urlsplit(url).port or 443)
+                r = requests.head(url, headers={"User-Agent": UA}, timeout=TIMEOUT_S, allow_redirects=False)
+            else:
+                r = head_fn(url)
+        except Exception as exc:
+            return non_confrontabile(f"HEAD non riuscita ({motivo_eccezione(exc, 120)})")
+        if r.status_code in STATI_BLOCCO:
+            return non_confrontabile(f"{frase_blocco(r.status_code)} sulla HEAD")
+        if r.status_code != 200:
+            return non_confrontabile(f"HEAD: HTTP {r.status_code}")
+        h = r.headers or {}
+        firma = [h.get("ETag"), h.get("Last-Modified"), h.get("Content-Length")]
+        if not any(firma):
+            return non_confrontabile("il sito non da' ETag, Last-Modified ne' Content-Length: nessun controllo leggero")
+        firme.append([url] + firma)
+    digest = hashlib.sha256(json.dumps(firme, sort_keys=True).encode("utf-8")).hexdigest()
+    return {"fonte": "sito", "varianti": {tipo: {"relazione": digest}}, "firme": firme}
 
 
 def scopri_senza_fonte(tickers, *, oggi=None, consigliere_fn=None, scopri_fn=None, scadenza=None):
@@ -862,10 +1313,14 @@ def scopri_senza_fonte(tickers, *, oggi=None, consigliere_fn=None, scopri_fn=Non
             break
         try:
             trovato = (scopri_fn or scopri)(t, oggi=oggi)
-            scelta = scegli_pdf(trovato.get("pdf"), oggi=oggi)
-            esiti.append({"ticker": t, "pdf": bool(scelta), "motivi": (trovato.get("motivi") or [])[:5]})
+            scelta = scegli_pdf(trovato.get("pdf"), oggi=oggi, prime_pagine=trovato.get("prime_pagine"),
+                                dominio=dominio_sito(trovato.get("sito")))
+            esito = {"ticker": t, "pdf": bool(scelta), "motivi": (trovato.get("motivi") or [])[:5]}
+            if trovato.get("accesso"):
+                esito["accesso"] = trovato["accesso"]
+            esiti.append(esito)
         except Exception as exc:
-            esiti.append({"ticker": t, "pdf": False, "motivi": [f"{type(exc).__name__}: {str(exc)[:160]}"]})
+            esiti.append({"ticker": t, "pdf": False, "motivi": [motivo_eccezione(exc)]})
     return esiti
 
 
@@ -877,6 +1332,20 @@ def scopri_giornaliero(store, *, escludi=(), oggi=None, consigliere_fn=None, pre
     esiti = scopri_profili(store, oggi=oggi, consigliere_fn=consigliere_fn, escludi=escludi, scadenza=scadenza)
     if any(e.get("rinviata") for e in esiti):
         return esiti
+    # Profili creati dal sito dell'emittente (V8B 05/10): una relazione piu' recente sul sito (es. la
+    # semestrale dopo l'annuale) diventa una nuova versione del profilo, verificata, prima dei run.
+    for riga in store.list_profiles():
+        if (not riga.get("enabled") or riga.get("ticker") in escludi
+                or (riga.get("profile") or {}).get("origine_collegamento") != "sito_emittente"):
+            continue
+        motivo = _fermati(consigliere_fn, scadenza)
+        if motivo:
+            return esiti + [{"ticker": None, "rinviata": True, "motivi": [motivo]}]
+        try:
+            from bellomberg.market_data.filing_attivazione import aggiorna_dal_sito
+            esiti.append(aggiorna_dal_sito(store, riga["ticker"]))
+        except Exception as exc:  # un sito non ferma gli altri
+            esiti.append({"ticker": riga["ticker"], "esito": "errore", "motivi": [motivo_eccezione(exc)]})
     try:
         pref = (pref_fn or filing_preferenze.carica)()
     except ValueError:

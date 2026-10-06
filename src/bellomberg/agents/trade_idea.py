@@ -1964,7 +1964,9 @@ def _incomplete_capo_result(run, blackboard, reason):
         "summary": gap, "pm_view_response": ("The PM view was not adjudicated. " if english else
                                          "La view del PM non e' stata giudicata. ") + gap,
         "pros": [], "cons": [], "risks": [], "catalysts": [], "invalidation": [],
-        "data_gaps": [gap], "review_conditions": [
+        # Voce 9: anche il ripiego del Capo caduto dichiara la run senza filing (la via di
+        # salvataggio non passa dal ciclo che la aggiunge dopo il Capo; li' resta deduplicata).
+        "data_gaps": [*official_documents_gaps(blackboard), gap], "review_conditions": [
             "A new explicitly authorized analysis is required to obtain a valid judgment." if english
             else "Serve una nuova analisi esplicitamente autorizzata per ottenere un giudizio valido."],
         "scenarios": [], "objections": [{"objection": gap,

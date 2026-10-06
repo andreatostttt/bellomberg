@@ -284,6 +284,202 @@ def _fmt_cost(v):
 
 
 # =============================================================================
+# ESITO VERO DELLA RUN per la pagina Agenti in diretta (handoff-4 voce 2, 05/10, Opus 5.5)
+# =============================================================================
+# La pagina deduceva «Completata · il comitato ha consegnato il memo» da due segnali
+# che NON sono l'esito: `running` passato da true a false e `memo_id` presente. Ma il
+# memo_id esiste dal primo secondo della run (la riga memos nasce '[IN PROGRESS]'),
+# quindi una run FERMA (operational_status blocked) si leggeva come consegnata.
+# `esito_run` legge l'esito dai campi che lo dicono davvero, in quest'ordine:
+#   1. running=true                          -> in_corso / in_corso_senza_segnale
+#   2. registro della run settimanale        -> status + operational_status + analytical/artifact
+#      (li fonde nel heartbeat _weekly_terminal_heartbeat di consigliere_multi)
+#   3. heartbeat di crash (`status: failed`) -> fallita
+#   4. technical_status di mark_run_complete -> Trade Idea e chiusure senza registro
+#   5. nient'altro                           -> sconosciuta, DICHIARATA (mai «completata» di ripiego)
+# e lo incrocia col memo nel DB: un memo ancora '[IN PROGRESS]' non e' mai «consegnato».
+ESITI_RUN = ("in_corso", "in_corso_senza_segnale", "completata", "incompleta", "bloccata",
+             "fallita", "annullata", "interrotta", "nessuna_run", "sconosciuta")
+STATI_MEMO_DB = ("scritto", "in_corso", "assente", "illeggibile", "non_letto")
+
+
+def stato_memo_nel_db(memo_id, db_path):
+    """Stato della riga `memos` della run, letto in SOLA LETTURA.
+    'in_corso' = full_markdown ancora '[IN PROGRESS]' (create_run lo scrive cosi' e solo il
+    Capo lo sostituisce); 'scritto' = qualunque altro testo; 'assente' = nessuna riga;
+    'illeggibile' = DB non apribile; 'non_letto' = nessun memo_id da cercare."""
+    if memo_id is None or isinstance(memo_id, bool):
+        return "non_letto"
+    try:
+        import sqlite3
+        from pathlib import Path
+        from contextlib import closing
+        with closing(sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro",
+                                     uri=True, timeout=2)) as cx:
+            row = cx.execute("SELECT substr(COALESCE(full_markdown,''),1,40) FROM memos WHERE id=?",
+                             (int(memo_id),)).fetchone()
+    except Exception:
+        return "illeggibile"
+    if row is None:
+        return "assente"
+    return "in_corso" if str(row[0]).startswith("[IN PROGRESS]") else "scritto"
+
+
+def _testo_errore(v):
+    if isinstance(v, dict):
+        v = v.get("message")
+    return str(v)[:500] if v else None
+
+
+def esito_run(state, stato_memo="non_letto", processo=None):
+    """Esito di pagina della run dal heartbeat `state` (dict) e dallo stato del memo nel DB.
+    `processo` (R-2 F3/F4, 06/10): fatti sul processo misurati dalla API, tutti opzionali —
+      heartbeat_precede_processo: True se un processo della run avviato da questo backend e'
+        vivo e il file e' piu' vecchio di lui (run in avvio/ripresa, primo heartbeat non ancora
+        scritto: il file e' della run PRECEDENTE) -> in_corso, fonte 'processo_vivo';
+      pid_vivo: True/False/None per il pid dichiarato nel heartbeat;
+      processi_backend_vivi: quanti processi consigliere vivi conosce questo backend;
+      annullata_da_utente: l'ultima run avviata da questo backend e' stata fermata (STOP).
+    Ritorna {"stato", "memo_consegnato", "motivo", "ripresa_disponibile", "ripresa", "fonte",
+    "stato_memo_db"}: `stato` sempre in ESITI_RUN, `memo_consegnato` True/False/None (None =
+    non misurabile, dichiarato). Pura: nessuna lettura, nessuna scrittura."""
+    out = {"stato": "sconosciuta", "memo_consegnato": None, "motivo": None,
+           "ripresa_disponibile": None, "ripresa": None, "fonte": "nessuna",
+           "stato_memo_db": stato_memo}
+    if not isinstance(state, dict):
+        out["motivo"] = "heartbeat non e' un oggetto JSON"
+        return out
+    rounds = state.get("round_esiti")
+    if isinstance(rounds, dict):
+        stati = [v.get("stato") for v in rounds.values() if isinstance(v, dict)]
+        out["ripresa"] = any(s in ("ripreso", "misto") for s in stati)
+    pr = processo if isinstance(processo, dict) else {}
+    if pr.get("heartbeat_precede_processo") is True:
+        out.update(fonte="processo_vivo", stato="in_corso", memo_consegnato=False, ripresa=None,
+                   motivo="run avviata, primo heartbeat non ancora scritto: gli altri dati della "
+                          "pagina sono della run precedente")
+        return out
+    if state.get("running") is True and (pr.get("pid_vivo") is False or (
+            pr.get("pid_vivo") is None and pr.get("processi_backend_vivi") == 0)):
+        # nessuno conferma il processo: o e' morto (pid sparito), o non e' verificabile
+        if pr.get("annullata_da_utente") is True:
+            out.update(fonte="processo_fermato", stato="annullata", memo_consegnato=False,
+                       motivo="run fermata dal PM (STOP): il processo non ha scritto un esito")
+        elif pr.get("pid_vivo") is False:
+            out.update(fonte="processo_morto", stato="interrotta", memo_consegnato=False,
+                       motivo="il processo della run (pid " + str(state.get("pid")) + ") non esiste "
+                              "piu' e non ha scritto un esito")
+        else:
+            out.update(fonte="processo_non_verificabile", stato="in_corso_senza_segnale",
+                       memo_consegnato=False,
+                       motivo="heartbeat senza pid e nessun processo della run conosciuto da questo "
+                              "backend: non e' confermato che la run stia lavorando")
+        return out
+    if state.get("running") is True:
+        out.update(fonte="heartbeat_vivo", memo_consegnato=False,
+                   stato="in_corso_senza_segnale" if state.get("stale_warning") is True else "in_corso")
+        if out["stato"] == "in_corso_senza_segnale":
+            out["motivo"] = ("heartbeat fermo da " + str(state.get("stale_seconds")) + " s: "
+                             "nessuno conferma che la run stia ancora lavorando")
+        return out
+    if "operational_status" in state:
+        status, operativo = state.get("status"), state.get("operational_status")
+        out["fonte"] = "registro_run_settimanale"
+        rd = state.get("resume_available")
+        out["ripresa_disponibile"] = rd if isinstance(rd, bool) else None
+        out["memo_consegnato"] = bool(state.get("analytical_status") == "complete"
+                                      and state.get("artifact_status") == "available")
+        errore = _testo_errore(state.get("last_error")) or _testo_errore(state.get("first_error"))
+        if status == "completed" and operativo != "blocked":
+            out["stato"] = "completata"
+            if not out["memo_consegnato"]:
+                # completata dal registro ma senza analisi/artefatti verificati: contraddizione,
+                # non si sceglie la versione piu' comoda
+                out.update(stato="sconosciuta", motivo="registro 'completed' ma analisi="
+                           + str(state.get("analytical_status")) + " artefatti="
+                           + str(state.get("artifact_status")))
+        elif status in ("incomplete", "failed"):
+            out["stato"] = "bloccata" if operativo == "blocked" else "incompleta"
+            out["motivo"] = (errore or _testo_errore(state.get("blocked_reason"))
+                             or _testo_errore(state.get("reason")) or _testo_errore(state.get("message")))
+        else:
+            out["motivo"] = "stato del registro non terminale: " + str(status)
+    elif state.get("status") == "failed":
+        out.update(fonte="heartbeat_crash", stato="fallita", memo_consegnato=False,
+                   motivo=_testo_errore(state.get("message")))
+    elif state.get("technical_status") is not None:
+        tecnico = state.get("technical_status")
+        out["fonte"] = "esito_tecnico_run"
+        mappa = {"completed": "completata", "incomplete": "incompleta", "failed": "fallita",
+                 "cancelled": "annullata", "interrupted": "annullata"}
+        out["stato"] = mappa.get(tecnico, "sconosciuta")
+        out["memo_consegnato"] = tecnico == "completed"
+        out["motivo"] = (_testo_errore(state.get("reason")) if tecnico in mappa
+                         else "technical_status fuori contratto: " + str(tecnico))
+    else:
+        out["motivo"] = "heartbeat chiuso senza esito dichiarato (ne' registro ne' technical_status)"
+    # il memo nel DB ha l'ultima parola sul «consegnato»
+    if stato_memo == "in_corso":
+        out["memo_consegnato"] = False
+        if out["stato"] == "completata":
+            out.update(stato="sconosciuta", motivo="la run risulta completata ma il memo #"
+                       + str(state.get("memo_id")) + " nel DB e' ancora [IN PROGRESS]")
+    elif stato_memo in ("assente", "illeggibile") and out["memo_consegnato"]:
+        out["memo_consegnato"] = None
+        out["motivo"] = (out["motivo"] + " | " if out["motivo"] else "") + (
+            "memo #" + str(state.get("memo_id")) + " nel DB: " + stato_memo)
+    return out
+
+
+def round_esiti(usage_log, start_time):
+    """Per i round 0/1/2 dei desk: chi ha lavorato IN QUESTO TENTATIVO e chi e' stato
+    ripreso da un checkpoint di un tentativo precedente. La misura e' `ts` di ogni riga di
+    usage contro `start_time` della Blackboard (stesso formato ISO locale, al secondo).
+    stato: 'eseguito' | 'ripreso' | 'misto' | 'assente' | 'n.d.' (righe senza ts leggibile).
+    Una riga ripresa che rigioca richieste gia' nel registro conta come 'eseguito': il
+    round e' girato di nuovo, anche se non e' stato ripagato."""
+    out = {}
+    for r in (0, 1, 2):
+        nuovi, ripresi, ignoti = set(), set(), set()
+        for e in usage_log or []:
+            a = str(e.get("agent") or "")
+            if e.get("round") != r or not a or a.startswith("_") or a == "capo":
+                continue
+            ts = e.get("ts")
+            if not isinstance(ts, str) or not isinstance(start_time, str) or len(ts) < 19:
+                ignoti.add(a)
+            elif ts[:19] < start_time[:19]:
+                ripresi.add(a)
+            else:
+                nuovi.add(a)
+        stato = ("n.d." if ignoti else "assente" if not (nuovi or ripresi)
+                 else "misto" if nuovi and ripresi else "eseguito" if nuovi else "ripreso")
+        out[str(r)] = {"stato": stato, "desk_eseguiti": sorted(nuovi),
+                       "desk_ripresi": sorted(ripresi - nuovi), "desk_senza_orario": sorted(ignoti)}
+    return out
+
+
+def leggi_richieste_journal(path):
+    """Righe native del registro richieste (request_journal) in SOLA LETTURA:
+    [{"request_id", "state", "cost", "agent", "round_n"}]. Solleva se il file non si apre:
+    il chiamante dichiara il buco, non lo tratta come «nessuna richiesta»."""
+    import sqlite3
+    from pathlib import Path
+    from contextlib import closing
+    p = Path(path).resolve()
+    if not p.is_file():
+        raise FileNotFoundError(str(p))
+    with closing(sqlite3.connect(p.as_uri() + "?mode=ro", uri=True, timeout=2)) as cx:
+        rows = cx.execute("SELECT request_id,state,cost,scope FROM requests").fetchall()
+    out = []
+    for request_id, state, cost, scope in rows:
+        s = json.loads(scope) if scope else {}
+        out.append({"request_id": request_id, "state": state, "cost": cost,
+                    "agent": s.get("agent"), "round_n": s.get("round_n")})
+    return out
+
+
+# =============================================================================
 # FALLBACK DICHIARATI (regola PM 14/07 applicata ai ripieghi di questo modulo)
 # =============================================================================
 # Voce MASTER "Il fallback del registro tool e' SILENZIOSO" (P1, 26/07 sera-4):
@@ -431,7 +627,7 @@ class Blackboard:
             self._write_heartbeat()
 
     def record_usage(self, agent, round_n, model, usage, duration_s=None,
-                     api_calls=0, cache_ttl=None, status="ok", retry_vuoto=0):
+                     api_calls=0, cache_ttl=None, status="ok", retry_vuoto=0, lavoro=None):
         """Registra token, durata e costo di UN agente-round (voce collaudo #44).
 
         Prima di oggi i token si stampavano e basta: il costo della run era
@@ -525,6 +721,10 @@ class Blackboard:
             # Campo ADDITIVO: memory_db.save_llm_usage lo ignora finche' la colonna
             # llm_usage.retry_vuoto non esiste (richiesta a parte, memory_db non e' qui).
             "retry_vuoto": int(retry_vuoto or 0),
+            # R-2 F5 (06/10): QUALE lavoro del desk in questo round (una consultazione Trade Idea
+            # ha il suo id): «fallito poi riuscito» vale solo fra tentativi dello STESSO lavoro.
+            # Campo ADDITIVO, None = lavoro unico del round (run settimanale).
+            "lavoro": lavoro,
             "ts": datetime.now().isoformat(timespec="seconds"),
         }
         with self._lock:
@@ -559,22 +759,42 @@ class Blackboard:
            senza costo e almeno uno con);
          - totale: somma per ENTRY, che e' identica alla somma dei per-agente
            non-None (invariante verificata numericamente).
-        Chiamare col lock gia' preso (lo fanno heartbeat e mark_run_complete)."""
+        Chiamare col lock gia' preso (lo fanno heartbeat e mark_run_complete).
+
+        TENTATIVI SENZA RICHIESTE (handoff-4 voce 2, 05/10, Opus 5.5): un tentativo
+        fallito PRIMA di mandare qualunque richiesta (es. cap del Red Team rifiutato in
+        quotazione) lasciava una riga api_error con costo None e rendeva PARZIALE un
+        totale completo. La misura si fa sul REGISTRO RICHIESTE, non sulla riga di usage:
+        v. _tentativi_senza_richieste. Quelle righe valgono 0 (misurato: nessuna
+        richiesta) e sono ELENCATE in total["tentativi_senza_richieste"]."""
+        _esenti, _misura, _misura_err = self._tentativi_senza_richieste()
         by = {}
+        _ultimi = {}   # {agente: {round: [status dei tentativi, in ordine]}}
+        _ko = ("api_error", "usage_unknown")
+        _poi_riusciti = []
         for e in self.usage_log:
             a = e.get("agent") or "?"
+            _zero = id(e) in _esenti
             d = by.setdefault(a, {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0,
                                   "cost_eur": None, "partial": False, "duration_s": None,
                                   "api_calls": 0, "retry_vuoto": 0, "status": "ok",
+                                  "tentativi_senza_richieste": 0,
                                   "_priced": 0, "_unpriced": 0})
+            if _zero:
+                d["tentativi_senza_richieste"] += 1
             for k in ("in", "out", "cache_read", "cache_write"):
+                if _zero and e.get(k) is None:
+                    continue   # nessuna richiesta nel registro: zero token MISURATI, non ignoti
                 d[k] = d[k] + e[k] if d[k] is not None and e.get(k) is not None else None
             d["api_calls"] += int(e.get("api_calls") or 0)
             # 12/09: quanti round del desk hanno ritentato una call a 0 char (-> heartbeat/UI)
             d["retry_vuoto"] += int(e.get("retry_vuoto") or 0)
             if e.get("duration_s") is not None:
                 d["duration_s"] = (d["duration_s"] or 0.0) + float(e["duration_s"])
-            if e.get("cost_eur") is None:
+            if _zero:
+                d["cost_eur"] = (d["cost_eur"] or 0.0) + 0.0
+                d["_priced"] += 1
+            elif e.get("cost_eur") is None:
                 # round non prezzabile: NON azzera ne' cancella i fratelli prezzati,
                 # segna solo che la cifra dell'agente e' un minimo (partial sotto)
                 d["_unpriced"] += 1
@@ -582,8 +802,35 @@ class Blackboard:
                 d["cost_eur"] = (d["cost_eur"] or 0.0) + float(e["cost_eur"])
                 d["_priced"] += 1
             # status dell'agente = il PEGGIORE dei suoi round (ok < usage_unknown <
-            # model_unknown < pricing_unavailable < api_error)
+            # model_unknown < pricing_unavailable < api_error) — e' la STORIA, non l'esito
             d["status"] = _worse_status(d["status"], e.get("status") or "ok")
+            # seguito V2 (PM 05/10, Opus 5.5): per (agente, round) conta l'ULTIMO tentativo
+            # (ordine di usage_log = ordine di registrazione, i ripresi da checkpoint prima)
+            _ultimi.setdefault(a, {}).setdefault((e.get("round"), e.get("lavoro")), []).append(
+                e.get("status") or "ok")
+        for a in sorted(by):
+            d = by[a]
+            # esito FINALE dell'agente = il peggiore fra gli ULTIMI tentativi dei suoi round:
+            # fallito e poi riuscito nello stesso round non e' un KO, ma resta dichiarato
+            d["status_finale"] = "ok"
+            d["tentativi_falliti_poi_riusciti"] = 0
+            for (r, lavoro), stati in sorted(_ultimi.get(a, {}).items(), key=lambda kv: str(kv[0])):
+                # R-2 F5 (06/10): «fallito poi riuscito» vale solo per i RITENTATIVI dello
+                # stesso lavoro: tutti i falliti PRIMA del primo successo. Un fallimento DOPO
+                # un successo e' un altro lavoro nello stesso round (consultazioni Trade Idea)
+                # e resta KO; fuori dalla run settimanale (un lavoro per desk e round) la
+                # regola non si applica: vale il peggiore, come prima.
+                primo_ok = next((i for i, x in enumerate(stati) if x not in _ko), None)
+                ritentativi = ((self.run_scope == "weekly" or lavoro is not None) and primo_ok is not None
+                               # tutti ok dal primo successo in poi (ultimo compreso)
+                               and all(x not in _ko for x in stati[primo_ok:]))
+                finale = stati[-1] if ritentativi else max(stati, key=lambda x: USAGE_STATUS_SEVERITY.get(x, 3))
+                d["status_finale"] = _worse_status(d["status_finale"], finale)
+                falliti = sum(1 for x in stati[:primo_ok or 0] if x in _ko)
+                if ritentativi and falliti:
+                    d["tentativi_falliti_poi_riusciti"] += 1
+                    _poi_riusciti.append({"agent": a, "round": r, "tentativi_falliti": falliti,
+                                          **({"lavoro": lavoro} if lavoro is not None else {})})
         for d in by.values():
             d["tokens_missing"] = [k for k in ("in", "out", "cache_read", "cache_write") if d[k] is None]
             d["tokens_status"] = "parziale" if d["tokens_missing"] else "completo"
@@ -594,14 +841,31 @@ class Blackboard:
             d.pop("_unpriced", None)
         total = {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0,
                  "cost_eur": None, "partial": False, "fx_source": None,
-                 "unpriced_agents": [], "error_agents": []}
+                 "unpriced_agents": [], "error_agents": [],
+                 # versione del SIGNIFICATO di error_agents (06/10): KO = esito FINALE del lavoro;
+                 # heartbeat e snapshot di score_history piu' vecchi non lo portano (= «almeno
+                 # un tentativo KO»)
+                 "error_agents_semantica": "esito_finale_v2",
+                 # storia dichiarata: round in cui un tentativo e' fallito e l'ultimo e' riuscito
+                 "tentativi_falliti_poi_riusciti": _poi_riusciti,
+                 # come e' stata misurata l'assenza di richieste dei tentativi falliti:
+                 # 'journal' | 'non_necessaria' | 'assente' | 'illeggibile' (gli ultimi due
+                 # lasciano il totale PARZIALE, come prima: il buco si dichiara)
+                 "misura_richieste": _misura,
+                 "tentativi_senza_richieste": [
+                     {"agent": e.get("agent"), "round": e.get("round"), "status": e.get("status"),
+                      "ts": e.get("ts")} for e in self.usage_log if id(e) in _esenti]}
+        if _misura_err:
+            total["misura_richieste_errore"] = _misura_err
         # Il totale si somma per ENTRY (non per agente): e' l'unico modo di non
         # perdere i round prezzati di un agente che ha anche round ignoti. Coincide
         # con la somma dei per-agente non-None -> invariante testata.
         _priced_total = 0.0
         _any_priced = False
         for e in self.usage_log:
-            if e.get("cost_eur") is None:
+            if id(e) in _esenti:
+                _any_priced = True   # 0 misurato sul registro richieste
+            elif e.get("cost_eur") is None:
                 total["partial"] = True  # almeno una entry non prezzabile: totale = MINIMO
             else:
                 _priced_total += float(e["cost_eur"])
@@ -617,7 +881,9 @@ class Blackboard:
             # error_agents e' una lista SEPARATA da unpriced_agents: "non so quanto e'
             # costato" e "e' andato KO" sono due buchi diversi (un agente puo' stare in
             # entrambe: KO senza token noti). La UI li deve dire con parole diverse.
-            if d["status"] in ("api_error", "usage_unknown"):
+            # Seguito V2 (PM 05/10): KO = ESITO FINALE (ultimo tentativo di un round), non
+            # «almeno un tentativo»; i falliti-poi-riusciti stanno in tentativi_falliti_poi_riusciti.
+            if d["status_finale"] in _ko:
                 total["error_agents"].append(a)
         # Finding 1/8 (semantica PM 15/07): il totale NON parte da 0.0. Con FX giu',
         # llm_pricing esploso o usage_log ancora vuoto (primi minuti di OGNI run) lo
@@ -646,6 +912,40 @@ class Blackboard:
         total["tokens_status"] = "parziale" if total["tokens_missing"] else "completo"
         return by, total
 
+    def _tentativi_senza_richieste(self):
+        """(id delle righe esenti, misura, errore). Esente = riga di usage api_error, costo
+        None, NESSUN request_id, di un agente che nel registro richieste della run
+        (self.request_journal, letto in sola lettura) non ha alcuna richiesta SCOPERTA,
+        cioe' non attribuita a nessuna riga di usage e con costo diverso da 0. Basta una
+        richiesta scoperta NELLA RUN (di qualunque agente: fallita a meta', esito ignoto,
+        spesa nota mai registrata) e nessuna riga e' esente: il totale resta PARZIALE (regola PM 05/10:
+        il costo incerto si dichiara). Senza registro o con registro illeggibile non si
+        esenta niente e lo si dice."""
+        candidati = [e for e in self.usage_log
+                     if e.get("cost_eur") is None and e.get("status") == "api_error"
+                     and not e.get("request_ids")]
+        if not candidati:
+            return set(), "non_necessaria", None
+        journal = getattr(self, "request_journal", None)
+        path = getattr(journal, "path", None)
+        if path is None:
+            return set(), "assente", None
+        try:
+            righe = leggi_richieste_journal(path)
+        except Exception as exc:
+            return set(), "illeggibile", type(exc).__name__
+        # R-2 F1/F2 (06/10): la copertura si misura sull'INTERA run, non per agente. Le
+        # etichette del registro e dell'usage non coincidono sempre (sonda: registro
+        # "_probe", usage "_probe:<slug>"; scope senza agente): una richiesta scoperta di
+        # QUALUNQUE agente e' un costo incerto della run e nessun tentativo si esenta.
+        coperte = set()
+        for e in self.usage_log:
+            coperte.update(e.get("request_ids") or [])
+        scoperte = [r for r in righe if r["request_id"] not in coperte and r["cost"] != 0]
+        if scoperte:
+            return set(), "journal", None
+        return ({id(e) for e in candidati}, "journal", None)
+
     def _usage_state(self):
         """Le due chiavi usage per lo 'state' di heartbeat e mark_run_complete.
         Mai far saltare la scrittura per un errore di aggregazione: il buco si
@@ -663,7 +963,18 @@ class Blackboard:
                         "cost_eur": None, "partial": True, "fx_source": "n.d.",
                         "unpriced_agents": ["(aggregazione fallita)"],
                         "error_agents": ["(aggregazione fallita)"],
+                        "misura_richieste": "illeggibile", "tentativi_senza_richieste": [],
+                        "tentativi_falliti_poi_riusciti": [],
+                        "error_agents_semantica": "esito_finale_v2",
                         "error": "aggregazione usage fallita: " + str(e)}
+
+    def _round_esiti_sicuri(self):
+        """round_esiti per il heartbeat: un guasto qui non deve far saltare la scrittura,
+        ma si dichiara (stato 'n.d.' con l'errore), mai un dizionario vuoto zitto."""
+        try:
+            return round_esiti(self.usage_log, self.start_time)
+        except Exception as exc:
+            return {str(r): {"stato": "n.d.", "errore": type(exc).__name__} for r in (0, 1, 2)}
 
     def _scrivi_heartbeat_atomico(self, payload):
         """Scrive `payload` su HEARTBEAT_PATH senza che il lettore possa mai
@@ -708,6 +1019,8 @@ class Blackboard:
                 "target_ticker": self.target_ticker,
                 "language": self.language,
                 "running": True,
+                # R-2 F4: chi scrive, per la verifica di vita del processo nella API
+                "pid": os.getpid(),
                 "start_time": self.start_time,
                 "current_round": self.current_round,
                 "current_specialist": self.current_specialist,
@@ -734,6 +1047,9 @@ class Blackboard:
                 # collaudo #44: token/costo per agente e totale run, live nella UI
                 "usage_by_specialist": _usage_by,
                 "usage_total": _usage_tot,
+                # handoff-4 voce 2: chi ha lavorato in QUESTO tentativo e chi e' ripreso
+                # da checkpoint (la pagina non lo indovina dagli orari HH:MM:SS del tool_log)
+                "round_esiti": self._round_esiti_sicuri(),
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }
             self._scrivi_heartbeat_atomico(json.dumps(state, default=str))
@@ -776,6 +1092,7 @@ class Blackboard:
                 "run_id": self.run_id,
                 "target_ticker": self.target_ticker,
                 "running": False,
+                "pid": os.getpid(),
                 "start_time": self.start_time,
                 "technical_status": technical_status,
                 "reason": reason,
@@ -790,6 +1107,7 @@ class Blackboard:
                 "memo_id": self.memo_id,
                 "usage_by_specialist": _usage_by,
                 "usage_total": _usage_tot,
+                "round_esiti": self._round_esiti_sicuri(),
             }
             self._scrivi_heartbeat_atomico(json.dumps(state, default=str))
         except Exception:
@@ -1897,6 +2215,16 @@ class Specialist:
         return preamble + "\n\nGo. Use tools. Then write your report."
 
     @scoped_language
+    def _lavoro_corrente(self):
+        """Chiave del lavoro per la contabilita' dei tentativi (R-2 F5): la consultazione col
+        suo id, altrimenti il tipo di compito; None = il lavoro unico del round."""
+        ctx = getattr(self, "_task_context", None)
+        if not isinstance(ctx, dict):
+            return None
+        if ctx.get("consultation") is True:
+            return "consultazione:" + str(ctx.get("id") or ctx.get("consultation_id") or "?")
+        return str(ctx["kind"]) if ctx.get("kind") else None
+
     def run(self, round_n, *, task_context=None, publish_report=True):
         consultation = isinstance(task_context, dict) and task_context.get("consultation") is True
         trade_idea = getattr(self.blackboard, "run_scope", "weekly") == "trade_idea"
@@ -2792,7 +3120,7 @@ class Specialist:
                         duration_s=round(time.perf_counter() - _t0, 2),
                         api_calls=iteration + _retry_529 + _retry_vuoto + _recovery_call_offset,
                         cache_ttl=CACHE_TTL if USE_PROMPT_CACHING else None,
-                        status="api_error", retry_vuoto=_retry_vuoto)
+                        status="api_error", retry_vuoto=_retry_vuoto, lavoro=self._lavoro_corrente())
                 except Exception as ue:
                     print("[" + self.name + "] WARN usage non registrato: " + str(ue))
                 return err_txt
@@ -3075,7 +3403,7 @@ class Specialist:
                 cache_ttl=CACHE_TTL if USE_PROMPT_CACHING else None,
                 status=("api_error" if _output_finale_mancante else
                         ("usage_unknown" if _usage_unknown else "ok")),
-                retry_vuoto=_retry_vuoto)
+                retry_vuoto=_retry_vuoto, lavoro=self._lavoro_corrente())
         except Exception as ue:
             print("[" + self.name + "] WARN usage non registrato: " + str(ue))
         if consultation and self.consultation_result_status == "truncated":

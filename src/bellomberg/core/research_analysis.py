@@ -110,6 +110,12 @@ def research_context(blackboard):
     for dossier in dossiers.values():
         for document in dossier.get('documents') or []:
             document.pop('text', None)
+    # V1-PONTE: un dossier col ponte Filing entra nel prompt come INDICE compatto (niente testo,
+    # percorsi o liste di esclusi); il dettaglio resta in read_company_dossier section=catalog.
+    if any(isinstance(dossier, dict) and 'filing_bridge' in dossier for dossier in dossiers.values()):
+        from bellomberg.agents.ponte_filing_dossier import indice_compatto
+        dossiers = {ticker: indice_compatto(dossier) if 'filing_bridge' in dossier else dossier
+                    for ticker, dossier in dossiers.items()}
     return {'research_ref': reference, 'dossiers': dossiers,
         'reports': deepcopy(sealed['reports']),
         'instruction': 'Discuss this exact research dossier and thesis. Observations, management guidance, '

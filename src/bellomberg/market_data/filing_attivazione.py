@@ -34,7 +34,7 @@ def _attiva_esef(store, ticker, scelto, origine, nome, proposta, motivo, indice_
                 "motivo": f"indice ESEF: {type(exc).__name__}: {exc}"[:300]}
     con_json = [r for r in righe if isinstance(r, dict) and r.get("json_url") and r.get("period_end")]
     ultimo = max((r["period_end"] for r in con_json), default=None)
-    dal_sito, nota_sito = [], None
+    dal_sito, nota_sito, trovato = [], None, None
     if esef_sito.atteso_piu_recente(ultimo, date.today()) and esef_sito.consigliere_in_corso():
         # mai esplorare durante una run del Consigliere (revisione finale): ci pensa il giro dopo
         nota_sito = "sito dell'emittente non esplorato: run del Consigliere in corso (si riprova al controllo giornaliero)"
@@ -47,11 +47,14 @@ def _attiva_esef(store, ticker, scelto, origine, nome, proposta, motivo, indice_
                 nota_sito = ("sito dell'emittente: " + "; ".join((trovato.get("motivi") or [])[:2])
                              if trovato.get("motivi") else "nessun pacchetto ESEF sul sito dell'emittente")
         except Exception as exc:
-            nota_sito = f"sito dell'emittente: {type(exc).__name__}: {str(exc)[:120]}"
+            nota_sito = f"sito dell'emittente: {esef_sito.motivo_eccezione(exc, 120)}"
     if not con_json and not dal_sito:
-        return {"ticker": ticker, "esito": "senza_fonte", "proposta": proposta,
-                "motivo": "nessun deposito ESEF con xBRL-JSON sul repository filings.xbrl.org"
-                          + (f"; {nota_sito}" if nota_sito else "")}
+        motivo_esef = ("nessun deposito ESEF con xBRL-JSON sul repository filings.xbrl.org"
+                       + (f"; {nota_sito}" if nota_sito else ""))
+        if trovato is not None:  # sito esplorato: relazioni in PDF dal sito (decisione PM 05/10)
+            return _attiva_sito(store, ticker, nome or scelto.get("nome"), proposta, motivo_esef, trovato=trovato,
+                                lei=scelto.get("lei"))
+        return {"ticker": ticker, "esito": "senza_fonte", "proposta": proposta, "motivo": motivo_esef}
     lingue_sito = {p.get("lingua") for p in dal_sito}
     lingua = scegli_lingua(con_json, "en") if con_json else ("en" if "en" in lingue_sito or None in lingue_sito
                                                               else sorted(lingue_sito)[0])
@@ -63,6 +66,353 @@ def _attiva_esef(store, ticker, scelto, origine, nome, proposta, motivo, indice_
     if dal_sito:
         esito["dal_sito"] = len(dal_sito)
     return esito
+
+
+# ------------------------------------------------------------------ sito dell'emittente (V8B, 05/10)
+# Decisione PM 05/10 (opzione B): un titolo senza documenti dall'archivio ufficiale (SEC/ESEF/OAM)
+# prende le relazioni periodiche in PDF dal sito dell'emittente, per QUALUNQUE societa' (nessuna
+# lista cablata). Profilo IR deterministico, senza AI, salvato SOLO se il PDF si verifica
+# (emittente, periodo, tipo, lingua, perimetro); origine sempre dichiarata.
+ORIGINE_COLLEGAMENTO_SITO = "sito_emittente"
+# Regole del periodo in piu' per le relazioni dal sito (prova reale 06/10): provate DOPO quelle di
+# ripiego di filing_proposta_ai, sempre misurate sul documento (_periodo_regge: periodo univoco e
+# durata del tipo). Gruppi ammessi da filing_verifica._periodo_testuale.
+_DATA_EN_SITO = r"[A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}\.?\s+[A-Za-zä]+\s+\d{4}"
+_PERIODI_SITO = {
+    "semestrale": [
+        # «1/1–30/6/2026», «1.1.–30.6.2026»: estremi numerici con l'anno in comune
+        r"(?P<giorno_inizio>\d{1,2})[./](?P<mese_inizio>\d{1,2})\.?\s*[–-]\s*(?P<giorno_fine>\d{1,2})[./]"
+        r"(?P<mese_fine>\d{1,2})\s*[./]\s*(?P<anno>\d{4})",
+        # titolo da semestrale e, poco dopo, la data di chiusura («Half-Yearly … up to 30 June 2026»)
+        rf"(?P<mesi>half)[-\s]*year(?:ly)?\b[\s\S]{{0,1500}}?\b(?:as\s+(?:of|at)|up\s+to|ended)\s+(?P<fine>{_DATA_EN_SITO})",
+    ],
+    "annuale": [
+        rf"(?P<inizio>(?:January\s+1|1\.?\s+January),?\s+\d{{4}})\s*(?:to|until|through|–|-)\s*"
+        rf"(?P<fine>(?:December\s+31|31\.?\s+December),?\s+\d{{4}})",
+        r"(?P<giorno_inizio>\d{1,2})[./](?P<mese_inizio>\d{1,2})\.?\s*[–-]\s*(?P<giorno_fine>\d{1,2})[./]"
+        r"(?P<mese_fine>\d{1,2})\s*[./]\s*(?P<anno>\d{4})",
+    ],
+    "trimestrale": [
+        r"(?P<giorno_inizio>\d{1,2})[./](?P<mese_inizio>\d{1,2})\.?\s*[–-]\s*(?P<giorno_fine>\d{1,2})[./]"
+        r"(?P<mese_fine>\d{1,2})\s*[./]\s*(?P<anno>\d{4})",
+    ],
+}
+
+
+def _periodo_sito(testo, tipo, url, altri):
+    """Prima regola di _PERIODI_SITO che regge sul documento e sugli altri; se nessuna regge su
+    tutti, la prima che regge sul documento (gli altri restano da verificare nel run, dichiarati)."""
+    from bellomberg.market_data import filing_proposta_ai as fp
+    validi = [rx for rx in _PERIODI_SITO.get(tipo, []) if fp._periodo_regge(testo, rx, tipo, url)]
+    tutti = [rx for rx in validi if all(fp._periodo_regge(t, rx, tipo, u) for u, t in altri)]
+    return (tutti or validi or [None])[0]
+
+
+def _senza_fonte(ticker, proposta, motivo):
+    return {"ticker": ticker, "esito": "senza_fonte", "proposta": proposta, "motivo": motivo}
+
+
+MAX_TENTATIVI_SITO = 2  # relazioni scelte provate per titolo (ognuna: fino a 2 PDF da 40 MB)
+# Revisione R-8 C1: parole che, subito DOPO il nome dell'emittente, indicano un'ALTRA entita' del
+# gruppo (veicolo, fondo pensione, controllata con altra forma giuridica). Quelle gia' nel nome
+# dell'emittente non contano («Zztest Holding AG»: «holding» e «ag» sono suoi).
+_QUALIFICHE_ENTITA = (
+    "finance", "financing", "funding", "capital", "treasury", "pension", "pensions", "pensionskasse",
+    "insurance", "reinsurance", "leasing", "bank", "beteiligungs", "beteiligung", "holding", "holdings",
+    "international", "services", "trust", "foundation", "stiftung",
+    "bv", "b.v.", "gmbh", "ltd", "limited", "inc", "llc", "sarl", "s.a.r.l.", "srl", "s.r.l.", "ag", "se",
+    "sa", "s.a.", "spa", "s.p.a.", "plc", "nv", "n.v.", "ab", "asa", "oyj", "kgaa", "kg")
+_PAROLE_GRUPPO = ("group", "gruppo", "groupe", "grupo", "groep")
+
+
+def _parole_del_nome(nome):
+    import re
+    return {w.replace(".", "") for w in re.findall(r"[a-z.]+", str(nome or "").lower())}
+
+
+def _qualifiche_estranee(nome):
+    import re
+    proprie = _parole_del_nome(nome)
+    return "|".join(re.escape(q) for q in _QUALIFICHE_ENTITA if q.replace(".", "") not in proprie)
+
+
+def regex_soggetto(nome):
+    """Prova dell'emittente come SOGGETTO: il nome non seguito da una qualifica di un'altra entita'
+    («Zztest Group» si', «Zztest Group Finance BV» no). Usata anche nel profilo (run)."""
+    from bellomberg.market_data.filing_profili_auto import _regex_nome
+    return _regex_nome(nome) + rf"(?![\s,.\-–]*(?:{_qualifiche_estranee(nome)})(?![a-z]))"
+
+
+def regex_perimetro(nome):
+    """Prova del perimetro consolidato che NON si regge sul nome dell'emittente (R-8 C1)."""
+    proprie = _parole_del_nome(nome)
+    gruppo = [w for w in _PAROLE_GRUPPO if w not in proprie]
+    return "consolidat|konzern" + (rf"|\b(?:{'|'.join(gruppo)})\b" if gruppo else "")
+
+
+def _altra_entita(testo, nome):
+    """Il nome dell'entita' se la PRIMA citazione del nome in copertina e' un'altra entita' del
+    gruppo, None se il documento e' dell'emittente."""
+    import re
+    from bellomberg.market_data.filing_profili_auto import _regex_nome
+    testa = testo[:3000]
+    m = re.search(_regex_nome(nome), testa, re.I)
+    if not m:
+        return None
+    coda = re.match(rf"(?:[\s,.\-–]*(?:{_qualifiche_estranee(nome)})(?![a-z]))+", testa[m.end():], re.I)
+    return " ".join(testa[m.start():m.end() + coda.end()].split()) if coda else None
+
+
+def _codici_discordi(testo, lei=None, isin=None):
+    """Motivo se il PDF dichiara LEI/ISIN e nessuno e' quello dell'emittente, None altrimenti."""
+    import re
+    for etichetta, atteso, forma in (("LEI", lei, r"[A-Z0-9]{18}[0-9]{2}"), ("ISIN", isin, r"[A-Z]{2}[A-Z0-9]{9}[0-9]")):
+        if not atteso:
+            continue
+        trovati = set(re.findall(rf"\b{etichetta}\b\W{{0,12}}({forma})\b", testo[:200_000]))
+        if trovati and str(atteso).upper() not in trovati:
+            return (f"{etichetta} nel documento ({', '.join(sorted(trovati)[:3])}) diverso da quello dell'emittente "
+                    f"({str(atteso).upper()}): documento di un altro soggetto")
+    return None
+
+
+def _scarica_pdf_sito(url, cartella, *, nav=None, dominio=None):
+    """PDF del sito: robots.txt dell'host rispettato (5xx/irraggiungibile = vietato), solo il dominio
+    dell'emittente, solo quell'host, IP pubblico, tetto 40 MB."""
+    from urllib.parse import urlsplit
+    from bellomberg.market_data import download_sicuro, esef_sito, lettore_trimestrali
+    host = (urlsplit(url).hostname or "").lower()
+    if dominio and not esef_sito.stesso_dominio(url, dominio):
+        return {"stato": "errore", "motivo": f"PDF su un altro dominio ({host}): non scaricato"}
+    nav = nav or esef_sito.Navigatore(esef_sito.dominio_registrabile(host) or host)
+    if not nav.consentito(url):
+        stato, ignoto = nav.bloccato.get(host), nav.robots_ignoto.get(host)
+        return {"stato": "errore", "motivo": (f"{esef_sito.frase_blocco(stato)} su robots.txt" if stato
+                                              else f"robots.txt non leggibile ({ignoto})" if ignoto
+                                              else f"robots.txt vieta {urlsplit(url).path[:80]}")}
+    return lettore_trimestrali.scarica_documento(url, str(cartella), host_consentiti={host}, public_only=True,
+                                                 max_bytes=download_sicuro.MAX_PDF)
+
+
+def profilo_dal_sito(ticker, *, nome, scelta, scarica_fn=None, dominio=None, lei=None, isin=None):
+    """{"profilo", "periodo", "avvisi"} se il PDF scelto sul sito si verifica, altrimenti {"motivo"}.
+
+    Regole di verifica tutte deterministiche: lingua dal testo, tipo dalle prove del codice,
+    emittente come SOGGETTO del documento (mai una controllata col suo nome; LEI/ISIN se il PDF li
+    dichiara), perimetro che non si regge sul nome, periodo dalle regole del codice (nessun
+    modello). Senza regex di sezione: tutto il testo come una sezione (sezioni_intero, come i 6-K)."""
+    import re
+    import tempfile
+    from bellomberg.market_data import esef_sito
+    from bellomberg.market_data import filing_proposta_ai as fp
+    from bellomberg.market_data.filing_profili_auto import _LINGUA_ESEF
+    from bellomberg.market_data.filing_verifica import verifica_documento
+    from bellomberg.market_data.lettore_trimestrali import estrai_testo
+    ultimo, precedente = scelta["ultimo"], scelta.get("precedente")
+    nav = None
+    if scarica_fn is None:
+        from urllib.parse import urlsplit
+        nav = esef_sito.Navigatore(dominio or esef_sito.dominio_registrabile(urlsplit(ultimo["url"]).hostname))
+    with tempfile.TemporaryDirectory() as cartella:
+        scaricati, avvisi = {}, []
+        for doc in (ultimo, precedente):
+            if not doc:
+                continue
+            try:
+                if scarica_fn is not None:
+                    r = scarica_fn(doc["url"], cartella)
+                else:
+                    if scaricati:
+                        nav._dormi(esef_sito.PAUSA_S)  # pausa anche fra un PDF e l'altro
+                    r = _scarica_pdf_sito(doc["url"], cartella, nav=nav, dominio=dominio)
+            except Exception as exc:
+                r = {"stato": "errore", "motivo": esef_sito.motivo_eccezione(exc)}
+            if r.get("stato") != "ok":
+                if doc is ultimo:
+                    return {"motivo": f"PDF non scaricato ({esef_sito._URL_NEL_TESTO.sub('<url>', str(r.get('motivo')))})"}
+                avvisi.append(f"PDF dell'anno prima non scaricato ({r.get('motivo')}): solo il documento recente")
+                continue
+            scaricati[doc["url"]] = r["path"]
+        try:
+            lingua = fp.estrai_input(scaricati[ultimo["url"]])["lingua_rilevata"]
+        except ValueError as exc:
+            return {"motivo": f"PDF non utilizzabile: {exc}"}
+        if not lingua or lingua not in _LINGUA_ESEF:
+            return {"motivo": f"lingua del documento non determinata ({lingua or 'ignota'}): nessuna lingua di ripiego"}
+        testi = {u: estrai_testo(p).get("testo") or "" for u, p in scaricati.items()}
+        testo = testi[ultimo["url"]]
+        # identita' (R-8 C1): il documento deve essere DELL'emittente, non di un'entita' col suo nome
+        altra = _altra_entita(testo, nome)
+        if altra:
+            return {"motivo": f"documento di un'altra entita' del gruppo («{altra}»), non dell'emittente «{nome}»"}
+        discordi = _codici_discordi(testo, lei, isin)
+        if discordi:
+            return {"motivo": discordi}
+        for u in [u for u in testi if u != ultimo["url"]]:
+            perche = _altra_entita(testi[u], nome) or _codici_discordi(testi[u], lei, isin)
+            if perche:
+                avvisi.append(f"PDF dell'anno prima scartato: documento di un altro soggetto ({perche})")
+                del testi[u], scaricati[u]
+        perimetro = regex_perimetro(nome)
+        from bellomberg.market_data.filing_profili_auto import _regex_nome
+        if not re.search(perimetro, re.sub(_regex_nome(nome), " ", testo[:200_000], flags=re.I), re.I):
+            return {"motivo": "perimetro consolidato non dichiarato nel documento (il nome dell'emittente non "
+                              "conta): bilancio della sola capogruppo o non riconosciuto, nessun profilo"}
+        urls = [d["url"] for d in (ultimo, precedente) if d and d["url"] in scaricati]
+        profilo = {"ticker": ticker, "emittente_id": f"EMITTENTE:{nome}", "nome": nome,
+                   "origine_collegamento": ORIGINE_COLLEGAMENTO_SITO, "origine_documenti": esef_sito.ETICHETTA_SITO,
+                   "fonti": ["ir"], "ir_urls": urls, "lingua": lingua, "tipo": ultimo["tipo"],
+                   "perimetro": "consolidato",
+                   "verifica": {"lingua": _LINGUA_ESEF[lingua], "perimetro": perimetro,
+                                "tipo": fp._PROVA_TIPO[ultimo["tipo"]], "emittente": regex_soggetto(nome)},
+                   "sezioni": {}, "sezioni_intero": True, "periodo_regola": "piu_recente"}
+        altri = [(u, t) for u, t in testi.items() if u != ultimo["url"]]
+        regole = fp._scegli_regole(testo, profilo, {}, ultimo["url"], altri)
+        if not regole["periodo"]["regex"]:
+            regole["periodo"]["regex"] = _periodo_sito(testo, ultimo["tipo"], ultimo["url"], altri)
+        regole["emittente"]["regex"] = (profilo["verifica"]["emittente"]
+                                        if fp._prova(profilo["verifica"]["emittente"], testo[:20_000]) else None)
+        for campo in ("emittente", "tipo", "periodo"):
+            if not regole[campo]["regex"]:
+                return {"motivo": {"emittente": f"nome dell'emittente «{nome}» non trovato nel documento",
+                                   "tipo": f"il documento non si dichiara relazione {ultimo['tipo']}",
+                                   "periodo": "periodo non verificabile: nessuna regola del codice trova un periodo "
+                                              "univoco del tipo"}[campo]}
+            profilo["verifica"][campo] = regole[campo]["regex"]
+        esito = verifica_documento(scaricati[ultimo["url"]], url=ultimo["url"], profilo=profilo)
+        if esito.get("stato") != "ok":
+            return {"motivo": "PDF non verificato: " + "; ".join(esito.get("motivi") or ["verifica non riuscita"])[:300]}
+        meta = esito["documento"]["metadati"]
+        if meta["periodo_fine"] != ultimo["periodo"]:
+            # prova reale 06/10: la regola del codice aveva preso il comparativo dell'anno prima nel
+            # testo della semestrale nuova. Discordanza = nessun profilo, motivo dichiarato.
+            presunto = "presunta" in str(ultimo.get("base_periodo") or "")
+            return {"motivo": (f"periodo ambiguo: il nome indica {ultimo['periodo']} (presunto), il testo "
+                               f"{meta['periodo_fine']}: nessun profilo") if presunto else
+                    (f"periodo trovato nel testo ({meta['periodo_fine']}) diverso da quello del nome e del "
+                     f"titolo ({ultimo['periodo']}): possibile comparativo, nessun profilo")}
+        profilo["periodo_sito"] = meta["periodo_fine"]
+    return {"profilo": profilo, "periodo": meta["periodo_fine"], "avvisi": avvisi}
+
+
+def _trovato_con_accesso(ticker, trovato, scopri_fn=None):
+    """Voce del sito con l'esito d'accesso: le voci di cache scritte prima del 05/10 non lo hanno
+    (R-8 C8) e si rileggono, mai lette come «nessun PDF»."""
+    from bellomberg.market_data import esef_sito
+    if trovato is not None and "accesso" in trovato:
+        return trovato, None
+    try:
+        trovato = (scopri_fn or esef_sito.scopri)(ticker, forza=True)
+    except Exception as exc:
+        return None, f"sito dell'emittente: {esef_sito.motivo_eccezione(exc, 120)}"
+    if "accesso" not in trovato:
+        return None, ("sito dell'emittente: voce di cache senza esito d'accesso (scritta prima del 05/10), "
+                      "riletta al prossimo giro")
+    return trovato, None
+
+
+def _prova_scelte(ticker, nome, trovato, *, dopo=None, lei=None, isin=None, scarica_fn=None):
+    """Prima relazione del sito che si verifica, fino a MAX_TENTATIVI_SITO: una scelta che non regge
+    (es. controllata col nome dell'emittente) si scarta col motivo e si prova la successiva.
+    (esito di profilo_dal_sito | None, scelta, motivi degli scarti)."""
+    from bellomberg.market_data import esef_sito
+    dominio = esef_sito.dominio_sito(trovato.get("sito")) or "dominio-ignoto.invalid"
+    pdf, motivi, prima = list(trovato.get("pdf") or []), [], None
+    for _ in range(MAX_TENTATIVI_SITO):
+        scelta = esef_sito.scegli_pdf(pdf, prime_pagine=trovato.get("prime_pagine"), dominio=dominio, dopo=dopo)
+        if not scelta:
+            break
+        prima = prima or scelta
+        esito = profilo_dal_sito(ticker, nome=nome, scelta=scelta, scarica_fn=scarica_fn, dominio=dominio,
+                                 lei=lei, isin=isin)
+        if "profilo" in esito:
+            return esito, scelta, motivi
+        motivi.append(f"relazione {scelta['tipo']} al {scelta['ultimo']['periodo']} dal {esef_sito.ETICHETTA_SITO}: "
+                      f"{esito['motivo']}")
+        via = {d["url"] for d in (scelta["ultimo"], scelta.get("precedente")) if d}
+        pdf = [v for v in pdf if v.get("url") not in via]
+    return None, prima, motivi
+
+
+def _attiva_sito(store, ticker, nome, proposta, motivo_base, *, trovato=None, scopri_fn=None, scarica_fn=None,
+                 lei=None, isin=None):
+    """Ultimo passo prima di «senza fonte»: relazioni in PDF dal sito dell'emittente. Blocchi del
+    sito (HTTP 403, robots.txt), PDF non ammessi o non verificati restano DICHIARATI nel motivo."""
+    from bellomberg.market_data import esef_sito
+    if trovato is None and esef_sito.consigliere_in_corso():
+        return _senza_fonte(ticker, proposta, f"{motivo_base}; sito dell'emittente non esplorato: run del "
+                                              "Consigliere in corso (si riprova al controllo giornaliero)")
+    if trovato is None:
+        try:
+            trovato = (scopri_fn or esef_sito.scopri)(ticker)
+        except Exception as exc:
+            return _senza_fonte(ticker, proposta, f"{motivo_base}; sito dell'emittente: "
+                                                  f"{esef_sito.motivo_eccezione(exc, 120)}")
+    trovato, perche = _trovato_con_accesso(ticker, trovato, scopri_fn)
+    if perche:
+        return _senza_fonte(ticker, proposta, f"{motivo_base}; {perche}")
+    accesso = trovato.get("accesso") or {}
+    if accesso.get("stato") != "ok":
+        return _senza_fonte(ticker, proposta, f"{motivo_base}; sito dell'emittente: {accesso.get('motivo')}")
+    dominio = esef_sito.dominio_sito(trovato.get("sito"))
+    if not esef_sito.scegli_pdf(trovato.get("pdf"), prime_pagine=trovato.get("prime_pagine"), dominio=dominio):
+        perche = (esef_sito.riepilogo_scarti(trovato["pdf"], prime_pagine=trovato.get("prime_pagine"), dominio=dominio)
+                  if trovato.get("pdf") else "nessun PDF di relazioni periodiche sul sito dell'emittente")
+        return _senza_fonte(ticker, proposta, f"{motivo_base}; {perche}")
+    if not nome:
+        return _senza_fonte(ticker, proposta, f"{motivo_base}; PDF trovati sul sito dell'emittente ma nome "
+                                              "dell'emittente non noto: prova d'identita' impossibile, nessun profilo")
+    isin = isin or (proposta or {}).get("isin")
+    esito, _, scarti = _prova_scelte(ticker, nome, trovato, lei=lei, isin=isin, scarica_fn=scarica_fn)
+    if esito is None:
+        return _senza_fonte(ticker, proposta, f"{motivo_base}; " + "; ".join(scarti))
+    salvato = store.set_profile(ticker, esito["profilo"], enabled=True, interval_hours=INTERVALLO_AUTO_ORE)
+    return {"ticker": ticker, "esito": "attivato", "fonte": ORIGINE_COLLEGAMENTO_SITO,
+            "origine": esef_sito.ETICHETTA_SITO, "profilo_versione": salvato["version"], "proposta": proposta,
+            "documenti": esito["profilo"]["ir_urls"], "avvisi": esito["avvisi"] + scarti,
+            "motivo": (f"relazione {esito['profilo']['tipo']} al {esito['periodo']} dal {esef_sito.ETICHETTA_SITO} "
+                       f"(verificata sul testo); {motivo_base}"
+                       + (f"; scartate prima: {'; '.join(scarti)}" if scarti else ""))}
+
+
+def aggiorna_dal_sito(store, ticker, *, scopri_fn=None, scarica_fn=None):
+    """Controllo giornaliero dei profili «sito dell'emittente»: se sul sito c'e' una relazione con
+    periodo PIU' RECENTE di quella del profilo (es. la semestrale dopo l'annuale), nuova versione del
+    profilo, verificata come all'attivazione. Mai verso un periodo piu' vecchio (R-8 C3); un documento
+    sparito dal sito resta quello archiviato, dichiarato. Esito: invariato | aggiornato | errore."""
+    from bellomberg.market_data import esef_sito
+    riga = store.get_profile(ticker)
+    profilo = (riga or {}).get("profile") or {}
+    if profilo.get("origine_collegamento") != ORIGINE_COLLEGAMENTO_SITO:
+        return {"ticker": ticker, "esito": "non_applicabile", "motivo": "profilo non creato dal sito dell'emittente"}
+    trovato, perche = _trovato_con_accesso(ticker, (scopri_fn or esef_sito.scopri)(ticker), scopri_fn)
+    if perche:
+        return {"ticker": ticker, "esito": "errore", "motivo": perche}
+    accesso = trovato.get("accesso") or {}
+    if accesso.get("stato") != "ok":
+        return {"ticker": ticker, "esito": "errore", "motivo": f"sito dell'emittente: {accesso.get('motivo')}"}
+    attuale = profilo.get("periodo_sito")
+    if not attuale:
+        doc = esef_sito.classifica_pdf({"url": (profilo.get("ir_urls") or [""])[0], "testo": ""})
+        attuale = doc.get("periodo")
+    if not attuale:
+        return {"ticker": ticker, "esito": "errore",
+                "motivo": "periodo del documento del profilo non noto: nessun confronto, profilo invariato"}
+    esito, scelta, scarti = _prova_scelte(ticker, profilo.get("nome"), trovato, dopo=attuale, scarica_fn=scarica_fn)
+    if esito is None and scelta is None:
+        sul_sito = {v.get("url") for v in trovato.get("pdf") or []}
+        if (profilo.get("ir_urls") or [None])[0] not in sul_sito:
+            return {"ticker": ticker, "esito": "invariato",
+                    "motivo": f"il documento del profilo ({attuale}) non e' piu' sul sito: resta quello archiviato; "
+                              "nessuna relazione piu' recente"}
+        return {"ticker": ticker, "esito": "invariato", "motivo": f"nessuna relazione piu' recente di {attuale} sul sito"}
+    if esito is None:
+        return {"ticker": ticker, "esito": "errore", "motivo": "nuova relazione non verificata: " + "; ".join(scarti)}
+    salvato = store.set_profile(ticker, esito["profilo"], enabled=riga["enabled"],
+                                interval_hours=riga["interval_hours"], qualitative_enabled=riga["qualitative_enabled"])
+    return {"ticker": ticker, "esito": "aggiornato", "profilo_versione": salvato["version"],
+            "motivo": f"relazione {esito['profilo']['tipo']} al {esito['periodo']} dal {esef_sito.ETICHETTA_SITO}"
+                      + (f"; scartate prima: {'; '.join(scarti)}" if scarti else "")}
 
 
 def senza_rifiutati(proposta, cik_rifiutati, lei_rifiutati):
@@ -162,9 +512,12 @@ def _attiva(store, ticker, *, cik, lei, proponi_fn, catalogo_fn, pref_path, indi
                 "motivo": f"{sec['motivo']}; ESEF: {esef_p['motivo']}"}
     elif esef_p["stato"] == "errore":
         return {"ticker": ticker, "esito": "errore", "proposta": proposta, "motivo": "ESEF: " + esef_p["motivo"]}
-    else:
+    elif "." not in ticker:  # titolo USA: la fonte ufficiale e' la SEC, mai il sito come ripiego
         return {"ticker": ticker, "esito": "senza_fonte", "proposta": proposta,
                 "motivo": f"SEC: {sec['motivo']}; ESEF: {esef_p['motivo']}"}
+    else:
+        return _attiva_sito(store, ticker, proposta.get("nome"), proposta,
+                            f"SEC: {sec['motivo']}; ESEF: {esef_p['motivo']}")
     catalogo = catalogo_fn(ticker, cik=scelto["cik"])
     if catalogo.get("stato") == "errore":
         return {"ticker": ticker, "esito": "errore", "proposta": proposta,
@@ -187,8 +540,10 @@ def _attiva(store, ticker, *, cik, lei, proponi_fn, catalogo_fn, pref_path, indi
             c = esef_p["candidati"][0]
             return _attiva_esef(store, ticker, c, c["origine"], proposta.get("nome"), proposta,
                                 f"{esef_p['motivo']} (SEC: {exc})", indice_fn)
-        esito = "da_confermare" if esef_p["stato"] == "ambiguo" else "senza_fonte"
-        return {"ticker": ticker, "esito": esito, "proposta": {**proposta, "esef": esef_p},
+        if esef_p["stato"] != "ambiguo":
+            return _attiva_sito(store, ticker, proposta.get("nome"), {**proposta, "esef": esef_p},
+                                f"SEC: {exc}; ESEF: {esef_p['motivo']}")
+        return {"ticker": ticker, "esito": "da_confermare", "proposta": {**proposta, "esef": esef_p},
                 "motivo": f"SEC: {exc}; ESEF: {esef_p['motivo']}"}
     salvato = store.set_profile(ticker, profilo, enabled=True, interval_hours=INTERVALLO_AUTO_ORE)
     return {"ticker": ticker, "esito": "attivato", "profilo_versione": salvato["version"], "proposta": proposta,
@@ -200,7 +555,7 @@ def attiva_mancanti(store, tickers, **kw):
 
     Le liste restano di ticker (chiamanti e frontend invariati); `motivi` {ticker: motivo} porta
     il motivo di OGNI esito non in errore, cosi' le preferenze lo salvano (prima: null).
-    `avviso_configurazione`: la frase SEC_NON_CONFIGURATA se manca il contatto SEC/ESEF, misurato
+    `avviso_configurazione`: la frase SEC_NON_CONFIGURATA se manca il contatto SEC (l'ESEF non lo esige), misurato
     sulla causa (variabile d'ambiente), non dedotto dagli errori; altrimenti None. (Opus 5.5, 05/10)"""
     from bellomberg.market_data.sec_edgar import _contatto
     out = {k: [] for k in ("attivati", "da_confermare", "senza_fonte", "esclusi", "gia_attivi", "scollegati",

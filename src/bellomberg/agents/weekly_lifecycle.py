@@ -86,11 +86,17 @@ def bind_blackboard(bb, store):
     def fail(error, *, desk=None, round_n=None, request_id=None, **kwargs):
         # Comitato «a lacune» (decisioni PM 04/10): il guasto LOCALE di un desk o del Red
         # Team e' una lacuna dichiarata, non la fine di una run gia' pagata. Resta errore
-        # di RUN tutto il resto: integrita', crash, costo ignoto (anche se il guasto e'
-        # locale: con una richiesta incerta nel registro nessuna spesa e' consentita).
+        # di RUN tutto il resto: integrita', crash.
+        # REGOLA PM 05/10 (prevale sul 04/10, R-0RT F-A): un costo incerto nel registro NON
+        # trasforma piu' la lacuna in errore di run: si DICHIARA nel messaggio della lacuna e il
+        # costo resta incerto (da riconciliare). Nessun reinvio: il desk/Red Team in lacuna non
+        # rigira e la riga incerta resta 'unknown' nel registro.
         kind = gap_kind(bb, store, error, desk)
         if kind is not None:
-            item = {"message": type(error).__name__ + ": " + str(error)[:2800],
+            incerto = ("; costo incerto nel registro richieste (DICHIARATO, da riconciliare; nessun "
+                       "reinvio automatico)" if _costs_uncertain(store) else "")
+            item = {"message": type(error).__name__ + ": " + str(error)[:2800] + incerto,
+                    **({"cost_uncertain": True} if incerto else {}),
                     "exception_type": type(error).__name__, "desk": desk, "round": round_n,
                     "request_id": request_id or getattr(error, "request_id", None),
                     "phase": "red_team" if kind == "red_team" else "round_" + str(round_n)}
@@ -184,9 +190,14 @@ def _costs_uncertain(store):
 def _red_team_local_failure(error):
     """Allow-list del Red Team: errore del provider sulla sua richiesta, risposta incompleta
     o critica inutilizzabile. Integrita' (checkpoint/contratto cambiati, esito tool ignoto),
-    configurazione e crash restano errori di run."""
+    errori di programmazione e crash restano errori di run.
+    V0-REDTEAM (decisione PM/main 05/10): anche il preventivo fallito PRIMA dell'invio
+    (RedTeamSenzaPreventivo, riconosciuto per TIPO: nessuna spesa per costruzione), compreso
+    il modello configurato assente dal catalogo o un listino anomalo (decisione main 06/10:
+    configurazione del Red Team = lacuna dichiarata, come per la sonda «red team best-effort»)."""
     from bellomberg.core.llm_client import APIError
-    if isinstance(error, APIError):
+    from bellomberg.agents.red_team import RedTeamSenzaPreventivo
+    if isinstance(error, (APIError, RedTeamSenzaPreventivo)):
         return True
     message = str(error)
     return ((isinstance(error, ValueError) and message.startswith("Red Team incomplete: "))
@@ -194,13 +205,17 @@ def _red_team_local_failure(error):
 
 
 def gap_kind(bb, store, error, desk):
-    """'desk' | 'red_team' se il guasto e' una lacuna dichiarabile, altrimenti None (run-level)."""
-    if desk is None or not is_research_mode(bb):
+    """'desk' | 'red_team' se il guasto e' una lacuna dichiarabile, altrimenti None (run-level).
+    V0-REDTEAM (PM/main 05/10): la lacuna del Red Team vale in OGNI modalita' (anche fuori
+    research); quella dei desk resta solo research (quorum del contratto research)."""
+    if desk is None:
         return None
     if desk in ("red_team", "_red_team"):
         if not _red_team_local_failure(error):
             return None
         kind = "red_team"
+    elif not is_research_mode(bb):
+        return None
     elif desk in store.context["contract"]["roster"]:
         from bellomberg.agents.trade_idea import _desk_local_failure
         if not _desk_local_failure(error):
@@ -208,7 +223,7 @@ def gap_kind(bb, store, error, desk):
         kind = "desk"
     else:
         return None
-    return None if _costs_uncertain(store) else kind
+    return kind   # costo incerto: dichiarato nel messaggio della lacuna (fail), non errore di run
 
 
 def _require_quorum(roster, present, missing):
@@ -290,7 +305,8 @@ def committee_summary(bb, store, *, memo=None, usage=None):
 def committee_memo_block(summary):
     if summary.get("status") == "unavailable":
         return ("## Comitato: stato non calcolato\nRiepilogo delle lacune del comitato non calcolato ("
-                + summary.get("error", "n.d.") + "): completezza del comitato NON verificata.")
+                + summary.get("error", "n.d.") + "): completezza del comitato NON verificata; decisioni "
+                "non ammesse (nessuna decisione registrata).")
     return summary.get("memo_markdown") or ""
 
 
@@ -357,16 +373,24 @@ def cap_high_conviction(memo):
     return memo, capped, residual
 
 
-def conviction_cap_block(capped, residual, language):
+def conviction_cap_block(capped, residual, language, *, comitato_non_calcolato=False):
     from bellomberg.core.language import text
     if not capped and not residual:
         return ""
+    # R-0RT F-E (06/10): con il riepilogo del comitato non calcolato la presenza del Red Team NON
+    # e' verificata: il declassamento resta (prudenza), ma il motivo detto e' quello vero.
+    motivo = (text("Stato del comitato non calcolato: la presenza del Red Team NON e' verificata e, per "
+                   "prudenza, nessuna proposta può avere convinzione ALTA. Il codice ha riscritto la "
+                   "colonna confidence della ACTION TABLE.",
+                   "Committee status not computed: the Red Team's presence is NOT verified and, as a "
+                   "precaution, no proposal may carry HIGH conviction. The code rewrote the ACTION TABLE "
+                   "confidence column.", language=language) if comitato_non_calcolato else
+              text("Il Red Team non ha completato la critica: per regola del PM nessuna proposta può avere "
+                   "convinzione ALTA. Il codice ha riscritto la colonna confidence della ACTION TABLE.",
+                   "The Red Team did not complete its critique: by PM rule no proposal may carry HIGH "
+                   "conviction. The code rewrote the ACTION TABLE confidence column.", language=language))
     lines = [text("## Comitato: convinzione ALTA non ammessa",
-                  "## Committee: HIGH conviction not allowed", language=language),
-             text("Il Red Team non ha completato la critica: per regola del PM nessuna proposta può avere "
-                  "convinzione ALTA. Il codice ha riscritto la colonna confidence della ACTION TABLE.",
-                  "The Red Team did not complete its critique: by PM rule no proposal may carry HIGH "
-                  "conviction. The code rewrote the ACTION TABLE confidence column.", language=language)]
+                  "## Committee: HIGH conviction not allowed", language=language), motivo]
     # Frase di verifica solo se la verifica e' passata (righe rilette con il parser del registro).
     lines.append(text("Verifica sulle righe estratte per il registro decisioni: nessuna riga con ALTA.",
                       "Check on the rows extracted for the decision register: no row with HIGH.",
@@ -684,6 +708,23 @@ def deliver_once(store, module, attachments, *, body_extra, delivery, send_email
                             send_email=send_email)
 
 
+def _riga_costo_incerto(costs):
+    """Riga HTML che dichiara il costo incerto nell'email (mai un costo «pieno» per default)."""
+    import html as _html
+    n = costs.get("unknown_requests")
+    parti = []
+    if isinstance(n, int) and n:
+        parti.append(str(n) + (" richiesta" if n == 1 else " richieste") + " a costo/esito incerto")
+    if costs.get("unavailable"):
+        parti.append("registro richieste non verificabile (" + str(costs.get("error") or "n.d.") + ")")
+    if not parti:
+        parti.append("richieste non riconciliate nel registro")
+    noto = costs.get("cost_usd")
+    return ("<p><strong>COSTO DELLA RUN INCERTO</strong>: " + _html.escape("; ".join(parti))
+            + ". Da riconciliare; " + ("il costo noto (" + _html.escape(str(noto)) + " USD) e' un MINIMO."
+                                        if noto is not None else "costo totale n.d.") + "</p>")
+
+
 def _deliver_checked(store, module, attachments, *, body_extra, delivery, send_email):
     """Controlli (decisioni, costi, bundle, ricevute) e invio, dopo la decisione su un esito precedente."""
     from bellomberg.reporting.valuation_delivery import record_email_outcome
@@ -691,8 +732,11 @@ def _deliver_checked(store, module, attachments, *, body_extra, delivery, send_e
         return False
     if store.get("decisions_finalized") is None:
         raise WeeklyRunBlocked("Decisioni non finalizzate: invio della consegna bloccato")
-    if costs_unresolved(store.status().get("request_costs") or {}):
-        raise WeeklyRunBlocked("Costi o richieste incerti: invio della consegna bloccato")
+    costi = store.status().get("request_costs") or {}
+    if costs_unresolved(costi):
+        # Decisione main 06/10 (regola PM 05/10): un costo incerto NON blocca l'email: parte con il
+        # costo DICHIARATO incerto in testa al corpo. Gli altri cancelli restano tutti.
+        body_extra = _riga_costo_incerto(costi) + (body_extra or "")
     bundle = store.get("artifact_bundle")
     if not bundle:
         raise WeeklyRunBlocked("Bundle artefatti attestato assente: invio bloccato")
@@ -757,13 +801,19 @@ def finish_status(store, bb, *, pdf_path, md_path, appendix_path, delivery, deli
         store.update(request_costs=costs, artifacts=receipts, delivery_manifest=str(delivery_path))
     prior = store.status()
     delivery_state = "sent" if sent else "uncertain" if prior.get("delivery_status") in ("sending", "uncertain") else "pending"
-    final_status = "incomplete" if uncertain_costs or prior.get("delivery_requested") and not sent else "completed"
+    # Decisione main 06/10: decisioni non ammesse dal comitato = run «incompleta» col motivo.
+    not_allowed = (store.get("decisions_finalized") or {}).get("not_allowed")
+    final_status = ("incomplete" if uncertain_costs or not_allowed or prior.get("delivery_requested") and not sent
+                    else "completed")
     store.update(status=final_status, analytical_status="complete", artifact_status="available",
-                 delivery_status=delivery_state, operational_status="blocked" if uncertain_costs else "requires_pm_review",
+                 delivery_status=delivery_state, operational_status="requires_pm_review",   # costo incerto: incompleta, non bloccata (05/10)
                  artifacts=receipts, delivery_manifest=str(delivery_path), phase="done", last_error=None)
     bb.mark_run_complete(technical_status=final_status,
                          reason=None if final_status == "completed" else
-                         "Richieste o costi incerti conservati" if uncertain_costs else "Consegna richiesta non confermata")
+                         "Richieste o costi incerti conservati" if uncertain_costs else
+                         str(not_allowed) if not_allowed else "Consegna richiesta non confermata")
+    if not_allowed:
+        store.update(incomplete_reason=str(not_allowed))
     return store.status()
 
 

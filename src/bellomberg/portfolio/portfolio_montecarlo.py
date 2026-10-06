@@ -1133,8 +1133,11 @@ def run_monte_carlo(
     cf_raw = _cornish_fisher_var(returns_at_horizon, alpha=0.01)
     cf_var99 = None if cf_raw is None else float(cf_raw * 100)
 
-    # Max drawdown
-    rolling_max = np.maximum.accumulate(cum, axis=1)
+    # Max drawdown misurato dal NAV di PARTENZA (seguito voce 5, 05/10 Opus 5.5): il
+    # massimo mobile parte da 1.0, non dalla chiusura del giorno 1 — prima la caduta
+    # della prima seduta non entrava mai nel drawdown (un replay 2008 di 10 sedute
+    # usciva con il drawdown di 9). `cum` resta intatto per path e bande.
+    rolling_max = np.maximum.accumulate(np.maximum(cum, 1.0), axis=1)
     dd = (cum - rolling_max) / rolling_max
     max_dd = dd.min(axis=1)
     max_dd_pct = np.percentile(max_dd, [5, 50, 95]) * 100
@@ -1174,6 +1177,10 @@ def run_monte_carlo(
         "p75": [round(float(x) * base_nav, 0) for x in fan[4]],
         "p90": [round(float(x) * base_nav, 0) for x in fan[5]],
         "p95": [round(float(x) * base_nav, 0) for x in fan[6]],
+        # voce 5 handoff-4 (revisione R-5): True = le "bande" sono UNA traiettoria
+        # (scenario deterministico), i p5..p95 coincidono e NON sono percentili
+        "deterministic": False,
+        "label": None,
     }
 
     # Distribuzione dei valori TERMINALI (#143, 15/07): istogramma dei NAV simulati a
@@ -1183,6 +1190,72 @@ def run_monte_carlo(
         "counts": [int(c) for c in _cnt],
         "edges_eur": [round(float(e), 0) for e in _edges],
     }
+
+    # Voce 5 handoff-4 (05/10, Opus 5.5): NATURA dello stress. Il replay 2008/2020
+    # rimpiazza le prime sedute di OGNI simulazione con la STESSA finestra storica:
+    # se la finestra copre tutto l'orizzonte le simulazioni sono identiche e non c'e'
+    # distribuzione (la UI e il tool del comitato leggevano E[R] = ES99 e
+    # P(perdita>20%) = 100% come probabilita'). Predicato sulla CAUSA (sedute
+    # replicate = orizzonte, replay applicato davvero), non sulla varianza nulla.
+    _replay_vero = (stress_meta.get("applied") in ("gfc_2008", "covid_2020")
+                    and not stress_meta.get("fallback"))
+    _n_replay = int(stress_meta.get("replaced_days") or 0) if _replay_vero else 0
+    deterministic_scenario = None
+    if _replay_vero and _n_replay >= horizon_days:
+        stress_nature = "deterministic"
+        stress_nature_label = _message(
+            "scenario deterministico: il replay {v0} copre tutto l'orizzonte ({v1} sedute) ed e' identico in ogni simulazione",
+            "deterministic scenario: the {v0} replay covers the whole horizon ({v1} sessions) and is identical in every simulation",
+            v0=stress_meta.get("applied"), v1=horizon_days)
+        # campi azzerati piu' sotto, sul payload: elencati per chi li legge
+        _metriche_na = ["expected_return_pct", "median_return_pct", "stdev_pct", "sharpe_simulated",
+                        "prob_negative_pct", "prob_loss_10pct", "prob_loss_20pct",
+                        "prob_gain_10pct", "prob_gain_20pct", "var_95_pct", "var_99_pct",
+                        "var_99_cornish_fisher_pct", "es_95_pct", "es_99_pct", "es_95_eur", "es_99_eur",
+                        "max_drawdown_p5_pct", "max_drawdown_median_pct", "max_drawdown_p95_pct",
+                        "percentiles_ratio", "percentiles_eur"]
+        _via = np.concatenate(([1.0], cum[0]))
+        deterministic_scenario = {
+            "label": _message("scenario deterministico", "deterministic scenario"),
+            "scenario": stress_meta.get("applied"),
+            "replayed_days": _n_replay,
+            "horizon_days": int(horizon_days),
+            # = stress_meta.window_loss_*: con la finestra che copre l'orizzonte la
+            # perdita della finestra E' la perdita a fine orizzonte. Rendimento CON
+            # SEGNO (stessa convenzione di window_loss_pct): negativo = perdita
+            "scenario_loss_pct": stress_meta.get("window_loss_pct"),
+            "scenario_loss_eur": stress_meta.get("window_loss_eur"),
+            "sign_convention": _message(
+                "scenario_loss_pct/eur sono un rendimento con segno: negativo = perdita, positivo = guadagno",
+                "scenario_loss_pct/eur are a signed return: negative = loss, positive = gain"),
+            # traiettoria unica (riga 0, uguale alle altre): drawdown massimo misurato
+            # dal NAV di PARTENZA (1.0 in testa), cosi' la caduta della prima seduta conta
+            "scenario_max_drawdown_pct": round(float(min(0.0, (
+                _via / np.maximum.accumulate(_via) - 1.0).min())) * 100, 2),
+            "metrics_not_applicable": _metriche_na,
+            "reason": _message(
+                "ogni simulazione ripete la stessa finestra storica: non esiste una distribuzione, quindi rendimento atteso, mediana, VaR, ES, percentili e probabilita' di perdita/guadagno non sono probabilita' (varrebbero tutti la perdita dello scenario, o 0%/100%) e sono null. Il numero da citare e' scenario_loss_pct/eur",
+                "every simulation replays the same historical window: there is no distribution, so expected return, median, VaR, ES, percentiles and loss/gain probabilities are not probabilities (they would all equal the scenario loss, or 0%/100%) and are null. The number to quote is scenario_loss_pct/eur"),
+        }
+        # il ventaglio resta (e' la traiettoria dello scenario) ma lo DICHIARA: i
+        # p5..p95 per giorno coincidono e non vanno etichettati come percentili
+        fan_bands["deterministic"] = True
+        fan_bands["label"] = _message(
+            "scenario deterministico: una sola traiettoria, le bande coincidono (non sono percentili)",
+            "deterministic scenario: a single path, the bands coincide (they are not percentiles)")
+    elif _replay_vero:
+        stress_nature = "fixed_then_simulated"
+        stress_nature_label = _message(
+            "replay deterministico delle prime {v0} sedute su {v1}, poi simulazione: le metriche sono CONDIZIONATE allo scenario e la dispersione viene solo dalle {v2} sedute simulate",
+            "deterministic replay of the first {v0} of {v1} sessions, then simulation: metrics are CONDITIONAL on the scenario and the dispersion comes only from the {v2} simulated sessions",
+            v0=_n_replay, v1=horizon_days, v2=horizon_days - _n_replay)
+    elif stress_meta.get("applied") == "shock_3sigma":
+        stress_nature = "fixed_then_simulated"
+        stress_nature_label = _message(
+            "shock fisso al giorno 0, poi simulazione: le metriche sono CONDIZIONATE allo shock",
+            "fixed shock on day 0, then simulation: metrics are CONDITIONAL on the shock")
+    else:
+        stress_nature, stress_nature_label = "none", None
 
     result = {
         "timestamp": datetime.now().isoformat(),
@@ -1200,6 +1273,11 @@ def run_monte_carlo(
         "stress_requested": stress_scenario,
         "stress_fallback": bool(stress_meta.get("fallback")),
         "stress_meta": stress_meta,
+        # voce 5 handoff-4: "none" | "deterministic" | "fixed_then_simulated"; in
+        # testa vicino allo stress, cosi' sopravvive a un taglio in coda del tool result
+        "stress_nature": stress_nature,
+        "stress_nature_label": stress_nature_label,
+        "deterministic_scenario": deterministic_scenario,
         "lookback_years": lookback_years,
         "lookback_days_calibration": int(len(rr)),
         "n_sims": int(n_sims),
@@ -1268,13 +1346,24 @@ def run_monte_carlo(
     if _extra_meta:
         result.update(_extra_meta)
 
+    # scenario deterministico: le metriche probabilistiche escono null DICHIARATE
+    # (elenco e motivo in deterministic_scenario), mai presentate come probabilita'
+    if deterministic_scenario is not None:
+        for _campo in deterministic_scenario["metrics_not_applicable"]:
+            result[_campo] = None
+
     # il payload va in JSON (FastAPI rifiuta NaN/inf): ogni non-finito diventa
     # null DICHIARATO, anche in cache cosi' i cache hit restano serializzabili
     result = _json_safe(result)
     # in cache va il pool intero; al chiamante solo il campione che ha chiesto
     _CACHE[cache_key] = {"ts": time.time(), "data": result}
-    _log(f"MC done: method={method} E[R]={expected:.2f}% ES99={es99:.2f}% "
-         f"P(loss>20%)={prob_l20:.1f}% P50_EUR={pct_eur['p50']:,.0f}")
+    if deterministic_scenario is not None:
+        _log(f"MC done: method={method} SCENARIO DETERMINISTICO {stress_meta.get('applied')} "
+             f"rendimento scenario={stress_meta.get('window_loss_pct')}% (con segno: negativo = perdita; "
+             f"metriche probabilistiche n.a.)")
+    else:
+        _log(f"MC done: method={method} E[R]={expected:.2f}% ES99={es99:.2f}% "
+             f"P(loss>20%)={prob_l20:.1f}% P50_EUR={pct_eur['p50']:,.0f}")
     return render_payload(_vista_paths(result, sample_paths_n))
 
 

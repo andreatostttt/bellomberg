@@ -291,15 +291,21 @@ def _summary_override(monkeypatch, **forced):
     monkeypatch.setattr(wl, "committee_summary", summary)
 
 
-def test_decisioni_non_ammesse_bloccano_la_persistenza(comitato, monkeypatch):
+def test_decisioni_non_ammesse_non_persistono_e_la_run_arriva_in_fondo(comitato, monkeypatch):
+    # RISCRITTO sulla decisione main 06/10 (goal PM: la run arriva in fondo, memo E PDF, ogni buco
+    # dichiarato). Prima la run si fermava qui; ora memo e PDF si pubblicano, NESSUNA decisione si
+    # registra e la run e' «incompleta» col motivo.
     observed, calls, faults = comitato
-    _summary_override(monkeypatch, decisions_allowed=False)
-    with pytest.raises(WeeklyRunBlocked, match="Decisioni non ammesse"):
-        cm.run_multi_agent(send_email=True)
+    _summary_override(monkeypatch, decisions_allowed=False, automatic_email_allowed=False)
+    result = cm.run_multi_agent(send_email=True)
     store = _store()
-    assert store.get("memo_validated") is None and store.get("decisions_finalized") is None
+    assert store.get("memo_validated")["decisions_not_allowed"].startswith("decisioni non ammesse")
+    assert store.get("decisions_finalized")["ids"] == []
     with store.db._conn() as conn:
         assert conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0] == 0
+    assert any(row["kind"] == "PDF" for row in result["artifacts"])
+    assert result["status"] == "incomplete"
+    assert result["incomplete_reason"].startswith("decisioni non ammesse dal comitato")
     assert observed.inviati == []
 
 
@@ -350,7 +356,10 @@ def test_capo_fallito_memo_parziale_incompleto_senza_decisioni_ne_email(comitato
 
 # ------------------------------------------------------------------- 5. costo ignoto
 
-def test_costo_ignoto_resta_bloccante_anche_se_il_guasto_e_di_un_desk(comitato, monkeypatch):
+def test_costo_ignoto_si_dichiara_nella_lacuna_e_non_ferma_la_run(comitato, monkeypatch):
+    # RISCRITTO sulla REGOLA PM 05/10 (R-0RT F-A, decisione main 06/10): un costo incerto si
+    # DICHIARA e non blocca. Prima (regola 04/10) qui la run si fermava; ora il desk e' in lacuna
+    # con l'incertezza nel motivo, la richiesta incerta NON viene reinviata, il costo resta incerto.
     from bellomberg.core.llm_client import OpenRouterClient
     from bellomberg.valuation import preparation_ai
     observed, calls, faults = comitato
@@ -370,14 +379,15 @@ def test_costo_ignoto_resta_bloccante_anche_se_il_guasto_e_di_un_desk(comitato, 
                                    messages=[{"role": "user", "content": "frozen weekly input"}])
         return original(self, round_n)
     monkeypatch.setattr(_DeskFinto, "run", run)
-    with pytest.raises(Exception):
-        cm.run_multi_agent(send_email=True)
+    result = cm.run_multi_agent(send_email=False)
     status = _store().status()
-    assert len(sent) == 1
-    assert status["first_error"]["desk"] == "crypto" and status["first_error"]["round"] == 1
-    assert not status.get("desk_gaps")     # NON una lacuna: errore di run
-    assert status["request_costs"]["unknown_requests"] == 1
-    assert observed.catturato == {} and observed.inviati == []
+    assert len(sent) == 1                                  # nessun reinvio automatico
+    gap = status["desk_gaps"]["crypto"]
+    assert gap["round"] == 1 and gap.get("cost_uncertain") is True
+    assert "costo incerto nel registro richieste (DICHIARATO" in gap["message"]
+    assert status["request_costs"]["unknown_requests"] == 1      # resta incerto, da riconciliare
+    assert result["analytical_status"] == "complete" and result["status"] == "incomplete"
+    assert observed.inviati == []
 
 
 # ------------------------------------------------------------------- ripresa e stato
@@ -545,13 +555,22 @@ def test_conferma_reinvio_nella_ripresa_senza_delivery_only(comitato, monkeypatc
 
 def test_conferma_reinvio_bloccata_resta_a_registro_col_suo_esito(comitato, monkeypatch):
     observed, store = _incerta(comitato, monkeypatch)
-    monkeypatch.setattr(wl, "costs_unresolved", lambda costs: True)
-    with pytest.raises(WeeklyRunBlocked, match="Costi o richieste incerti"):
+    # Decisione main 06/10: il costo incerto non blocca piu' l'email; qui il cancello che blocca
+    # e' un altro (allegato non attestato), e l'esito resta a registro.
+    import sys
+    vero = wl.verify_receipts
+
+    def non_attestato(receipts):
+        if sys._getframe(1).f_code.co_name == "_deliver_checked":   # solo il cancello dell'email
+            raise WeeklyRunBlocked("Allegato non attestato (sintetico)")
+        return vero(receipts)
+    monkeypatch.setattr(wl, "verify_receipts", non_attestato)
+    with pytest.raises(WeeklyRunBlocked, match="Allegato non attestato"):
         cm.run_multi_agent(resume_memo_id=store.memo_id, delivery_only=True, send_email=True,
                            acknowledge_uncertain_email=True)
     acks = store.status()["email_uncertain_acknowledgements"]
     assert len(observed.inviati) == 1
-    assert len(acks) == 1 and acks[0]["outcome"].startswith("blocked: Costi o richieste incerti")
+    assert len(acks) == 1 and acks[0]["outcome"].startswith("blocked: Allegato non attestato")
 
 
 def test_i_grafici_del_pdf_restano_nel_tmp(comitato):

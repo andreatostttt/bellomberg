@@ -80,9 +80,16 @@ def test_provider_first_cause_and_unknown_cost_survive_both_resumes(run_offline,
     with pytest.raises(Exception):
         cm.run_multi_agent(send_email=False)
     store = _store()
+    # RISCRITTO sulla REGOLA PM 05/10 (V0-REDTEAM / R-0RT F-A, 06/10): il costo incerto non
+    # trasforma piu' il guasto del desk in errore di run. La CAUSA ORIGINALE resta, nella lacuna
+    # dichiarata del desk (con la sua richiesta e l'incertezza del costo); la run si ferma per il
+    # QUORUM (Fundamentals obbligatorio), e il motivo del fermo nomina quella causa.
+    gap = store.status()["desk_gaps"]["fundamentals"]
+    assert gap["round"] == 0 and gap["request_id"] and gap.get("cost_uncertain") is True
+    assert "costo incerto nel registro richieste (DICHIARATO" in gap["message"]
     first = store.status()["first_error"]
-    assert first["desk"] == "fundamentals" and first["round"] == 0
-    assert first["request_id"]
+    assert "Comitato sotto quorum" in first["message"] and "fundamentals (" in first["message"]
+    assert gap["message"].split(";")[0] in first["message"]       # la prima causa non si perde
     for _ in range(2):
         with pytest.raises(Exception) as resumed:
             cm.run_multi_agent(resume_memo_id=store.memo_id, authorize_new_ai=True, send_email=False)
@@ -273,9 +280,14 @@ def test_status_reads_reservation_durably_after_snapshot_and_refuses_missing_jou
     assert not journal_path.exists()
     recovered = cm.run_multi_agent(resume_memo_id=store.memo_id, delivery_only=True, send_email=False)
     assert recovered['status'] == 'incomplete' and recovered['artifact_status'] == 'available'
-    with pytest.raises(WeeklyRunBlocked, match='invio della consegna bloccato'):
-        cm.run_multi_agent(resume_memo_id=store.memo_id, delivery_only=True, send_email=True)
-    assert run_offline.inviati == []
+    # RISCRITTO sulla decisione main 06/10 (regola PM 05/10): il registro non verificabile NON
+    # blocca l'email; parte col costo DICHIARATO incerto/non verificabile in testa al corpo.
+    sent = cm.run_multi_agent(resume_memo_id=store.memo_id, delivery_only=True, send_email=True)
+    assert len(run_offline.inviati) == 1 and sent["delivery_status"] == "sent"
+    corpo = next(part.get_payload(decode=True).decode("utf-8") for part in run_offline.inviati[0].walk()
+                 if part.get_content_type() == "text/html")
+    assert "COSTO DELLA RUN INCERTO" in corpo and "registro richieste non verificabile" in corpo
+    assert sent["status"] == "incomplete"
     assert not journal_path.exists()
 
 

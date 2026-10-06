@@ -97,8 +97,8 @@ def test_advanced_metrics_language_preserves_beta_and_declares_risk_free_origin(
 
 def test_beta_guard_same_verdict_threshold_and_failures_in_both_languages(monkeypatch):
     from bellomberg.portfolio import advanced_metrics as am, portfolio_risk, portfolio_factors
-    monkeypatch.setattr(am, "portfolio_metrics", lambda: {"benchmark": {"beta": .5}})
-    monkeypatch.setattr(portfolio_risk, "compute_portfolio_risk", lambda: {"portfolio": {"beta_vs_spy": 1.}})
+    monkeypatch.setattr(am, "portfolio_metrics", lambda: {"benchmark": {"beta": .5, "n_obs": 120}})  # 05/10: n_obs dichiarato (guardrail osservazioni)
+    monkeypatch.setattr(portfolio_risk, "compute_portfolio_risk", lambda: {"portfolio": {"beta_vs_spy": 1.}, "beta_obs": 120})
     monkeypatch.setattr(portfolio_factors, "compute_portfolio_factors", lambda: {})
     with language_context("it"):
         italian = am.reconcile_betas()

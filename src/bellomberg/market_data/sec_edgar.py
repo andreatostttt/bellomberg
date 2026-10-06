@@ -841,6 +841,12 @@ def _titolare_form4(xml_text: str):
     return titolare, join_messages(", ", ruoli)
 
 
+# Voce 3 handoff-4 (Opus 5.5): sottocartella del foglio di stile di un Form 4 (X05, X06, ...)
+# e cartella del filing (cik + accession senza trattini) dentro l'archivio EDGAR.
+_XSL_FORM4 = re.compile(r"/xslF345X\d\d/")
+_CARTELLA_FILING = re.compile(r"^(https://www\.sec\.gov/Archives/edgar/data/\d+/\d+)/")
+
+
 def get_insider_trades(ticker: str, days: int = 30, max_items: int = 30,
                         motivo: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """Ritorna i Form 4 (insider buy/sell) per un ticker. Parse XML del filing.
@@ -859,25 +865,48 @@ def get_insider_trades(ticker: str, days: int = 30, max_items: int = 30,
             # 202-A2: il primaryDocument dei Form 4 e' l'HTML RENDERIZZATO (prefisso xslF345X05/):
             # i regex sui tag XML falliscono -> Unknown/0/$0. L'XML grezzo sta allo stesso
             # path SENZA il prefisso xsl.
-            raw_url = url.replace("/xslF345X05/", "/") if "/xslF345X05/" in url else url
+            # Voce 3 handoff-4 (Opus 5.5): la SEC usa anche xslF345X06 (e ne usera' altre):
+            # si toglie QUALUNQUE versione, non solo X05 (prima con X06 si scaricava l'HTML).
+            raw_url = _XSL_FORM4.sub("/", url)
             attendi_sec()
             r = requests.get(raw_url, headers=_headers(), timeout=10)
+            ripiego_ko = None   # perche' il ripiego index.json non ha potuto cercare
             if r.status_code != 200 or "<ownershipDocument" not in r.text:
-                # fallback: cerca il .xml nella cartella del filing via index.json
-                try:
-                    folder = raw_url.rsplit("/", 1)[0]
-                    attendi_sec()
-                    idx = requests.get(folder + "/index.json", headers=_headers(), timeout=10).json()
-                    xmls = [it["name"] for it in idx.get("directory", {}).get("item", [])
-                            if str(it.get("name", "")).lower().endswith(".xml")]
-                    for name in xmls:
+                # fallback: cerca il .xml nella cartella del filing via index.json.
+                # La cartella e' quella dell'ACCESSION (.../data/<cik>/<acc>), non quella del
+                # documento: prima con X06 si cercava dentro .../xslF345X06/ e non si trovava nulla.
+                cartella = _CARTELLA_FILING.match(url)
+                if cartella is None:
+                    ripiego_ko = message("cartella del filing non riconosciuta",
+                                         "filing folder not recognised")
+                else:
+                    try:
+                        folder = cartella.group(1)
                         attendi_sec()
-                        r2 = requests.get(folder + "/" + name, headers=_headers(), timeout=10)
-                        if r2.status_code == 200 and "<ownershipDocument" in r2.text:
-                            r = r2
-                            break
-                except Exception:
-                    pass
+                        idx = requests.get(folder + "/index.json", headers=_headers(), timeout=10).json()
+                        xmls = [it["name"] for it in idx.get("directory", {}).get("item", [])
+                                if str(it.get("name", "")).lower().endswith(".xml")]
+                        for name in xmls:
+                            attendi_sec()
+                            r2 = requests.get(folder + "/" + name, headers=_headers(), timeout=10)
+                            if r2.status_code == 200 and "<ownershipDocument" in r2.text:
+                                r = r2
+                                break
+                    except Exception as e:
+                        # prima `pass`: il guasto del ripiego spariva (regola PM 14/07). Solo il
+                        # TIPO: il testo delle eccezioni di rete contiene l'URL completo.
+                        ripiego_ko = type(e).__name__
+            if ripiego_ko is not None and (r.status_code != 200 or "<ownershipDocument" not in r.text):
+                _msg = message("Form 4 {doc}: documento XML non trovato (HTTP {status}) e ripiego "
+                               "sull'indice del filing fallito ({kind}), operazione non letta",
+                               "Form 4 {doc}: XML document not found (HTTP {status}) and filing-index "
+                               "fallback failed ({kind}), transaction not read",
+                               doc=f.get("accession") or url.rsplit("/", 1)[-1],
+                               status=r.status_code, kind=ripiego_ko)
+                _log("  " + _msg)
+                if motivo is not None:
+                    motivo.append(_msg)
+                continue
             if r.status_code != 200 or "<ownershipDocument" not in r.text:
                 # 13/09: prima qui fermava solo un HTTP diverso da 200. Una pagina 200 SENZA
                 # <ownershipDocument> (l'HTML renderizzato, con l'index.json che non trova

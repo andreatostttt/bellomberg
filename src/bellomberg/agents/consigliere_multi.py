@@ -953,6 +953,49 @@ def _record_capo_usage(blackboard, usage, duration_s):
         status="api_error" if usage.get("error") else "ok")
 
 
+def _riga_usage_laterale(agent, entry):
+    """Riga di log di una chiamata laterale (sonda, reflection, action table), letta dalla
+    ENTRY normalizzata da record_usage — la stessa che va nel conto della run.
+
+    05/10 sera (Opus 5.5, HANDOFF-4 voce 6): la riga leggeva usage["in"]/["out"], ma la
+    sonda consegna lo schema del client (input_tokens/output_tokens) -> «in=None out=None»
+    con i token veri nel journal; e "%.2f" mostrava «0,00 EUR» per costi sotto il
+    centesimo (un ping costa frazioni di cent). Ora: token dalla entry, costo con
+    format_eur (4 decimali sotto il cent) e ogni buco dichiarato n.d. COL MOTIVO
+    (lo status della entry), mai uno 0,00 al posto del dato.
+    """
+    e = entry if isinstance(entry, dict) else {}
+    # str(): uno status non stringa non deve far cadere la riga (l'except del chiamante
+    # direbbe «usage non registrato» per una entry GIA' registrata).
+    status = str(e.get("status") or "entry assente")
+    mancanti = e.get("tokens_missing") if isinstance(e.get("tokens_missing"), list) else []
+
+    def _tok(k):
+        v = e.get(k)
+        if isinstance(v, int) and not isinstance(v, bool):
+            return str(v)
+        # con status "ok" lo status non e' un motivo: il buco e' nei token non consegnati
+        if status == "ok":
+            if mancanti:
+                return "n.d. (token non esposti, mancanti: " + ",".join(map(str, mancanti)) + ")"
+            return "n.d. (token non esposti dal provider)"
+        return "n.d. (" + status + ")"
+
+    c = e.get("cost_eur")
+    if isinstance(c, (int, float)) and not isinstance(c, bool):
+        if 0 < abs(c) < 0.0001:
+            # R-36 F1: la sonda costa ~1e-6 EUR; format_eur (4 decimali) la stamperebbe
+            # «0,0000 EUR», lo stesso zero finto di prima -> cifre significative.
+            c_s = "< 0,0001 EUR (" + ("%.1e" % c).replace(".", ",") + ")"
+        else:
+            from bellomberg.core.llm_pricing import format_eur
+            c_s = format_eur(c)
+    else:
+        c_s = "n.d. (" + status + ")"
+    return (str(agent) + " usage: in=" + _tok("in") + " out=" + _tok("out")
+            + " status=" + status + " costo=" + c_s)
+
+
 def _record_side_usage(blackboard, agent, usage):
     """Registra nel conto della run le chiamate LLM 'laterali' (#44/finding 4).
 
@@ -982,13 +1025,12 @@ def _record_side_usage(blackboard, agent, usage):
             api_calls=int(usage.get("api_calls") or 0),
             cache_ttl=None,  # nessun prompt caching in queste due chiamate
             status=status)
-        # 21/07 (minore run #45): formato costi uniforme alle righe agente — prima
-        # qui usciva il float grezzo (0.013723463109396698) accanto agli "0,19 EUR".
-        _c = (entry or {}).get("cost_eur")
-        _c_s = ("%.2f EUR" % _c).replace(".", ",") if isinstance(_c, (int, float)) else str(_c)
-        _log(agent + " usage: in=" + str(usage.get("in")) + " out=" + str(usage.get("out"))
-             + " status=" + str((entry or {}).get("status"))
-             + " costo=" + _c_s)
+        try:
+            _log(_riga_usage_laterale(agent, entry))
+        except Exception as e:
+            # la entry e' GIA' registrata: fallisce solo la riga, e lo si dice cosi'
+            _log("[!] " + str(agent) + " usage registrato, riga di log non formattata: "
+                 + type(e).__name__)
         return entry
     except Exception as e:
         _log("[!] " + str(agent) + " usage non registrato (procedo): " + str(e))
@@ -1214,6 +1256,19 @@ def _weekly_terminal_heartbeat(store):
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         state = {}
+    if not isinstance(state, dict):
+        state = {}
+    # Seguito V2 (PM 05/10, Opus 5.5): il registro si fonde SOPRA l'ultimo heartbeat della
+    # Blackboard. Se la run e' morta prima di crearla, quel file e' della run PRECEDENTE:
+    # tool_log, usage, start_time e technical_status suoi non si spacciano per questa run.
+    # Si scartano e lo si dichiara (`lavagna` + `heartbeat_precedente_scartato`). Questa run =
+    # stesso run_id, oppure run_id ancora None (la Blackboard nasce senza, bind_blackboard lo
+    # mette dopo) con lo stesso memo.
+    stessa = bool(state) and (state.get("run_id") == store.run_id
+                              or (state.get("run_id") is None and state.get("memo_id") == store.memo_id))
+    if state and not stessa:
+        state = {"heartbeat_precedente_scartato": {k: state.get(k) for k in ("run_id", "memo_id", "start_time")}}
+    state["lavagna"] = "questa_run" if stessa else "assente"
     result = store.status()
     state.update(result, run_scope="weekly", running=False,
                  message=((result.get("last_error") or result.get("first_error") or {}).get("message")
@@ -1221,6 +1276,30 @@ def _weekly_terminal_heartbeat(store):
     ok, error = scrivi_file_atomico(str(path), json.dumps(state, ensure_ascii=False, default=str))
     if not ok:
         _log("[!] Stato finale non scritto nel heartbeat: " + str(error))
+
+
+def _calcola_guardrail_beta():
+    """Guardrail beta (advanced_metrics.reconcile_betas) calcolato UNA volta per run, nel
+    priming (PM 06/10): lo leggono il punteggio quant in R1 e il blocco del Capo. Un guasto
+    non sparisce: payload {"error": tipo} DICHIARATO, e a valle la beta e' esclusa/vietata.
+    review R-SEG 06/10: `calcolato_il` nel payload (anche di errore), cosi' una ripresa in un
+    altro giorno lo DICHIARA al Capo; riga di log PRIMA del calcolo (rete/DB senza timeout:
+    un blocco non resta muto)."""
+    calcolato_il = datetime.now().isoformat(timespec="seconds")
+    _log("Guardrail beta: calcolo (3 motori: TWR, rischio, fattori)...")
+    try:
+        from bellomberg.portfolio.advanced_metrics import reconcile_betas
+        rb = reconcile_betas()
+    except Exception as e:
+        _log("[!] guardrail beta non disponibile: " + type(e).__name__)
+        return {"error": type(e).__name__, "calcolato_il": calcolato_il}
+    if not isinstance(rb, dict):
+        _log("[!] guardrail beta: payload non valido (" + type(rb).__name__ + ")")
+        return {"error": "payload non valido", "calcolato_il": calcolato_il}
+    rb = dict(rb, calcolato_il=calcolato_il)
+    _log("Guardrail beta: " + str(rb.get("verdict") or "senza verdetto") + " " + str(rb.get("betas"))
+         + " (calcolato il " + calcolato_il + ")")
+    return rb
 
 
 @scoped_language
@@ -1286,7 +1365,11 @@ def run_multi_agent(*, resume_memo_id=None, delivery_only=False,
                             run_id=store.run_id, authorization={"scope": "weekly", "memo_id": store.memo_id,
                                 "context_sha256": digest(store.context), "authorized_usd": None})
                         if costs_unresolved(store.request_journal.summary()):
-                            raise WeeklyRunBlocked("Richieste o costi incerti: ripresa analitica bloccata")
+                            # REGOLA PM 05/10 (decisione main 06/10): costo incerto DICHIARATO, la
+                            # ripresa prosegue. Nessun reinvio: la stessa richiesta incerta ha la
+                            # stessa chiave e il registro la rifiuta (RequestBlocked, mai pagata due volte).
+                            _log("[!] Ripresa con richieste/costi INCERTI nel registro: DICHIARATI (da "
+                                 "riconciliare), la ripresa prosegue; nessuna richiesta incerta viene reinviata")
                         with request_scope(store.request_journal, phase="weekly"):
                             result = _run_multi_agent(store, db, send_email=send_email)
             except BaseException as exc:
@@ -1426,6 +1509,20 @@ def _run_multi_agent(store, db, *, send_email=True):
         except Exception as exc:
             bb.data["_filing_context"] = ("ARCHIVIO FILING NON DISPONIBILE: "
                                           + type(exc).__name__ + ": " + str(exc)[:200])
+        if is_research_mode(bb):
+            # V1-PONTE: documenti gia' verificati dall'archivio Filing nel dossier, prima di R0 (no rete/AI).
+            # Esiti del pre-run letti UNA volta (gli stessi del contesto Filing); guasto = lacuna dichiarata.
+            try:
+                from bellomberg.agents import ponte_filing_dossier as _ponte
+                _esiti_letti = {"esiti": locals()["_freschezza"]} if "_freschezza" in locals() else {}
+                _ponte.ammetti_archivio_filing(bb, store, aggiornamento=_filing_agg,
+                                               servizio_factory=_filing_service, log=_log, **_esiti_letti)
+            except Exception as exc:
+                _log("  [!] Ponte Filing -> dossier non eseguito: " + type(exc).__name__)
+                try:
+                    _ponte.ponte_non_eseguito(bb, exc)
+                except Exception:
+                    pass
 
         # HEALTH-CHECK PRE-RUN (audit/07 §3, P1): il giorno del memo #42 var_contribution
         # rispondeva "insufficient history: 0 obs" e la run e' partita comunque, senza
@@ -1550,6 +1647,11 @@ def _run_multi_agent(store, db, *, send_email=True):
                     _probe_usage.update(model=_s, api_calls=1, duration_s=_e.get("durata_s"),
                                         cost_usd=_e.get("cost_usd"),
                                         status="ok" if _e.get("ok") else "api_error")
+                    # R-2 F1 (06/10, Opus 5.5): la richiesta della sonda, anche FALLITA, e'
+                    # nel registro: la riga di usage la nomina, cosi' il costo incerto resta
+                    # attribuito e dichiarato (mai «tentativo senza richieste»)
+                    if _e.get("request_id") and _e["request_id"] not in (_probe_usage.get("request_ids") or []):
+                        _probe_usage["request_ids"] = list(_probe_usage.get("request_ids") or []) + [_e["request_id"]]
                     _record_side_usage(bb, "_probe:" + _s, _probe_usage)
                 if not _e.get("ok"):
                     tool_health["ko"].append("modello " + _s + " -> " + str(_e.get("motivo"))[:160])
@@ -1619,10 +1721,21 @@ def _run_multi_agent(store, db, *, send_email=True):
             _progress_score_error = type(e).__name__ + ": " + str(e)
             _log("[!] scorekeeper skipped: " + str(e))
 
+        # GUARDRAIL BETA nel priming (PM 06/10, Opus 5.5): calcolato UNA volta, prima di R1,
+        # lo leggono il punteggio quant (R1) e il blocco del Capo; guasto = {"error": tipo}
+        bb.data["_beta_reconcile"] = _calcola_guardrail_beta()
         store.complete("priming", {"macro": macro, "correlation_matrix": correlation_matrix,
             "freshness_report": freshness_report, "tool_health": tool_health,
-            "scorecard": _progress_scorecard, "score_error": _progress_score_error}, bb)
+            "scorecard": _progress_scorecard, "score_error": _progress_score_error,
+            "beta_reconcile": bb.data["_beta_reconcile"]}, bb)
     else:
+        # ripresa: il guardrail del priming si RIUSA; checkpoint di una run precedente alla
+        # regola 06/10 (chiave assente) = ricalcolato una volta, dichiarato nel log
+        _rb_priming = _priming.get("beta_reconcile")
+        if _rb_priming is None:
+            _log("[!] checkpoint di priming senza guardrail beta (run precedente al 06/10): ricalcolato una volta")
+            _rb_priming = _calcola_guardrail_beta()
+        bb.data["_beta_reconcile"] = _rb_priming
         macro = _priming["macro"]
         correlation_matrix = _priming["correlation_matrix"]
         freshness_report = _priming["freshness_report"]
@@ -1752,23 +1865,32 @@ def _run_multi_agent(store, db, *, send_email=True):
 
         # GUARDRAIL BETA (13/07): verdetto di riconciliazione dei 3 motori nel contesto
         # del Capo — nel memo #42 un beta artefatto (0,04) ha deciso da solo il "no hedge".
+        # 05/10 (Opus 5.5): beta vietato per le coperture con OGNI verdetto != RECONCILED; fuori
+        # da RECONCILED al Capo arrivano solo verdetto, motivo e divieto (niente valori per fonte
+        # ne' intervallo/mediana). Guardrail rotto o senza verdetto = blocco che lo DICHIARA e
+        # vieta il beta (review R-4: prima la riga spariva e con lei il divieto).
+        # 06/10: riusa il guardrail del priming (stesso verdetto visto dal quant in R1).
         try:
-            from bellomberg.portfolio.advanced_metrics import reconcile_betas
-            _rb = reconcile_betas()
-            if isinstance(_rb, dict) and _rb.get("verdict"):
-                bb.data["_beta_reconcile"] = _rb
-                _line = ("\n\n=== GUARDRAIL BETA (riconciliazione 3 motori) ===\n"
-                         "verdetto: " + str(_rb["verdict"])
-                         + " | beta: " + str(_rb.get("betas"))
-                         + (" | consenso: " + str(_rb["beta_consensus"])
-                            if _rb.get("beta_consensus") is not None else "")
-                         + "\nREGOLA: se il verdetto e' UNRELIABLE, il beta NON e' un argomento "
-                           "decisionale valido (vietati verdetti di hedge basati sul beta) "
-                           "finche' non riconciliato.")
-                sizing_context = (sizing_context or "") + _line
-                _log("Guardrail beta: " + str(_rb["verdict"]) + " " + str(_rb.get("betas")))
+            from bellomberg.portfolio.advanced_metrics import testo_guardrail_beta_capo
+            _rb = bb.data.get("_beta_reconcile")
+            if _rb is None:   # non dovrebbe: il priming lo scrive sempre
+                _log("[!] guardrail beta assente dalla blackboard: calcolato ora, una volta")
+                _rb = bb.data["_beta_reconcile"] = _calcola_guardrail_beta()
+            if not (isinstance(_rb, dict) and _rb.get("verdict")):
+                _log("[!] guardrail beta senza verdetto: beta vietato al Capo")
+            _line = testo_guardrail_beta_capo(_rb)
+            # review R-SEG 06/10 (S2): ripresa in un altro giorno = il Capo sa che e' vecchio
+            _quando = str(_rb.get("calcolato_il") or "")[:10] if isinstance(_rb, dict) else ""
+            if _quando and _quando != datetime.now().date().isoformat():
+                _line += ("\nNB: guardrail calcolato il " + _quando + " (priming di questa run) e "
+                          "riusato nella ripresa di oggi: non ricalcolato.")
         except Exception as e:
-            _log("[!] guardrail beta skipped: " + str(e))
+            _log("[!] guardrail beta non disponibile: " + type(e).__name__)
+            _line = ("\n\n=== GUARDRAIL BETA (riconciliazione 3 motori) ===\n"
+                     "GUARDRAIL BETA non disponibile (" + type(e).__name__ + "): il beta NON e' un "
+                     "argomento decisionale valido (vietati verdetti di hedge basati sul beta) "
+                     "finche' non riconciliato.")
+        sizing_context = (sizing_context or "") + _line
 
         # CRUSCOTTO SCORING (#186b): sintesi degli score deterministici per il Capo + memo
         scoring_context = None
@@ -1822,11 +1944,16 @@ def _run_multi_agent(store, db, *, send_email=True):
             sizing_context = (sizing_context or "") + "\n\n" + preparation_status_text(
                 bb.data["_valuation_preparation"], language=bb.language)
         from bellomberg.core.llm_client import request_scope
-        if is_research_mode(bb) and not _wl.committee_summary(bb, store).get("high_conviction_allowed", False):
-            sizing_context = (sizing_context or "") + (
+        _comitato_pre_capo = _wl.committee_summary(bb, store)
+        if not _comitato_pre_capo.get("high_conviction_allowed", False):   # ogni modalita' (V0-REDTEAM 05/10)
+            sizing_context = (sizing_context or "") + ((
+                "\n\nSTATO DEL COMITATO NON CALCOLATO in questa run: la presenza del Red Team NON e' "
+                "verificata (R-0RT F-E); per prudenza nessuna proposta puo' avere confidence ALTA; il "
+                "codice declassa ALTA a MEDIA nella colonna confidence della ACTION TABLE e lo dichiara nel memo.")
+                if _comitato_pre_capo.get("status") == "unavailable" else (
                 "\n\nRED TEAM MANCANTE O PARZIALE in questa run (regola PM 04/10): nessuna proposta "
                 "puo' avere confidence ALTA; il codice declassa ALTA a MEDIA nella colonna confidence "
-                "della ACTION TABLE e lo dichiara nel memo.")
+                "della ACTION TABLE e lo dichiara nel memo."))
         with request_scope(store.request_journal, phase="capo", agent="capo", round_n=3):
             memo, capo_usage = run_capo(bb, portfolio_data=portfolio, memory_db=db, sizing_context=sizing_context, scoring_context=scoring_context)
         _capo_dur = time.perf_counter() - _capo_t0
@@ -1863,9 +1990,10 @@ def _run_multi_agent(store, db, *, send_email=True):
     # Deterministico: in ripresa si ricalcola dallo stesso checkpoint 'capo'.
     _committee = _wl.committee_summary(bb, store, memo=memo, usage=capo_usage)
     _conviction_block = ""
-    if is_research_mode(bb) and not _committee.get("high_conviction_allowed", False):
+    if not _committee.get("high_conviction_allowed", False):   # ogni modalita' (V0-REDTEAM 05/10)
         memo, _capped, _residual = _wl.cap_high_conviction(memo)
-        _conviction_block = _wl.conviction_cap_block(_capped, _residual, store.context.get("language"))
+        _conviction_block = _wl.conviction_cap_block(_capped, _residual, store.context.get("language"),
+                                                     comitato_non_calcolato=_committee.get("status") == "unavailable")
 
     # PUBLICATION GATE (Andrea, ported): il testo intatto del Capo resta in un
     # sidecar *_capo_raw.md mai sovrascritto (stessa via congelata degli artefatti
@@ -1956,12 +2084,16 @@ def _run_multi_agent(store, db, *, send_email=True):
         _analysis_memo = memo
         # Difesa in piu' (PM 04/10): sotto quorum o Capo non completo NESSUNA decisione si
         # persiste. Riepilogo non calcolato = non ammesso (mai «ammesso» per default).
+        # Decisione main 06/10: decisioni non ammesse NON fermano la run. Memo e PDF si pubblicano
+        # fail-closed (gate senza registro: nessuna decisione persistita, righe d'ingresso non
+        # operative col motivo), le decisioni restano NON ammesse e dichiarate, run «incompleta».
+        _decisioni_non_ammesse = None
         if not _committee.get("decisions_allowed", False):
-            from bellomberg.storage.weekly_run_store import WeeklyRunBlocked as _NonAmmesse
-            raise _NonAmmesse("Decisioni non ammesse dal comitato (stato " + str(_committee.get("status"))
-                                   + "): nessuna decisione persistita")
-        _gate = _publication_gate(bb, db, store, memo_id, memo, capo_source_memo,
-                                  _raw_sidecar_error, _sanity_pairs)
+            _decisioni_non_ammesse = ("decisioni non ammesse dal comitato (stato "
+                                      + str(_committee.get("status")) + "): nessuna decisione registrata")
+            _log("[!] " + _decisioni_non_ammesse + "; memo e PDF pubblicati, run incompleta")
+        _gate = _publication_gate(bb, None if _decisioni_non_ammesse else db, store, memo_id, memo,
+                                  capo_source_memo, _decisioni_non_ammesse or _raw_sidecar_error, _sanity_pairs)
         publication = _gate["publication"]
         decision_ids = _gate["decision_ids"]
         _decisions_error = _gate["decisions_error"]
@@ -1974,9 +2106,12 @@ def _run_multi_agent(store, db, *, send_email=True):
                                                            if k != "source_markdown"},
                                            "hard_pairs": [list(pair) for pair in _hard_pairs],
                                            "decision_ids": decision_ids,
-                                           "decisions_error": _decisions_error}, bb)
+                                           "decisions_error": _decisions_error,
+                                           **({"decisions_not_allowed": _decisioni_non_ammesse}
+                                              if _decisioni_non_ammesse else {})}, bb)
     else:
         capo_usage = _validated["capo_usage"]
+        _decisioni_non_ammesse = _validated.get("decisions_not_allowed")   # ripresa: resta non ammesso
         _analysis_memo = _validated.get("analysis_memo", _validated["memo"])
         _restored = _restore_validated(
             _validated, capo_source_memo,
@@ -2172,6 +2307,9 @@ def _run_multi_agent(store, db, *, send_email=True):
             # Here they become final for the weekly lifecycle; a gate that could not
             # persist them is retried once with the snapshot that was published.
             _finalize_error = None
+            if _decisioni_non_ammesse:
+                # Decisione main 06/10: nessun nuovo tentativo di registrare decisioni non ammesse.
+                decision_ids, _finalize_error, _decisions_error = [], _decisioni_non_ammesse, None
             if _decisions_error is not None:
                 # REV R1/R2: retry idempotente e mai bloccante per sempre. Il memo e' gia'
                 # congelato e dichiara cio' che il gate non ha confermato; il registro si
@@ -2183,7 +2321,9 @@ def _run_multi_agent(store, db, *, send_email=True):
                     _log("[!] FINALIZZAZIONE CON GUASTO DICHIARATO (la consegna procede): " + _finalize_error)
                 _decisions_error = None
             _log("Decisions extracted from ACTION TABLE: " + str(len(decision_ids)))
-            store.complete("decisions_finalized", {"ids": decision_ids, "error": _finalize_error}, bb)
+            store.complete("decisions_finalized", {"ids": decision_ids, "error": _finalize_error,
+                                                   **({"not_allowed": _decisioni_non_ammesse}
+                                                      if _decisioni_non_ammesse else {})}, bb)
             _persistence_ok = True
         except Exception as e:
             _log("[!] DB memo finalize failed: " + str(e))

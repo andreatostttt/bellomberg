@@ -14,7 +14,7 @@ from bellomberg.agents import trade_idea
 from bellomberg.core.research_analysis import RESEARCH_ANALYSIS_MODE
 from test_trade_idea_no_workbook_e2e import no_workbook_case  # noqa: F401 (fixture)
 from test_trade_idea_economic import IDENTITY
-from test_trade_idea_delivery import smtp  # noqa: F401 (fixture of the fixture)
+from _smtp_cattura import smtp  # noqa: F401 (fixture of the fixture)
 from test_trade_idea_store import db_path, migrated  # noqa: F401 (fixtures of the fixture)
 
 GAP_MARK = "nessun bilancio o documento ufficiale"
@@ -59,5 +59,6 @@ def test_run_without_any_official_document_completes_and_declares_the_gap(no_wor
     assert len(gaps) == 1, detail['result']['data_gaps']
     manifest = detail['artifacts']
     assert manifest['complete_package_status'] == 'ready'
-    # Measured 05/10: this fixture's research PDF renders none of result['data_gaps'] (not even the
-    # Capo's own): the declared gap lives in the result/manifest; PDF rendering is a separate follow-up.
+    # Voce 9 (06/10/2026): result['data_gaps'] is now printed by every renderer (memo: page one, before
+    # "1. Raccomandazione"; legacy: first text page, before the contents), this gap included. Proved in
+    # tests/test_trade_idea_pdf_limiti_prima_pagina.py; this test does not reopen the PDF.

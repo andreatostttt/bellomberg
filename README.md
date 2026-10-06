@@ -72,8 +72,8 @@ the application is writing.
 3. Open `.env` in a text editor. Set `BELLOMBERG_PIN` to **four ASCII digits**,
    different from the rejected default `1234`. For AI features, add your own
    `OPENROUTER_API_KEY` and review the per-function model settings. Add market-data
-   keys only for the features you want; US filings and European reports also need
-   `SEC_CONTACT_EMAIL`. Keep the delivery fields `EMAIL_FROM`, `EMAIL_PASSWORD` and
+   keys only for the features you want; US filings (SEC) also need
+   `SEC_CONTACT_EMAIL` (European ESEF reports work without it). Keep the delivery fields `EMAIL_FROM`, `EMAIL_PASSWORD` and
    `EMAIL_TO` empty unless you intend to configure delivery. See
    [configuration](docs/guide/configuration.md).
 

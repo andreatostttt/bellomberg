@@ -43,8 +43,9 @@ os.environ["NEWS_AUTO_REFRESH_ENABLED"] = "false"   # G3: assegnazione forte, un
 # Idem per il controllo filing: nei test del lifespan non deve toccare il DB reale.
 os.environ.setdefault("FILING_AUTO_REFRESH_ENABLED", "false")
 # 02/09 (pubblicazione B2): SEC_CONTACT_EMAIL e' letta A OGNI CHIAMATA da
-# sec_edgar._headers()/esef._headers(); senza, sollevano ContattoMancante PRIMA
-# della richiesta e i test che simulano la rete non arrivano al mock. Un
+# sec_edgar._headers()/esef._headers(); senza, sec_edgar solleva ContattoMancante PRIMA
+# della richiesta e i test che simulano la rete non arrivano al mock (esef dal 05/10
+# usa invece uno User-Agent generico: decisione PM «ESEF senza contatto SEC»). Un
 # contatto finto basta (setdefault: quello vero del .env non si tocca); i test
 # del caso ASSENTE lo tolgono con monkeypatch.delenv.
 os.environ.setdefault("SEC_CONTACT_EMAIL", "test-suite@example.com")
@@ -722,3 +723,27 @@ def cache_proposte_ai_di_prova(monkeypatch, tmp_path):
     """Fase C: le proposte AI dei profili IR (DATA_DIR/filing_ai) nel tmp del test, mai in data/."""
     from bellomberg.market_data import filing_proposta_ai
     monkeypatch.setattr(filing_proposta_ai, "_cache_dir", lambda: tmp_path / "filing_ai")
+
+
+@pytest.fixture(autouse=True)
+def acquisizione_fund_fuori_dalla_suite(monkeypatch):
+    """V0-RETE (06/10/2026, Opus 5.5): ogni `with TestClient(api.app)` esegue il lifespan, che
+    avvia FundMarketWorker su SQLITE_PATH/DB_DIR di PRODUZIONE (bellomberg_api, dal 03/10). Il
+    primo giro legge il book vero (`_universe`, sqlite3 diretto: fuori dal tripwire (b)) e chiama
+    yf.Ticker per ogni ticker con quotazione in cache scaduta (>15'), in un thread: rete vera nei
+    test, e un tentativo di scrittura in data/consensus_cache (fermato dalla spia (c) ma solo come
+    warning, perche' avviene in un thread). Verde o rosso secondo l'eta' della cache vera: i
+    test delle notizie cadevano in teardown con ['yfinance.Ticker'].
+    Sandbox, come (a): il giro restituisce uno stato DICHIARATO (unavailable + motivo), mai un
+    «completato» zitto. Chi prova il worker (tests/test_fund_market_worker.py) ripatcha lo stesso
+    nome dentro il test: la sua setattr vince. La prova: tests/test_fund_worker_fuori_dalla_suite.py."""
+    from bellomberg.market_data import fund_market_worker
+
+    def _giro_dichiarato(db_path, *, cache_dir, now=None, stop_event=None):
+        return {"contract": "fund-market-refresh/1", "status": "unavailable",
+                "error": "fund_market_refresh_disabled_in_test_suite", "universe_count": None,
+                "counts": {}, "errors": [{"stage": "test_suite",
+                                          "error": "fund_market_refresh_disabled_in_test_suite"}],
+                "notices": []}
+
+    monkeypatch.setattr(fund_market_worker, "refresh_followed_market_data", _giro_dichiarato)

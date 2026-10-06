@@ -59,9 +59,9 @@ def _variante(profilo, righe, rif, allegati_fn, soglia_6k):
 
 def relazioni(impronta):
     """{variante: relazione} di un'impronta, o None se assente o in forma non riconosciuta."""
-    if not isinstance(impronta, dict) or impronta.get("fonte") not in ("sec", "esef") \
-            or not isinstance(impronta.get("varianti"), dict):
-        return None
+    if not isinstance(impronta, dict) or impronta.get("fonte") not in ("sec", "esef", "sito") \
+            or not isinstance(impronta.get("varianti"), dict) or impronta.get("non_confrontabile"):
+        return None  # «sito» non confrontabile (HEAD vietata o senza firma): mai gli stessi depositi
     if any(not isinstance(v, dict) for v in impronta["varianti"].values()):
         return None
     return {k: v.get("relazione") for k, v in impronta["varianti"].items()}
@@ -97,6 +97,11 @@ def impronta_depositi(profilo, *, riferimento=None, catalogo_fn=None, allegati_f
     completo o controllo leggero), limita le sonde 6-K ai depositi piu' nuovi. Catalogo o indice 6-K illeggibili:
     ValueError (il chiamante fa il run completo).
     """
+    if isinstance(profilo, dict) and profilo.get("origine_collegamento") == "sito_emittente":
+        # V8B/R-8 C4: PDF dal sito dell'emittente: HEAD con robots.txt (esef_sito.impronta_sito); se
+        # non confrontabile, l'impronta porta il motivo e il run e' completo (mai un controllo zitto)
+        from bellomberg.market_data.esef_sito import impronta_sito
+        return impronta_sito(profilo)
     oggi_d = date.fromisoformat(oggi) if isinstance(oggi, str) else (oggi or date.today())
     if isinstance(profilo, dict) and profilo.get("esef_modo") == "blocchi" and profilo.get("fonti") == ["esef"]:
         if any(isinstance(v, dict) and v.get("fonti", ["esef"]) != ["esef"] for v in profilo.get("varianti") or []):

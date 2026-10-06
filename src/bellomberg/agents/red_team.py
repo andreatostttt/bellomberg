@@ -42,16 +42,27 @@ WEEKLY_RED_MAX_TOKENS = 128000
 def _cap_del_provider(richiesti, model, metadata_fn=None):
     """Run 05/10 21:00: 128000 > 65536 di google/gemini-3.8-flash e il controllo prezzi fermava
     la run PRIMA di spendere. Si chiede il tetto del provider (Models API, gratuita), DICHIARATO;
-    se il catalogo non risponde resta il valore richiesto (il controllo prezzi decide, come prima)."""
+    se il catalogo non risponde resta il valore richiesto (il controllo prezzi decide, come prima).
+    V0-REDTEAM (05/10): dentro una run il listino viene dal registro richieste (la stessa memoria
+    che la sonda dei modelli e il controllo prezzi riempiono): una sola lettura per modello e per
+    run, e tetto e controllo prezzi vedono lo stesso listino. Senza registro: lettura diretta."""
+    from bellomberg.core.request_journal import current_request_scope
+    origine = "letto ora"
     try:
-        meta = (metadata_fn or _live_metadata)(model)
+        registro = None if metadata_fn is not None else (current_request_scope() or {}).get("journal")
+        if registro is not None:
+            meta, gia_letto = registro.metadati_modello(model)
+            if gia_letto:
+                origine = "listino gia' letto in questa run"
+        else:
+            meta = (metadata_fn or _live_metadata)(model)
         cap = (meta.get("top_provider") or {}).get("max_completion_tokens")
     except Exception as exc:
         print("[RED_TEAM] tetto del provider non letto (" + type(exc).__name__ + "): resta " + str(richiesti))
         return richiesti
     if type(cap) is int and 0 < cap < richiesti:
         print("[RED_TEAM] max_tokens " + str(richiesti) + " -> " + str(cap) + " (tetto del provider "
-              + str(model) + ", dichiarato)")
+              + str(model) + ", " + origine + ", dichiarato)")
         return cap
     return richiesti
 
@@ -59,6 +70,101 @@ def _cap_del_provider(richiesti, model, metadata_fn=None):
 def _live_metadata(model):
     from bellomberg.valuation.preparation_ai import live_metadata
     return live_metadata(model)
+
+
+def _red_team_mai_inviato():
+    """True solo se il registro richieste della run PROVA che nessuna richiesta del Red Team e'
+    stata registrata (quindi nessuna spesa). Senza registro o con lettura fallita: non provato."""
+    from bellomberg.core.request_journal import current_request_scope
+    registro = (current_request_scope() or {}).get("journal")
+    if registro is None:
+        return False
+    try:
+        righe = registro.summary().get("requests")
+    except Exception as exc:
+        print("[RED_TEAM] registro richieste non leggibile (" + type(exc).__name__ + "): invio non escluso")
+        return False
+    return isinstance(righe, list) and not any(
+        isinstance(r, dict) and r.get("agent") in ("_red_team", "red_team") for r in righe)
+
+
+class RedTeamSenzaPreventivo(RuntimeError):
+    """Preventivo del Red Team fallito PRIMA di qualsiasi invio (listino Models API non
+    leggibile o cap rifiutato dal controllo prezzi): nessuna spesa per costruzione. Decisione
+    PM/main 05/10: e' una lacuna DICHIARATA (weekly_lifecycle._red_team_local_failure, per tipo),
+    la run prosegue senza contraddittorio; non e' un errore di run."""
+
+
+def _senza_preventivo(model, max_tokens, dettaglio, exc):
+    return RedTeamSenzaPreventivo("Red Team senza preventivo prima dell'invio (nessuna spesa), modello "
+                                  + str(model) + ", max_tokens " + str(max_tokens) + ": " + dettaglio)
+
+
+def _valida_listino(meta):
+    """Forma del listino della Models API (dato del FORNITORE): ogni anomalia e' ValueError, cosi'
+    diventa lacuna dichiarata senza allargare l'except a TypeError/AttributeError, che restano
+    errori di programmazione (R-0RT F-C, 06/10)."""
+    from decimal import Decimal, InvalidOperation
+    if not isinstance(meta, dict):
+        raise ValueError("listino del modello non e' un oggetto (" + type(meta).__name__ + ")")
+    if type(meta.get("context_length")) is not int:
+        raise ValueError("listino senza context_length intero")
+    top = meta.get("top_provider")
+    if top is not None and not isinstance(top, dict):
+        raise ValueError("listino con top_provider non valido (" + type(top).__name__ + ")")
+    pricing = meta.get("pricing")
+    if not isinstance(pricing, dict):
+        raise ValueError("listino senza pricing (" + type(pricing).__name__ + ")")
+    for chiave in ("prompt", "completion"):
+        grezzo = pricing.get(chiave)
+        if isinstance(grezzo, bool) or not isinstance(grezzo, (str, int, float)):
+            raise ValueError("listino: pricing " + chiave + " assente o non numerico")
+        try:
+            valore = Decimal(str(grezzo))
+        except InvalidOperation:
+            raise ValueError("listino: pricing " + chiave + " non numerico") from None
+        if not valore.is_finite() or valore < 0:
+            raise ValueError("listino: pricing " + chiave + " non finito o negativo")
+
+
+def _preventivo_prima_dell_invio(model, max_tokens, *, ricalcola_cap=False):
+    """Lo stesso controllo che il registro richieste fa a ogni invio (listino memorizzato +
+    preparation_price_ceiling), anticipato: cosi' il suo rifiuto e' riconoscibile come
+    'nessun invio fatto'. Restituisce il max_tokens da usare.
+    Revisione R-0RT (06/10):
+    - F-B: max_tokens non intero positivo = errore di PROGRAMMAZIONE (TypeError), prima del try;
+      il ValueError diventa lacuna solo dalle due fonti legittime: lettura del catalogo (anche
+      «modello configurato assente», scelta main) e rifiuto del preventivo.
+    - F-C: listino anomalo validato (_valida_listino) -> ValueError -> lacuna.
+    - F-D: con ricalcola_cap (nessun checkpoint salvato: contratto non ancora fissato) il tetto
+      viene dal listino letto QUI, non da una lettura precedente fallita.
+    Della rete solo il tipo (il testo puo' contenere URL). Senza registro non c'e' controllo
+    prezzi a valle: niente da anticipare."""
+    if type(max_tokens) is not int or max_tokens <= 0:
+        raise TypeError("Red Team: max_tokens deve essere un intero positivo, non " + repr(max_tokens))
+    from bellomberg.core.request_journal import current_request_scope
+    registro = (current_request_scope() or {}).get("journal")
+    if registro is None:
+        return max_tokens
+    from bellomberg.core.llm_pricing import preparation_price_ceiling
+    try:
+        meta, _gia_letto = registro.metadati_modello(model)
+    except OSError as exc:
+        raise _senza_preventivo(model, max_tokens, type(exc).__name__ + " (catalogo modelli non letto)", exc) from exc
+    except ValueError as exc:
+        raise _senza_preventivo(model, max_tokens, "catalogo modelli: " + type(exc).__name__ + ": "
+                                + str(exc)[:200], exc) from exc
+    try:
+        _valida_listino(meta)
+    except ValueError as exc:
+        raise _senza_preventivo(model, max_tokens, str(exc)[:200], exc) from exc
+    if ricalcola_cap:
+        max_tokens = _cap_del_provider(max_tokens, model, metadata_fn=lambda _m: meta)
+    try:
+        preparation_price_ceiling(meta, model=model, max_tokens=max_tokens)
+    except ValueError as exc:
+        raise _senza_preventivo(model, max_tokens, "preventivo rifiutato: " + str(exc)[:200], exc) from exc
+    return max_tokens
 
 RED_TEAM_PROMPT = """Sei il RISK MANAGER SCETTICO di Bellomberg, l'avvocato del diavolo del team. Gli specialisti hanno prodotto le loro tesi. Il tuo compito NON e' proporre trade, ma ATTACCARE le tesi prima che il Capo decida, in italiano professionale e diretto.
 
@@ -501,18 +607,31 @@ def _run_red_team_loop(blackboard, trade_idea, MODEL_SYNTHESIZER, user_msg,
                 systems = [None] + ([base_system] if trade_idea else [])
                 match = next(((system, cap, thinking) for system in systems for cap, thinking in candidates
                               if saved_checkpoint["contract"] == contract_for(cap, thinking, system)), None)
+                _al_cap_pieno = next((th for th in (red_thinking, {"type": "adaptive"})
+                                      if saved_checkpoint["contract"] == contract_for(WEEKLY_RED_MAX_TOKENS, th)), None)
                 if (match is None and not trade_idea and max_tokens < WEEKLY_RED_MAX_TOKENS
+                        and _al_cap_pieno is not None
                         and saved_checkpoint.get("iteration") == 0 and not saved_checkpoint.get("calls")
-                        and any(saved_checkpoint["contract"] == contract_for(WEEKLY_RED_MAX_TOKENS, th)
-                                for th in (red_thinking, {"type": "adaptive"}))):
+                        and not saved_checkpoint.get("pending_tools") and not saved_checkpoint.get("inflight_tools")
+                        and _red_team_mai_inviato()):
                     # Run 05/10 21:00: checkpoint al cap 128000 oltre il tetto del provider; il controllo
                     # prezzi rifiuta PRIMA dell'invio, quindi nessun corpo di quel contratto e' mai stato
-                    # pagato (iterazione 0, nessuna chiamata): si riparte col tetto del provider, dichiarato.
+                    # pagato: si riparte col tetto del provider, dichiarato. V0-REDTEAM (06/10): il «mai
+                    # inviato» e' MISURATO sul registro richieste (nessuna richiesta _red_team) e senza
+                    # tool gia' eseguiti: il checkpoint 'red_team_tool' resta a iterazione 0 con calls 0
+                    # anche dopo un giro PAGATO, e cambiarne il cap rifaceva la spesa con un corpo nuovo.
                     print("[RED_TEAM] checkpoint al cap " + str(WEEKLY_RED_MAX_TOKENS) + " mai inviato "
                           "(oltre il tetto del provider): ripreso col cap " + str(max_tokens) + " (dichiarato)")
                     saved_checkpoint = {**saved_checkpoint, "contract": contract,
                                         **({"max_tokens": max_tokens} if "max_tokens" in saved_checkpoint else {})}
                     match = (None, max_tokens, red_thinking)
+                elif match is None and not trade_idea and _al_cap_pieno is not None:
+                    # Giro gia' (forse) pagato al cap pieno: il contratto pagato NON cambia (corpi
+                    # identici = nessuna doppia spesa). Se il fornitore ora lo rifiuta, il preventivo
+                    # lo dichiara come lacuna prima di qualsiasi invio.
+                    print("[RED_TEAM] checkpoint al cap " + str(WEEKLY_RED_MAX_TOKENS) + " gia' inviato: "
+                          "contratto pagato conservato (non si riduce a " + str(max_tokens) + ")")
+                    match = (None, WEEKLY_RED_MAX_TOKENS, _al_cap_pieno)
                 if match is None:
                     raise ValueError("Red Team checkpoint contract changed"
                         + (" (system diverso da quello attuale e da quello precedente all'ingresso "
@@ -544,6 +663,12 @@ def _run_red_team_loop(blackboard, trade_idea, MODEL_SYNTHESIZER, user_msg,
             _calls = saved_checkpoint["calls"]
             pending_tools = deepcopy(saved_checkpoint.get("pending_tools", {}))
             inflight_tools = deepcopy(saved_checkpoint.get("inflight_tools", {}))
+        if not trade_idea:   # V0-REDTEAM: preventivo prima di ogni invio (anche in ripresa)
+            _cap_preventivo = _preventivo_prima_dell_invio(MODEL_SYNTHESIZER, max_tokens,
+                                                           ricalcola_cap=saved_checkpoint is None)
+            if _cap_preventivo != max_tokens:
+                # R-0RT F-D: contratto non ancora salvato, il tetto viene dal listino del preventivo
+                max_tokens, contract = _cap_preventivo, contract_for(_cap_preventivo)
         client = OpenRouterClient(timeout=timeout_specialisti(max_tokens), max_retries=0)
         if trade_idea:
             gate = getattr(blackboard, "budget_gate", None)
