@@ -33,11 +33,27 @@ function costruisci(l: Lingua) {
       search_news: [tr('agentsPage.do_search_news'), (tk: string) => tr('agentsPage.do_search_news_tk', { t: tk })],
       tavily_search: [tr('agentsPage.do_tavily_search'), null],
   };
+  const esitoPill: Record<string, () => string> = {
+    in_corso: () => tr('agentsPage.esitoPill_in_corso'), in_corso_senza_segnale: () => tr('agentsPage.esitoPill_in_corso_senza_segnale'),
+    completata: () => tr('agentsPage.esitoPill_completata'), incompleta: () => tr('agentsPage.esitoPill_incompleta'),
+    bloccata: () => tr('agentsPage.esitoPill_bloccata'), fallita: () => tr('agentsPage.esitoPill_fallita'),
+    annullata: () => tr('agentsPage.esitoPill_annullata'), interrotta: () => tr('agentsPage.esitoPill_interrotta'),
+    nessuna_run: () => tr('agentsPage.esitoPill_nessuna_run'), sconosciuta: () => tr('agentsPage.esitoPill_sconosciuta'),
+  };
+  const esitoTitolo: Record<string, () => string> = {
+    incompleta: () => tr('agentsPage.esitoTitle_incompleta'), bloccata: () => tr('agentsPage.esitoTitle_bloccata'),
+    fallita: () => tr('agentsPage.esitoTitle_fallita'), annullata: () => tr('agentsPage.esitoTitle_annullata'),
+    interrotta: () => tr('agentsPage.esitoTitle_interrotta'), sconosciuta: () => tr('agentsPage.esitoTitle_sconosciuta'),
+  };
+  const memoFrase = (memo: boolean | null, id: number | null) => memo === true
+    ? (id != null ? tr('agentsPage.memoDelivered_id', { memo: id }) : tr('agentsPage.memoDelivered'))
+    : memo === false ? tr('agentsPage.memoNotDelivered') : tr('agentsPage.memoUnmeasured');
   return {
     titleLive: tr('agentsPage.titleLive'),
     titleSynthesis: tr('agentsPage.titleSynthesis'),
-    titleDone: tr('agentsPage.titleDone'),
+    titleDone: (memo: number | null) => memo != null ? tr('agentsPage.titleDone_memo', { memo }) : tr('agentsPage.titleDone'),
     titleDoneNoMemo: tr('agentsPage.titleDoneNoMemo'),
+    titleDoneMemoUnmeasured: tr('agentsPage.titleDoneMemoUnmeasured'),
     titleIdle: tr('agentsPage.titleIdle'),
     titleUnreadable: tr('agentsPage.titleUnreadable'),
     descLive: tr('agentsPage.descLive'),
@@ -49,6 +65,31 @@ function costruisci(l: Lingua) {
     pillStuck: tr('agentsPage.pillStuck'),
     pillDone: tr('agentsPage.pillDone'),
     pillEnded: tr('agentsPage.pillEnded'),
+    // esito vero della run (esito_run, 06/10): una voce per stato, «sconosciuta» per i valori fuori contratto
+    pillEsito: (stato: string) => (esitoPill[stato] ?? esitoPill.sconosciuta)(),
+    titleEsito: (stato: string) => (esitoTitolo[stato] ?? esitoTitolo.sconosciuta)(),
+    memoEsito: (memo: boolean | null, id: number | null) => memoFrase(memo, id),
+    descEsito: (stato: string, motivo: string | null, memo: boolean | null, id: number | null, ripresa: boolean) => {
+      if (stato === 'interrotta') return tr('agentsPage.esitoDesc_interrotta');
+      if (stato === 'annullata') return tr('agentsPage.esitoDesc_annullata');
+      // «bloccata» dice gia' nel titolo che nessun memo e' stato consegnato
+      return [motivo ? tr('agentsPage.esitoReason', { motivo }) : tr('agentsPage.esitoNoReason'),
+        stato === 'bloccata' ? '' : memoFrase(memo, id), ripresa ? tr('agentsPage.esitoResumable') : ''].filter(Boolean).join(' ');
+    },
+    titleStarting: tr('agentsPage.titleStarting'),
+    descStarting: tr('agentsPage.descStarting'),
+    pillStarting: tr('agentsPage.pillStarting'),
+    titleUnverified: tr('agentsPage.titleUnverified'),
+    descUnverified: tr('agentsPage.descUnverified'),
+    pillUnverified: tr('agentsPage.pillUnverified'),
+    descNoCommittee: tr('agentsPage.descNoCommittee'),
+    sNoRunCost: tr('agentsPage.sNoRunCost'),
+    stepResumed: tr('agentsPage.stepResumed'),
+    stepPartlyResumed: tr('agentsPage.stepPartlyResumed'),
+    resumeAvailable: tr('agentsPage.resumeAvailable'),
+    resumeOpen: tr('agentsPage.resumeOpen'),
+    retriedBeforeSuccess: (desk: string, n: number, r: number) => tr(n === 1 ? 'agentsPage.retriedBeforeSuccess_one' : 'agentsPage.retriedBeforeSuccess', { desk, n, r }),
+    shareKnownOnly: (n: number) => n === 0 ? tr('agentsPage.shareKnownOnly_partial') : n === 1 ? tr('agentsPage.shareKnownOnly_one') : tr('agentsPage.shareKnownOnly', { n }),
     pillIdle: tr('agentsPage.pillIdle'),
     pillUnreadable: tr('agentsPage.pillUnreadable'),
     pillQuerying: tr('agentsPage.pillQuerying'),
@@ -95,6 +136,7 @@ function costruisci(l: Lingua) {
     stepNowShort: tr('agentsPage.stepNowShort'),
     stepStale: (dur: string) => tr('agentsPage.stepStale', { dur }),
     stepSkipped: tr('agentsPage.stepSkipped'),
+    stepRoundNd: tr('agentsPage.stepRoundNd'),
     stepNoMemo: tr('agentsPage.stepNoMemo'),
     nowRound: (r: number) => tr('agentsPage.nowRound', { r }),
     nowWorking: (n: number, tot: number, done: number) => tr(tot === 1 ? 'agentsPage.nowWorking_one' : 'agentsPage.nowWorking', { n, tot, done: done ? (done === 1 ? tr('agentsPage.nowWorking_done_one') : tr('agentsPage.nowWorking_done_other', { done })) : '' }),

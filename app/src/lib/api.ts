@@ -228,7 +228,7 @@ export interface FilingActivateMissing {
   aggiornamento?: string;
   /** motivo di ogni esito non in errore, per ticker (RUN-ANDREA, 05/10); assente sui backend precedenti */
   motivi?: Record<string, string | null>;
-  /** non null se manca SEC_CONTACT_EMAIL (SEC ed ESEF non configurate): la card lo dice tradotto */
+  /** non null se manca SEC_CONTACT_EMAIL (solo SEC non configurata: ESEF attivo): la card lo dice tradotto */
   avviso_configurazione?: string | null;
 }
 /** `GET /filings/{t}/context-preview`: la riga che il Consigliere riceve per quel titolo. */
@@ -726,6 +726,9 @@ export interface UsageBySpecialist {
   partial?: boolean;
   tokens_status?: 'completo' | 'parziale';
   tokens_missing?: string[];
+  // 06/10: esito FINALE del lavoro (ultimo tentativo di ogni round); `status` resta la
+  // storia del peggiore. La card del desk legge questo, quando c'e'.
+  status_finale?: UsageStatus | string;
 }
 
 // Totale run (v2). Stessa regola dell'aggregato per agente, ma sommando per ENTRY:
@@ -753,7 +756,29 @@ export interface UsageTotal {
   unpriced_agents?: string[];
   error_agents?: string[];
   error?: string;
+  // 06/10: "esito_finale_v2" = error_agents contiene i KO FINALI; assente = heartbeat
+  // vecchio, dove error_agents vuol dire «almeno un tentativo KO»
+  error_agents_semantica?: string;
+  // round in cui un tentativo e' fallito e l'ultimo e' riuscito: informativo, non un KO
+  tentativi_falliti_poi_riusciti?: { agent: string; round: number; tentativi_falliti: number }[];
+  misura_richieste?: string;
 }
+
+/** Esito VERO della run (GET /agents/live, 06/10): titolo e pastiglia vengono da qui,
+ *  mai da `running` + `memo_id` (il memo_id esiste dal primo secondo della run). */
+export type StatoEsitoRun = 'in_corso' | 'in_corso_senza_segnale' | 'completata' | 'incompleta' | 'bloccata'
+  | 'fallita' | 'annullata' | 'interrotta' | 'nessuna_run' | 'sconosciuta';
+export interface EsitoRun {
+  stato: StatoEsitoRun | string;
+  memo_consegnato: boolean | null;   // null = non misurabile (lo dice `motivo`)
+  motivo: string | null;
+  ripresa_disponibile: boolean | null;
+  ripresa: boolean | null;
+  fonte: string;
+  stato_memo_db?: 'scritto' | 'in_corso' | 'assente' | 'illeggibile' | 'non_letto' | string;
+}
+export interface RoundEsito { stato: 'eseguito' | 'ripreso' | 'misto' | 'assente' | 'n.d.' | string;
+  desk_eseguiti?: string[]; desk_ripresi?: string[]; desk_senza_orario?: string[] }
 
 export interface AgentsLiveState {
   language?: 'it' | 'en' | null;
@@ -785,6 +810,50 @@ export interface AgentsLiveState {
   // la UI degrada nascondendo la metrica (mai NaN, mai 0 finto).
   usage_by_specialist?: Record<string, UsageBySpecialist>;
   usage_total?: UsageTotal;
+  esito_run?: EsitoRun;
+  round_esiti?: Record<string, RoundEsito>;
+  // "assente" = la run e' morta prima di avviare il comitato: niente tool_log ne' usage
+  lavagna?: 'questa_run' | 'assente' | string;
+}
+
+// ── GUARDRAIL BETA (advanced_metrics.reconcile_betas, contratto del 06/10) ──────
+/** Fonte esclusa per osservazioni insufficienti: il suo beta resta visibile ma NON entra nello
+ *  scarto né nel consenso. `n_obs` null = osservazioni non dichiarate o non verificabili. */
+export interface BetaFonteInsufficiente { beta: number; n_obs: number | null; min_obs: number; reason: string }
+/** Solo con UNRELIABLE: intervallo e mediana DESCRITTIVI. `uso` vale "non_per_decisioni":
+ *  non è una banda di consenso e non va mai presentata come tale. */
+export interface BetaIndicativo { range: [number, number]; median: number; basis?: string[]; uso: string; note?: string }
+export interface BetaReconcile {
+  /** SOLO le fonti riconciliate (osservazioni ≥ min_obs) */
+  betas?: Record<string, number>;
+  definitions?: Record<string, string>;
+  /** osservazioni per fonte; null = non dichiarate dal motore */
+  n_obs?: Record<string, number | null>;
+  min_obs?: number;
+  sources_insufficient?: Record<string, BetaFonteInsufficiente>;
+  sources_failed?: Record<string, string>;
+  threshold?: number; max_spread?: number;
+  verdict?: string; beta_consensus?: number;
+  /** unico interruttore per chi decide: true SOLO con RECONCILED */
+  beta_per_decisioni?: boolean;
+  /** sempre presente se qualche fonte è stata esclusa, anche con RECONCILED */
+  note?: string;
+  indicative?: BetaIndicativo;
+  error?: string;
+}
+/** `metrics.beta_guardrail` del punteggio quant (specialist_scores.quant_score): codice STABILE,
+ *  uguale in ogni lingua. Non si mostra mai grezzo: lo traduce `fraseGuardrailBeta`. */
+export type CodiceGuardrailBeta =
+  | 'RECONCILED' | 'UNRELIABLE' | 'INSUFFICIENT_SOURCES' | 'NON_CALCOLATO' | 'NON_DISPONIBILE'
+  | 'RECONCILED_SENZA_VIA_LIBERA' | 'RECONCILED_SENZA_FONTE_RISCHIO';
+export interface QuantScoreMetrics {
+  vol_annual_pct?: number | null; sharpe?: number | null;
+  /** null quando il guardrail esclude la beta dal punteggio */
+  beta_vs_spy?: number | null;
+  /** un codice sconosciuto resta possibile (verdetto nuovo del backend): `string` lo ammette */
+  beta_guardrail?: CodiceGuardrailBeta | string | null;
+  var_95_1d_pct?: number | null; max_dd_1y_pct?: number | null;
+  top_position_pct?: number | null; hhi?: number | null;
 }
 
 export interface RiskAlert { level: 'high'|'med'|'low'; metric: string; message: string; }
@@ -974,6 +1043,21 @@ export interface NewsTopicMeta {
   tickers_affected?: string[];
 }
 
+/** Scenario deterministico (stress_nature = "deterministic"): il replay storico copre tutto
+ *  l'orizzonte. `scenario_loss_pct/eur` sono un rendimento CON SEGNO (negativo = perdita). */
+export interface MonteCarloDeterministicScenario {
+  label: string;
+  scenario?: string | null;
+  replayed_days: number | null;
+  horizon_days: number | null;
+  scenario_loss_pct: number | null;
+  scenario_loss_eur: number | null;
+  scenario_max_drawdown_pct: number | null;
+  metrics_not_applicable: string[];
+  sign_convention?: string | null;
+  reason?: string | null;
+}
+
 export interface MonteCarloResult {
   timestamp: string;
   version?: string;
@@ -998,6 +1082,14 @@ export interface MonteCarloResult {
     window_loss_eur?: number;
     basis?: string;
   };
+  // Natura dello stress (voce 5 handoff-4, sync 2a72bf8). "deterministic" = il replay copre
+  // TUTTO l'orizzonte: ogni simulazione è identica, non c'è distribuzione e le metriche
+  // statistiche escono null (elenco in deterministic_scenario.metrics_not_applicable).
+  // "fixed_then_simulated" = replay o shock fisso e poi simulazione: metriche CONDIZIONATE.
+  // Assenti sui payload pre-sync: la pagina non deduce la natura da sola.
+  stress_nature?: 'none' | 'deterministic' | 'fixed_then_simulated';
+  stress_nature_label?: string | null;
+  deterministic_scenario?: MonteCarloDeterministicScenario | null;
   calibration_note?: string | null;
   returns_basis?: string;
   lookback_years?: number;
@@ -1011,27 +1103,28 @@ export interface MonteCarloResult {
   added_tickers: string[];
   weights: Record<string, number>;
   base_nav_eur: number;
-  percentiles_ratio: Record<string, number>;
-  percentiles_eur: Record<string, number>;
-  expected_return_pct: number;
-  median_return_pct: number;
-  stdev_pct: number;
-  sharpe_simulated: number;
-  prob_negative_pct: number;
-  prob_loss_10pct: number;
-  prob_loss_20pct: number;
-  prob_gain_10pct: number;
-  prob_gain_20pct: number;
-  var_95_pct?: number;
-  var_99_pct?: number;
-  var_99_cornish_fisher_pct?: number;
-  es_95_pct?: number;
-  es_99_pct?: number;
-  es_95_eur?: number;
-  es_99_eur?: number;
-  max_drawdown_p5_pct: number;
-  max_drawdown_median_pct: number;
-  max_drawdown_p95_pct: number;
+  // ⚠ null con lo scenario deterministico (vedi stress_nature): mai letti come zero
+  percentiles_ratio: Record<string, number> | null;
+  percentiles_eur: Record<string, number> | null;
+  expected_return_pct: number | null;
+  median_return_pct: number | null;
+  stdev_pct: number | null;
+  sharpe_simulated: number | null;
+  prob_negative_pct: number | null;
+  prob_loss_10pct: number | null;
+  prob_loss_20pct: number | null;
+  prob_gain_10pct: number | null;
+  prob_gain_20pct: number | null;
+  var_95_pct?: number | null;
+  var_99_pct?: number | null;
+  var_99_cornish_fisher_pct?: number | null;
+  es_95_pct?: number | null;
+  es_99_pct?: number | null;
+  es_95_eur?: number | null;
+  es_99_eur?: number | null;
+  max_drawdown_p5_pct: number | null;
+  max_drawdown_median_pct: number | null;
+  max_drawdown_p95_pct: number | null;
   sample_paths: number[][];
   // Giorno di ciascun punto di sample_paths (decimazione esplicita lato backend):
   // la UI NON re-indovina lo step. Assente sui payload vecchi -> si dichiara.
@@ -1051,6 +1144,10 @@ export interface MonteCarloResult {
     days: number[];
     p5: number[]; p10: number[]; p25: number[]; p50: number[];
     p75: number[]; p90: number[]; p95: number[];
+    // true = scenario deterministico: UNA traiettoria, i p5..p95 coincidono e NON sono
+    // percentili; `label` lo dice (testo del motore, localizzato)
+    deterministic?: boolean;
+    label?: string | null;
   };
   // Distribuzione dei NAV a scadenza (#143): istogramma VERO delle simulazioni,
   // non ricampionato. edges_eur ha SEMPRE un elemento in piu' di counts.
@@ -1608,13 +1705,7 @@ export const Bellomberg = {
   // F6 (F23): il guardrail che riconcilia i beta del book da tre motori diversi.
   // ⚠ Chiede al modulo la finestra 3y, quindi SPOSTA la cache di cui sopra.
   betaReconcile: () =>
-    api.get<{
-      betas?: Record<string, number>;
-      definitions?: Record<string, string>;
-      sources_failed?: Record<string, string>;
-      threshold?: number; max_spread?: number;
-      verdict?: string; beta_consensus?: number;
-    }>('/portfolio/metrics/beta_reconcile', { timeout: 120000 }).then(r => r.data),
+    api.get<BetaReconcile>('/portfolio/metrics/beta_reconcile', { timeout: 120000 }).then(r => r.data),
   portfolioMonteCarlo: (params: {
     horizon_days?: number; n_sims?: number; lookback_years?: number;
     method?: 'parametric_t'|'fhs'|'block_bootstrap';

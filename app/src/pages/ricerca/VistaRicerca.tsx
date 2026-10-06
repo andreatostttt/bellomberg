@@ -1,5 +1,5 @@
 // Ricerca opportunità (F13 Edge Scanner) · vista Nuova, dal mockup approvato il 05/10/2026
-// (`outputs/ricerca-opportunita-nuova/mockup.html`). Solo presentazione: stato, chiamate e
+// (non versionato nel repo). Solo presentazione: stato, chiamate e
 // orologio stanno in EdgeScannerPage.tsx; i giudizi sul payload in lib/edge.ts.
 import type { ReactNode } from 'react';
 import {
@@ -15,6 +15,7 @@ import {
   CATEGORIE, SPIEGAZIONE, etichettaMappa, fileMarcatori, livelloForza, nomeCategoria, rilevatoreDi, scalaDiagnosi, type Grado,
 } from './calcoli';
 import { parole, type ChiavePagina, type Parole } from './parole';
+import { usaFocusPannello } from '@/lib/usaFocusPannello';
 
 export type Diagnosi =
   | { ticker: string; stato: 'attesa' }
@@ -38,6 +39,8 @@ export interface DatiRicerca {
   tutti: RigaSegnale[];
   righe: RigaSegnale[];
   sel: RigaSegnale | null;
+  /** la scelta del PM non c'è più nell'ultima scansione: `sel` è il ripiego sul primo, dichiarato */
+  selPersa: boolean;
   vuoto: Vuoto | null;
   eta: EtaResa | null;
   oraScan: string | null;
@@ -269,17 +272,19 @@ function Copertura({ d, a, p }: { d: DatiRicerca; a: AzioniRicerca; p: P }) {
 }
 
 function DialogoCopertura({ d, a, p }: { d: DatiRicerca; a: AzioniRicerca; p: P }) {
+  // montato solo da aperto: il focus entra, TAB gira dentro, alla chiusura torna al link
+  const fuoco = usaFocusPannello<HTMLDivElement>(true, () => a.copertura(false));
   const c = d.viva?.copertura;
   if (!c || !c.dichiarata) return null;
   const titoli = titoliCoperti(c, p);
   const nome = (g: Grado) => p.t(GRADI.find(x => x[0] === g)![1]);
   return (
     <div className="ro-scrim" onClick={e => { if (e.target === e.currentTarget) a.copertura(false); }}>
-      <div className="ro-dialog" role="dialog" aria-modal="true" aria-label={p.t('edge.covDialogTitle')} data-zona="dialogo-copertura">
+      <div ref={fuoco.ref} className="ro-dialog" role="dialog" aria-modal="true" aria-label={p.t('edge.covDialogTitle')} data-zona="dialogo-copertura" onKeyDown={fuoco.onKeyDown}>
         <Testa icona={<ShieldCheck size={16} />} titolo={p.t('edge.covDialogTitle')}
           nota={[d.oraScan ? p.t('edge.scanAt', { a: d.oraScan }) : '', c.contate ? p.t('edge.covDialogMeta', { a: c.scansionate, b: c.totali }) : ''].filter(Boolean).join(' · ')}>
           <span className="bbn-grow" />
-          <button type="button" className="bbn-icon-btn" aria-label={p.t('edge.close')} autoFocus onClick={() => a.copertura(false)}><X size={16} /></button>
+          <button type="button" className="bbn-icon-btn" aria-label={p.t('edge.close')} onClick={() => a.copertura(false)}><X size={16} /></button>
         </Testa>
         <div className="ro-dialog-body">
           <div className="ro-ctab">
@@ -429,6 +434,10 @@ function Dettaglio({ d, a, p }: { d: DatiRicerca; a: AzioniRicerca; p: P }) {
   const sottoDir = s.category === 'momentum' ? p.t('edge.dirSubMomentum') : dir === 'caution' ? p.t('edge.dirSubCaution') : p.t('edge.dirSubOther');
   return (
     <section className="bbn-card ro-card ro-det" data-zona="dettaglio">
+      {d.selPersa && (
+        <p className="ro-note is-warn" data-avviso="scelta-persa"><AlertTriangle size={15} aria-hidden="true" />
+          <span>{p.t('edge.detLost')}</span></p>
+      )}
       <div className="ro-det-head">
         <IconaTitolo ticker={s.ticker} dimensione="lg" />
         <div className="ro-det-t">
