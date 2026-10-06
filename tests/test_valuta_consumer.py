@@ -192,7 +192,7 @@ def test_nav_storico_usa_gbx_salvata_nel_trade(monkeypatch):
     monkeypatch.setattr(analytics, "prezzi_speciali", _negozio_prezzi_sano)
     monkeypatch.setattr(analytics, "_trade_history", lambda: trades)
     monkeypatch.setattr(analytics, "_download_prices_for_history",
-                        lambda *_args: prezzi)
+                        lambda *_args, **_kw: prezzi)
 
     def fx_storico(valute, _start, _end):
         viste.append(valute)

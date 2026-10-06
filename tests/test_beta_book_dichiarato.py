@@ -176,7 +176,7 @@ def test_log_nav_porta_l_ultima_data_reale_non_il_limite_escluso(monkeypatch, ca
                "prezzo": 10.0, "valuta": "EUR", "data": "2030-03-04"}]
     monkeypatch.setattr(pa, "_opening_positions", lambda: [])
     monkeypatch.setattr(pa, "_trade_history", lambda: trades)
-    monkeypatch.setattr(pa, "_download_prices_for_history", lambda tk, s, e, salta: df)
+    monkeypatch.setattr(pa, "_download_prices_for_history", lambda tk, s, e, salta, **_kw: df)
     monkeypatch.setattr(pa, "_build_fx_history", lambda c, s, e: pd.DataFrame())
     monkeypatch.setattr(memory_db, "leggi_cassa_portfolio",
                         lambda path=None: {"cash_eur": 0.0, "cash_source": "portfolio.json",

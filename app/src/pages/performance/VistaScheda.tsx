@@ -6,7 +6,7 @@ import { linguaCorrente, localeDi } from '@/i18n/lingua';
 import { Segmenti } from '@/components/nuova/Card';
 import IconaTitolo from '@/components/nuova/IconaTitolo';
 import PastigliaVariazione from '@/components/nuova/PastigliaVariazione';
-import { PERIODI, indiceBase, pnlPeriodo, pnlTotale, rendimentiMensili, rendimentoAllaData, statistichePeriodo } from './calcoli';
+import { PERIODI, indiceBase, inizioStatistiche, pnlPeriodo, pnlTotale, rendimentiMensili, rendimentoAllaData, statistichePeriodo } from './calcoli';
 import type { AnnoMensile, Periodo } from './calcoli';
 import GraficoTwr from './GraficoTwr';
 import { VUOTO, dataBreve, euro, num, pct, punti } from './formato';
@@ -76,7 +76,9 @@ function Riepilogo({ periodo, onPeriodo, twr, spy, nav }: Pick<PropsScheda, 'per
   // tasso privo di rischio non dichiarato dal motore: Sharpe n.d. col motivo, mai rf = 0 muto (08b S10)
   const rfDato = twr.metrics?.risk_free_used;
   const rf = typeof rfDato === 'number' && Number.isFinite(rfDato) ? rfDato : null;
-  const st0 = statistichePeriodo(indice, base, rf ?? 0, date);
+  // statistiche dal primo punto dopo la base al costo (backend indice_statistiche_da); rendimento e € dalla base
+  const daStat = inizioStatistiche(twr.indice_statistiche_da, date.length).da;
+  const st0 = statistichePeriodo(indice, base, rf ?? 0, date, daStat);
   const st = rf == null ? { ...st0, sharpe: null } : st0;
   const spyOk = spy.stato === 'ok' ? spy.dati : null;
   const spyPct = spyOk && date[base] ? rendimentoAllaData(spyOk.date, spyOk.indice, date[base]) : null;
@@ -134,7 +136,7 @@ function Riepilogo({ periodo, onPeriodo, twr, spy, nav }: Pick<PropsScheda, 'per
             opzioni={PERIODI.map(id => ({ id, testo: w.periods[id] }))} />
         </span>
       </div>
-      <GraficoTwr date={date} indice={indice} spy={spyAllineato} base={base}
+      <GraficoTwr date={date} indice={indice} spy={spyAllineato} base={base} daStat={daStat}
         mostraSpy={mostraSpy && !!spyOk} mostraMedie={mostraMedie} ricostruitaFino={twr.regime_summary?.official_since ?? null} />
     </section>
   );
@@ -144,9 +146,51 @@ function Riga({ etichetta, info, children, forte = false }: { etichetta: string;
   return <div className={'perf-mrow' + (forte ? ' is-strong' : '')}><span title={info}>{etichetta}</span><b>{children}</b></div>;
 }
 
-function AltreMetriche({ twr, avanzate, contabilita }: Pick<PropsScheda, 'twr' | 'avanzate' | 'contabilita'>) {
+/** Rendimento € dall'inizio contro P&L contabile (backend `riconciliazione_pnl`): differenza, residuo
+ *  misurato e voci nel tooltip, tutto dal payload. Lo `stato` è il peggiore fra residuo, voci e controllo
+ *  cassa: solo «riconciliato_entro_tolleranza» mostra il residuo accanto alla cifra; ogni altro stato lo
+ *  dice in chiaro (parola accanto alla cifra + frase sotto), mai un «residuo» che sembri a posto.
+ *  Residuo n.d. = riga dichiarata col motivo del backend; campo assente = nessuna riga. */
+function RigaRiconciliazione({ r }: { r: NonNullable<TwrPayload['riconciliazione_pnl']> }) {
+  const w = parole();
+  const misurata = r.residuo_stato !== 'n.d.' && finito(r.residuo_eur) && finito(r.pnl_performance_eur) && finito(r.pnl_contabile_eur);
+  if (!misurata) return <p className="perf-state" role="status" data-qa="perf-pnl-recon">{w.pnlReconNd(r.motivo_nd || VUOTO)}</p>;
+  const stato: string = r.stato ?? r.residuo_stato;
+  const verde = stato === 'riconciliato_entro_tolleranza';
+  const diff = r.pnl_performance_eur - (r.pnl_contabile_eur as number);
+  const residuo = euro(r.residuo_eur, 2, true), tolleranza = euro(r.tolleranza_residuo_eur);
+  const daVerificare = (r.voci || []).filter(v => v.stato === 'da_verificare');
+  const c = r.cassa;
+  const info = [
+    w.pnlReconInfo(euro(r.pnl_performance_eur, 2, true), dataBreve(r.contabile?.data), euro(r.pnl_contabile_eur, 2, true)),
+    ...(r.voci || []).map(v => `${w.pnlReconItem[v.voce] ?? v.voce}: ${euro(v.importo_eur, 2, true)}`
+      + (v.stato === 'da_verificare' ? ` (${w.pnlReconItemToCheck})` : '') + (v.nota ? ' — ' + v.nota : '')),
+    ...(c ? [w.pnlReconCash(euro(c.variazione_osservata_eur, 2, true), euro(c.variazione_attesa_eur, 2, true), euro(c.versamenti_ledger_eur, 2, true),
+      euro(c.acquisti_meno_vendite_eur, 2, true), euro(c.dividendi_incassati_eur, 2, true), euro(c.non_spiegata_eur, 2, true))] : []),
+    w.pnlReconResidualLine(residuo, tolleranza),
+  ].join('\n');
+  const avvisi: string[] = [];
+  if (!verde) {
+    if (r.residuo_stato === 'non_riconciliato') avvisi.push(w.pnlReconNotReconciled(residuo, tolleranza));
+    if (daVerificare.length) avvisi.push(w.pnlReconToCheck(daVerificare.map(v => w.pnlReconItem[v.voce] ?? v.voce).join(', '), num(r.soglia_ultimo_punto_pct, 1)));
+    if (r.controllo_cassa?.stato === 'incoerente') avvisi.push(w.pnlReconCashIncoherent(euro(r.controllo_cassa.scarto_eur, 2, true)));
+    if (!avvisi.length) avvisi.push(w.pnlReconUnknownState(stato));
+  }
+  return (
+    <>
+      <Riga etichetta={w.pnlRecon} info={info}>
+        <span data-qa="perf-pnl-recon" data-stato={stato}><span className={classeSegno(diff)}>{euro(diff, 2, true)}</span>
+          <small>{verde ? w.pnlReconResidual(residuo) : w.pnlReconState[stato] ?? stato}</small></span></Riga>
+      {avvisi.map(a => <p key={a} className="perf-state is-error" role="status" data-qa="perf-pnl-recon-stato">{a}</p>)}
+    </>
+  );
+}
+
+function AltreMetriche({ periodo, twr, avanzate, contabilita }: Pick<PropsScheda, 'periodo' | 'twr' | 'avanzate' | 'contabilita'>) {
   const w = parole();
   const m = twr.stato === 'ok' ? twr.dati.metrics : undefined;
+  // la riconciliazione spiega il rendimento € «dall'inizio»: solo nella vista Tutto
+  const ricon = periodo === 'Tutto' && twr.stato === 'ok' ? twr.dati.riconciliazione_pnl : null;
   const a = avanzate.stato === 'ok' ? avanzate.dati : null;
   const inizio = twr.stato === 'ok' ? twr.dati.dates?.[0] : undefined;
   return (
@@ -169,6 +213,7 @@ function AltreMetriche({ twr, avanzate, contabilita }: Pick<PropsScheda, 'twr' |
             {c.nota && <p className="perf-state" role="status">{c.nota}</p>}
             <Riga etichetta={w.mTotal} info={w.mTotalInfo} forte>
               <span className={classeSegno(pnlTotale(c.nonRealizzato, c.realizzato, c.dividendi))}>{euro(pnlTotale(c.nonRealizzato, c.realizzato, c.dividendi), 2, true)}</span></Riga>
+            {ricon && <RigaRiconciliazione r={ricon} />}
             <Riga etichetta={w.mMv} info={w.mMvInfo}>{euro(c.valoreMercato)}{c.costo != null && <small>{w.mCost(euro(c.costo))}</small>}</Riga>
             <Riga etichetta={w.mUpl} info={w.mUplInfo}><span className={classeSegno(c.nonRealizzato)}>{euro(c.nonRealizzato, 2, true)}</span></Riga>
             <Riga etichetta={w.mRpl} info={w.mRplInfo}><span className={classeSegno(c.realizzato)}>{euro(c.realizzato, 2, true)}</span></Riga>
@@ -183,8 +228,14 @@ function AltreMetriche({ twr, avanzate, contabilita }: Pick<PropsScheda, 'twr' |
 
 function Mensili({ twr, spy }: { twr: TwrPayload; spy: Stato<{ date: string[]; indice: number[] }> }) {
   const w = parole();
-  const port = rendimentiMensili(twr.dates || [], twr.twr_index || []);
-  const bench = spy.stato === 'ok' ? rendimentiMensili(spy.dati.date, spy.dati.indice, twr.dates?.[0]) : null;
+  // mensili = statistica: partono da indice_statistiche_da (il punto base al costo non e' un mese misurato)
+  const da = inizioStatistiche(twr.indice_statistiche_da, twr.dates?.length ?? 0).da;
+  const port = rendimentiMensili((twr.dates || []).slice(da), (twr.twr_index || []).slice(da));
+  // SPY sulla stessa base del portafoglio: dalla stessa data di partenza delle statistiche
+  const inizio = twr.dates?.[da];
+  //  (da = 0: invariato, serie intera)
+  const k = spy.stato === 'ok' && da > 0 && inizio ? spy.dati.date.findIndex(d => d >= inizio) : 0;
+  const bench = spy.stato === 'ok' && k >= 0 ? rendimentiMensili(spy.dati.date.slice(k), spy.dati.indice.slice(k), inizio) : null;
   if (!port) return <p className="perf-state">{w.unavailable}</p>;
   const mesi = Array.from({ length: 12 }, (_, m) => {
     const t = new Intl.DateTimeFormat(localeDi(linguaCorrente()), { month: 'short', timeZone: 'UTC' }).format(new Date(Date.UTC(2000, m, 1)));
@@ -339,7 +390,7 @@ export default function VistaScheda(p: PropsScheda) {
                 opzioni={PERIODI.map(id => ({ id, testo: w.periods[id] }))} /></span></header>
             <StatoCard s={p.twr}>{() => null}</StatoCard>
           </section>}
-      <AltreMetriche twr={p.twr} avanzate={p.avanzate} contabilita={p.contabilita} />
+      <AltreMetriche periodo={p.periodo} twr={p.twr} avanzate={p.avanzate} contabilita={p.contabilita} />
       <section className="bbn-card perf-month">
         <header className="bbn-card-head"><h2>{w.monthly}</h2><Info testo={w.monthlyInfo} /><span className="bbn-grow" />
           {p.twr.stato === 'ok' && p.twr.dati.dates?.length ? <span className="bbn-card-note">{[...new Set([p.twr.dati.dates[0].slice(0, 4), p.twr.dati.dates[p.twr.dati.dates.length - 1].slice(0, 4)])].join('–')}</span> : null}</header>

@@ -460,6 +460,17 @@ def test_percorso_fonti_punta_al_negozio_dentro_data(monkeypatch):
     import bellomberg.market_data.fonti_guidance as fg
     prima = fg.PERCORSO_FONTI
     monkeypatch.delenv("BELLOMBERG_DATA_DIR", raising=False)
+    # Il ricaricamento di fg legge il negozio all'import (_CARICATO): qui il percorso e' quello
+    # VERO accanto al modulo, quindi la lettura va impedita (sigillo dei dati veri, 06/10).
+    # Il test misura solo DOVE punta il percorso, non il contenuto.
+    import builtins
+    _open_vero = builtins.open
+
+    def _open_senza_negozio(file, *a, **k):
+        if str(file).endswith("fonti_guidance.json"):
+            raise PermissionError("negozio vero non letto dal test")
+        return _open_vero(file, *a, **k)
+    monkeypatch.setattr(builtins, "open", _open_senza_negozio)
     try:
         import bellomberg.core.paths as paths
         importlib.reload(paths)

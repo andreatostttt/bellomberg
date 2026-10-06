@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from 'react';
-import { mediaMobile, sottAcqua } from './calcoli';
+import { mediaMobileDa, sottAcquaDa } from './calcoli';
 import { dataBreve, num, pct } from './formato';
 import { parole } from './parole';
 
@@ -19,9 +19,11 @@ function percorso(valori: (number | null)[], x: (i: number) => number, y: (v: nu
 
 /** Indice TWR del periodo con SPY tratteggiato (ribasato sulla base del periodo) e medie mobili.
  *  Il drawdown resta nel tooltip e nel riquadro «Max drawdown» (fascia rossa tolta su richiesta, 02/10/2026). */
-export default function GraficoTwr({ date, indice, spy, base, mostraSpy, mostraMedie, ricostruitaFino }: {
+export default function GraficoTwr({ date, indice, spy, base, daStat = 0, mostraSpy, mostraMedie, ricostruitaFino }: {
   date: string[];
   indice: number[];
+  /** backend indice_statistiche_da: drawdown e medie mobili partono da qui (il punto base al costo non entra) */
+  daStat?: number;
   /** SPY allineato a `date` (stessa lunghezza, null dove manca) */
   spy: (number | null)[] | null;
   base: number;
@@ -45,8 +47,10 @@ export default function GraficoTwr({ date, indice, spy, base, mostraSpy, mostraM
         s = parte.map(x => (finito(x) ? x * f : null));
       }
     }
-    return { d, v, s, m20: mediaMobile(indice, 20).slice(base), m50: mediaMobile(indice, 50).slice(base), uw: sottAcqua(indice.slice(base)) };
-  }, [date, indice, spy, base]);
+    // drawdown del tooltip dal picco DENTRO il periodo, e mai prima di indice_statistiche_da
+    return { d, v, s, m20: mediaMobileDa(indice, 20, daStat).slice(base), m50: mediaMobileDa(indice, 50, daStat).slice(base),
+      uw: sottAcquaDa(indice, Math.max(base, daStat)).slice(base) };
+  }, [date, indice, spy, base, daStat]);
   const n = dati.v.length;
   if (n < 2) return <p className="perf-state">{w.unavailable}</p>;
   const visibili = [...dati.v, ...(mostraSpy && dati.s ? dati.s : []), ...(mostraMedie ? [...dati.m20, ...dati.m50] : [])].filter(finito);

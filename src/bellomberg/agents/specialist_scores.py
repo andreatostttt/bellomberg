@@ -43,6 +43,56 @@ def _band(value, thresholds, points, reverse=False):
         return points[-1]
 
 
+def codice_guardrail_beta(beta_reconcile) -> str:
+    """Codice STABILE del guardrail beta (uguale in ogni lingua) dal payload di
+    advanced_metrics.reconcile_betas. Funzione pura: non calcola nulla, legge il payload.
+    La usano quant_score (metrics.beta_guardrail) e la rotta /portfolio/metrics/beta_reconcile.
+    RECONCILED solo con via libera (beta_per_decisioni True) e motore portfolio_risk_spy fra i
+    riconciliati (review R-SEG 06/10, C1: la beta del punteggio e' QUELLA di portfolio_risk)."""
+    rb = beta_reconcile
+    fonte = "portfolio_risk_spy"
+    if isinstance(rb, dict) and rb.get("error"):
+        # un errore del motore vince SEMPRE, anche su un RECONCILED con via libera (main 06/10)
+        return "NON_DISPONIBILE"
+    if isinstance(rb, dict) and rb.get("verdict") == "RECONCILED" and rb.get("beta_per_decisioni") is True:
+        return "RECONCILED" if fonte in (rb.get("betas") or {}) else "RECONCILED_SENZA_FONTE_RISCHIO"
+    if rb is None:
+        # review R-SEG 06/10 (C2): nessun guasto, il chiamante non l'ha calcolato
+        return "NON_CALCOLATO"
+    if isinstance(rb, dict) and rb.get("verdict"):   # `error` gia' escluso in testa
+        verdetto = str(rb["verdict"])
+        # payload incoerente: verdetto RECONCILED senza via libera
+        return "RECONCILED_SENZA_VIA_LIBERA" if verdetto == "RECONCILED" else verdetto
+    return "NON_DISPONIBILE"
+
+
+def payload_rotta_beta_reconcile(threshold: float = 0.35) -> dict:
+    """Payload di GET /portfolio/metrics/beta_reconcile: quello di reconcile_betas piu' il campo
+    di primo livello `beta_guardrail` (stesso codice di quant_score, BG-ROTTA 06/10). Qui il
+    calcolo si FA, quindi NON_CALCOLATO non esce mai: un guasto (eccezione, `error`, payload non
+    valido o senza verdetto) e' NON_DISPONIBILE con `error` dichiarato."""
+    from bellomberg.core.presentation import message as _message, error_text
+    try:
+        from bellomberg.portfolio.advanced_metrics import reconcile_betas
+        rb = reconcile_betas(threshold=threshold)
+    except Exception as e:
+        return {"error": _message("reconcile_betas fallito ({tipo}: {motivo})",
+                                  "reconcile_betas failed ({tipo}: {motivo})",
+                                  tipo=type(e).__name__, motivo=error_text(e)),
+                "beta_guardrail": "NON_DISPONIBILE"}
+    if not isinstance(rb, dict):
+        return {"error": _message("payload non valido ({tipo})", "invalid payload ({tipo})", tipo=type(rb).__name__),
+                "beta_guardrail": "NON_DISPONIBILE"}
+    if rb.get("error"):
+        # l'errore del motore vince su ogni verdetto (anche un RECONCILED incoerente)
+        return dict(rb, beta_guardrail="NON_DISPONIBILE")
+    codice = codice_guardrail_beta(rb)
+    if codice in ("NON_DISPONIBILE", "NON_CALCOLATO"):
+        return dict(rb, beta_guardrail="NON_DISPONIBILE",
+                    error=_message("payload senza verdetto", "payload without verdict"))
+    return dict(rb, beta_guardrail=codice)
+
+
 @scoped_language
 def quant_score(portfolio_data=None, risk_data=None, beta_reconcile=None):
     """Rubric di rischio del portafoglio. Ritorna dict o None se dati insufficienti.
@@ -98,14 +148,13 @@ def quant_score(portfolio_data=None, risk_data=None, beta_reconcile=None):
     beta_esclusa = None
     if beta is not None:
         rb = beta_reconcile
-        # review R-SEG 06/10 (C1): la beta del punteggio e' QUELLA di portfolio_risk
-        # (motore portfolio_risk_spy): pesa solo se quel motore e' fra i riconciliati
+        # BG-ROTTA 06/10: il codice viene dalla funzione pura condivisa con la rotta API;
+        # qui si costruisce solo il testo localizzato di ogni codice
         _fonte = "portfolio_risk_spy"
-        _riconciliati = (rb.get("betas") or {}) if isinstance(rb, dict) else {}
-        if (isinstance(rb, dict) and rb.get("verdict") == "RECONCILED" and rb.get("beta_per_decisioni") is True
-                and _fonte in _riconciliati):
-            beta_guardrail = beta_guardrail_codice = "RECONCILED"
-        elif isinstance(rb, dict) and rb.get("verdict") == "RECONCILED" and rb.get("beta_per_decisioni") is True:
+        beta_guardrail_codice = codice_guardrail_beta(rb)
+        if beta_guardrail_codice == "RECONCILED":
+            beta_guardrail = "RECONCILED"
+        elif beta_guardrail_codice == "RECONCILED_SENZA_FONTE_RISCHIO":
             _ins = (rb.get("sources_insufficient") or {}).get(_fonte)
             if _ins is not None:
                 _perche = _message("insufficiente: {n}/{m} osservazioni", "insufficient: {n}/{m} observations",
@@ -115,25 +164,22 @@ def quant_score(portfolio_data=None, risk_data=None, beta_reconcile=None):
                 _perche = _message("fallita", "failed")
             else:
                 _perche = _message("assente", "missing")
-            beta_guardrail_codice = "RECONCILED_SENZA_FONTE_RISCHIO"
             beta_guardrail = _message("RECONCILED senza la fonte della beta di rischio ({fonte} {perche})",
                                       "RECONCILED without the risk-beta source ({fonte} {perche})",
                                       fonte=_fonte, perche=_perche)
             beta_esclusa = _message("beta esclusa: guardrail {verdetto}", "beta excluded: guardrail {verdetto}",
                                     verdetto=beta_guardrail)
         else:
-            if rb is None:
+            if beta_guardrail_codice == "NON_CALCOLATO":
                 # review R-SEG 06/10 (C2): nessun guasto, il chiamante non l'ha calcolato
-                beta_guardrail_codice = "NON_CALCOLATO"
                 beta_guardrail = _message("non calcolato da questo percorso", "not computed by this path")
-            elif isinstance(rb, dict) and rb.get("verdict") and not rb.get("error"):
-                beta_guardrail = beta_guardrail_codice = str(rb["verdict"])
-                if beta_guardrail == "RECONCILED":   # payload incoerente: verdetto senza via libera
-                    beta_guardrail_codice = "RECONCILED_SENZA_VIA_LIBERA"
-                    beta_guardrail = _message("RECONCILED senza via libera", "RECONCILED without clearance")
+            elif beta_guardrail_codice == "RECONCILED_SENZA_VIA_LIBERA":
+                # payload incoerente: verdetto senza via libera
+                beta_guardrail = _message("RECONCILED senza via libera", "RECONCILED without clearance")
+            elif beta_guardrail_codice != "NON_DISPONIBILE":
+                beta_guardrail = beta_guardrail_codice      # verdetto del motore, verbatim
             else:
                 errore = rb.get("error") if isinstance(rb, dict) else None
-                beta_guardrail_codice = "NON_DISPONIBILE"
                 beta_guardrail = (_message("non disponibile ({motivo})", "not available ({motivo})", motivo=str(errore))
                                   if errore else _message("non disponibile", "not available"))
             beta_esclusa = _message("beta esclusa: guardrail {verdetto}", "beta excluded: guardrail {verdetto}",

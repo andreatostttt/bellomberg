@@ -186,12 +186,37 @@ def _ticker_cost_value_at(trades: List[Dict[str, Any]], ticker: str, iso: str, f
     return max(cost, 0.0)
 
 
+# fix PNL-B (06/10, Opus 5.5): riempimento in avanti LIMITATO. Il vecchio
+# ffill() illimitato portava l'ultima candela di un titolo per mesi in silenzio
+# (buco del provider): oltre questo limite di sedute il punto resta NaN e il
+# chiamante lo dichiara (feed vivo etichettato, esclusione o valore al costo).
+FFILL_LIMITE_SEDUTE = 5
+# fix PNL-B F10: un solo giorno riportato e' di norma una festivita' della borsa (il prezzo
+# riportato e' quello vero: si tiene, senza feed, che nel periodo polygon era in ritardo di
+# un giorno); dalla seconda seduta consecutiva il feed del giorno sostituisce il prezzo
+# fermo, e senza feed il prezzo fermo si DICHIARA in prezzi_fermi_ffill.
+FERMI_DICHIARATI_DA_SEDUTE = 2
+
+
 def _download_prices_for_history(tickers: List[str], start: str, end: str,
-                                 salta: frozenset) -> Optional[pd.DataFrame]:
+                                 salta: frozenset, auto_adjust: bool = True) -> Optional[pd.DataFrame]:
     """Download daily closes per la lista ticker per il range start-end (YYYY-MM-DD).
     `salta` viene dal negozio dei prezzi speciali e arriva dal chiamante, letto UNA volta
     per giro: senza default, cosi' un punto di chiamata dimenticato e' un TypeError subito
-    e non un insieme vuoto zitto (lezione del 05/09: gli usi sostituiti e l'assegnazione no)."""
+    e non un insieme vuoto zitto (lezione del 05/09: gli usi sostituiti e l'assegnazione no).
+    auto_adjust=True: chiusure aggiustate (attribuzione, rendimento total-return nel prezzo).
+    Revisione R-PNL G1: si scarica SEMPRE non aggiustato (Close + Adj Close nello stesso
+    download) e si restituisce Adj Close; `df.attrs["fattore_adj"]` = {ticker: {data:
+    Adj Close / Close}} serve a riscalare un prezzo NON aggiustato (feed vivo) sulla base
+    aggiustata. Senza colonna Adj Close: Close restituito e `df.attrs["base_prezzi"]` =
+    "non_aggiustati", fattore None (dichiarato dal chiamante, mai un fattore inventato).
+    False: chiusure NON aggiustate per dividendi (split si'), usate dalla storia del NAV;
+    in quel caso i dividendi per azione (ex-date) di Yahoo viaggiano in
+    `df.attrs["dividendi"]` ({ticker: [(data, importo)]}, None = colonna assente) per
+    maturare i dividendi registrati all'ex-date e dichiarare quelli non registrati.
+    `df.attrs["riempiti_ffill"]` = {ticker: {data ISO: n-esima seduta consecutiva riempita}}.
+    Chiusure con ffill limitato a FFILL_LIMITE_SEDUTE e SENZA bfill."""
+    con_dividendi = not auto_adjust
     yf_tickers = [t for t in tickers if t not in salta]
     if not yf_tickers:
         return None
@@ -208,19 +233,81 @@ def _download_prices_for_history(tickers: List[str], start: str, end: str,
     dl_list = sorted(set(dl_map.values()))
     try:
         raw = yf.download(dl_list, start=start, end=end, progress=False,
-                           auto_adjust=True, threads=True)
+                           auto_adjust=False, actions=con_dividendi, threads=True)
         if raw is None or raw.empty:
             return None
-        if isinstance(raw.columns, pd.MultiIndex):
-            close = raw["Close"]
+
+        def _colonna(nome):
+            if isinstance(raw.columns, pd.MultiIndex):
+                if nome not in raw.columns.get_level_values(0):
+                    return None
+                col = raw[nome]
+            else:
+                if nome not in raw.columns:
+                    return None
+                col = raw[[nome]].rename(columns={nome: dl_list[0]})
+            return col.rename(columns={v: k for k, v in dl_map.items() if v in col.columns and v != k})
+
+        if isinstance(raw.columns, pd.MultiIndex) or "Close" in raw.columns:
+            close = _colonna("Close")
         else:
-            close = raw[["Close"]] if "Close" in raw.columns else raw
-            if isinstance(close, pd.Series):
-                close = close.to_frame(dl_list[0])
-        close = close.rename(columns={v: k for k, v in dl_map.items() if v in close.columns and v != k})
-        # ffill: buchi infrasettimanali; bfill: giorni PRIMA della prima candela di un nome
-        # appena comprato (innocuo: prima dell'acquisto qty=0, il prezzo non entra nel NAV).
-        return close.ffill().bfill()
+            close = raw.rename(columns={v: k for k, v in dl_map.items() if v in raw.columns and v != k})
+        if isinstance(close, pd.Series):
+            close = close.to_frame(dl_list[0])
+        fattore_adj, base_prezzi = None, "non_aggiustati"
+        if auto_adjust:
+            adj = _colonna("Adj Close")
+            if adj is not None:
+                fattore_adj = {}
+                for tk in adj.columns:
+                    if tk not in close.columns:
+                        continue
+                    rapp = (adj[tk] / close[tk]).dropna()
+                    fattore_adj[str(tk)] = {_iso_safe(ts): float(v) for ts, v in rapp.items()
+                                            if v == v and v > 0}
+                close = adj.reindex(columns=close.columns)
+                base_prezzi = "aggiustati"
+        dividendi = None
+        if con_dividendi:
+            if isinstance(raw.columns, pd.MultiIndex):
+                if "Dividends" in raw.columns.get_level_values(0):
+                    dividendi = raw["Dividends"]
+            elif "Dividends" in raw.columns:
+                dividendi = raw[["Dividends"]].rename(columns={"Dividends": dl_list[0]})
+            if dividendi is not None:
+                dividendi = dividendi.rename(columns={v: k for k, v in dl_map.items()
+                                                      if v in dividendi.columns and v != k})
+        # ffill LIMITATO: festivita' e borse con calendari diversi; oltre il limite il punto
+        # resta NaN e lo dichiara il chiamante. Niente bfill: il passato prima della prima
+        # candela non si riempie col futuro.
+        buchi = close.isna()
+        close = close.ffill(limit=FFILL_LIMITE_SEDUTE)
+        # fix PNL-B F10: celle riempite dal ffill (prezzo FERMO), per ticker: il chiamante
+        # preferisce il feed vivo del giorno quando c'e' e dichiara il resto.
+        riempiti = buchi & close.notna()
+        segnati: Dict[str, Dict[str, int]] = {}
+        for tk in riempiti.columns:
+            corsa, giorni = 0, {}
+            for ts, pieno in zip(riempiti.index, riempiti[tk].to_numpy()):
+                corsa = corsa + 1 if pieno else 0
+                if pieno:
+                    giorni[_iso_safe(ts)] = corsa
+            if giorni:
+                segnati[str(tk)] = giorni
+        close.attrs["riempiti_ffill"] = segnati
+        close.attrs["base_prezzi"] = base_prezzi
+        close.attrs["fattore_adj"] = fattore_adj
+        if con_dividendi:
+            # dict semplice {ticker: [(data ISO, dividendo per azione in valuta)]}: un
+            # DataFrame dentro attrs rompe concat/copie di pandas.
+            per_ticker = None
+            if dividendi is not None:
+                per_ticker = {}
+                for tk in dividendi.columns:
+                    serie = dividendi[tk].dropna()
+                    per_ticker[str(tk)] = [(_iso_safe(ts), float(v)) for ts, v in serie.items() if float(v) > 0]
+            close.attrs["dividendi"] = per_ticker
+        return close
     except Exception as e:
         _log(f"price download failed: {e}")
         return None
@@ -273,11 +360,16 @@ def _infer_currency(ticker: str, valuta_posizione=None) -> Optional[str]:
 
 
 def _currency_labels_for_tickers(tickers, records, negozio=None):
-    """Etichetta ogni ticker preferendo l'ultima valuta esplicita salvata nel DB."""
+    """Etichetta ogni ticker preferendo l'ultima valuta esplicita salvata nel DB.
+    fix PNL-B (06/10, Opus 5.5): le righe DIVIDEND NON contano: per convenzione portano
+    valuta EUR (importo per azione in EUR), non la valuta di quotazione. Prima una
+    registrazione di dividendo su un titolo USD/GBX lo rietichettava EUR e la storia del
+    NAV lo valutava senza cambio (misurato su una copia del book: ~1.000 EUR di NAV falso)."""
     labels = {}
     for ticker in tickers:
         esplicita = next((r.get("valuta") for r in reversed(records)
-                          if r.get("ticker") == ticker and r.get("valuta") is not None), None)
+                          if r.get("ticker") == ticker and r.get("valuta") is not None
+                          and (r.get("action") or "").upper() != "DIVIDEND"), None)
         labels[ticker] = _currency_label(ticker, esplicita, negozio=negozio)
     return labels
 
@@ -498,6 +590,20 @@ def pl_fx_per_posizione(trades: List[Dict[str, Any]], oggi_iso: str, openings=No
     if not trades and not openings:
         return {"error": _message('trade_history vuota: costo storico n.d.', 'Empty trade_history: historical cost unavailable')}
     labels_from = list(trades) + list(openings or [])
+    # fix PNL-B G7 (R-PNL giro 3): un ticker con SOLE righe DIVIDEND (refuso/alias, nessun
+    # acquisto) non ha una valuta di quotazione da etichettare (le DIVIDEND non contano):
+    # si isola e si dichiara, invece di mandare in errore il costo storico di TUTTE le posizioni.
+    con_posizione = {t.get("ticker") or "?" for t in labels_from
+                     if (t.get("action") or "BUY").upper() != "DIVIDEND"}
+    solo_dividendi = sorted({t.get("ticker") or "?" for t in labels_from} - con_posizione)
+    if solo_dividendi:
+        labels_from = [t for t in labels_from if (t.get("ticker") or "?") not in solo_dividendi]
+        trades = [t for t in trades if (t.get("ticker") or "?") not in solo_dividendi]
+        if not labels_from:
+            return {"error": _message('solo righe DIVIDEND senza acquisti ({v0}): costo storico n.d.',
+                                      'Only DIVIDEND rows without purchases ({v0}): historical cost unavailable',
+                                      v0=", ".join(solo_dividendi)),
+                    "dividendi_senza_posizione": solo_dividendi}
     tickers = sorted({t.get("ticker") or "?" for t in labels_from})
     currency_labels = _currency_labels_for_tickers(tickers, labels_from)
     non_determinate = [x for x in currency_labels.values() if x.valore is None]
@@ -540,7 +646,9 @@ def pl_fx_per_posizione(trades: List[Dict[str, Any]], oggi_iso: str, openings=No
     return {"per_ticker": costo_storico_per_ticker(trades, lookup, openings),
             "currency_labels": {k: v.as_dict() for k, v in currency_labels.items()},
             "fx_basis": (_message("costo = pool in EUR al FX daily yfinance (EURCCY=X, auto_adjust) del giorno di ogni acquisto, vendite pro-quota; componente cambio = pool in valuta x FX di oggi - pool in EUR. Differisce da nav_history.final_cost_basis_eur (la' le vendite tolgono il costo al FX del giorno della vendita e le posizioni chiuse restano nel costo)", 'Cost = EUR pool at daily yfinance FX (EURCCY=X, auto_adjust) on each acquisition date, sales deducted pro rata; FX component = native currency pool x current FX - EUR pool. Differs from nav_history.final_cost_basis_eur (there sales remove cost at sale-date FX and closed positions remain in cost)')),
-            "fx_serie": {"start": start, "end_escluso": end} if estere else None}
+            "fx_serie": {"start": start, "end_escluso": end} if estere else None,
+            # G7: righe DIVIDEND su ticker senza acquisti, escluse dal costo storico (dichiarate)
+            "dividendi_senza_posizione": solo_dividendi or None}
 
 
 def _compute_irr(trades: List[Dict[str, Any]], current_nav_eur: float,
@@ -595,9 +703,11 @@ def _compute_irr(trades: List[Dict[str, Any]], current_nav_eur: float,
         return None
 
     def npv(rate: float) -> float:
+        # fix PNL-B F7 (06/10, Opus 5.5): valore FUTURO a oggi, cf * (1+r)^anni_fa.
+        # Prima cf / (1+r)^anni_fa: esponente invertito (100 -> 110 in un anno dava -9,09%).
         total = current_nav_eur  # liquidation today (t=0)
         for years_back, cf in cfs:
-            total += cf / (1.0 + rate) ** years_back
+            total += cf * (1.0 + rate) ** years_back
         return total
 
     try:
@@ -646,6 +756,106 @@ def _iso_safe(ts) -> str:
     except Exception:
         s = str(ts)
         return s[:10] if (s and s[0:1].isdigit()) else ""
+
+
+# fix PNL-B F9/G5: ex-date fino a 45 giorni prima dell'incasso registrato, 7 dopo (data di
+# registrazione approssimata). Ogni registrazione consuma UNO stacco, il piu' vicino.
+# Perche' 45: il pagamento arriva da pochi giorni (Borsa Italiana, T+2) a circa 5 settimane
+# (UK/US) dopo lo stacco; con stacchi trimestrali (circa 90 giorni) 45 resta sotto la meta'
+# dell'intervallo, quindi una registrazione non puo' agganciare lo stacco del trimestre
+# PRIMA quando quello giusto manca su Yahoo (prima, con 120, succedeva: R-PNL G5).
+DIVIDENDI_FINESTRA_PRIMA_GG = 45
+DIVIDENDI_FINESTRA_DOPO_GG = 7
+
+
+def _abbina_dividendi(trades, div_yahoo, timeline, ccy_of) -> Dict[str, Any]:
+    """Helper PURO. Ritorna {maturazioni: [(data ISO, importo EUR)], abbinati: [...],
+    non_registrati: [...] | None, verifica: messaggio}. L'importo e' sempre quello
+    REGISTRATO (il DB e' la fonte); Yahoo da' solo la data dello stacco."""
+    registrati = sorted(
+        ((t.get("ticker") or ""), (t.get("data") or "")[:10],
+         float(t.get("quantita") or 0) * float(t.get("prezzo") or 0), float(t.get("prezzo") or 0))
+        for t in trades if (t.get("action") or "").upper() == "DIVIDEND")
+    registrati.sort(key=lambda r: r[1])
+    usati = set()
+    maturazioni, abbinati = [], []
+    for tk, pay, importo, per_azione in registrati:
+        scelto, senza_possesso = None, []
+        if div_yahoo is not None and _valid_iso(pay):
+            pay_d = datetime.strptime(pay, "%Y-%m-%d")
+            lo = (pay_d - timedelta(days=DIVIDENDI_FINESTRA_PRIMA_GG)).strftime("%Y-%m-%d")
+            hi = (pay_d + timedelta(days=DIVIDENDI_FINESTRA_DOPO_GG)).strftime("%Y-%m-%d")
+            candidati = [(abs((datetime.strptime(ex, "%Y-%m-%d") - pay_d).days), ex, ps)
+                         for ex, ps in (div_yahoo.get(tk) or [])
+                         if _valid_iso(ex) and lo <= ex <= hi and (tk, ex) not in usati]
+            # G6: il diritto al dividendo richiede il titolo in portafoglio alla VIGILIA
+            # dello stacco; un candidato senza possesso si scarta (dichiarato sotto).
+            senza_possesso = [c for c in candidati if _qty_at(timeline.get(tk, []), (
+                datetime.strptime(c[1], "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")) <= 0]
+            candidati = [c for c in candidati if c not in senza_possesso]
+            if candidati:
+                _, ex, ps = min(candidati)
+                usati.add((tk, ex))
+                scelto = (ex, ps)
+        data_mat = scelto[0] if scelto else pay
+        maturazioni.append((data_mat, importo))
+        abbinati.append({"ticker": tk, "data_incasso": pay, "importo_eur": round(importo, 2),
+                         "ex_date": scelto[0] if scelto else None,
+                         "per_azione_registrato": per_azione,
+                         "per_azione_yahoo": scelto[1] if scelto else None,
+                         "matura": "ex_date" if scelto else "incasso",
+                         "stacchi_scartati_senza_possesso": [c[1] for c in senza_possesso] or None})
+    if div_yahoo is None:
+        return {"maturazioni": maturazioni, "abbinati": abbinati, "non_registrati": None,
+                "verifica": _message("non eseguita: dividendi Yahoo assenti dal download; i dividendi registrati maturano alla data di incasso",
+                                     "Not performed: Yahoo dividends missing from the download; recorded dividends accrue on the payment date")}
+    non_registrati = []
+    for tk, eventi in sorted(div_yahoo.items()):
+        for ex_iso, per_azione in eventi:
+            if not _valid_iso(ex_iso) or (tk, ex_iso) in usati:
+                continue
+            vigilia = (datetime.strptime(ex_iso, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+            q_ex = _qty_at(timeline.get(tk, []), vigilia)  # diritto: possesso alla vigilia
+            if q_ex <= 0:
+                continue
+            non_registrati.append({"ticker": tk, "ex_date": ex_iso, "per_azione": per_azione,
+                                   "valuta": ccy_of.get(tk), "quantita": q_ex})
+    return {"maturazioni": maturazioni, "abbinati": abbinati, "non_registrati": non_registrati,
+            "verifica": _message("eseguita: ogni DIVIDEND registrato abbinato 1:1 allo stacco Yahoo piu' vicino (ex-date da -{v0} a +{v1} giorni dall'incasso), maturato all'ex-date; stacchi durante il possesso senza registrazione dichiarati",
+                                 "Performed: each recorded DIVIDEND matched 1:1 to the nearest Yahoo ex-date (from -{v0} to +{v1} days from payment), accrued on the ex-date; ex-dates during holding without a record declared",
+                                 v0=DIVIDENDI_FINESTRA_PRIMA_GG, v1=DIVIDENDI_FINESTRA_DOPO_GG)}
+
+
+def serie_pnl_rendimento(nav_hist: Dict[str, Any]) -> Optional[List[float]]:
+    """fix PNL-B F2: la serie UNICA per misurare rendimenti dalla storia del NAV =
+    non realizzato + dividendi MATURATI (chiusure non aggiustate: senza i dividendi lo
+    stacco sarebbe una perdita permanente). None = serie assente o disallineata."""
+    serie = (nav_hist or {}).get("pnl_con_dividendi_eur")
+    if serie is None or len(serie) != len((nav_hist or {}).get("cost_basis_eur") or []):
+        return None
+    return list(serie)
+
+
+def _feed_giornaliero(ticker: str) -> Dict[str, Tuple[float, str, str]]:
+    """fix PNL-B (A2): {giorno ISO (UTC, come position_prices.timestamp): (prezzo, valuta,
+    fonte)} con l'ULTIMA riga di ogni giorno. {} se la tabella manca o la lettura fallisce
+    (il punto resta allora al costo, gia' dichiarato in valorizzati_al_costo)."""
+    try:
+        db = MemoryDB()
+        with db._conn() as conn:
+            rows = conn.execute(
+                "SELECT prezzo, valuta, source, timestamp FROM position_prices "
+                "WHERE ticker=? ORDER BY timestamp ASC, id ASC", (ticker,)).fetchall()
+    except Exception as e:
+        _log(f"feed position_prices {ticker} non leggibile: {type(e).__name__}")
+        return {}
+    out: Dict[str, Tuple[float, str, str]] = {}
+    for r in rows:
+        try:
+            out[str(r["timestamp"])[:10]] = (float(r["prezzo"]), r["valuta"], r["source"] or "n.d.")
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _opening_positions():
@@ -735,7 +945,11 @@ def compute_nav_history(start_date: Optional[str] = None,
     _log(f"NAV history: {len(tickers)} tickers, richiesta [{start_date}, {end_date}) (fine esclusa)")
 
     try:
-        prices = _download_prices_for_history(tickers, start_date, end_date, salta)
+        # fix PNL-B (06/10): chiusure NON aggiustate per dividendi (split si'). Con quelle
+        # aggiustate i prezzi passati scendono per ogni dividendo successivo e il P&L
+        # contava il dividendo due volte (nel prezzo e come incasso registrato).
+        prices = _download_prices_for_history(tickers, start_date, end_date, salta,
+                                              auto_adjust=False)
     except Exception as e:
         return {"error": _message("alias yfinance non risolvibile: {error}", "Cannot resolve yfinance alias: {error}", error=error_text(e)),
                 "timestamp": datetime.now().isoformat()}
@@ -807,13 +1021,38 @@ def compute_nav_history(start_date: Optional[str] = None,
     nav_series: List[float] = []
     cost_basis_series: List[float] = []
     pnl_series: List[float] = []
-    dividend_series: List[float] = []   # cumulative dividends EUR
+    dividend_series: List[float] = []   # cumulative dividends EUR (alla data di INCASSO)
+    dividend_accrued_series: List[float] = []  # fix PNL-B: cumulati alla data di MATURAZIONE
+    pnl_div_series: List[float] = []    # fix PNL-B: non realizzato + dividendi maturati
     realized_sales_series: List[float] = []  # cumulative realized P/L da vendite (bugfix #164)
     total_return_series: List[float] = []  # (nav - cb + divs + realized) EUR
     # F43(4) 31/08: registro dei punti-proxy — quando il 205-fix valorizza un
     # ticker al COSTO (nessun prezzo quel giorno), qui si annota chi e quando;
     # esce nel payload come `valorizzati_al_costo` (pattern `stale_positions`)
     al_costo: Dict[str, Dict[str, Any]] = {}
+    da_feed: Dict[str, Dict[str, Any]] = {}  # fix PNL-B (A2): punti dal feed vivo, per ticker
+    fermi: Dict[str, Dict[str, Any]] = {}    # fix PNL-B (F10): prezzi fermi da ffill senza feed
+    ultimo_noto: Dict[str, float] = {}       # ultimo prezzo usato per ticker (Yahoo o feed)
+    riempiti = (prices.attrs.get("riempiti_ffill") or {}) if hasattr(prices, "attrs") else {}
+    _feed_cache: Dict[str, Dict[str, Tuple[float, str, str]]] = {}
+
+    def _prezzo_feed(ticker: str, iso_day: str, ccy: str):
+        """(prezzo, fonte) = ultima riga di position_prices del giorno (data UTC del
+        timestamp) nella stessa valuta della serie; None se assente."""
+        if ticker not in _feed_cache:
+            _feed_cache[ticker] = _feed_giornaliero(ticker)
+        riga = _feed_cache[ticker].get(iso_day)
+        if riga is None or (riga[1] or "").upper() != (ccy or "").upper() or not (riga[0] > 0):
+            return None
+        return riga[0], riga[2]
+
+    # fix PNL-B F1/F9 (06/10): ogni DIVIDEND registrato si abbina 1:1 allo stacco Yahoo
+    # piu' vicino e MATURA all'ex-date (il prezzo non aggiustato cala li'): niente buco
+    # fra stacco e incasso. Senza abbinamento matura all'incasso, dichiarato.
+    div_yahoo = prices.attrs.get("dividendi") if hasattr(prices, "attrs") else None
+    abbinamento = _abbina_dividendi(trades, div_yahoo, timeline, ccy_of)
+    maturazioni = abbinamento["maturazioni"]
+
     for ts in date_index:
         iso = _iso_safe(ts)
         nav_day = 0.0
@@ -830,6 +1069,28 @@ def compute_nav_history(start_date: Optional[str] = None,
                     px_ok = bool(np.isfinite(px) and px > 0)
                 except Exception:
                     px_ok = False
+            fonte_feed = None
+            if t in prices.columns and (not px_ok or (riempiti.get(t) or {}).get(iso, 0) >= FERMI_DICHIARATI_DA_SEDUTE):
+                # fix PNL-B (A2/F10): buco del provider (NaN oltre il limite di ffill) o prezzo
+                # FERMO riportato dal ffill -> ultimo prezzo del giorno dal feed vivo
+                # (position_prices), DICHIARATO con la fonte. Senza feed: il NaN va al costo,
+                # il prezzo fermo resta ma e' dichiarato in prezzi_fermi_ffill.
+                dal_feed = _prezzo_feed(t, iso, ccy_of[t])
+                if dal_feed is not None:
+                    px, fonte_feed = dal_feed
+                    px_ok = True
+                elif px_ok and (riempiti.get(t) or {}).get(iso, 0) >= FERMI_DICHIARATI_DA_SEDUTE:
+                    _reg = fermi.setdefault(t, {"ticker": t, "n_giorni": 0, "primo": iso, "ultimo": iso})
+                    _reg["n_giorni"] += 1
+                    _reg["ultimo"] = iso
+                elif not px_ok and t in ultimo_noto:
+                    # oltre il limite di ffill e senza feed: ultimo prezzo NOTO (Yahoo o feed),
+                    # DICHIARATO come fermo. Valutare al costo creerebbe un salto finto
+                    # (mercato -> costo -> mercato) nella storia e nei rendimenti.
+                    px, px_ok = ultimo_noto[t], True
+                    _reg = fermi.setdefault(t, {"ticker": t, "n_giorni": 0, "primo": iso, "ultimo": iso})
+                    _reg["n_giorni"] += 1
+                    _reg["ultimo"] = iso
             if px_ok:
                 ccy = ccy_of[t]
                 fx_rate = fx_lookup(iso, ccy)
@@ -839,6 +1100,14 @@ def compute_nav_history(start_date: Optional[str] = None,
                                                 for k, v in currency_labels.items()},
                             "timestamp": datetime.now().isoformat()}
                 nav_day += qty * px * fx_rate
+                ultimo_noto[t] = px
+                if fonte_feed is not None:
+                    _reg = da_feed.setdefault(t, {"ticker": t, "n_giorni": 0, "primo": iso,
+                                                  "ultimo": iso, "fonti": []})
+                    _reg["n_giorni"] += 1
+                    _reg["ultimo"] = iso
+                    if fonte_feed not in _reg["fonti"]:
+                        _reg["fonti"].append(fonte_feed)
             else:
                 # 205-fix: nessun prezzo per questo nome -> vale il suo COSTO (P&L 0),
                 # non zero: niente piu' tuffi finti che avvelenano TWR e MaxDD.
@@ -864,12 +1133,15 @@ def compute_nav_history(start_date: Optional[str] = None,
                                         for k, v in currency_labels.items()},
                     "timestamp": datetime.now().isoformat()}
         div_day = _dividend_income_at(trades, iso)
+        div_maturato_day = sum(imp for d_mat, imp in maturazioni if d_mat <= iso)
         pnl_day = nav_day - cost_basis_day
-        total_return_day = pnl_day + div_day + realized_day
+        total_return_day = pnl_day + div_maturato_day + realized_day
         nav_series.append(round(nav_day, 2))
         cost_basis_series.append(round(cost_basis_day, 2))
         pnl_series.append(round(pnl_day, 2))
         dividend_series.append(round(div_day, 2))
+        dividend_accrued_series.append(round(div_maturato_day, 2))
+        pnl_div_series.append(round(pnl_day + div_maturato_day, 2))
         realized_sales_series.append(round(realized_day, 2))
         total_return_series.append(round(total_return_day, 2))
 
@@ -917,6 +1189,21 @@ def compute_nav_history(start_date: Optional[str] = None,
         # anche il punto di OGGI e' al costo, non a mercato. None = serie pulita.
         "valorizzati_al_costo": (sorted(al_costo.values(), key=lambda r: r["ticker"])
                                  or None),
+        # fix PNL-B (A2): punti oltre il limite di ffill presi dal feed vivo, con la fonte.
+        "prezzi_da_feed_vivo": (sorted(da_feed.values(), key=lambda r: r["ticker"]) or None),
+        "ffill_limite_sedute": FFILL_LIMITE_SEDUTE,
+        "price_basis": _message("chiusure giornaliere yfinance NON aggiustate per dividendi (prezzi aggiustati per split; le quantita' dei trade NO); dividendi solo dalle registrazioni DIVIDEND: dividend_income_eur alla data di incasso, dividendi_maturati_eur e pnl_con_dividendi_eur all'ex-date abbinato",
+                                "Daily yfinance closes NOT adjusted for dividends (prices split-adjusted; trade quantities NOT); dividends only from recorded DIVIDEND rows: dividend_income_eur on the payment date, dividendi_maturati_eur and pnl_con_dividendi_eur on the matched ex-date"),
+        "dividendi_non_registrati": abbinamento["non_registrati"],
+        "dividendi_verifica": abbinamento["verifica"],
+        "dividendi_abbinati": abbinamento["abbinati"],
+        # fix PNL-B F10: prezzi FERMI senza feed del giorno: riportati dal ffill (dalla 2a seduta)
+        # o, oltre il limite, l'ultimo prezzo noto
+        "prezzi_fermi_ffill": (sorted(fermi.values(), key=lambda r: r["ticker"]) or None),
+        # fix PNL-B F1/F2: serie per chi misura RENDIMENTI dalla storia (drawdowns,
+        # charts_quant, advanced_metrics): leggerla con serie_pnl_rendimento().
+        "dividendi_maturati_eur": dividend_accrued_series,
+        "pnl_con_dividendi_eur": pnl_div_series,
         "n_days": len(dates_iso),
         "final_nav_eur": round(final_nav, 2),
         "final_cost_basis_eur": round(final_cb, 2),
@@ -954,10 +1241,12 @@ def compute_drawdowns(force: bool = False) -> Dict[str, Any]:
         return nav_hist
 
     dates = nav_hist["dates"]
-    pnl_series = nav_hist.get("pnl_eur") or []
+    # fix PNL-B F2: non realizzato + dividendi MATURATI (con le chiusure non aggiustate lo
+    # stacco senza il suo dividendo sarebbe un drawdown permanente finto)
+    pnl_series = serie_pnl_rendimento(nav_hist) or []
     cb_series  = nav_hist.get("cost_basis_eur") or []
     if not pnl_series or not cb_series:
-        return {"error": _message('serie pnl/cost_basis assenti', 'missing pnl/cost_basis series'), "n_days": 0}
+        return {"error": _message('serie pnl (con dividendi maturati)/cost_basis assenti', 'missing pnl (with accrued dividends)/cost_basis series'), "n_days": 0}
 
     # Cumulative return ratio = 1 + (pnl / cost_basis). At t=0 con CB=0 usiamo 1.0.
     # Questo e' il "growth of EUR1" che esclude l'effetto cashflow.

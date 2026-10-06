@@ -74,7 +74,9 @@ def _returns_from_nav(nav_hist):
     """Serie rendimenti giornalieri % dal P/L INCREMENTALE sul cost basis del giorno
     prima. audit/11 §4: il diff del ratio pnl/cb generava rendimenti FANTASMA a ogni
     variazione di capitale (ADD/BUY/TRIM cambiano il denominatore, non la performance)."""
-    pnl = np.array(nav_hist.get("pnl_eur") or [], dtype=float)
+    # fix PNL-B F2 (06/10): serie unica con i dividendi maturati (chiusure non aggiustate)
+    from bellomberg.portfolio.portfolio_analytics import serie_pnl_rendimento
+    pnl = np.array(serie_pnl_rendimento(nav_hist) or [], dtype=float)
     cb = np.array(nav_hist.get("cost_basis_eur") or [], dtype=float)
     if len(pnl) < 10 or len(cb) != len(pnl):
         return None
@@ -250,7 +252,9 @@ def chart_underwater(nav_hist):
     if not MPL_OK:
         return None
     try:
-        pnl = np.array((nav_hist or {}).get("pnl_eur") or [], dtype=float)
+        # fix PNL-B F2 (06/10): serie unica con i dividendi maturati
+        from bellomberg.portfolio.portfolio_analytics import serie_pnl_rendimento
+        pnl = np.array(serie_pnl_rendimento(nav_hist) or [], dtype=float)
         cb = np.array((nav_hist or {}).get("cost_basis_eur") or [], dtype=float)
         if len(pnl) < 10 or len(cb) != len(pnl):
             return None

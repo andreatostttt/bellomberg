@@ -286,7 +286,8 @@ def test_legacy_tail_align_e_insufficiente(monkeypatch):
     ratio = np.cumprod(1 + rng.normal(0, .01, n))
     monkeypatch.setattr(twr, "compute_twr_payload", lambda: {"error": "twr finto spento"})
     monkeypatch.setattr(pa, "compute_nav_history",
-                        lambda: {"pnl_eur": list(ratio - 1), "cost_basis_eur": [1.0] * n,
+                        lambda: {"pnl_eur": list(ratio - 1), "pnl_con_dividendi_eur": list(ratio - 1),
+                                 "cost_basis_eur": [1.0] * n,
                                  "dates": ["2099-01-01"] * (n - 3)})
     monkeypatch.setattr(bsm, "compute_benchmark_series",
                         lambda ticker=None, twr_payload=None: {

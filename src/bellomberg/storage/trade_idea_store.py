@@ -11,8 +11,12 @@ import math
 import os
 import re
 import sqlite3
+import sys
+import threading
+import time
 import uuid
 from contextlib import contextmanager
+from functools import wraps
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -419,11 +423,102 @@ def _text(value, label, limit, *, empty=False):
     return value
 
 
+# Lock SQLite transitori (06/10: la run Trade Idea del PM e' morta per un «database is locked» di
+# ~25 s durante il desk quant). Il worker costruisce lo store con lock_wait_s: ogni
+# scrittura (BEGIN IMMEDIATE ... COMMIT) che trova il DB occupato si ritenta con
+# attese crescenti fino al tetto complessivo, e ogni attesa oltre 1 s va nel log
+# (chi, quale scrittura, quanto). Si ritenta SOLO se il COMMIT non e' avvenuto: la
+# transazione e' stata annullata per intero, quindi ritentare non duplica nulla
+# (una prenotazione costo ritentata non diventa mai due prenotazioni).
+LOCK_LOG_SOGLIA_S = 1.0
+WORKER_LOCK_WAIT_S = 120.0
+WORKER_LOCK_BUSY_S = 30.0
+_LOCK_STATO = threading.local()
+
+
+def errore_di_lock(exc):
+    """Vero solo per il DB occupato (locked/busy), mai per altri OperationalError."""
+    return isinstance(exc, sqlite3.OperationalError) and any(
+        word in str(exc).lower() for word in ("locked", "busy"))
+
+
+def log_lock(message):
+    """Una riga su stderr (il worker.log della run): la sola traccia per misurare il colpevole."""
+    stamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+    print(f"[LOCK] {stamp} pid={os.getpid()} {message}", file=sys.stderr, flush=True)
+
+
+class _ConnessioneMisurata(sqlite3.Connection):
+    """Misura l'attesa di BEGIN/COMMIT e annota se il COMMIT e' avvenuto."""
+
+    def execute(self, sql, *args):
+        verbo = sql.lstrip()[:6].upper() if isinstance(sql, str) else ""
+        if verbo not in ("BEGIN ", "COMMIT"):
+            return super().execute(sql, *args)
+        inizio, esito = time.monotonic(), "ok"
+        try:
+            cursor = super().execute(sql, *args)
+            if verbo == "COMMIT":
+                _LOCK_STATO.commit = True
+            return cursor
+        except sqlite3.OperationalError as exc:
+            esito = type(exc).__name__ + ": " + str(exc)[:80]
+            raise
+        finally:
+            attesa = time.monotonic() - inizio
+            if attesa > LOCK_LOG_SOGLIA_S:
+                log_lock(f"scrittura={getattr(_LOCK_STATO, 'operazione', None) or '?'} "
+                         f"{verbo.strip()} attesa={attesa:.1f}s esito={esito}")
+
+
+def _scrittura_ritentata(method):
+    """Ritenta la scrittura intera sul DB occupato, solo se lo store ha lock_wait_s."""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if getattr(_LOCK_STATO, "operazione", None) is not None:
+            return method(self, *args, **kwargs)  # annidata: ritenta solo la piu' esterna
+        totale = getattr(self, "lock_wait_s", None)
+        nome = method.__name__
+        _LOCK_STATO.operazione = nome
+        try:
+            inizio, tentativo = time.monotonic(), 0
+            while True:
+                _LOCK_STATO.commit = False
+                try:
+                    return method(self, *args, **kwargs)
+                except sqlite3.OperationalError as exc:
+                    if not totale or not errore_di_lock(exc):
+                        raise
+                    trascorso = time.monotonic() - inizio
+                    if _LOCK_STATO.commit:
+                        log_lock(f"scrittura={nome} DB occupato DOPO il commit ({trascorso:.1f}s): "
+                                 "non ritento, la scrittura e' gia' avvenuta")
+                        raise
+                    pausa = min(0.5 * 2 ** tentativo, 8.0)
+                    if trascorso + pausa >= totale:
+                        log_lock(f"scrittura={nome} DB occupato oltre il tetto di {totale:g}s "
+                                 f"({tentativo + 1} tentativi, {trascorso:.1f}s): rinuncio, "
+                                 "il chiamante dichiara la lacuna")
+                        raise
+                    tentativo += 1
+                    log_lock(f"scrittura={nome} DB occupato (tentativo {tentativo}, "
+                             f"{trascorso:.1f}s trascorsi): riprovo fra {pausa:g}s")
+                    time.sleep(pausa)
+        finally:
+            _LOCK_STATO.operazione = None
+    return wrapper
+
+
 class TradeIdeaStore:
     """An accepted run is immutable input; paid work never resumes implicitly."""
 
-    def __init__(self, db_path, *, mandate_loader=None, clock=None):
+    def __init__(self, db_path, *, mandate_loader=None, clock=None,
+                 lock_wait_s=None, lock_busy_s=None):
         self.db_path = os.fspath(db_path)
+        # None = comportamento storico (attesa SQLite 10 s, nessun nuovo tentativo).
+        # Il worker Trade Idea passa WORKER_LOCK_WAIT_S/WORKER_LOCK_BUSY_S.
+        self.lock_wait_s = lock_wait_s
+        self.lock_busy_s = lock_busy_s
         self._mandate_loader = mandate_loader or self._load_mandate_hash
         self._clock = clock or _now
         if not os.path.isfile(self.db_path):
@@ -442,11 +537,13 @@ class TradeIdeaStore:
     @contextmanager
     def _connect(self, *, read_only=False):
         path = Path(self.db_path).resolve(strict=True)
+        busy = float(getattr(self, "lock_busy_s", None) or 10)
         conn = sqlite3.connect(path.as_uri() + ("?mode=ro" if read_only else "?mode=rw"),
-                               uri=True, timeout=10, isolation_level=None)
+                               uri=True, timeout=busy, isolation_level=None,
+                               factory=_ConnessioneMisurata)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute(f"PRAGMA busy_timeout={int(busy * 1000)}")
         try:
             yield conn
         finally:
@@ -601,6 +698,7 @@ class TradeIdeaStore:
                                (key,)).fetchone()
         return self.get_run(row["id"]) if row else None
 
+    @_scrittura_ritentata
     def create_run(self, request: dict, *, idempotency_key: str):
         if not isinstance(request, dict):
             raise ValueError("request must be a JSON object")
@@ -1275,6 +1373,7 @@ class TradeIdeaStore:
             "original_iteration": iteration, "max_tool_iters": 30,
             "task_context": task, "native_validation_required": True}
 
+    @_scrittura_ritentata
     def create_continuation(self, parent_run_id: str, *, idempotency_key: str,
                             authorize_new_requests: bool = False,
                             recover_truncated_request_id: str | None = None,
@@ -1474,6 +1573,7 @@ class TradeIdeaStore:
                 raise
         return {**self.get_run(run_id), "created": True}
 
+    @_scrittura_ritentata
     def record_failure(self, run_id, worker_token, failure):
         """First cause is durable; downstream errors cannot overwrite it."""
         if not isinstance(failure, dict) or not failure.get("message"):
@@ -1498,6 +1598,7 @@ class TradeIdeaStore:
                     conn.execute("ROLLBACK")
                 raise
 
+    @_scrittura_ritentata
     def claim_run(self, run_id: str):
         """Claim accepted work exactly once; a running/interrupted run cannot replay."""
         token, now = str(uuid.uuid4()), self._at()
@@ -1518,6 +1619,7 @@ class TradeIdeaStore:
                 raise
         return token
 
+    @_scrittura_ritentata
     def update_progress(self, run_id: str, worker_token: str, phase: str, progress: dict):
         phase = _text(phase, "phase", 120)
         if not isinstance(progress, dict):
@@ -1555,6 +1657,7 @@ class TradeIdeaStore:
                     conn.execute("ROLLBACK")
                 raise
 
+    @_scrittura_ritentata
     def request_stop(self, run_id: str):
         now = self._at()
         with self._connect() as conn:
@@ -1579,6 +1682,7 @@ class TradeIdeaStore:
                     conn.execute("ROLLBACK")
                 raise
 
+    @_scrittura_ritentata
     def finish_run(self, run_id: str, worker_token: str, result, technical_status: str,
                    reason: str | None = None):
         if technical_status not in _FINAL:
@@ -1636,6 +1740,7 @@ class TradeIdeaStore:
                 raise
         return self.get_run(run_id)
 
+    @_scrittura_ritentata
     def interrupt_run(self, run_id: str, *, reason: str):
         """Explicit recovery after the owner process is known dead; never resumes it."""
         reason, now = _text(reason, "reason", 4000), self._at()
@@ -1660,6 +1765,7 @@ class TradeIdeaStore:
                     conn.execute("ROLLBACK")
                 raise
 
+    @_scrittura_ritentata
     def cancel_run_after_stop(self, run_id: str, *, reason: str):
         """Called by API only after it confirms the paid worker has stopped."""
         reason, now = _text(reason, "reason", 4000), self._at()
@@ -1732,6 +1838,7 @@ class TradeIdeaStore:
         return ("model_revision" if role == "aux:revision" or role.endswith(":model_revision") else
                 "model_preparation" if role == "aux" or role.startswith("aux:") else "committee")
 
+    @_scrittura_ritentata
     def reserve_cost(self, run_id: str, request_id: str, role: str, model: str, max_usd,
                      *, request_sha256=None, worker_token=None, capo_request_body=None):
         request_id = _text(request_id, "request_id", 200)
@@ -1817,6 +1924,7 @@ class TradeIdeaStore:
                     conn.execute("ROLLBACK")
                 raise
 
+    @_scrittura_ritentata
     def reusable_capo_response(self, run_id, worker_token):
         """Replay one exact paid response without rebuilding its dynamic prompt.
 
@@ -1932,6 +2040,7 @@ class TradeIdeaStore:
                     conn.execute("ROLLBACK")
                 raise
 
+    @_scrittura_ritentata
     def reusable_response(self, run_id, worker_token, *, role, request_sha256):
         """Recover a received ancestor response once, never redispatch it."""
         with self._connect() as conn:
@@ -1997,6 +2106,7 @@ class TradeIdeaStore:
                     conn.execute("ROLLBACK")
                 raise
 
+    @_scrittura_ritentata
     def _settle_cost(self, run_id, request_id, status, *, charged=None, usage=None,
                      receipt=None, reason=None):
         if status not in ("charged", "released", "unknown"):
@@ -2222,6 +2332,7 @@ class TradeIdeaStore:
         return {"kind": row["destination_kind"], "decision_id": row["destination_decision_id"],
                 "memo_id": row["memo_id"], "reason": row["destination_reason"]}
 
+    @_scrittura_ritentata
     def route_result(self, run_id: str, checks: dict):
         """One primary destination, decided and inserted in one SQLite transaction.
 
@@ -2401,6 +2512,7 @@ class TradeIdeaStore:
                     conn.execute("ROLLBACK")
                 raise
 
+    @_scrittura_ritentata
     def mark_routing_failure(self, run_id: str, reason: str):
         """A persisted result without a destination is technically incomplete."""
         reason, now = _text(reason, "routing failure", 4000), self._at()
@@ -2425,6 +2537,7 @@ class TradeIdeaStore:
                     conn.execute("ROLLBACK")
                 raise
 
+    @_scrittura_ritentata
     def demote_unreviewed_destination(self, run_id: str, reason: str):
         """Withdraw only this run's untouched PENDING DCN after final report failure.
 
@@ -2562,6 +2675,7 @@ class TradeIdeaStore:
                         run_id=row["id"], ticker=row["ticker"]))}
         return output
 
+    @_scrittura_ritentata
     def save_manifest(self, run_id: str, manifest: dict):
         if not isinstance(manifest, dict) or manifest.get("run_id") != run_id:
             raise ValueError("manifest must identify this run")
@@ -2619,6 +2733,7 @@ class TradeIdeaStore:
                     conn.execute("ROLLBACK")
                 raise
 
+    @_scrittura_ritentata
     def claim_email(self, run_id: str, *, retry=False, acknowledge_uncertain=False):
         """CAS delivery claim. An ambiguous SMTP attempt never retries blindly."""
         attempt_id, now = str(uuid.uuid4()), self._at()
@@ -2654,6 +2769,7 @@ class TradeIdeaStore:
                     conn.execute("ROLLBACK")
                 raise
 
+    @_scrittura_ritentata
     def block_delivery(self, run_id: str, *, reason: str):
         """Record a package failure before dispatch without altering the verdict."""
         reason, now = _text(reason, "delivery reason", 4000), self._at()
@@ -2675,6 +2791,7 @@ class TradeIdeaStore:
                     conn.execute("ROLLBACK")
                 raise
 
+    @_scrittura_ritentata
     def record_email_outcome(self, run_id, attempt_id, status, *, receipt=None, error=None):
         if status not in ("accepted", "failed", "uncertain", "blocked"):
             raise ValueError("invalid email outcome")
@@ -2702,6 +2819,7 @@ class TradeIdeaStore:
                     conn.execute("ROLLBACK")
                 raise
 
+    @_scrittura_ritentata
     def recover_sending(self, run_id: str):
         """A restart after SMTP dispatch is ambiguous, not an automatic retry."""
         now = self._at()

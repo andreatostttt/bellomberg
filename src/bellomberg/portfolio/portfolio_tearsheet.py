@@ -203,6 +203,11 @@ def compute_tearsheet(twr_payload: Optional[Dict[str, Any]] = None,
 
     rets = [idx[t] / idx[t - 1] - 1.0 for t in range(1, len(idx))]
     r_dates = dates[1:]
+    # R-PNL G2 (06/10, Opus 5.5): il punto base al costo (primo r = chiusura/costo) non e'
+    # un rendimento giornaliero: escluso da mensili, rolling e drawdown (dichiarato dal TWR)
+    salta = int(twr_payload.get("indice_statistiche_da") or 0)
+    if salta:
+        rets, r_dates = rets[salta:], r_dates[salta:]
 
     if rf_annual is None:
         try:
@@ -215,8 +220,11 @@ def compute_tearsheet(twr_payload: Optional[Dict[str, Any]] = None,
     rf_daily = (1.0 + rf_annual) ** (1.0 / TRADING_DAYS) - 1.0
 
     notes: List[str] = []
-    monthly = _monthly_table(r_dates, rets, base_date=dates[0])
-    dd = _drawdown_episodes(dates, idx)
+    monthly = _monthly_table(r_dates, rets, base_date=dates[salta])
+    dd = _drawdown_episodes(dates[salta:], idx[salta:])
+    if salta:
+        notes.append(_message('punto base al costo ({v0}) escluso da mensili, rolling e drawdown: non vale come rendimento giornaliero (dichiarato dal TWR)',
+                              'Cost base point ({v0}) excluded from monthly, rolling and drawdown: it is not a daily return (declared by TWR)', v0=dates[0]))
 
     rolling: Dict[str, Any] = {}
     for w in rolling_windows:
@@ -245,7 +253,7 @@ def compute_tearsheet(twr_payload: Optional[Dict[str, Any]] = None,
         notes.append(_message('ATTENZIONE: metriche scalari su serie LEGACY (contaminata dai flussi) mentre mensili/drawdown sono sul TWR ufficiale: due serie DIVERSE nello stesso payload — non confrontarle', 'WARNING: scalar metrics use a LEGACY series (affected by cash flows), while monthly returns/drawdowns use official TWR: two DIFFERENT series in the same payload — do not compare them'))
 
     out = {
-        "period": {"start": dates[0], "end": dates[-1], "n_trading_days": len(rets)},
+        "period": {"start": dates[salta], "end": dates[-1], "n_trading_days": len(rets)},
         "monthly": monthly["months"],
         "yearly": monthly["years"],
         "drawdowns": dd,

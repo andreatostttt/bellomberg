@@ -259,6 +259,11 @@ def portfolio_metrics(benchmark_ticker="SPY"):
             arr = np.asarray(idx, dtype=float)
             rets = np.diff(arr) / arr[:-1]
             ret_dates = [str(d)[:10] for d in dts[1:]]
+            # R-PNL G2 (06/10, Opus 5.5): il punto base al costo non e' un rendimento
+            # giornaliero: fuori da vol/sortino/VaR/alpha/beta e dal pairing col benchmark
+            salta = int(p.get("indice_statistiche_da") or 0)
+            if salta:
+                rets, ret_dates = rets[salta:], ret_dates[salta:]
             serie_src = message("twr_index ufficiale (twr_engine, GIPS flow-adjusted)", "official twr_index (twr_engine, GIPS flow-adjusted)")
     except Exception:
         rets = None
@@ -275,7 +280,9 @@ def portfolio_metrics(benchmark_ticker="SPY"):
         if isinstance(nav, dict) and nav.get("error"):
             return {"error": message("nav history: {reason}", "nav history: {reason}", reason=nav["error"]),
                     "negozio_prezzi": nav.get("negozio_prezzi")}
-        pnl = nav.get("pnl_eur") or []
+        # fix PNL-B F2 (06/10): serie unica con i dividendi maturati (chiusure non aggiustate)
+        from bellomberg.portfolio.portfolio_analytics import serie_pnl_rendimento
+        pnl = serie_pnl_rendimento(nav) or []
         cb = nav.get("cost_basis_eur") or []
         if len(pnl) < 10:
             return {"error": message("storico NAV insufficiente", "insufficient NAV history"), "n": len(pnl)}

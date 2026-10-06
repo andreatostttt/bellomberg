@@ -1305,6 +1305,31 @@ export interface TwrMetrics {
   irr_basis: string;
 }
 
+/** P&L di performance (somma dei P&L giornalieri della catena TWR) contro P&L contabile, con le voci
+ *  che li separano misurate una per una; residuo misurato, n.d. col motivo se non misurabile. */
+export interface TwrRiconciliazionePnl {
+  pnl_performance_eur: number;
+  pnl_performance_esatto_eur?: number;
+  pnl_contabile_eur: number | null;
+  contabile: { data: string; non_realizzato_eur: number; realizzato_eur: number; dividendi_eur: number } | null;
+  voci: { voce: string; importo_eur: number; stato?: string; nota?: string }[];
+  /** cassa del tratto ufficiale misurata da sola: la parte non spiegata resta nel residuo */
+  cassa?: {
+    variazione_osservata_eur: number; variazione_attesa_eur: number; versamenti_ledger_eur: number;
+    acquisti_meno_vendite_eur: number; dividendi_incassati_eur: number; interessi_eur: number | null;
+    non_spiegata_eur: number; nota?: string;
+  } | null;
+  controllo_cassa?: { scarto_eur: number; stato: 'coerente' | 'incoerente' } | null;
+  residuo_eur: number | null;
+  residuo_stato: 'riconciliato_entro_tolleranza' | 'non_riconciliato' | 'n.d.';
+  /** il PEGGIORE fra residuo, voci («da_verificare») e controllo cassa («incoerente») */
+  stato?: 'riconciliato_entro_tolleranza' | 'da_verificare' | 'incoerente' | 'non_riconciliato' | 'n.d.';
+  tolleranza_residuo_eur?: number;
+  soglia_ultimo_punto_pct?: number;
+  motivo_nd: string | null;
+  nota?: string;
+}
+
 export interface TwrPayload {
   copertura?: {
     primo_trade: string | null; primo_snapshot: string | null; ultimo_snapshot: string | null;
@@ -1326,6 +1351,18 @@ export interface TwrPayload {
   metrics?: TwrMetrics;
   external_flows?: { date: string; type: string; amount_eur: number; note?: string | null }[];
   reconciliation?: TwrReconciliation | null;
+  // backend PNL-B 06/10: da dove parte il rendimento, dividendi del tratto ricostruito,
+  // base alla cucitura e riconciliazione performance/contabile (campi assenti nei backend precedenti)
+  base?: { tipo: 'costo' | 'chiusura' | 'snapshot'; data: string; valore_eur: number; nota: string; data_convenzionale?: boolean; escluso_dalle_statistiche?: boolean } | null;
+  /** primo indice di dates/twr_index da cui partono le statistiche (punto base al costo escluso); assente = 0 */
+  indice_statistiche_da?: number;
+  statistiche_nota?: string | null;
+  dividendi_ricostruiti?: { stato: string; inclusi_eur?: number | null; nota: string } | null;
+  cucitura?: {
+    base_eur: number | null; data: string; posizioni_ricostruite_eur?: number; cassa_snapshot_eur?: number;
+    investito_snapshot_eur?: number | null; scarto_snapshot_meno_ricostruzione_eur?: number | null; nota: string;
+  } | null;
+  riconciliazione_pnl?: TwrRiconciliazionePnl | null;
   notes?: string[];
   methodology?: string;
   n_days?: number;

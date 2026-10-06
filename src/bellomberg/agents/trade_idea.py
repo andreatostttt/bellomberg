@@ -761,6 +761,10 @@ class TradeIdeaBudgetGate:
             except sqlite3.OperationalError as exc:
                 text = str(exc).lower()
                 if attempt == 5 or not ("locked" in text or "busy" in text):
+                    if "locked" in text or "busy" in text:
+                        # Soldi: la ricevuta di una risposta pagata non e' scritta.
+                        # Mai lacuna di un desk: resta un guasto della run.
+                        exc.pagata_non_registrata = True
                     raise
                 time.sleep(0.5 * 2 ** attempt)
 
@@ -799,6 +803,7 @@ class TradeIdeaBudgetGate:
                                   usage=details, receipt=receipt)
 
     def _unknown(self, request_id, exc):
+        import sqlite3
         partial = _partial_provider_evidence(getattr(exc, "partial_response", None))
         from bellomberg.core.generation_lookup import generation_id_from
         receipt = {"request_sha256": self._requests.get(request_id, {}).get("request_sha256"),
@@ -814,7 +819,12 @@ class TradeIdeaBudgetGate:
                    "exception_type": type(exc).__name__, "request_id": request_id,
                    "desk": request.get("role"), "round": request.get("round_n"),
                    "phase": getattr(self, "phase", "committee")}
-        self.store.record_failure(self.run_id, self.worker_token, failure)
+        try:
+            self.store.record_failure(self.run_id, self.worker_token, failure)
+        except sqlite3.OperationalError as lock_exc:
+            # Costo ignoto gia' scritto (mark_cost_unknown): il guasto resta della run.
+            lock_exc.pagata_non_registrata = True
+            raise
         blackboard = getattr(self, "blackboard", None)
         if blackboard is not None and not blackboard.data.get("_primary_failure"):
             blackboard.data["_primary_failure"] = failure
@@ -1233,6 +1243,11 @@ def run_trade_idea_capo(blackboard, *, portfolio, mandate, decision_context=None
                  "mandato (size di una nuova posizione, peso massimo per posizione, posizione minima, "
                  "cassa minima), limitate dai limiti misurati del motore di sizing; azione e importo si "
                  "scelgono solo dentro la fascia di quell'azione." if policy_v4 else ""))
+    red_notes = _red_inadmissible_gaps(blackboard) if research else []
+    if red_notes:
+        system += ("\n\nRED TEAM, OBIEZIONI DICHIARATE NON AMMISSIBILI DAL SERVER: " + " ".join(red_notes)
+                   + " Non trattarle come obiezioni discusse; se la critica del Red Team e' una lacuna, "
+                     "la convinzione non puo' essere ALTA.")
     if incomplete_reasons:
         system += ("\n\nQuesta run ha componenti obbligatori incompleti: "
                    + "; ".join(incomplete_reasons)
@@ -1531,6 +1546,16 @@ def _desk_annex(data):
                       | {"objection": str(objection.get("objection") or objection.get("text") or ""),
                          "requested_change": str(objection.get("requested_change") or ""),
                          "state": row.get("state"), "response": str(row.get("response") or "")})
+    for row in data.get("_red_inadmissible_objections") or []:  # 06/10: dichiarate, non discusse
+        objection = row.get("objection") if isinstance(row, dict) else None
+        if not isinstance(objection, dict):
+            continue
+        ledger.append({key: objection.get(key) for key in ("id", "desk", "category", "material")}
+                      | {"objection": str(objection.get("objection") or ""),
+                         "requested_change": str(objection.get("requested_change") or ""),
+                         "state": "inammissibile",
+                         "response": (str(row.get("reason") or RED_INADMISSIBLE_REASON) + ": "
+                                      + ", ".join(str(ref) for ref in row.get("outside_refs") or []))})
     return {"version": 1, "desks": desks, "red_team": red, "ledger": ledger,
             "decisive_questions": [str(item) for item in data.get("_decisive_questions") or []]}
 
@@ -1789,29 +1814,75 @@ def _configure_native_recovery(blackboard, store, token, *, inherited=None):
         if blackboard.valuation_results and not _verified_candidate_valuations(blackboard):
             raise RuntimeError("Saved exact workbook/hash/generation is no longer verifiable")
 
+    from bellomberg.storage.trade_idea_store import errore_di_lock, log_lock
+    # Scritture rimandate perche' il DB era occupato oltre il tetto dello store
+    # (06/10). Il checkpoint e' solo un aiuto alla ripresa: il successivo contiene
+    # tutto lo stato, quindi rimandarlo non perde nulla; lo si dichiara nel log e
+    # nella prima scrittura riuscita. Un guasto non registrato si riscrive appena
+    # il DB e' libero, prima del checkpoint.
+    deferred = {"failure": None, "checkpoints": []}
+
     def persist(event="checkpoint", payload=None):
-        store.update_progress(blackboard.run_id, token, "checkpoint",
-            _progress(blackboard, "checkpoint", events=(event,)))
+        try:
+            pending = deferred["failure"]
+            if pending is not None:
+                store.record_failure(blackboard.run_id, token, pending)
+                deferred["failure"] = None
+                log_lock("guasto rimandato ora registrato: " + str(pending.get("message"))[:200])
+            events = (*(f"checkpoint rimandato (DB occupato): {row}" for row in deferred["checkpoints"]),
+                      event)
+            store.update_progress(blackboard.run_id, token, "checkpoint",
+                _progress(blackboard, "checkpoint", events=events))
+            if deferred["checkpoints"]:
+                log_lock(f"checkpoint scritto dopo {len(deferred['checkpoints'])} rimandati")
+                deferred["checkpoints"].clear()
+        except Exception as exc:
+            if not errore_di_lock(exc):
+                raise
+            deferred["checkpoints"].append(str(event)[:200])
+            log_lock("checkpoint rimandato, DB occupato oltre il tetto: " + str(event)[:200]
+                     + " (lo stato completo va nel prossimo checkpoint)")
 
     def failure(error, *, desk=None, round_n=None, request_id=None):
         item = {"message": type(error).__name__ + ": " + str(error)[:2800],
             "exception_type": type(error).__name__, "desk": desk, "round": round_n,
             "request_id": request_id or getattr(error, "request_id", None),
             "phase": getattr(blackboard, "model_phase", "committee")}
+        # 06/10: un DB occupato oltre il tetto dei tentativi su UN desk e' locale a quel
+        # desk (lacuna dichiarata), non la fine della run. Una risposta pagata non
+        # registrata (pagata_non_registrata) resta invece bloccante.
+        lock_locale = (desk in TRADE_IDEA_DESKS and errore_di_lock(error)
+                       and not getattr(error, "pagata_non_registrata", False))
+        if lock_locale:
+            item["message"] = ("Database occupato oltre il tetto di attesa: lacuna dichiarata del desk, "
+                               "run proseguita. " + item["message"])[:2900]
+            log_lock(f"desk={desk} R{round_n}: lacuna dichiarata per DB occupato")
         if (is_research_mode(blackboard) and desk is not None
-                and desk == getattr(blackboard, "reply_completion_desk", None) and _desk_local_failure(error)):
+                and desk == getattr(blackboard, "reply_completion_desk", None)
+                and (_desk_local_failure(error) or lock_locale)):
             persist("reply_completion_failure:" + desk)  # its objections are flagged unanswered
             return
-        if is_research_mode(blackboard) and desk in TRADE_IDEA_DESKS and _desk_local_failure(error):
+        if (is_research_mode(blackboard) and desk in TRADE_IDEA_DESKS
+                and (_desk_local_failure(error) or lock_locale)):
             # PM 03/10/2026: one desk that truncates, refuses or writes an unusable report
             # is a declared gap, not the end of an already paid committee. Money, budget,
             # integrity and PM stops below stay run-blocking.
             with blackboard._lock:
-                blackboard.data.setdefault("_desk_gaps", {})[desk] = item
+                blackboard.data.setdefault("_desk_gaps", {}).setdefault(desk, item)  # vale la prima causa
             persist("desk_gap:" + desk)
             return
         with blackboard._lock:
-            first = store.record_failure(blackboard.run_id, token, item)
+            try:
+                first = store.record_failure(blackboard.run_id, token, item)
+            except Exception as exc:
+                if not errore_di_lock(exc):
+                    raise
+                # Il gestore non cade sullo stesso lock che sta gestendo: il guasto resta
+                # in memoria (blocca comunque la run) e si scrive al primo DB libero.
+                first = {**item, "registrazione": "rimandata: database occupato"}
+                if deferred["failure"] is None:
+                    deferred["failure"] = item
+                log_lock("guasto non registrabile ora (DB occupato), rimandato: " + item["message"][:200])
             if not blackboard.data.get("_primary_failure"):
                 blackboard.data["_primary_failure"] = first
         persist("execution_failure")
@@ -3435,6 +3506,53 @@ def _complete_research_objection_replies(blackboard):
         blackboard.persist_run_checkpoint('research_objection_completion_complete')
 
 
+RED_INADMISSIBLE_REASON = "obiezione inammissibile: fonte fuori dal dossier sigillato"
+
+
+def _admit_red_objections(blackboard, review):
+    """06/10 (run Trade Idea del PM): un riferimento fuori dal dossier non uccide piu' la run.
+
+    Le obiezioni che citano un id assente dal catalogo sigillato diventano obiezioni
+    INAMMISSIBILI dichiarate (memo, Capo, controlli); si prosegue con le ammissibili.
+    Se nessuna e' ammissibile la critica del Red Team e' una lacuna dichiarata: il
+    controllo red_team_complete resta falso, quindi niente proposta operativa.
+    """
+    allowed = _review_source_ids(blackboard)
+    admissible, inadmissible = [], []
+    for row in review['objections']:
+        outside = sorted(set(row['evidence_refs']) - allowed)
+        if outside:
+            inadmissible.append({'objection': deepcopy(row), 'outside_refs': outside,
+                                 'reason': RED_INADMISSIBLE_REASON})
+        else:
+            admissible.append(row)
+    blackboard.data.pop('_red_inadmissible_objections', None)
+    blackboard.data.pop('_red_team_gap', None)
+    if inadmissible:
+        blackboard.data['_red_inadmissible_objections'] = inadmissible
+        print("  [RED_TEAM] " + str(len(inadmissible)) + " obiezioni inammissibili (fonte fuori dal dossier "
+              "sigillato): " + ", ".join(str(item['objection'].get('id')) + " <- " + ", ".join(item['outside_refs'])
+                                         for item in inadmissible)[:1500], flush=True)
+    if review['objections'] and not admissible:
+        blackboard.data['_red_team_gap'] = ("Critica del Red Team non utilizzabile: tutte le "
+            + str(len(inadmissible)) + " obiezioni citano fonti fuori dal dossier sigillato")
+    return admissible
+
+
+def _red_inadmissible_gaps(blackboard):
+    """Le frasi per data_gaps del memo: obiezioni inammissibili e lacuna Red Team."""
+    rows = blackboard.data.get('_red_inadmissible_objections') or []
+    gaps = []
+    if blackboard.data.get('_red_team_gap'):
+        gaps.append(str(blackboard.data['_red_team_gap']) + ": nessuna proposta operativa.")
+    if rows:
+        gaps.append("Red Team, " + str(len(rows)) + " " + ("obiezione inammissibile" if len(rows) == 1
+            else "obiezioni inammissibili") + " (fonte fuori dal dossier sigillato, non discusse dai desk): "
+            + "; ".join(str(item['objection'].get('id')) + " cita " + ", ".join(item['outside_refs'])
+                        for item in rows)[:900] + ".")
+    return gaps
+
+
 def _committee_quorum(blackboard):
     """Present desks and declared gaps; Fundamentals plus four of six desks are required."""
     gaps = blackboard.data.get("_desk_gaps") or {}
@@ -3481,11 +3599,10 @@ def _run_research_committee(blackboard, portfolio, runner, red_runner, check_sto
     if not reused:
         _run_research_red_team(blackboard, portfolio, red_runner)
     review = validate_committee_review(blackboard.get_latest('red_team')['report'])
-    if any(set(row['evidence_refs']) - _review_source_ids(blackboard) for row in review['objections']):
-        raise ValueError('Red Team cites evidence outside the sealed candidate research')
+    admissible = _admit_red_objections(blackboard, review)
     if not reused or '_objections' not in blackboard.data:
         blackboard.data['_objections'] = [{'objection': row, 'response': None,
-            'evidence_refs': [], 'state': 'open', 'model_revision_id': None} for row in review['objections']]
+            'evidence_refs': [], 'state': 'open', 'model_revision_id': None} for row in admissible]
     blackboard.data['_decisive_questions'] = review['decisive_questions']
     persist('red_team')
     check_stop()
@@ -5516,6 +5633,9 @@ def _operational_checks(run, result, blackboard, sizing, portfolio, mandate,
         "identity_verified": bool(run.get("company_name") and run.get("exchange") and run["ticker"] == result["ticker"]),
         "evidence_sufficient": (_quality_sufficient(report_quality)
             and not blackboard.data.get("_desk_gaps")
+            # PM 06/10: contano solo le inammissibili MATERIALI; le non materiali restano dichiarate.
+            and not any((row.get("objection") or {}).get("material")
+                        for row in blackboard.data.get("_red_inadmissible_objections") or [])
             and not any(row.get("unanswered") and row["objection"].get("material")
                         for row in blackboard.data.get("_objections") or [])
             and {section["key"] for section in result.get("dossier", [])} >= set(DOSSIER_KEYS)
@@ -5525,7 +5645,8 @@ def _operational_checks(run, result, blackboard, sizing, portfolio, mandate,
             and _bound_evidence(result, blackboard, run["ticker"],
                                 blackboard.data.get("_data_cutoff") or run["started_at"])),
         "red_team_complete": bool(red and not motivo_critica_non_utilizzabile(red.get("report"))
-                                  and "CRITICA TRONCATA" not in red.get("report", "")),
+                                  and "CRITICA TRONCATA" not in red.get("report", "")
+                                  and not blackboard.data.get("_red_team_gap")),
         "capo_valid": True,
         "mandate_valid": mandate_valid,
         "sizing_valid": _sizing_valid(result, sizing, portfolio, policy=execution_policy(run), mandate=mandate),
@@ -5785,7 +5906,9 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
     from bellomberg.core.language import language_context
     from bellomberg.core.paths import DATA_DIR, REPORT_DIR, SQLITE_PATH
     from pathlib import Path
-    store = store or TradeIdeaStore(db_path)
+    from bellomberg.storage.trade_idea_store import WORKER_LOCK_BUSY_S, WORKER_LOCK_WAIT_S
+    store = store or TradeIdeaStore(db_path, lock_wait_s=WORKER_LOCK_WAIT_S,
+                                    lock_busy_s=WORKER_LOCK_BUSY_S)
     initial_detail = store.get_run(run_id)
     run = initial_detail["run"]
     if not is_research_mode(run):
@@ -6137,6 +6260,9 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                 for pm_gap in pm_constraints_gaps(blackboard):  # E7: vincoli/mandato PM mancanti
                     if pm_gap not in result["data_gaps"] and len(result["data_gaps"]) < 80:
                         result["data_gaps"].append(pm_gap)
+                for red_gap in reversed(_red_inadmissible_gaps(blackboard)):  # 06/10: Red Team fuori dossier
+                    if red_gap not in result["data_gaps"]:
+                        result["data_gaps"] = [red_gap, *result["data_gaps"]][:80]
                 for doc_gap in official_documents_gaps(blackboard):  # PM 05/10: run senza filing, buco dichiarato
                     if doc_gap not in result["data_gaps"]:  # in testa: col tetto 80 non e' lui a cadere
                         result["data_gaps"] = [doc_gap, *result["data_gaps"]][:80]

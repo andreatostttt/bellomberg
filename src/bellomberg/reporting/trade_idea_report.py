@@ -1441,6 +1441,26 @@ _M_TABLE = [("VALIGN", (0, 0), (-1, -1), "TOP"), ("LINEABOVE", (0, 0), (-1, 0), 
             ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4)]
 
 _M_RUNNING = ("Memo d'investimento | ", "Investment memo | ")
+# Margini del corpo del memo M (alto, basso): l'altezza utile della cornice decide se una riga sta in una pagina.
+_M_TOP, _M_BOTTOM = 58, 56
+
+
+def _m_rows_table(data, col_widths, style, **options):
+    """Tabella con testo scritto dai modelli: una riga non si spezza fra due pagine (va intera
+    alla pagina dopo). Una riga piu' alta di un'intera pagina non puo' andare intera da nessuna
+    parte: SOLO quella tabella torna a spezzare dentro la riga, nessun testo si perde e
+    l'ispettore la ricompone (_ricomposto_fra_pagine)."""
+    frame = A4[1] - _M_TOP - _M_BOTTOM
+    table = Table(data, colWidths=col_widths, repeatRows=1, splitByRow=1, splitInRow=0, **options)
+    table.setStyle(TableStyle(style))
+    table.wrap(sum(col_widths), frame)
+    heights = list(table._rowHeights or [])
+    if heights and any(heights[0] + height > frame for height in heights[1:]):
+        table = Table(data, colWidths=col_widths, repeatRows=1, splitByRow=1, splitInRow=1, **options)
+        table.setStyle(TableStyle(style))
+    return table
+
+
 _M_FOOTER = ("Bellomberg | Documento interno riservato al Comitato d'investimento",
              "Bellomberg | Internal document reserved to the Investment Committee")
 
@@ -1627,10 +1647,8 @@ def _m_variant_table(rows, show, st, width, language):
                      Paragraph(_text(_m_number(row.get("consensus"), language)), st["cellr"]),
                      Paragraph(_text(_m_number(row.get("committee"), language)), st["cellr"]),
                      Paragraph(show(row.get("rationale")), st["cell"])])
-    table = Table(data, colWidths=[width * .21, width * .10, width * .14, width * .18, width * .37],
-                  repeatRows=1, splitByRow=1, splitInRow=1, hAlign="LEFT")
-    table.setStyle(TableStyle(_M_TABLE))
-    return table
+    return _m_rows_table(data, [width * .21, width * .10, width * .14, width * .18, width * .37], _M_TABLE,
+                         hAlign="LEFT")
 
 
 def _m_scenario_change(target, price, scenario_currency, quote_currency):
@@ -1667,9 +1685,8 @@ def _m_scenario_table(scenarios, facts, show, st, width, language):
                      Paragraph(_text(_m_sig(target, language, 2) + " " + str(scenario.get("currency") or "")), st["cellr"]),
                      Paragraph(_text(change_text), st["cellr"]),
                      Paragraph(show(scenario.get("method")), st["cell"])])
-    table = Table(data, colWidths=[width * .14, width * .14, width * .17, width * .16, width * .39],
-                  repeatRows=1, splitByRow=1, splitInRow=1, hAlign="LEFT")
-    table.setStyle(TableStyle(_M_TABLE))
+    table = _m_rows_table(data, [width * .14, width * .14, width * .17, width * .16, width * .39], _M_TABLE,
+                          hAlign="LEFT")
     if isinstance(price, (int, float)) and not isinstance(price, bool) and price > 0:
         date = quote.get("date")
         basis = ((("Variazione calcolata sul prezzo di " if it else "Change computed on the price of ")
@@ -1868,7 +1885,7 @@ def _render_company_memo(path, run, result, language, partial_reasons, *, locali
     st = _m_styles(styles)
     reg, bold = styles["body"].fontName, styles["h1"].fontName
     w, h = A4
-    margin, bottom, top = 64, 56, 58
+    margin, bottom, top = 64, _M_BOTTOM, _M_TOP
     width = w - 2*margin
     ticker = result["ticker"]
     it = language == "it"
@@ -2110,9 +2127,7 @@ def _render_company_memo(path, run, result, language, partial_reasons, *, locali
                     where = Paragraph(show_sans(trigger.get("condition")), st["cell"])
                 rows_t.append([Paragraph(_text(_M_TRIGGER_KIND.get(kind, (str(kind),) * 2)[0 if it else 1]), st["cellb"]),
                                where, Paragraph(show_sans(trigger.get("what")), st["cell"])])
-            table = Table(rows_t, colWidths=[width * .16, width * .34, width * .50], repeatRows=1,
-                          splitByRow=1, splitInRow=1, hAlign="LEFT")
-            table.setStyle(TableStyle(_M_TABLE))
+            table = _m_rows_table(rows_t, [width * .16, width * .34, width * .50], _M_TABLE, hAlign="LEFT")
             story.append(table)
         sources_line([*reviews, *(t.get("condition") for t in triggers), *(t.get("what") for t in triggers)])
 
@@ -2154,9 +2169,7 @@ def _render_company_memo(path, run, result, language, partial_reasons, *, locali
             rows_x += [[Paragraph(show_sans(x.get("risk")), st["cell"]), Paragraph(show_sans(x.get("threshold")), st["cell"]),
                         Paragraph(_text(_M_EXIT_ACTION.get(x.get("action"), (str(x.get("action")),) * 2)[0 if it else 1]),
                                   st["cellb"])] for x in exits]
-            table = Table(rows_x, colWidths=[width * .46, width * .38, width * .16], repeatRows=1,
-                          splitByRow=1, splitInRow=1, hAlign="LEFT")
-            table.setStyle(TableStyle(_M_TABLE))
+            table = _m_rows_table(rows_x, [width * .46, width * .38, width * .16], _M_TABLE, hAlign="LEFT")
             story.append(table)
         for title, values in ((label("Rischi principali", "Main risks"), result.get("risks")),
                               (label("Criteri di invalidazione", "Invalidation criteria"), result.get("invalidation")),
@@ -2220,9 +2233,7 @@ def _render_company_memo(path, run, result, language, partial_reasons, *, locali
                                  Paragraph(_text(label("Risolta", "Resolved") if objection["resolved"]
                                                  else label("Aperta", "Open")), st["cellb"])])
                     texts.extend([objection["objection"], objection["response"]])
-                table = Table(rows, colWidths=[22, (width - 80) * .5, (width - 80) * .5, 58], repeatRows=1,
-                              splitByRow=1, splitInRow=1)
-                table.setStyle(TableStyle(_M_TABLE))
+                table = _m_rows_table(rows, [22, (width - 80) * .5, (width - 80) * .5, 58], _M_TABLE)
                 story.append(table)
             elif key == "decision":
                 if gap_rows:  # impianto A: rinvio alla prima pagina; oltre il tetto, l'elenco completo
@@ -2269,8 +2280,7 @@ def _render_company_memo(path, run, result, language, partial_reasons, *, locali
                 rows.extend([Paragraph(show(cell, cell=True), st["cell"]) for cell in row] for row in table_data["rows"])
                 count = len(table_data["columns"])
                 widths = [width] if count == 1 else [width*.3] + [width*.7/(count-1)]*(count-1)
-                rendered = Table(rows, colWidths=widths, repeatRows=1, splitByRow=1, splitInRow=1, hAlign="LEFT")
-                rendered.setStyle(TableStyle(_M_TABLE))
+                rendered = _m_rows_table(rows, widths, _M_TABLE, hAlign="LEFT")
                 story.extend([rendered, Paragraph(show(f"{table_data['unit']} | {table_data['period']} | "
                                                        f"{table_data['source']}", cell=True), st["note"])])
                 texts.append(table_data["source"])
@@ -2627,6 +2637,52 @@ def _normalized_text(value, rendered=False):
     return re.sub(r"\s+", "", unicodedata.normalize("NFKC", value).replace("\u00ad", "")).casefold()
 
 
+def _ricomposto_fra_pagine(printed, page_lines):
+    """True se ``printed`` (normalizzato) e' stampato come pezzi su pagine CONSECUTIVE, ognuno fatto di
+    righe intere: il primo finisce a fine riga, i successivi iniziano a inizio riga. E' la forma di una
+    cella spezzata dal salto pagina: in mezzo il testo estratto interpone pie' di pagina, intestazione
+    ripetuta e le altre colonne. Ogni carattere deve esserci, in ordine: una parola mancante (anche al
+    taglio) lascia il frammento perso. ``page_lines``: per pagina, le righe gia' normalizzate."""
+    if not printed:
+        return False
+    pages = []
+    for lines in page_lines:
+        text, starts, ends, position = "", [], set(), 0
+        for line in lines:
+            if line:
+                starts.append(position)
+                position += len(line)
+                ends.add(position)
+                text += line
+        pages.append((text, starts, ends))
+
+    def common(text, start, tail):
+        size, limit = 0, min(len(text) - start, len(tail))
+        while size < limit and text[start + size] == tail[size]:
+            size += 1
+        return size
+
+    tried = set()  # (pagina, lunghezza coda) gia' esclusi: il testo ripetitivo non fa esplodere la ricerca
+
+    def follows(index, tail, first):
+        # first: il primo pezzo deve fermarsi prima della fine (almeno due pagine); gli altri possono chiudere.
+        if index >= len(pages) or (index, len(tail), first) in tried:
+            return False
+        text, starts, ends = pages[index]
+        for start in starts:
+            size = common(text, start, tail)
+            if size == len(tail) and not first:
+                return True
+            for end in sorted((e for e in ends if start < e <= start + size and e - start < len(tail)),
+                              reverse=True):
+                if follows(index + 1, tail[end - start:], False):
+                    return True
+        tried.add((index, len(tail), first))
+        return False
+
+    return any(follows(index, printed, True) for index in range(len(pages) - 1))
+
+
 _NO_MARKET = object()  # inspect called without the run (direct calls): no market check
 
 
@@ -2687,9 +2743,13 @@ def _inspect_company_memo(path, result, section_pages, language, execution_polic
                  "ANTEPRIMA · DATI SINTETICI", "PREVIEW · SYNTHETIC DATA", *_M_FOOTER}
     table_heads = {shown(".table.", cell).strip() for section in result.get("dossier", [])
                    for table in section.get("tables", []) for cell in table["columns"]}
-    body = "\n".join(line for text in pages for line in text.splitlines()
-        if line.strip() not in furniture | table_heads and not re.fullmatch(r"(?:Pagina|Page) \d+", line.strip())
+    keep = lambda line: (line.strip() not in furniture | table_heads
+        and not re.fullmatch(r"(?:Pagina|Page) \d+", line.strip())
         and "TRADE IDEA | " not in line and not line.strip().startswith(_M_RUNNING))
+    body = "\n".join(line for text in pages for line in text.splitlines() if keep(line))
+    # Righe per pagina, per ricomporre una cella che il salto pagina ha spezzato (_ricomposto_fra_pagine).
+    page_lines = [[_normalized_text(line, rendered=True) for line in text.splitlines() if keep(line)]
+                  for text in pages]
     # Headers themselves are also verified against the unfiltered document.
     normalized, raw = _normalized_text(body, rendered=True), _normalized_text("\n".join(pages), rendered=True)
     annex_fragments = [(name if len(pieces) == 1 else f"{name}.{index}", piece)
@@ -2697,7 +2757,8 @@ def _inspect_company_memo(path, result, section_pages, language, execution_polic
                        for pieces in [_integrity_pieces(text)] for index, piece in enumerate(pieces)]
     lost = sorted({name for name, value in [*_content_fragments(result), *annex_fragments]
                    for printed in [_normalized_text(shown(name, value))]
-                   if printed not in normalized and printed not in raw})
+                   if printed not in normalized and printed not in raw
+                   and not _ricomposto_fra_pagine(printed, page_lines)})
     if _is_memo_v4(result):  # policy /4: structured numbers are read back at their printed rounding
         lost = sorted({*lost, *_m_numbers_not_reread(result, pages, section_pages, language)})
     market_unreconciled = []

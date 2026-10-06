@@ -461,7 +461,7 @@ def _parse_venue_date(x):
 
 def _parse_venue_number(x):
     """Numeri della sede: float/int nativi o stringhe tedesche ("54,80",
-    "1.046,80"). Con la virgola si assume formato tedesco; senza, float
+    "2.468,13"). Con la virgola si assume formato tedesco; senza, float
     diretto ("1.021" resta 1.021: le migliaia di sede arrivano con la
     virgola o lo spazio, mai col solo punto). None se illeggibile."""
     if x is None or isinstance(x, bool):

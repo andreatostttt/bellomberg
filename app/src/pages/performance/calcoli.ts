@@ -30,12 +30,18 @@ export function indiceBase(date: string[], p: Periodo): number {
 export interface StatPeriodo { rendimentoPct: number | null; maxDdPct: number | null; ddOggiPct: number | null; sharpe: number | null; nRendimenti: number }
 /** Sharpe con la convenzione del backend (twr_engine._twr_metrics): (CAGR − rf) / volatilità annua,
  *  CAGR sullo span di calendario, varianza campionaria; solo con almeno 20 rendimenti e 20 giorni.
- *  Drawdown misurati dal picco DENTRO il periodo, cosi' riquadro e fascia sotto il grafico coincidono. */
-export function statistichePeriodo(indice: number[], base: number, rfAnnuo: number, date: string[] = []): StatPeriodo {
+ *  Drawdown misurati dal picco DENTRO il periodo, cosi' riquadro e fascia sotto il grafico coincidono.
+ *  `daStat` (backend `indice_statistiche_da`): drawdown e Sharpe partono da max(base, daStat), il
+ *  rendimento resta dalla base (il punto al costo conta nel totale, non come rendimento giornaliero). */
+export function statistichePeriodo(indice: number[], base: number, rfAnnuo: number, date: string[] = [], daStat = 0): StatPeriodo {
   const b = Math.max(0, base);
-  const s = indice.slice(b), d = date.slice(b);
-  if (s.length < 2 || !s.every(finito) || !(s[0] > 0)) return { rendimentoPct: null, maxDdPct: null, ddOggiPct: null, sharpe: null, nRendimenti: 0 };
-  const rendimentoPct = (s[s.length - 1] / s[0] - 1) * 100;
+  const t = indice.slice(b);
+  const nulla = { rendimentoPct: null, maxDdPct: null, ddOggiPct: null, sharpe: null, nRendimenti: 0 };
+  if (t.length < 2 || !t.every(finito) || !(t[0] > 0)) return nulla;
+  const rendimentoPct = (t[t.length - 1] / t[0] - 1) * 100;
+  const sb = Math.max(b, daStat);
+  const s = indice.slice(sb), d = date.slice(sb);
+  if (s.length < 2 || !(s[0] > 0)) return { ...nulla, rendimentoPct };
   let picco = s[0], dd = 0, oggi = 0;
   for (const v of s) { if (v > picco) picco = v; oggi = (v / picco - 1) * 100; dd = Math.min(dd, oggi); }
   const r: number[] = [];
@@ -49,6 +55,14 @@ export function statistichePeriodo(indice: number[], base: number, rfAnnuo: numb
     if (vol > 0) sharpe = (cagr - rfAnnuo) / vol;
   }
   return { rendimentoPct, maxDdPct: dd, ddOggiPct: oggi, sharpe, nRendimenti: r.length };
+}
+
+/** Primo indice di dates/twr_index da cui partono le statistiche (backend `indice_statistiche_da`:
+ *  il punto base al costo è escluso da vol, Sharpe, drawdown, mensili e medie). Campo assente = 0, come
+ *  prima; un valore non intero o fuori serie non si indovina: 0 e la pagina dichiara il campo illeggibile. */
+export function inizioStatistiche(da: unknown, n: number): { da: number; illeggibile: boolean } {
+  if (da === undefined || da === null) return { da: 0, illeggibile: false };
+  return Number.isInteger(da) && (da as number) >= 0 && (da as number) < n - 1 ? { da: da as number, illeggibile: false } : { da: 0, illeggibile: true };
 }
 
 /** Rendimento % dall'ultimo valore con data <= `da` all'ultimo valore. null se la serie parte dopo. */
@@ -68,6 +82,17 @@ export function sottAcqua(indice: number[]): number[] {
 export function mediaMobile(valori: number[], n: number): (number | null)[] {
   let somma = 0;
   return valori.map((v, i) => { somma += v; if (i >= n) somma -= valori[i - n]; return i >= n - 1 ? somma / n : null; });
+}
+
+/** Sottacqua e media mobile che partono da `da` (indice_statistiche_da), allineate all'indice intero:
+ *  prima di `da` null (non misurato), mai il punto base al costo dentro una statistica. */
+export function sottAcquaDa(indice: number[], da = 0): (number | null)[] {
+  const k = Math.min(Math.max(0, da), indice.length);
+  return [...Array<number | null>(k).fill(null), ...sottAcqua(indice.slice(k))];
+}
+export function mediaMobileDa(valori: number[], n: number, da = 0): (number | null)[] {
+  const k = Math.min(Math.max(0, da), valori.length);
+  return [...Array<number | null>(k).fill(null), ...mediaMobile(valori.slice(k), n)];
 }
 
 export type AnnoMensile = { anno: string; celle: (number | null)[]; ytd: number | null };
@@ -105,8 +130,12 @@ export interface Seduta { data: string; eur: number }
  *  dei flussi non ha la stessa lunghezza delle date: nessun giorno è attribuibile, serie n.d. */
 export interface PnlGiornaliero { sedute: Seduta[]; senzaFlusso: string[]; disallineata: boolean }
 /** P&L giornaliero in euro dal rendimento dell'indice TWR: pnl_t = (V_t − F_t) · r_t / (1 + r_t), con
- *  r_t = I_t / I_{t−1} − 1. Coincide con V_t − V_{t−1} − F_t nei giorni normali (twr_engine.compute_twr) e
- *  vale 0 sul salto ricostruita → ufficiale, dove il backend fissa r = 0 (lo snapshot include la cassa). */
+ *  r_t = I_t / I_{t−1} − 1. Coincide con V_t − V_{t−1} − F_t nei giorni normali (twr_engine.compute_twr).
+ *  Sul passaggio ricostruita → ufficiale la catena è continua: il backend calcola r sulla base «posizioni
+ *  ricostruite + cassa dello snapshot» (non sul V_{t−1} della serie), quindi qui il giorno vale V_t − base − F_t
+ *  e lo scarto fra quella base e il NAV dello snapshot NON entra nel P&L: è dichiarato in `cucitura` e
+ *  misurato in `riconciliazione_pnl`. Solo se la transizione non è sovrapposta il backend fissa r = 0 e il
+ *  giorno vale 0 (dichiarato nelle note). */
 export function pnlGiornalieri(date: string[], valori: number[], flussi: number[] | null | undefined, indice: number[]): PnlGiornaliero {
   if (!Array.isArray(flussi) || flussi.length !== date.length) return { sedute: [], senzaFlusso: [], disallineata: true };
   const out: Seduta[] = [], senzaFlusso: string[] = [];
@@ -119,6 +148,14 @@ export function pnlGiornalieri(date: string[], valori: number[], flussi: number[
     out.push({ data: date[i], eur: (valori[i] - f) * r / (1 + r) });
   }
   return { sedute: out, senzaFlusso, disallineata: false };
+}
+
+/** Sedute della DISTRIBUZIONE (statistica): solo dopo date[da]; il giorno dal punto base al costo
+ *  (indice_statistiche_da) non è una seduta. da = 0: invariato. Il P&L del titolo NON passa di qui. */
+export function seduteStatistiche(p: PnlGiornaliero, date: string[], da: number): PnlGiornaliero {
+  if (!(da > 0) || !date[da]) return p;
+  const dopo = (d: string) => d > date[da];
+  return { ...p, sedute: p.sedute.filter(x => dopo(x.data)), senzaFlusso: p.senzaFlusso.filter(dopo) };
 }
 
 /** P&L in euro del periodo: somma del P&L giornaliero (pnlGiornalieri) sulle sedute DOPO la base,

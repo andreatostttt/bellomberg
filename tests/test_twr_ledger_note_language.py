@@ -41,9 +41,11 @@ def test_pre_snapshot_ledger_note_uses_singular_without_changing_series(monkeypa
     else:
         assert not it_notes and not en_notes
     for payload in [italian, english]:
-        assert payload["dates"] == ["2024-01-03", "2024-01-04"]
-        assert payload["values_eur"] == [100.0, 101.0]
-        assert payload["flows_eur"] == [100.0, 0]
+        # regola PNL-B (06/10): punto base al costo alla vigilia della prima chiusura
+        # (nessun first_trade_date nella ricostruzione finta), poi la prima chiusura senza flusso
+        assert payload["dates"] == ["2024-01-02", "2024-01-03", "2024-01-04"]
+        assert payload["values_eur"] == [100.0, 100.0, 101.0]
+        assert payload["flows_eur"] == [100.0, 0.0, 0]
     assert (snapshots, ledger) == original
     historical = {"notes": ["1 ledger movements precede: original historical text"]}
     assert render_payload(historical, language="it") == historical

@@ -15,7 +15,7 @@ import { portfolioValues } from '@/lib/portfolio-values';
 import ModernPage from '@/components/ModernPage';
 import { Segmenti } from '@/components/nuova/Card';
 import PastigliaVariazione from '@/components/nuova/PastigliaVariazione';
-import { RichiesteUltime, periodoAttribuzione, pnlGiornalieri } from './performance/calcoli';
+import { RichiesteUltime, inizioStatistiche, periodoAttribuzione, pnlGiornalieri, seduteStatistiche } from './performance/calcoli';
 import type { Periodo } from './performance/calcoli';
 import { euro, num, pct } from './performance/formato';
 import MetodoFonti from './performance/MetodoFonti';
@@ -301,9 +301,11 @@ export default function PerformancePage() {
     const s = stato<TwrPayload>(twr);
     if (s.stato !== 'ok') return s as Stato<never>;
     // flussi mancanti: niente «|| []» che li spaccerebbe per zero (regola 14/07)
-    const p = pnlGiornalieri(s.dati.dates || [], s.dati.values_eur || [], s.dati.flows_eur, s.dati.twr_index || []);
+    const date = s.dati.dates || [];
+    const p = pnlGiornalieri(date, s.dati.values_eur || [], s.dati.flows_eur, s.dati.twr_index || []);
     if (p.disallineata) return { stato: 'errore' as const, testo: w.distFlowsMisaligned };
-    return { stato: 'ok' as const, dati: p };
+    // distribuzione = statistica: il giorno dal punto base al costo (indice_statistiche_da) non è una seduta
+    return { stato: 'ok' as const, dati: seduteStatistiche(p, date, inizioStatistiche(s.dati.indice_statistiche_da, date.length).da) };
   })();
   const tearStato = stato<TearsheetPayload>(tearRaw);
   const drawdownStato: Stato<NonNullable<TearsheetPayload['drawdowns']>> = tearStato.stato !== 'ok' ? tearStato
@@ -321,12 +323,14 @@ export default function PerformancePage() {
   }
   if (adv?.risk_free_note) avvisi.push(String(adv.risk_free_note));
   if (twr?.reconciliation?.breach) avvisi.push(twr.reconciliation.note);
+  if (twr && !twr.error && inizioStatistiche(twr.indice_statistiche_da, twr.dates?.length ?? 0).illeggibile)
+    avvisi.push(w.statsStartUnreadable(String(twr.indice_statistiche_da)));
   if (valori?.note) avvisi.push(valori.note);
 
   const sezioniMetodo: SezioneMetodo[] = [];
   if (avvisi.length) sezioniMetodo.push({ titolo: w.mWarn, avviso: true, testo: avvisi });
   if (twr && !twr.error) {
-    sezioniMetodo.push({ titolo: w.mTwr, testo: twr.methodology ? [twr.methodology] : [], voci: [
+    sezioniMetodo.push({ titolo: w.mTwr, testo: [twr.methodology, twr.statistiche_nota].filter((t): t is string => !!t), voci: [
       [w.mBase, twr.dates?.[0] ?? '—'],
       [w.mOfficialSince, twr.regime_summary?.official_since ?? '—'],
       [w.mGaps, String(twr.copertura?.giorni_senza_snapshot ?? '—')],

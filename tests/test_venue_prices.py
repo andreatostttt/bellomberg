@@ -11,7 +11,7 @@ Il contratto:
     (sezione `tradegate`); un ticker fuori mappa resta sul fallback Yahoo
     dichiarato, mai silenzio;
   - `_fetch_venue` rende {"price", "venue_close"} con parsing dei decimali
-    tedeschi ("54,80", "1.046,80"); `last` assente -> medio bid/ask;
+    tedeschi ("54,80", "2.468,13"); `last` assente -> medio bid/ask;
   - `update_all_prices` con fonte "tradegate" scrive snapshot + chiusura di
     sede; `get_portfolio` preferisce la chiusura di sede datata prima
     dell'ultimo giorno con prezzi, altrimenti snapshot+carico invariati.
@@ -92,9 +92,9 @@ def test_fetch_venue_senza_last_usa_il_medio_bid_ask(monkeypatch):
 
 
 def test_fetch_venue_parsa_le_migliaia_tedesche(monkeypatch):
-    _rete(monkeypatch, {"bid": "1.046,80", "ask": "1.047,20",
-                        "last": "1.046,40", "close": 1000})
-    assert pu._fetch_venue("ALFA.DE", "EUR")["price"] == pytest.approx(1046.40)
+    _rete(monkeypatch, {"bid": "2.468,13", "ask": "2.468,57",
+                        "last": "2.468,31", "close": 1000})
+    assert pu._fetch_venue("ALFA.DE", "EUR")["price"] == pytest.approx(2468.31)
 
 
 def test_fetch_venue_none_su_sconosciuto_vuoto_errore(monkeypatch):

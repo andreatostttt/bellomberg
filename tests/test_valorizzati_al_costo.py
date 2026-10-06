@@ -15,8 +15,9 @@ Zero rete e zero DB: `_trade_history`, `_download_prices_for_history`,
 `_build_fx_history` e la cassa sono stubbate; ticker .MI (EUR) cosi' il
 lookup FX non tocca price_updater.
 
-ONESTA' sull'input vero (misura 31/08): in produzione il download fa
-`ffill().bfill()`, quindi il buco per-GIORNO delle fixture 1/2/5 non arriva
+ONESTA' sull'input vero (misura 31/08): in produzione il download faceva
+`ffill().bfill()` (dal 06/10, PNL-B: ffill limitato a 5 sedute, niente bfill,
+poi feed vivo dichiarato), quindi il buco per-GIORNO delle fixture 1/2/5 non arrivava
 al loop — il caso fedele e' la colonna interamente NaN/assente (simbolo
 fallito o SKIP_TICKERS), che e' il test 3. Sul book vero del 31/08 il
 registro e' None (serie pulita, LAMBDA.DE ha gia' la barra di oggi); i test
@@ -30,6 +31,9 @@ import pytest
 def _no_opening_balances(monkeypatch):
     from bellomberg.portfolio import portfolio_analytics as pa
     monkeypatch.setattr(pa, "_opening_positions", lambda: [])
+    # PNL-B (06/10): un buco oltre il ffill limitato cerca prima il feed vivo
+    # (position_prices); qui il feed e' vuoto, quindi il punto resta al costo.
+    monkeypatch.setattr(pa, "_feed_giornaliero", lambda ticker: {})
 
 from bellomberg.storage import memory_db
 import bellomberg.portfolio.portfolio_analytics as pa
@@ -47,7 +51,7 @@ def _nav(monkeypatch, trades, prezzi):
     df = pd.DataFrame({t: [serie.get(g) for g in giorni] for t, serie in prezzi.items()},
                       index=idx, dtype=float)
     monkeypatch.setattr(pa, "_trade_history", lambda: trades)
-    monkeypatch.setattr(pa, "_download_prices_for_history", lambda tk, s, e, salta: df)
+    monkeypatch.setattr(pa, "_download_prices_for_history", lambda tk, s, e, salta, **_kw: df)
     monkeypatch.setattr(pa, "_build_fx_history", lambda c, s, e: pd.DataFrame())
     monkeypatch.setattr(memory_db, "leggi_cassa_portfolio",
                         lambda path=None: {"cash_eur": 0.0, "cash_source": "portfolio.json",

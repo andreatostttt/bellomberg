@@ -33,6 +33,32 @@ _pp = os.environ.get("PYTHONPATH", "")
 if SRC not in _pp.split(os.pathsep):
     os.environ["PYTHONPATH"] = SRC + (os.pathsep + _pp if _pp else "")
 
+# ============================================================================
+# SIGILLO DELLA CARTELLA DATI VERA (06/10/2026, Opus 5.5 — rapporto LOCK).
+# PRIMA di ogni import di bellomberg: `core.paths` e `memory_db` fissano DATA_DIR e
+# SQLITE_PATH all'import, quindi BELLOMBERG_DATA_DIR va spostata QUI, non in una fixture
+# (la fixture arriva quando i moduli hanno gia' il percorso vero). Da qui in poi il DB, il
+# lock della run pagata, l'heartbeat, i journal, trade_ideas/ e consensus_cache del
+# processo dei test nascono in una cartella tmp di SESSIONE. Le cartelle VERE (junction
+# `data`, `data` del checkout principale, BELLOMBERG_DATA_DIR dichiarata) si calcolano
+# PRIMA dello spostamento e vanno al sigillo (audit hook, sotto) e alla spia (c).
+# Dettagli e limiti: tests/_sigillo_dati.py. Prova: tests/test_sigillo_dati_veri.py.
+# ============================================================================
+_QUI_SIGILLO = os.path.dirname(os.path.abspath(__file__))
+if _QUI_SIGILLO not in sys.path:
+    sys.path.insert(0, _QUI_SIGILLO)
+import _sigillo_dati  # noqa: E402
+
+_DATI = _sigillo_dati.prepara_ambiente(os.environ, ROOT)
+CARTELLE_VERE = _DATI["protette"]
+CARTELLA_DATI_SESSIONE = _DATI["sessione"]
+# installato subito: copre anche gli import e la collection. Uno per processo (vedi
+# `sigillo_di_sessione`): `from tests.conftest import ...` rilegge questo file
+_SIGILLO = _sigillo_dati.sigillo_di_sessione(
+    CARTELLE_VERE, os.environ.get(_sigillo_dati.VARIABILE_MODALITA, "tripwire") != "conta",
+    CARTELLA_DATI_SESSIONE)
+CARTELLA_DATI_SESSIONE = _SIGILLO.sessione
+
 # In CI non c'e' .env: una chiave fittizia basta perche' NESSUN test deve
 # mai creare un client Anthropic vero (setdefault: quella vera non si tocca).
 os.environ.setdefault("ANTHROPIC_API_KEY", "dummy-offline-test-suite")
@@ -239,8 +265,31 @@ from bellomberg.agents.specialists.base import Blackboard as _Blackboard
 import bellomberg.storage.memory_db as _memory_db
 
 # B4 (02/09): il DB del PM e' dove dice memory_db (BELLOMBERG_DATA_DIR compresa),
-# catturato QUI prima di ogni fixture — non piu' un join su ROOT
+# catturato QUI prima di ogni fixture — non piu' un join su ROOT.
+# SIGILLO 06/10: ora e' il DB della cartella di SESSIONE (il vero e' sotto il sigillo).
+# La regola (b) resta com'era: un test che apre il percorso di DEFAULT invece del suo
+# tmp_path cade, ovunque punti il default.
 DB_PRODUZIONE = _memory_db.SQLITE_PATH
+
+# SIGILLO 06/10: controllo d'avvio. Se un percorso fissato all'import puntasse ancora a una
+# cartella vera (un import di bellomberg arrivato PRIMA della testa di questo file, una
+# BELLOMBERG_DATA_DIR rimessa dal .env...), la suite non parte: nessun test gira.
+# Una volta per processo: `from tests.conftest import ...` rilegge questo file DENTRO un test,
+# quando le fixture hanno gia' ripuntato HEARTBEAT_PATH al tmp_path del test.
+from bellomberg.core import paths as _paths_sigillo  # noqa: E402
+_PERCORSI_ALL_AVVIO = () if getattr(_sigillo_dati, "avvio_controllato", False) else (
+    ("core.paths.DATA_DIR", _paths_sigillo.DATA_DIR),
+    ("core.paths.SQLITE_PATH", _paths_sigillo.SQLITE_PATH),
+    ("memory_db.DB_DIR", _memory_db.DB_DIR),
+    ("memory_db.SQLITE_PATH", _memory_db.SQLITE_PATH),
+    ("Blackboard.HEARTBEAT_PATH", _Blackboard.HEARTBEAT_PATH))
+for _nome_p, _valore_p in _PERCORSI_ALL_AVVIO:
+    if _SIGILLO.tocca_il_vero(_valore_p) or not _sigillo_dati._sotto(_valore_p, CARTELLA_DATI_SESSIONE):
+        raise RuntimeError(
+            "SIGILLO: %s = %s non e' nella cartella dati di SESSIONE (%s): la suite si ferma "
+            "prima di toccare i dati veri (%s)." % (_nome_p, _valore_p, CARTELLA_DATI_SESSIONE,
+                                                     "; ".join(CARTELLE_VERE)))
+_sigillo_dati.avvio_controllato = True
 
 # i 3 moduli che legano `connect_sqlite` a import-time: NON basta patchare
 # `memory_db.connect_sqlite`, il nome locale resta il loro. E non e' un rischio
@@ -676,7 +725,15 @@ from _spia_scritture import SpiaScritture as _SpiaScritture  # noqa: E402
 _SPIA_MODALITA = os.environ.get("BELLOMBERG_SPIA_SCRITTURE", "tripwire")
 _SPIA = _SpiaScritture(radice=ROOT, esenti=[_tempfile.gettempdir()],
                        tripwire=(_SPIA_MODALITA != "registra"),
-                       alberi_extra=[_memory_db.DB_DIR])   # B4: anche la cartella dati spostata
+                       # B4: anche la cartella dati spostata. SIGILLO 06/10: DB_DIR ora e' il
+                       # tmp di sessione (esente); si sorvegliano le cartelle VERE
+                       alberi_extra=list(CARTELLE_VERE))
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", _sigillo_dati.MARKER + ": il test LEGGE apposta la cartella dati vera "
+        "(sqlite solo con mode=ro/immutable=1, file in sola lettura). Scrivere resta vietato.")
 
 
 def pytest_sessionstart(session):
@@ -685,15 +742,44 @@ def pytest_sessionstart(session):
 
 def pytest_sessionfinish(session, exitstatus):
     _SPIA.disinstalla()
+    # violazioni del sigillo FUORI da un test (import, collection, thread rimasti vivi dopo
+    # l'ultimo test): nessun teardown le ha fatte cadere, le fa cadere la sessione
+    if any(v["test"].startswith("<") for v in _SIGILLO.violazioni) and _SIGILLO.tripwire:
+        session.exitstatus = 1
+    # la cartella di sessione creata QUI si toglie (quella ereditata la toglie il padre).
+    # ignore_errors: un thread ancora vivo puo' tenere un file aperto, e resta solo un tmp
+    if not _DATI["ereditata"]:
+        import shutil
+        shutil.rmtree(CARTELLA_DATI_SESSIONE, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
 def _spia_sa_chi_scrive(request):
     """Il rapporto deve dire CHI ha scritto: il nodeid del test in corso. Fuori
-    da un test (import, collection) la spia etichetta da sola."""
-    _SPIA.test_corrente = request.node.nodeid
+    da un test (import, collection) la spia etichetta da sola.
+    SIGILLO 06/10 (punto 3): la spia solleva PRIMA della scrittura, ma se la scrittura parte
+    da un THREAD (worker del lifespan) l'eccezione muore nel thread e pytest la riduce a un
+    warning: il test passava. Ora ogni scrittura registrata a nome di questo test, in
+    qualunque thread, lo fa FALLIRE in teardown. Stesso controllo per il sigillo."""
+    nodeid = request.node.nodeid
+    _SPIA.test_corrente = nodeid
+    _SIGILLO.test_corrente = nodeid
+    _SIGILLO.lettura_consentita = request.node.get_closest_marker(_sigillo_dati.MARKER) is not None
+    da_spia, da_sigillo = len(_SPIA.scritture), len(_SIGILLO.violazioni)
     yield
     _SPIA.test_corrente = None
+    _SIGILLO.test_corrente = None
+    _SIGILLO.lettura_consentita = False
+    scritte = [ev for ev in _SPIA.scritture[da_spia:] if ev["test"] == nodeid]
+    toccate = _SIGILLO.violazioni_di(nodeid, da_sigillo)
+    if _SPIA.tripwire and scritte:
+        pytest.fail("SPIA: il test ha provato a scrivere in produzione (anche da un thread): %s"
+                    % sorted({"%s %s" % (ev["op"], ev["percorso"]) for ev in scritte}))
+    if _SIGILLO.tripwire and toccate:
+        pytest.fail("SIGILLO: il test ha toccato la cartella dati VERA: %s"
+                    % sorted({"%s %s (%s, thread %s)" % (v["op"], v["percorso"],
+                              "lettura" if v["lettura"] else "SCRITTURA", v["thread"])
+                              for v in toccate}))
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
@@ -703,6 +789,9 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
             if _SPIA.tripwire else
             "REGISTRA (solo misura: BELLOMBERG_SPIA_SCRITTURE=registra)"))
     for riga in _SPIA.rapporto().splitlines():
+        terminalreporter.write_line(riga)
+    terminalreporter.section("SIGILLO DATI VERI")
+    for riga in _SIGILLO.rapporto().splitlines():
         terminalreporter.write_line(riga)
 
 

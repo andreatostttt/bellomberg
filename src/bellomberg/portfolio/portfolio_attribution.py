@@ -184,12 +184,17 @@ def compute_attribution(period: str = "YTD",
     # l'esclusione piu' sotto, e dichiarata nelle note (lotto 6 criterio (1), 05/09)
     _prezzi = prezzi_speciali()
     salta = _prezzi["prezzi"]["senza_yfinance"]
+    # fix PNL-B (R-PNL F4, 06/10): sui prezzi SCARICATI i buchi oltre il ffill limitato
+    # (e i prezzi fermi del ffill) si riempiono dal feed vivo del giorno, dichiarato come
+    # nella storia del NAV. Prezzi iniettati: niente feed (nessun DB).
+    usa_feed = prices is None
     if prices is None:
         dl_end = (datetime.strptime(end_iso, "%Y-%m-%d")
                   + timedelta(days=1)).strftime("%Y-%m-%d")
         prices = _download_prices_for_history(tickers, dl_start, dl_end, salta)
     if prices is None or prices.empty:
         return {"error": _message('prezzi storici non disponibili', 'Historical prices unavailable')}
+    base_non_aggiustata = usa_feed and (getattr(prices, "attrs", {}) or {}).get("base_prezzi") == "non_aggiustati"
 
     negozio_veicoli = cl.carica_veicoli()
     currency_labels = _currency_labels_for_tickers(tickers, trades, negozio_veicoli)
@@ -236,6 +241,49 @@ def compute_attribution(period: str = "YTD",
     day_returns: List[float] = []
     empty_days = 0
 
+    riempiti = (getattr(prices, "attrs", {}) or {}).get("riempiti_ffill") or {}
+    feed_cache: Dict[str, Dict[str, Any]] = {}
+    da_feed: Dict[str, Dict[str, Any]] = {}
+    fermi: Dict[str, set] = {}
+
+    def _riga_feed(tk: str, iso_day: str):
+        if tk not in feed_cache:
+            from bellomberg.portfolio import portfolio_analytics as _pa
+            feed_cache[tk] = _pa._feed_giornaliero(tk)
+        riga = feed_cache[tk].get(iso_day)
+        if riga is None or (riga[1] or "").upper() != ccy_of[tk].upper() or not (riga[0] > 0):
+            return None
+        return riga
+
+    fattori_adj = (getattr(prices, "attrs", {}) or {}).get("fattore_adj")
+
+    def _fattore(tk: str, iso_day: str) -> Optional[float]:
+        """Revisione R-PNL G1: fattore = Adj Close / Close dello STESSO download Yahoo
+        all'ultimo giorno <= iso_day che lo ha (il fattore cambia solo agli stacchi), MAI
+        dal feed (il feed polygon era in ritardo di un giorno: il fattore diventava un
+        rendimento). Titolo senza dividendi = 1. None = non misurabile (feed non usato)."""
+        serie = (fattori_adj or {}).get(tk)
+        if not serie:
+            return None
+        noti = [d for d in serie if d <= iso_day]
+        return serie[max(noti)] if noti else None
+
+    def _da_feed(tk: str, ts) -> Optional[float]:
+        """Prezzo del feed vivo (NON aggiustato) riscalato sulla base aggiustata della serie."""
+        if not usa_feed or tk not in ccy_of:
+            return None
+        riga = _riga_feed(tk, _iso(ts))
+        if riga is None:
+            return None
+        fattore = _fattore(tk, _iso(ts))
+        if fattore is None:
+            return None
+        reg = da_feed.setdefault(tk, {"ticker": tk, "giorni": set(), "fonti": set(), "fattori": set()})
+        reg["giorni"].add(_iso(ts))
+        reg["fonti"].add(riga[2])
+        reg["fattori"].add(round(fattore, 6))
+        return float(riga[0]) * fattore
+
     def _px(tk: str, ts) -> Optional[float]:
         if tk not in prices.columns:
             return None
@@ -243,7 +291,25 @@ def compute_attribution(period: str = "YTD",
         if not len(v):
             return None
         val = float(v.iloc[-1])
-        return val if val == val and val > 0 else None
+        # una seduta riportata dal ffill e' di norma una festivita' (prezzo giusto): il feed
+        # sostituisce il prezzo fermo solo dalla seconda seduta consecutiva (R-PNL G1)
+        if not (val == val and val > 0) or (riempiti.get(tk) or {}).get(_iso(ts), 0) >= 2:
+            dal_feed = _da_feed(tk, ts)
+            if dal_feed is not None:
+                return dal_feed
+        if val == val and val > 0:
+            return val
+        if usa_feed:
+            # oltre il limite di ffill e senza feed: ultimo prezzo NOTO (chiusura o feed
+            # riscalato) DICHIARATO come fermo, cosi' il movimento del buco non si perde
+            # (escludere il giorno lo farebbe sparire dalla composizione)
+            for ts_c, v_c in list(v.items())[::-1][1:]:
+                noto = float(v_c) if (v_c == v_c and v_c > 0) else _da_feed(tk, ts_c)
+                if noto is not None:
+                    reg = fermi.setdefault(tk, set())
+                    reg.add(_iso(ts))
+                    return noto
+        return None
 
     daily_rows = []   # (ts, {tk: (w, r_tot, r_loc, r_fx)})
     for i in range(1, len(days)):
@@ -325,6 +391,9 @@ def compute_attribution(period: str = "YTD",
     # --- aggregazioni: posizione / bucket economico / valuta -----------------
     smap = get_sector_map(sorted(contrib.keys()), fetch=fetch, negozio=negozio_veicoli)
     notes: List[str] = []
+    if base_non_aggiustata:
+        notes.append(_message("prezzi NON aggiustati per dividendi: Yahoo non ha restituito Adj Close; i dividendi non sono nel rendimento e il feed vivo non si usa (fattore n.d.) — dichiarato",
+                              "Prices NOT dividend-adjusted: Yahoo returned no Adj Close; dividends are not in the return and the live feed is not used (factor unavailable) — declared"))
     if nota_negozio(negozio_veicoli):
         notes.append(nota_negozio(negozio_veicoli))
     # il predicato e' l'ORIGINE (la causa), non il motivo (la conseguenza): un ramo di guasto
@@ -407,6 +476,9 @@ def compute_attribution(period: str = "YTD",
                     "dates": tp.get("dates") or [],
                     "_r": ([idx[j] / idx[j - 1] - 1.0 for j in range(1, len(idx))]
                            if len(idx) > 1 else []),
+                    # fix PNL-B (R-PNL giro 3): il primo r dal punto base al costo non e' un
+                    # rendimento giornaliero: fuori dal confronto, come dalle statistiche
+                    "_salta": int(tp.get("indice_statistiche_da") or 0),
                 }
         except Exception as e:
             official_series = {"error": error_text(e)}
@@ -426,13 +498,15 @@ def compute_attribution(period: str = "YTD",
                               "note": _message('riconciliazione NON disponibile: dichiarato', 'Reconciliation NOT available: declared')}
         else:
             start_bound = _iso(day0)
-            lg = sum(math.log1p(r) for dstr, r in zip(od[1:], orr)
+            salta = int(official_series.get("_salta") or 0)
+            lg = sum(math.log1p(r) for dstr, r in zip(od[1 + salta:], orr[salta:])
                      if start_bound < dstr <= end_iso)
             r_official = math.expm1(lg)
             reconciliation = {
                 "recon_return_pct": round(r_period * 100.0, 3),
                 "official_twr_pct": round(r_official * 100.0, 3),
                 "delta_pp": round((r_period - r_official) * 100.0, 3),
+                "punto_base_escluso": bool(salta),
                 "note": (_message('basi DIVERSE dichiarate: attribution = capitale investito, chiusure yfinance auto-adjusted; TWR ufficiale = NAV totale (cash incluso), snapshot price_updater nel tratto official. Un delta ampio va capito, non nascosto.', 'DIFFERENT bases declared: attribution = invested capital, yfinance auto-adjusted closes; official TWR = total NAV (including cash), price_updater snapshots in the official segment. A large delta must be understood, not hidden.')),
             }
     else:
@@ -453,6 +527,15 @@ def compute_attribution(period: str = "YTD",
             "cross_pct": round(sum(c["cross"] for c in contrib.values()) * 100.0, 3),
         },
         "excluded": excluded_out,
+        # fix PNL-B: giorni valutati all'ultimo prezzo noto (nessuna chiusura ne' feed)
+        "prezzi_fermi": ([{"ticker": tk, "n_giorni": len(g), "primo": min(g), "ultimo": max(g)}
+                          for tk, g in sorted(fermi.items())] or None),
+        # fix PNL-B (F4): prezzi presi dal feed vivo (buco del provider o prezzo fermo da ffill),
+        # PROXY riscalati sulla base aggiustata (fattore = Adj Close / Close dello stesso download Yahoo)
+        "prezzi_da_feed_vivo": ([{"ticker": tk, "n_giorni": len(r["giorni"]), "primo": min(r["giorni"]),
+                                  "ultimo": max(r["giorni"]), "fonti": sorted(r["fonti"]),
+                                  "fattori_aggiustamento": sorted(r["fattori"])}
+                                 for tk, r in sorted(da_feed.items())] or None),
         "reconciliation": reconciliation,
         "notes": notes,
         "basis": (_message("CONTRIBUTION assoluta (NON Brinson vs benchmark): contributi al rendimento del capitale INVESTITO (cash escluso), pesi a inizio giorno, chiusure yfinance auto-adjusted (dividendi nel prezzo), linking Carino (somma contributi = rendimento composto esatto); scomposizione locale+FX+cross residuo dichiarato; bucket = asse economico unico di portfolio_sectors (fase 1b){empty_note}", "Absolute CONTRIBUTION (NOT Brinson vs benchmark): contributions to INVESTED capital returns (cash excluded), beginning-of-day weights, yfinance auto-adjusted closes (dividends in price), Carino linking (sum of contributions = exact compounded return); local+FX+residual cross decomposition declared; bucket = portfolio_sectors single economic axis (phase 1b){empty_note}", empty_note=_message("; {days} giorni a capitale 0 esclusi", "; {days} zero-capital days excluded", days=empty_days) if empty_days else "")),

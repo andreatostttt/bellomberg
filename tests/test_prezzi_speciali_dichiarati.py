@@ -128,7 +128,7 @@ def test_la_lista_arriva_al_download_del_nav(negozio, monkeypatch):
     import bellomberg.portfolio.portfolio_analytics as pa
     visti = {}
 
-    def _finto(tickers, start, end, salta):
+    def _finto(tickers, start, end, salta, **_kw):
         visti["salta"] = salta
         return None
     monkeypatch.setattr(pa, "_download_prices_for_history", _finto)

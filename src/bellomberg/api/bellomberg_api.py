@@ -2933,10 +2933,13 @@ if FASTAPI_OK:
     @app.get("/portfolio/metrics/beta_reconcile")
     def get_beta_reconcile(threshold: float = 0.35):
         """Guardrail 13/07: confronta il beta del book dai 3 motori (advanced/risk/factors);
-        verdetto UNRELIABLE se divergono oltre soglia — il beta non va usato per decidere."""
+        verdetto UNRELIABLE se divergono oltre soglia — il beta non va usato per decidere.
+        BG-ROTTA 06/10: campo di primo livello `beta_guardrail` = stesso codice stabile di
+        quant_score (specialist_scores.codice_guardrail_beta); un guasto di reconcile_betas
+        e' NON_DISPONIBILE con `error` nel payload, mai NON_CALCOLATO."""
         try:
-            from bellomberg.portfolio.advanced_metrics import reconcile_betas
-            return reconcile_betas(threshold=threshold)
+            from bellomberg.agents.specialist_scores import payload_rotta_beta_reconcile
+            return payload_rotta_beta_reconcile(threshold=threshold)
         except Exception as e:
             raise _err500(e, "get_beta_reconcile")
 

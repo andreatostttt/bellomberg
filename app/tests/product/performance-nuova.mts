@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   PERIODI, periodoAttribuzione, indiceBase, statistichePeriodo, rendimentoAllaData,
   sottAcqua, mediaMobile, rendimentiMensili, pnlGiornalieri, pnlPeriodo, pnlTotale, istogramma, sintesiDistribuzione, RichiesteUltime,
+  inizioStatistiche, sottAcquaDa, mediaMobileDa, seduteStatistiche,
 } from '../../src/pages/performance/calcoli.ts';
 
 const close = (a: number | null, b: number, eps = 1e-9) => a != null && Math.abs(a - b) < eps;
@@ -166,4 +167,46 @@ test('pnlTotale: non realizzato + realizzato + dividendi, n.d. se una voce manca
   assert.ok(close(pnlTotale(-40.5, 210.25, 12.75), 182.5, 1e-9));
   assert.equal(pnlTotale(null, 210.25, 12.75), null);
   assert.equal(pnlTotale(-40.5, 210.25, Number.NaN), null);
+});
+
+// 06/10/2026 (PNL-F): il punto base al costo (backend indice_statistiche_da) è escluso dalle statistiche
+test('inizioStatistiche: assente = 0 come prima; valido solo un intero dentro la serie, altrimenti 0 dichiarato', () => {
+  assert.deepEqual(inizioStatistiche(undefined, 5), { da: 0, illeggibile: false });
+  assert.deepEqual(inizioStatistiche(null, 5), { da: 0, illeggibile: false });
+  assert.deepEqual(inizioStatistiche(1, 5), { da: 1, illeggibile: false });
+  assert.deepEqual(inizioStatistiche(0, 5), { da: 0, illeggibile: false });
+  for (const x of [4, 9, -1, 1.5, '1']) assert.deepEqual(inizioStatistiche(x, 5), { da: 0, illeggibile: true });
+});
+
+test('statistichePeriodo con daStat: rendimento dalla base, drawdown e Sharpe dalla prima chiusura', () => {
+  const indice = [100, 80, 88, 84];
+  const tutti = statistichePeriodo(indice, 0, 0), dopo = statistichePeriodo(indice, 0, 0, [], 1);
+  assert.ok(close(tutti.rendimentoPct, -16)); assert.ok(close(dopo.rendimentoPct, -16));
+  assert.ok(close(tutti.maxDdPct, -20)); assert.ok(close(dopo.maxDdPct, (84 / 88 - 1) * 100));
+  assert.equal(tutti.nRendimenti, 3); assert.equal(dopo.nRendimenti, 2);
+  // base del periodo gia' dopo daStat: nessun effetto
+  assert.deepEqual(statistichePeriodo(indice, 2, 0, [], 1), statistichePeriodo(indice, 2, 0));
+  // Sharpe: il primo rendimento (costo -> chiusura) non entra nella volatilita'
+  const lungo = [100, 50, ...Array.from({ length: 40 }, (_, i) => 50 * Math.pow(1.001, i + 1) * (i % 2 ? 1.002 : 1))];
+  const d = sedute.slice(0, lungo.length);
+  const conBase = statistichePeriodo(lungo, 0, 0.03, d), senzaBase = statistichePeriodo(lungo, 0, 0.03, d, 1);
+  assert.ok(conBase.sharpe != null && senzaBase.sharpe != null);
+  assert.ok(close(senzaBase.sharpe, statistichePeriodo(lungo.slice(1), 0, 0.03, d.slice(1)).sharpe as number));
+  assert.notEqual(Math.round(conBase.sharpe! * 1e6), Math.round(senzaBase.sharpe! * 1e6));
+});
+
+test('sottAcquaDa e mediaMobileDa: allineate all\'indice, null prima di da', () => {
+  assert.deepEqual(sottAcquaDa([100, 80, 88, 84], 1).map(v => (v == null ? v : Math.round(v * 100) / 100)), [null, 0, 0, -4.55]);
+  assert.deepEqual(sottAcquaDa([100, 80, 88], 0).map(v => Math.round((v as number) * 100) / 100), [0, -20, -12]);
+  assert.deepEqual(mediaMobileDa([100, 2, 4, 6], 2, 1), [null, null, 3, 5]);
+  assert.deepEqual(mediaMobileDa([1, 2, 3], 2), [null, 1.5, 2.5]);
+});
+
+test('seduteStatistiche: la seduta dal punto base al costo esce dalla distribuzione; da = 0 invariato', () => {
+  const p = pnlGiornalieri(['a', 'b', 'c', 'd'], [1000, 800, 880, 840], [1000, 0, 0, null as unknown as number], [100, 80, 88, 84]);
+  assert.deepEqual(p.sedute.map(x => x.data), ['b', 'c']);
+  const s = seduteStatistiche(p, ['a', 'b', 'c', 'd'], 1);
+  assert.deepEqual(s.sedute.map(x => x.data), ['c']);
+  assert.deepEqual(s.senzaFlusso, ['d']);
+  assert.equal(seduteStatistiche(p, ['a', 'b', 'c', 'd'], 0), p);
 });

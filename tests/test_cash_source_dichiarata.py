@@ -94,7 +94,7 @@ def _nav_history_offline(monkeypatch):
          "valuta": "EUR", "data": "2026-08-03"}])
     idx = pd.to_datetime(["2026-08-03", "2026-08-04", "2026-08-05"])
     monkeypatch.setattr(pa, "_download_prices_for_history",
-                        lambda tickers, s, e, salta: pd.DataFrame({"AAA.MI": [100.0, 110.0, 120.0]}, index=idx))
+                        lambda tickers, s, e, salta, **_kw: pd.DataFrame({"AAA.MI": [100.0, 110.0, 120.0]}, index=idx))
     monkeypatch.setattr(pa, "_build_fx_history", lambda c, s, e: pd.DataFrame())
     pa._ANALYTICS_CACHE.clear()
     return pa

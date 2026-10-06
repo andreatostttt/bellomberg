@@ -73,7 +73,7 @@ GITLEAKS_FUORI_RAGGIO_PIN = {
     "tests/fixtures/fonti_it/oi_id_iso.pdf": "31cf814fe0c251863cbe757ab9e73429caddf413239a61a4775658b4d4d7c2a5",
     "tests/fixtures/fonti_it/oi_id_usa.pdf": "9a3cf8a0b6dc880a20954b25163b354465535f14156c328062255674abb77f6d",
 }
-MAX_TREE = 32 * 1024 * 1024  # PM 03/10: 32 MiB ordinary release files; other guards unchanged.
+MAX_TREE = 40 * 1024 * 1024  # PM 06/10 (was 32 MiB from 03/10): 40 MiB ordinary release files; other guards unchanged.
 MAX_FILE = 2 * 1024 * 1024
 BUDGET_SCREENSHOTS = "BUDGET_SCREENSHOTS_APPROVATO.json"
 # Exact private PM ratification metadata for the one historical public manifest.
