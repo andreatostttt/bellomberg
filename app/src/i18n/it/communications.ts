@@ -80,7 +80,6 @@ export const communications = {
   "costMagnitude": "Ordine di grandezza",
   "costEstimate": "~10-15 $ di API per run (stima storica, non una misura)",
   "duration": "Durata",
-  "runDuration": "25-40 min · email a fine run · avanzamento in F4",
   "runAlreadyActive": "Una run e' gia' in corso",
   "runLaunchQuestion": "Lanciare la run del consigliere?",
   "runIntro": "Avvia il comitato multi-agente sul portafoglio. Spende API a ogni lancio e fermarla a meta' da F4 perde i risultati parziali.",

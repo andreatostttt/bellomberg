@@ -80,7 +80,6 @@ export const communications = {
   "costMagnitude": "Order of magnitude",
   "costEstimate": "~$10-15 in API costs per run (historical estimate, not a measurement)",
   "duration": "Duration",
-  "runDuration": "25-40 min · email when complete · progress in F4",
   "runAlreadyActive": "A run is already in progress",
   "runLaunchQuestion": "Launch the committee run?",
   "runIntro": "Starts the multi-agent committee on the portfolio. Every launch incurs API costs, and stopping it midway from F4 loses the partial results.",
