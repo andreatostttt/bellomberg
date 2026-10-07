@@ -94,7 +94,7 @@ def test_real_return_on_indexed_base_has_nominal_cash_without_double_inflation(t
     result=dcf_engine.generate_valuation('SYNTH-RAB',prepared_bundle=rab_bundle(rows),output_dir=str(tmp_path))
     assert result['valuation_usability']['usable'],result.get('error')
     assert result['fair_value_base']==round((9/1.1+(9.2+9.704/.08)/1.21)/10,2)
-    assert result['calculation_details']['scenarios']['base']['rows'][1]['closing_rab']==pytest.approx(104.04)
+    assert result['calculation_details']['scenarios']['base']['rows'][1]['closing_rab']==pytest.approx(100 * 1.02 ** 2)
 
 
 @pytest.mark.parametrize('period',['forecast','continuing'])
