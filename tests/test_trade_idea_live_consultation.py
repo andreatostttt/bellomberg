@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from _trade_idea_contratto import contratto_default  # MOD-TI 06/10: contratto dei gate finti
 
 from bellomberg.agents import chat_tools, trade_idea
 from bellomberg.agents.specialists import base as specialist_base
@@ -32,7 +33,7 @@ def board(tmp_path, monkeypatch):
         "status": "pricing_unavailable"})
     b = Blackboard(memory_db=None, heartbeat_path=tmp_path / "heartbeat.json",
         run_scope="trade_idea", run_id="isolated-consultation", target_ticker="TEST",
-        budget_gate=SimpleNamespace(wrap_client=lambda client, role: client))
+        budget_gate=SimpleNamespace(catalog_snapshot=contratto_default(), wrap_client=lambda client, role: client))
     b.current_round = 1
     b.independent_round = 0
     b.model_phase = "building"

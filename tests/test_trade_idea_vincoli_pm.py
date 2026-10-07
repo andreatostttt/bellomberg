@@ -183,7 +183,7 @@ def _capture_red(monkeypatch, board):
         def create(self, **kwargs):
             calls.append(kwargs)
             raise _Stop()
-    monkeypatch.setattr(trade_idea, "model_for_role", lambda role: "synthetic/red-model")
+    monkeypatch.setattr(trade_idea, "model_for_role", lambda role, contract=None: "synthetic/red-model")
     monkeypatch.setattr(trade_idea, "candidate_model_context", lambda *a, **k: {"status": "synthetic"})
     monkeypatch.setattr(red_team, "role_thinking", lambda *a, **k: {"type": "disabled"})
     monkeypatch.setattr(llm_client, "OpenRouterClient", lambda **k: SimpleNamespace())

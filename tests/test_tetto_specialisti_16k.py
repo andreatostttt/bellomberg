@@ -132,7 +132,7 @@ def test_all_native_specialist_phases_send_128k_without_changing_model_or_effort
     """Catch a desk/round/consultation retaining the former output ceiling."""
     bb.run_scope, bb.model_phase, bb.target_ticker = scope, "building", "SYNTH"
     bb.source_qualification = {}
-    bb.budget_gate = types.SimpleNamespace(wrap_client=lambda client, **kwargs: client)
+    bb.budget_gate = types.SimpleNamespace(catalog_snapshot=__import__('_trade_idea_contratto').contratto_default(), wrap_client=lambda client, **kwargs: client)
     report = "Complete synthetic report with remaining evidence gaps explicitly declared. " * 30
     client = _FakeClient(lambda n, kw: _Resp("end_turn", [_TextBlock(report)], _Usage()))
     actor_type = type("Policy" + desk, (_MockSpecialist,), {"name": desk})
@@ -209,7 +209,7 @@ def test_explicit_legacy_r2_keeps_65536_and_its_effective_timeout(bb, monkeypatc
     bb._trade_idea_r2_completion_limits = {"scope": "trade_idea_r2_final_completion_v1",
         "round": 2, "model_ref": dict(ref), "max_tokens_by_desk": {"macro": 65536, "crypto": 65536}}
     monkeypatch.setattr(trade_idea, "_verified_candidate_valuations", lambda board: [dict(ref)])
-    bb.budget_gate = types.SimpleNamespace(wrap_client=lambda client, **kwargs: client)
+    bb.budget_gate = types.SimpleNamespace(catalog_snapshot=__import__('_trade_idea_contratto').contratto_default(), wrap_client=lambda client, **kwargs: client)
     client = _FakeClient(lambda n, kw: _Resp("end_turn",
         [_TextBlock("Complete frozen-model review with all evidence gaps declared. " * 30)], _Usage()))
     client._http = types.SimpleNamespace(timeout=httpx.Timeout(base.TIMEOUT_SPECIALIST_S, connect=10))

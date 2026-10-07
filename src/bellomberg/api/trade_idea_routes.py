@@ -219,6 +219,14 @@ def _active_id(store):
     return None
 
 
+def start_refusal_code(reasons):
+    """409 SOLO per un conflitto con un'altra run (pagata o Trade Idea attiva); ogni altro
+    preflight fallito e' una precondizione (428). R-MOD punto 4 (06/10): prima bastava la parola
+    «Trade Idea» nel testo, e un modello del .env inadatto usciva 409 come una run in corso."""
+    conflicts = ("un'altra run pagata e' attiva", "Trade Idea gia' accettata o in esecuzione")
+    return 409 if any(any(item in str(reason) for item in conflicts) for reason in reasons) else 428
+
+
 def active_paid_reason(store=None, *, weekly_active=False):
     """Read-only admission check shared with weekly start; OS lock covers CLI too."""
     if weekly_active or paid_run_is_active():
@@ -648,9 +656,7 @@ def install_trade_idea_routes(app, require_session, *, db_path=SQLITE_PATH,
                                        source_qualifier=recheck, archive_root=root,
                                        **({"document_sources": body.document_sources} if body.document_sources else {}))
         if not checked["ok"]:
-            code = 409 if any("run pagata" in reason or "Trade Idea" in reason
-                              for reason in checked["reasons"]) else 428
-            raise HTTPException(code, "; ".join(checked["reasons"]))
+            raise HTTPException(start_refusal_code(checked["reasons"]), "; ".join(checked["reasons"]))
         if not source_verified:
             raise HTTPException(428, "Controverifica delle fonti del preflight non eseguita")
         if (checked.get('execution_policy') != CURRENT_EXECUTION_POLICY or

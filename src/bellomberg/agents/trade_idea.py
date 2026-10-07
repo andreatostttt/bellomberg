@@ -23,17 +23,31 @@ from bellomberg.core.trade_idea_policy import (RESEARCH_POLICIES, EXECUTION_POLI
     report_quality_sufficient as _quality_sufficient)
 
 
+# DECISIONE PM 06/10 (MOD-TI, Opus 5.5): i modelli della Trade Idea si scelgono nel .env
+# (MODEL_ENV sotto) come quelli della run settimanale. Questi sono i DEFAULT quando la
+# variabile e' assente o vuota. La scelta si CONGELA nel contratto della run all'accettazione
+# (models_json + catalog_snapshot_json): durante l'esecuzione e alla ripresa vale SEMPRE il
+# contratto, mai il .env corrente (v. model_for_role con `contract`).
 MODEL_IDS = {
     "specialist": "meta/muse-spark-1.3",
     "red_team": "meta/muse-spark-1.3",
     "capo": "anthropic/claude-opus-5.5",
     "aux": "meta/muse-spark-1.3",
 }
+# Slug OpenRouter «fornitore/modello» (variante `:exacto`/`:free` ammessa).
+_MODEL_SLUG_RE = re.compile(r"[a-z0-9][a-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*(?::[a-z0-9._-]+)?\Z")
 MODEL_ENV = {
     "specialist": "TRADE_IDEA_SPECIALIST_MODEL",
     "red_team": "TRADE_IDEA_RED_TEAM_MODEL",
     "capo": "TRADE_IDEA_CAPO_MODEL",
     "aux": "TRADE_IDEA_AUX_MODEL",
+}
+# Letture col nome LETTERALE (test_env_example censisce le getenv con la stringa scritta): stesse chiavi di MODEL_ENV.
+_MODEL_ENV_READ = {
+    "specialist": lambda: os.getenv("TRADE_IDEA_SPECIALIST_MODEL"),
+    "red_team": lambda: os.getenv("TRADE_IDEA_RED_TEAM_MODEL"),
+    "capo": lambda: os.getenv("TRADE_IDEA_CAPO_MODEL"),
+    "aux": lambda: os.getenv("TRADE_IDEA_AUX_MODEL"),
 }
 MODEL_EFFORT = {role: "max" for role in MODEL_IDS}
 VIEW_SOURCES = frozenset(("manual", "market", "favorite_note", "reused_run"))
@@ -131,15 +145,120 @@ def paid_run_is_active():
         return True
 
 
-def model_for_role(role: str) -> str:
-    """A configured override cannot replace either model explicitly selected by the PM."""
+class ModelChoiceError(ValueError):
+    """R-MOD punto 4 (06/10): la scelta dei modelli nel .env non e' utilizzabile.
+
+    `problems` elenca TUTTI i ruoli che non vanno, ognuno con la variabile da cambiare e
+    cosa fare: chi scarica la repo li legge cosi' come sono nel preflight."""
+
+    def __init__(self, problems):
+        self.problems = list(problems)
+        super().__init__("; ".join(self.problems))
+
+
+ROLE_LABELS = {"specialist": "desk specialisti", "red_team": "Red Team",
+               "capo": "Capo", "aux": "ausiliario"}
+# Varianti di instradamento OpenRouter: non sono righe del catalogo e il fornitore risponde col
+# nome BASE, che il controllo d'identita' della risposta (modello del contratto) rifiuterebbe.
+_ROUTING_VARIANTS = frozenset({"exacto", "nitro", "floor"})
+
+
+def _choice_problem(role, slug, text):
+    return (MODEL_ENV[role] + "=" + str(slug) + " (ruolo " + ROLE_LABELS[role] + "): " + text)
+
+
+def configured_model_for_role(role: str) -> str:
+    """La scelta CORRENTE del .env (solo prima dell'accettazione: preflight e catalogo).
+
+    Variabile assente o vuota = default di MODEL_IDS. Un valore che non e' uno slug
+    OpenRouter e' un errore col nome della variabile, mai un ripiego zitto sul default."""
     if role not in MODEL_IDS:
         raise ValueError("Trade Idea model role sconosciuto: " + str(role))
-    expected = MODEL_IDS[role]
-    value = (os.getenv(MODEL_ENV[role]) or "").strip()
-    if value and value != expected:
-        raise ValueError(MODEL_ENV[role] + " non corrisponde al modello Trade Idea autorizzato")
-    return expected
+    value = (_MODEL_ENV_READ[role]() or "").strip()
+    if not value:
+        return MODEL_IDS[role]
+    if not _MODEL_SLUG_RE.fullmatch(value):
+        raise ModelChoiceError([_choice_problem(role, repr(value[:80]),
+            "non e' uno slug OpenRouter valido (atteso fornitore/modello, come in openrouter.ai/models). "
+            "Correggi la variabile o lasciala vuota per il default " + MODEL_IDS[role] + ".")])
+    base, _, variant = value.partition(":")
+    if variant in _ROUTING_VARIANTS:
+        raise ModelChoiceError([_choice_problem(role, value,
+            "la variante di instradamento :" + variant + " non e' ammessa nella Trade Idea (non e' nel "
+            "catalogo OpenRouter e il fornitore risponde col nome base, che il controllo d'identita' "
+            "della risposta rifiuta). Usa lo slug base " + base + ".")])
+    return value
+
+
+def configured_models() -> dict:
+    chosen, problems = {}, []
+    for role in MODEL_IDS:
+        try:
+            chosen[role] = configured_model_for_role(role)
+        except ModelChoiceError as exc:
+            problems.extend(exc.problems)
+    if problems:
+        raise ModelChoiceError(problems)
+    return chosen
+
+
+def contract_models(contract) -> dict:
+    """Ruolo -> slug dal CONTRATTO accettato della run.
+
+    `contract` puo' essere: la blackboard della Trade Idea (via il suo budget gate), il
+    TradeIdeaBudgetGate, la run (``models`` = {ruolo: {"model": ...}}) o il catalog snapshot
+    accettato (``models`` = {ruolo: {"id": ...}}). Un contratto incompleto e' un errore."""
+    gate = getattr(contract, "budget_gate", None)
+    if gate is not None:
+        contract = gate
+    if not isinstance(contract, dict):
+        # TradeIdeaBudgetGate (o un gate che ne porta lo snapshot accettato)
+        contract = getattr(contract, "catalog_snapshot", None)
+    models = contract.get("models") if isinstance(contract, dict) else None
+    if not isinstance(models, dict):
+        raise ValueError("contratto modelli Trade Idea assente: la run non dichiara i suoi modelli")
+    selected = {}
+    for role in MODEL_IDS:
+        row = models.get(role)
+        slug = (row.get("model", row.get("id")) if isinstance(row, dict) else None)
+        if not isinstance(slug, str) or not slug.strip():
+            raise ValueError("contratto modelli Trade Idea senza il ruolo " + role)
+        selected[role] = slug
+    return selected
+
+
+def model_for_role(role: str, contract=None) -> str:
+    """Senza `contract`: la scelta del .env (solo preflight, prima dell'accettazione).
+    Con `contract`: il modello CONGELATO nella run, qualunque cosa dica oggi il .env."""
+    if role not in MODEL_IDS:
+        raise ValueError("Trade Idea model role sconosciuto: " + str(role))
+    if contract is None:
+        return configured_model_for_role(role)
+    return contract_models(contract)[role]
+
+
+def _effort_sent_natively(model) -> bool:
+    """True se llm_client non invia l'effort a questo slug (z-ai/: ragionamento nativo)."""
+    from bellomberg.core.llm_client import PREFISSI_RAGIONAMENTO_NATIVO
+    return str(model).startswith(PREFISSI_RAGIONAMENTO_NATIVO)
+
+
+def model_selection_drift(contract) -> list:
+    """Ruoli dove il .env di OGGI sceglie un modello diverso dal contratto della run.
+
+    Serve a DICHIARARE alla ripresa che il cambio non si applica; un .env illeggibile e'
+    dichiarato anch'esso (la run resta sul contratto)."""
+    accepted = contract_models(contract)
+    drift = []
+    for role in MODEL_IDS:
+        try:
+            current, error = configured_model_for_role(role), None
+        except ValueError as exc:
+            current, error = None, str(exc)[:200]
+        if current != accepted[role]:
+            drift.append({"role": role, "variable": MODEL_ENV[role], "contract_model": accepted[role],
+                          "env_model": current, **({"env_error": error} if error else {})})
+    return drift
 
 
 def normalize_ticker(value: str) -> str:
@@ -231,34 +350,52 @@ def resolve_ticker_identity(ticker: str, *, opener=urlopen) -> dict:
             "status": "confirmed", "reason": None, "identity_source": source}
 
 
-def fetch_model_catalog(*, opener=urlopen, use_cache=True) -> dict:
-    """Public GET only: exact IDs, reasoning/tools and nonnegative tariff snapshot."""
+def fetch_model_catalog(*, opener=urlopen, use_cache=True, models=None) -> dict:
+    """Public GET only: exact IDs, reasoning/tools and nonnegative tariff snapshot.
+
+    `models` (ruolo -> slug): i modelli del CONTRATTO di una run accettata; assente = la
+    scelta corrente del .env (preflight). La cache vale solo per la stessa scelta."""
     global _CATALOG_CACHE
     import time
+    if models is None:
+        models = configured_models()
+    if not isinstance(models, dict) or set(models) != set(MODEL_IDS):
+        raise ValueError("modelli Trade Idea per il catalogo incompleti")
+    cache_key = tuple(sorted(models.items()))
     with _CATALOG_LOCK:
         stamp, cached = _CATALOG_CACHE
-        if use_cache and cached is not None and time.monotonic() - stamp < 60:
-            return cached
+        if (use_cache and cached is not None and time.monotonic() - stamp < 60
+                and cached.get("_selection") == cache_key):
+            return {k: v for k, v in cached.items() if k != "_selection"}
     with opener(Request(_CATALOG_URL, headers={"Accept": "application/json"}), timeout=20) as response:
         document = json.load(response)
     by_id = {row.get("id"): row for row in document.get("data", []) if isinstance(row, dict)}
-    selected = {}
+    selected, problems = {}, []
     for role in MODEL_IDS:
-        slug = model_for_role(role)
+        slug = models[role]
         row = by_id.get(slug)
+        # R-MOD punto 4: un modello inadatto al ruolo e' un problema della SCELTA (variabile +
+        # cosa fare), raccolto per tutti i ruoli; il catalogo malformato resta un ValueError.
         if row is None:
-            raise ValueError("modello Trade Idea assente dal catalogo: " + slug)
+            problems.append(_choice_problem(role, slug, "modello assente dal catalogo OpenRouter "
+                "(openrouter.ai/models). Controlla lo slug o scegli un altro modello per questo ruolo."))
+            continue
         params = row.get("supported_parameters") or []
         efforts = (row.get("reasoning") or {}).get("supported_efforts") or []
         required = ("reasoning", "reasoning_effort", "max_tokens")
         # Each accepted policy checks its own effort against supported_efforts; "max" is
         # required only by the historical contract (see reasoning_effort below).
+        missing = []
         if not efforts or any(item not in params for item in required):
-            raise ValueError("ragionamento non confermato nel catalogo: " + slug)
+            missing.append("ragionamento con effort")
         if role in ("specialist", "red_team") and any(item not in params for item in ("tools", "tool_choice")):
-            raise ValueError("tool calling non confermato nel catalogo: " + slug)
+            missing.append("tool calling")
         if role in ("capo", "red_team", "aux") and "response_format" not in params:
-            raise ValueError("output JSON strutturato non confermato nel catalogo: " + slug)
+            missing.append("output JSON strutturato")
+        if missing:
+            problems.append(_choice_problem(role, slug, "il catalogo OpenRouter non conferma "
+                + ", ".join(missing) + ", necessari a questo ruolo. Scegli un altro modello per questo ruolo."))
+            continue
         context = row.get("context_length")
         max_completion = (row.get("top_provider") or {}).get("max_completion_tokens")
         if type(context) is not int or context <= 0 or type(max_completion) is not int or max_completion <= 0:
@@ -278,10 +415,12 @@ def fetch_model_catalog(*, opener=urlopen, use_cache=True) -> dict:
                           "tools": role in ("specialist", "red_team"),
                           "supported_efforts": list(efforts),
                           "structured_output": "response_format" in params}
+    if problems:
+        raise ModelChoiceError(problems)
     snapshot = {"checked_at": datetime.now(timezone.utc).isoformat(), "models": selected,
                 "source": _CATALOG_URL, "account_access_verified": False}
     with _CATALOG_LOCK:
-        _CATALOG_CACHE = (time.monotonic(), snapshot)
+        _CATALOG_CACHE = (time.monotonic(), {**snapshot, "_selection": cache_key})
     return snapshot
 
 
@@ -349,19 +488,43 @@ def preflight_trade_idea(ticker, pm_view="", view_source="manual", budget_limit_
         models = [{"role": role, "model": catalog["models"][role]["id"],
                    "reasoning_effort": role_effort(policy, role)} for role in MODEL_IDS]
         if execution_policy is not None:
+            effort_problems = []
             for row in models:
-                if row['reasoning_effort'] not in catalog['models'][row['role']].get('supported_efforts', []):
-                    raise ValueError('Effort richiesto non confermato dal catalogo: ' + row['role'])
-            # Checked before any spending: a Capo cap above the provider maximum would
-            # otherwise surface only at the Capo call, after desks and Red Team are paid.
+                quoted_row = catalog['models'][row['role']]
+                if _effort_sent_natively(row['model']):
+                    # MOD-TI 06/10: su z-ai/ llm_client NON invia l'effort (misurato 05/09: ogni
+                    # effort esplicito azzera il ragionamento): il catalogo non lo vincola, lo si dichiara.
+                    row['reason'] = 'effort non inviato: ragionamento nativo del fornitore'
+                elif row['reasoning_effort'] not in quoted_row.get('supported_efforts', []):
+                    # R-MOD punto 4: TUTTI i ruoli, con variabile, effort ammessi e cosa fare.
+                    wanted = str(row['reasoning_effort'])
+                    effort_problems.append(_choice_problem(row['role'], row['model'],
+                        "la policy della run chiede effort '" + wanted + "' (lo fissa la policy, non si "
+                        "configura); questo modello accetta solo "
+                        + (', '.join(map(str, quoted_row.get('supported_efforts') or [])) or 'nessun effort')
+                        + ". Scegli per questo ruolo un modello che accetti '" + wanted
+                        + "' (es. il default " + MODEL_IDS[row['role']] + ")."))
+            if effort_problems:
+                raise ModelChoiceError(effort_problems)
+            # Checked before any spending: a Capo cap the model cannot hold would otherwise
+            # surface only at the Capo call, after desks and Red Team are paid.
+            # MOD-CAP (06/10, decisione PM): sopra il massimo di uscita del provider il cap si
+            # ADATTA al tetto del catalogo (gate, dichiarato alla chiamata); resta un rifiuto
+            # solo un tetto non dichiarato dal catalogo o non contenuto nel contesto.
             capo_cap = policy_output_cap(policy, 'capo', 0)
             capo_row = catalog['models']['capo']
             if (not isinstance(capo_row.get('max_completion_tokens'), int)
-                    or capo_cap > capo_row['max_completion_tokens']
-                    or capo_cap >= int(capo_row.get('context_length') or 0)):
+                    or capo_row['max_completion_tokens'] <= 0
+                    or min(capo_cap, capo_row['max_completion_tokens'])
+                    >= int(capo_row.get('context_length') or 0)):
                 raise ValueError('Tetto di output del Capo non supportato dal catalogo: '
-                                 + str(capo_cap) + ' > ' + str(capo_row.get('max_completion_tokens')))
+                                 + str(capo_cap) + ' (tetto ' + str(capo_row.get('max_completion_tokens'))
+                                 + ', contesto ' + str(capo_row.get('context_length')) + ')')
         prices = {role: catalog["models"][role]["pricing"] for role in MODEL_IDS}
+    except ModelChoiceError as exc:
+        # Il catalogo risponde: e' la SCELTA dei modelli nel .env che non va (ogni ruolo elencato).
+        catalog, models, prices = None, [], {}
+        reasons.extend("modello non utilizzabile: " + problem for problem in exc.problems)
     except Exception as exc:
         catalog, models, prices = None, [], {}
         reasons.append("catalogo modelli non verificabile: " + str(exc))
@@ -481,9 +644,31 @@ class TradeIdeaBudgetGate:
         self.worker_token = worker_token
         self.catalog_snapshot = catalog_snapshot
         # One live catalog read per minute at most; the accepted snapshot prices every reservation.
-        self.catalog_fetcher = catalog_fetcher or (lambda: fetch_model_catalog(use_cache=True))
+        # MOD-TI 06/10: il catalogo live si chiede per i modelli del CONTRATTO, non del .env di oggi.
+        self.catalog_fetcher = catalog_fetcher or (lambda: fetch_model_catalog(
+            use_cache=True, models=self.contract_models))
         self.catalog_notices = []
+        self.model_contract_notice = None
         self._requests = {}
+
+    @property
+    def contract_models(self):
+        """Ruolo -> slug dal catalog snapshot ACCETTATO (create_run lo ha verificato = models_json)."""
+        return contract_models(self.catalog_snapshot)
+
+    def declare_model_selection(self):
+        """Alla presa in carico: un .env cambiato dopo l'accettazione e' DICHIARATO, non applicato."""
+        drift = model_selection_drift(self.catalog_snapshot)
+        self.model_contract_notice = {
+            "status": "env_differs" if drift else "env_matches",
+            "models": self.contract_models, "drift": drift,
+            "notice": ("Il .env sceglie oggi modelli diversi da quelli accettati: la run usa il "
+                       "contratto. " + "; ".join(
+                           row["variable"] + "=" + str(row["env_model"]) + " non applicato, contratto "
+                           + row["contract_model"] for row in drift)) if drift else None}
+        if drift:
+            print("[TRADE_IDEA] " + self.model_contract_notice["notice"])
+        return self.model_contract_notice
 
     def wrap_client(self, client, *, role):
         return _BudgetedClient(client, self, role)
@@ -491,6 +676,25 @@ class TradeIdeaBudgetGate:
     def reuse_capo_response(self):
         payload = self.store.reusable_capo_response(self.run_id, self.worker_token)
         return _restore_provider_message(payload) if payload is not None else None
+
+    def _cap_al_tetto(self, role, cap):
+        """MOD-CAP (06/10): max_tokens = min(cap, tetto di uscita del modello CONGELATO nel
+        contratto della run: catalog_snapshot). La Trade Idea ha contabilita' propria (il client
+        non tocca il suo corpo, llm_client._corpo_al_tetto): l'adattamento avviene qui, prima di
+        _reuse/_reserve, dichiarato una volta per (ruolo, modello). Senza tetto nel contratto il
+        cap resta quello richiesto e _reserve decide (rifiuto dichiarato, nessuna spesa)."""
+        expected_role = ("specialist" if role.startswith("specialist:") else
+                         "aux" if role.startswith("aux:") else role)
+        row = ((getattr(self, "catalog_snapshot", None) or {}).get("models") or {}).get(expected_role) or {}
+        tetto = row.get("max_completion_tokens")
+        if type(cap) is not int or cap <= 0 or type(tetto) is not int or tetto <= 0 or cap <= tetto:
+            return cap
+        from bellomberg.core.llm_client import tetto_uscita
+        return tetto_uscita(row.get("id"), cap, ruolo="trade_idea:" + role, tetto_provider=tetto)
+
+    def _al_tetto(self, kwargs, role):
+        cap = self._cap_al_tetto(role, kwargs.get("max_tokens"))
+        return kwargs if cap == kwargs.get("max_tokens") else {**kwargs, "max_tokens": cap}
 
     def capo_finalization(self):
         resolve = getattr(self.store, "accepted_capo_finalization", None)
@@ -558,17 +762,20 @@ class TradeIdeaBudgetGate:
             return self._validate_failed_author_response_recovery(descriptor, accepted, kwargs, role)
         if (not isinstance(accepted, dict) or descriptor != accepted
                 or role != "specialist:" + str(accepted.get("desk"))
-                or kwargs.get("model") != model_for_role("specialist")
+                or kwargs.get("model") != model_for_role("specialist", self)
                 or kwargs.get("thinking") != {"type": "effort", "effort": "max"}
                 or kwargs.get("tool_choice") != {"type": "none"}
                 or kwargs.get("max_tokens") not in (16000, 64000, 65536)
                 or accepted.get("replacement_max_tokens") != 128000):
             raise ValueError("report completion differs from its accepted authorization")
         pricing = self.catalog_snapshot["models"]["specialist"]["pricing"]
-        body = costruisci_corpo(**{**kwargs, "provider_max_price": {
-            "prompt": float(Decimal(pricing["prompt"]) * 10**6),
-            "completion": float(Decimal(pricing["completion"]) * 10**6), "request": 0.0}})
-        if _plan_digest(body) != accepted.get("request_sha256"):
+        prices = {"prompt": float(Decimal(pricing["prompt"]) * 10**6),
+                  "completion": float(Decimal(pricing["completion"]) * 10**6), "request": 0.0}
+        # R-MOD F3 (06/10): la richiesta originale e' partita al cap ADATTATO al tetto del contratto
+        # quando il modello ne accetta meno: si prova lo sha di cio' che e' stato inviato davvero.
+        if accepted.get("request_sha256") not in {
+                _plan_digest(costruisci_corpo(**{**variant, "provider_max_price": prices}))
+                for variant in (kwargs, self._al_tetto(kwargs, role))}:
             raise ValueError("original report request wire contract differs")
 
     def _validate_failed_author_response_recovery(self, descriptor, accepted, kwargs, role):
@@ -586,7 +793,7 @@ class TradeIdeaBudgetGate:
                 or getattr(board, "model_phase", None) != "building"
                 or getattr(board, "current_round", None) != 1
                 or task.get("version") != 1 or task.get("mode") != "model_authoring_completion"
-                or kwargs.get("model") != model_for_role("specialist")
+                or kwargs.get("model") != model_for_role("specialist", self)
                 or kwargs.get("thinking") != {"type": "effort", "effort": "max"}
                 or kwargs.get("max_tokens") != 128000 or kwargs.get("tool_choice") is not None
                 or not kwargs.get("tools")
@@ -599,21 +806,26 @@ class TradeIdeaBudgetGate:
         prices = {"prompt": float(Decimal(pricing["prompt"]) * 10**6),
                   "completion": float(Decimal(pricing["completion"]) * 10**6), "request": 0.0}
         raw = _stable_provider_messages(kwargs["messages"])
-        original = {**kwargs, "messages": raw, "provider_max_price": prices}
-        original_sha = _plan_digest(costruisci_corpo(**original))
         projected, receipt = project_model_authoring_messages(raw)
-        projected_sha = _plan_digest(costruisci_corpo(**{**original, "messages": projected}))
         expected = accepted.get("request_sha256")
-        if original_sha == expected:
-            return
-        pin = {"contract": "model_authoring_dispatch_projection/1", "role": role,
-               "receipt": receipt, "original_wire_sha256": original_sha,
-               "projected_wire_sha256": projected_sha}
         pins = board.data.get("_model_authoring_context_projections", [])
-        if (not isinstance(pins, list) or any(not isinstance(row, dict) for row in pins)
-                or projected_sha != expected
-                or [row for row in pins if row.get("original_wire_sha256") == original_sha] != [pin]):
+        if not isinstance(pins, list) or any(not isinstance(row, dict) for row in pins):
             raise ValueError("original failed author request or saved projection differs")
+        # R-MOD F3 (06/10): il dispatch fallito e' partito al cap richiesto (128000) o, col modello
+        # del contratto a tetto minore, al cap ADATTATO (il wrapper adatta prima della proiezione).
+        for variant in (kwargs, self._al_tetto(kwargs, role)):
+            original = {**variant, "messages": raw, "provider_max_price": prices}
+            original_sha = _plan_digest(costruisci_corpo(**original))
+            if original_sha == expected:
+                return
+            projected_sha = _plan_digest(costruisci_corpo(**{**original, "messages": projected}))
+            pin = {"contract": "model_authoring_dispatch_projection/1", "role": role,
+                   "receipt": receipt, "original_wire_sha256": original_sha,
+                   "projected_wire_sha256": projected_sha}
+            if (projected_sha == expected
+                    and [row for row in pins if row.get("original_wire_sha256") == original_sha] == [pin]):
+                return
+        raise ValueError("original failed author request or saved projection differs")
 
     def _reserve(self, kwargs, role):
         blackboard = getattr(self, "blackboard", None)
@@ -621,14 +833,16 @@ class TradeIdeaBudgetGate:
             blackboard.raise_if_run_blocked()
         finalization = self.capo_finalization()
         if finalization is not None and (role != "capo"
-                or kwargs.get("max_tokens") != finalization["max_tokens"]):
+                or kwargs.get("max_tokens") not in (finalization["max_tokens"],
+                                                     self._cap_al_tetto(role, finalization["max_tokens"]))):
             raise ValueError("Authorized finalization permits only its exact Capo request")
         model = kwargs.get("model")
         expected_role = ("specialist" if role.startswith("specialist:") else
                          "aux" if role.startswith("aux:") else role)
-        expected = model_for_role(expected_role)
+        # Anti-replay sul CONTRATTO della run (MOD-TI 06/10): mai sul .env corrente.
+        expected = model_for_role(expected_role, self)
         if model != expected:
-            raise ValueError("modello fuori mapping Trade Idea: " + str(model))
+            raise ValueError("modello fuori dal contratto della run Trade Idea: " + str(model))
         try:
             live = self.catalog_fetcher()
         except OSError as exc:
@@ -647,9 +861,13 @@ class TradeIdeaBudgetGate:
         if live_model["id"] != model:
             raise ValueError("catalogo modello cambiato prima della chiamata")
         accepted_run = self.store.get_run(self.run_id)['run']
+        if model_for_role(expected_role, accepted_run) != model:
+            raise ValueError("modello diverso da models_json della run accettata: " + str(model))
         effort = role_effort(accepted_run, expected_role)
         if execution_policy(accepted_run) is not None:
-            if any(effort not in row.get('supported_efforts', []) for row in (quoted, live_model)):
+            if _effort_sent_natively(model):
+                pass  # z-ai/: llm_client non invia l'effort (dichiarato nel preflight)
+            elif any(effort not in row.get('supported_efforts', []) for row in (quoted, live_model)):
                 raise ValueError('capability reasoning richiesta non confermata prima della chiamata')
             if (accepted_run['models'][expected_role].get('reasoning_effort') != effort):
                 raise ValueError('Effort differs from the accepted execution policy')
@@ -660,10 +878,13 @@ class TradeIdeaBudgetGate:
         cap = kwargs.get("max_tokens")
         if finalization is not None:
             # An explicit finalization grant carries its own authorized cap.
-            if cap != finalization.get("max_tokens"):
+            if cap not in (finalization.get("max_tokens"),
+                           self._cap_al_tetto(role, finalization.get("max_tokens"))):
                 raise ValueError('Capo output cap differs from its explicit finalization grant')
         elif (execution_policy(accepted_run) in RESEARCH_POLICIES and expected_role == 'capo'
-                and cap != policy_output_cap(accepted_run, 'capo', 128000)):
+                and cap not in (policy_output_cap(accepted_run, 'capo', 128000),
+                                self._cap_al_tetto(role, policy_output_cap(accepted_run, 'capo', 128000)))):
+            # MOD-CAP: il cap della policy, o lo stesso adattato al tetto del contratto.
             raise ValueError('Capo output cap differs from the accepted execution policy')
         if (type(cap) is not int or cap <= 0
                 or cap > min(quoted["max_completion_tokens"], live_model["max_completion_tokens"])):
@@ -964,6 +1185,15 @@ class _BudgetedMessages:
         recovered = self.gate._reuse(kwargs, self.role)
         if recovered is not None:
             return recovered
+        # MOD-CAP: un antenato pagato al cap richiesto e' gia' stato cercato sopra (corpo originale);
+        # il lavoro nuovo parte al tetto di uscita del contratto. R-MOD F3: l'adattamento avviene
+        # PRIMA della proiezione, cosi' il pin della proiezione e il corpo inviato coincidono.
+        adattati = self.gate._al_tetto(kwargs, self.role)
+        if adattati is not kwargs:
+            recovered = self.gate._reuse(adattati, self.role)
+            if recovered is not None:
+                return recovered
+            kwargs = adattati
         if projection is not None:
             kwargs = self.gate._project_model_authoring_request(kwargs, projection, self.role)
             recovered = self.gate._reuse(kwargs, self.role)
@@ -1007,6 +1237,13 @@ class _BudgetedStream:
         if self.recovered is not None:
             self.reconciled = True
             return self
+        adattati = self.gate._al_tetto(self.kwargs, self.role)   # MOD-CAP (vedi create)
+        if adattati is not self.kwargs:
+            self.recovered = self.gate._reuse(adattati, self.role)
+            if self.recovered is not None:
+                self.reconciled = True
+                return self
+            self.kwargs = adattati
         self.request_id, kw = self.gate._reserve(self.kwargs, self.role)
         retried = False
         while True:
@@ -1196,7 +1433,7 @@ def run_trade_idea_capo(blackboard, *, portfolio, mandate, decision_context=None
             blackboard.mark_specialist_start("capo", 3)
             try:
                 result = _accept_capo_response(blackboard, response, verified_valuations, incomplete_reasons)
-                blackboard.record_usage("capo", 3, model_for_role("capo"), {},
+                blackboard.record_usage("capo", 3, model_for_role("capo", blackboard), {},
                     duration_s=0, api_calls=0, cache_ttl=None, status="reused")
                 blackboard.mark_specialist_done("capo")
                 return result
@@ -1394,7 +1631,7 @@ def run_trade_idea_capo(blackboard, *, portfolio, mandate, decision_context=None
     start = time.perf_counter()
     try:
         with budgeted.messages.stream(
-            model=model_for_role("capo"), max_tokens=output_cap,
+            model=model_for_role("capo", blackboard), max_tokens=output_cap,
             thinking=(finalization["thinking"] if finalization is not None
                       else role_thinking(blackboard, 'capo')), system=system,
             messages=[{"role": "user", "content": "\n\n".join(parts)}],
@@ -1403,7 +1640,7 @@ def run_trade_idea_capo(blackboard, *, portfolio, mandate, decision_context=None
             response = stream.get_final_message()
         result = _accept_capo_response(blackboard, response, verified_valuations, incomplete_reasons)
         usage = getattr(response, "usage", None)
-        blackboard.record_usage("capo", 3, model_for_role("capo"),
+        blackboard.record_usage("capo", 3, model_for_role("capo", blackboard),
                                 usage.to_dict() if hasattr(usage, "to_dict") else {},
                                 duration_s=time.perf_counter() - start, api_calls=1,
                                 cache_ttl=None, status="ok")
@@ -1412,7 +1649,7 @@ def run_trade_idea_capo(blackboard, *, portfolio, mandate, decision_context=None
     except Exception as exc:
         if "response" in locals():
             usage = getattr(response, "usage", None)
-            blackboard.record_usage("capo", 3, model_for_role("capo"),
+            blackboard.record_usage("capo", 3, model_for_role("capo", blackboard),
                                     usage.to_dict() if hasattr(usage, "to_dict") else {},
                                     duration_s=time.perf_counter() - start, api_calls=1,
                                     cache_ttl=None, status="api_error")
@@ -1442,11 +1679,12 @@ def bind_trade_idea_preparer(gate, ticker, *, output_dir=None, phase="preparatio
             client._http.close()
 
     proposer = BudgetedProposer(directory / ("model-" + phase + ".sqlite"),
-        authorized_usd=run["budget_limit_usd"], model=model_for_role("aux"), max_tokens=128000,
+        authorized_usd=run["budget_limit_usd"], model=model_for_role("aux", gate),
+        max_tokens=gate._cap_al_tetto("aux:" + phase, 128000),   # MOD-CAP: tetto del contratto
         thinking={"type": "effort", "effort": "max"}, metadata=live_metadata,
         call=call, automatic_sections=True, provider_context_check=True)
     return proposer, {"status": "enabled", "authorization": "single_run",
-                      "model": model_for_role("aux"), "phase": phase}
+                      "model": model_for_role("aux", gate), "phase": phase}
 
 
 def _candidate_history(store, ticker, current_id):
@@ -1579,6 +1817,7 @@ def _progress(blackboard, phase, *, events=()):
             "primary_failure": blackboard.data.get("_primary_failure"),
             "desk_gaps": deepcopy(blackboard.data.get("_desk_gaps") or {}),
             "catalog_notices": list(getattr(getattr(blackboard, "budget_gate", None), "catalog_notices", None) or [])[-20:],
+            "model_contract": deepcopy(getattr(getattr(blackboard, "budget_gate", None), "model_contract_notice", None)),
             "remaining_work": _remaining_work(blackboard),
             "specialists": [{"name": name, "round": blackboard.current_round,
                              "status": status} for name, status in blackboard.specialist_status.items()],
@@ -5951,6 +6190,11 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                 history = _candidate_history(store, run["ticker"], run_id)
                 gate = TradeIdeaBudgetGate(store, run_id, token, run["catalog_snapshot"],
                                            catalog_fetcher=catalog_fetcher)
+                # MOD-TI 06/10: i modelli sono quelli del contratto; un .env cambiato dopo
+                # l'accettazione si dichiara qui (progresso + log) e non si applica.
+                if contract_models(run) != gate.contract_models:
+                    raise ValueError("models_json e catalog snapshot della run non coincidono")
+                model_contract = gate.declare_model_selection()
                 identity = {"ticker": run["ticker"], "name": run.get("company_name"),
                     "exchange": run.get("exchange"), "currency": run.get("currency"), "status": "confirmed"}
                 accepted_request = store.get_accepted_request(run_id)
@@ -5994,7 +6238,8 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                         receipt_file.flush()
                         os.fsync(receipt_file.fileno())
                     os.replace(receipt_tmp, validation_path)
-                store.update_progress(run_id, token, 'source_validation', {'source_validation': source_validation})
+                store.update_progress(run_id, token, 'source_validation', {'source_validation': source_validation,
+                                                                            'model_contract': model_contract})
                 qualification = deepcopy(accepted_sources) if source_qualifier is None else checked_sources
                 if is_research_mode(run):
                     preparer, prep_state = None, {'status': 'not_required',

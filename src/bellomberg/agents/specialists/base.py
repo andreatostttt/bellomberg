@@ -1572,7 +1572,7 @@ class Specialist:
         (CONSIGLIERE_R0_MODEL; CONSIGLIERE_<DESK>_MODEL o CONSIGLIERE_MODEL)."""
         if getattr(self.blackboard, "run_scope", "weekly") == "trade_idea":
             from bellomberg.agents.trade_idea import model_for_role
-            return model_for_role("specialist")
+            return model_for_role("specialist", self.blackboard)  # MOD-TI 06/10: contratto della run
         return _modello_llm("consigliere", self.name, round_n)
 
     def _chiama_modello(self, **kw):

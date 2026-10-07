@@ -125,12 +125,20 @@ def test_128k_compatibility_never_reuses_a_different_request(migrated, change):
                    "input_schema": {"type": "object", "properties": {}}}],
         "thinking": {"type": "effort", "effort": "low"},
     }[change]
-    provider = FrozenProvider(label="blocked-new-request")
-    with pytest.raises(ValueError, match="max_tokens|reasoning"):
-        _gate(current, child, payload).wrap_client(SimpleNamespace(messages=provider), role=role)\
-            .messages.create(**arguments)
-    assert provider.calls == 0 and _reuses(migrated, child) == []
-    assert len(_cost_rows(migrated, parent)) == 1 and _cost_rows(migrated, child) == []
+    provider = FrozenProvider(label="new-request")
+    gate = _gate(current, child, payload)
+    if change == "thinking":
+        with pytest.raises(ValueError, match="reasoning"):
+            gate.wrap_client(SimpleNamespace(messages=provider), role=role).messages.create(**arguments)
+        assert provider.calls == 0 and _reuses(migrated, child) == []
+        assert len(_cost_rows(migrated, parent)) == 1 and _cost_rows(migrated, child) == []
+        return
+    # MOD-CAP (06/10, decisione PM): 128000 oltre il tetto accettato (65536) non e' piu' un
+    # rifiuto, si ADATTA. Il lavoro diverso resta lavoro NUOVO: mai il riuso dell'antenato pagato.
+    response = gate.wrap_client(SimpleNamespace(messages=provider), role=role).messages.create(**arguments)
+    assert provider.calls == 1 and [a["max_tokens"] for a in provider.arguments] == [65536]
+    assert response.id.startswith("new-request") and _reuses(migrated, child) == []
+    assert len(_cost_rows(migrated, parent)) == 1 and len(_cost_rows(migrated, child)) == 1
 
 
 def test_changed_payload_with_capacity_is_a_new_measured_request(migrated):
@@ -159,12 +167,14 @@ def test_changed_payload_with_capacity_is_a_new_measured_request(migrated):
 def test_legacy_compatibility_is_limited_to_approved_role_and_cap_pairs(
         migrated, role, legacy_cap, target_cap):
     current, payload, parent, child, _, _, _ = _legacy_parent_and_child(migrated, role, legacy_cap)
-    provider = FrozenProvider(label="must-not-reuse-or-dispatch")
-    with pytest.raises(ValueError, match="max_tokens"):
-        _gate(current, child, payload).wrap_client(SimpleNamespace(messages=provider), role=role)\
-            .messages.create(**_arguments(role, target_cap))
-    assert provider.calls == 0 and _reuses(migrated, child) == []
-    assert len(_cost_rows(migrated, parent)) == 1 and _cost_rows(migrated, child) == []
+    provider = FrozenProvider(label="must-not-reuse")
+    # MOD-CAP: il cap oltre il tetto accettato (65536) si adatta invece di essere rifiutato; il
+    # riuso resta limitato alle coppie approvate: qui nessun riuso, una richiesta NUOVA misurata.
+    _gate(current, child, payload).wrap_client(SimpleNamespace(messages=provider), role=role)\
+        .messages.create(**_arguments(role, target_cap))
+    assert provider.calls == 1 and [a["max_tokens"] for a in provider.arguments] == [65536]
+    assert _reuses(migrated, child) == []
+    assert len(_cost_rows(migrated, parent)) == 1 and len(_cost_rows(migrated, child)) == 1
 
 
 @pytest.mark.parametrize("tamper", ["text", "hash", "identity", "cost"])
@@ -227,7 +237,9 @@ def test_128k_reservation_is_durable_and_larger_inside_original_budget(migrated)
     assert Decimal(summary["remaining_after_holds_usd"]) == Decimal("0.99")
 
 
-@pytest.mark.parametrize("fault", ["budget", "accepted_cap", "live_cap", "accepted_context",
+# MOD-CAP (06/10): "accepted_cap" non e' piu' infattibile (il cap si adatta al tetto accettato):
+# lo prova test_128k_oltre_il_tetto_accettato_si_adatta_al_contratto qui sotto.
+@pytest.mark.parametrize("fault", ["budget", "live_cap", "accepted_context",
     "live_context", "missing_live_catalog", "missing_live_cap", "catalog_error"])
 def test_128k_infeasible_request_stops_before_reservation_and_dispatch(migrated, fault):
     current = store(migrated)
@@ -459,3 +471,25 @@ def test_remaining_floor_does_not_replace_a_native_ready_legacy_contract(
     assert Decimal(floors["macro:R1"]["output_reservation_floor_usd"]) == Decimal("0.256")
     assert summary["feasibility"] == "insufficient_even_before_input"
     assert summary["completion_guaranteed"] is False
+
+
+def test_128k_oltre_il_tetto_accettato_si_adatta_al_contratto(migrated, capsys, monkeypatch):
+    """MOD-CAP (06/10, decisione PM «di default 128.000, ma si adatta al tetto del modello»): il
+    tetto CONGELATO nel contratto (catalog_snapshot, 65536) vince sul 128000 richiesto, dichiarato;
+    prenotazione e invio al cap adattato."""
+    from bellomberg.core import llm_client
+    monkeypatch.setattr(llm_client, "_TETTI_DICHIARATI", set())   # dichiarazione una per processo
+    current = store(migrated)
+    payload = _payload()
+    payload["catalog_snapshot"]["models"]["specialist"]["max_completion_tokens"] = 65536
+    run_id = current.create_run(payload, idempotency_key="adapted")["run"]["id"]
+    current.claim_run(run_id)
+    gate = _gate(current, run_id, payload)
+    live = deepcopy(payload["catalog_snapshot"])
+    gate.catalog_fetcher = lambda: live
+    provider = FrozenProvider()
+    gate.wrap_client(SimpleNamespace(messages=provider), role="specialist:quant").messages.create(
+        **_arguments("specialist:quant", NEW_CAP))
+    assert [a["max_tokens"] for a in provider.arguments] == [65536]
+    assert len(_cost_rows(migrated, run_id)) == 1
+    assert "trade_idea:specialist:quant: richiesti 128000 token" in capsys.readouterr().out

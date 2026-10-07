@@ -289,6 +289,31 @@ class RequestJournal:
                 self._quotes[model] = deepcopy(metadata)
             return deepcopy(self._quotes[model]), gia_letto
 
+    def tetto_congelato(self, model):
+        """R-MOD F1 (06/10): il tetto di uscita del modello (top_provider.max_completion_tokens)
+        CONGELATO per la run al primo uso, come il contratto della Trade Idea. In ripresa lo stesso
+        lavoro produce lo stesso corpo (e la stessa chiave) anche se il fornitore ha cambiato tetto
+        nel frattempo: una richiesta incerta resta bloccata, una pagata si rigioca, mai una nuova.
+        Restituisce (tetto int o None, gia_congelato). Il controllo prezzi resta sul listino vivo:
+        un tetto sceso sotto quello congelato e' un rifiuto PRIMA dell'invio, dichiarato."""
+        with self._lock:
+            with self._db() as db:
+                db.execute("CREATE TABLE IF NOT EXISTS output_caps("
+                           "model TEXT PRIMARY KEY, cap INTEGER NOT NULL)")
+                row = db.execute("SELECT cap FROM output_caps WHERE model=?", (model,)).fetchone()
+            if row is not None:
+                if type(row["cap"]) is not int or row["cap"] <= 0:
+                    raise ValueError("stored output cap is invalid")
+                return row["cap"], True
+            meta, _gia_letto = self.metadati_modello(model)
+            cap = ((meta or {}).get("top_provider") or {}).get("max_completion_tokens") if isinstance(meta, dict) else None
+            if type(cap) is not int or cap <= 0:
+                return None, False
+            with self._db() as db:
+                db.execute("INSERT OR IGNORE INTO output_caps(model, cap) VALUES(?,?)", (model, cap))
+                stored = db.execute("SELECT cap FROM output_caps WHERE model=?", (model,)).fetchone()["cap"]
+            return stored, False
+
     def _quote(self, body):
         from bellomberg.core.llm_pricing import preparation_price_ceiling
         model = body.get("model")
@@ -297,27 +322,46 @@ class RequestJournal:
             return preparation_price_ceiling(self._quotes[model], model=model,
                                               max_tokens=body.get("max_tokens"))
 
-    def _attempt_labels(self, body, labels):
+    def _attempt_labels(self, body, labels, forme=()):
         """A request settled from the provider's bill (paid, no usable answer) is closed:
         the same work becomes a new attempt with its own key, never a replay or a block.
-        KA (04/10): a ``released`` request (provably never billed) is closed the same way."""
+        KA (04/10): a ``released`` request (provably never billed) is closed the same way.
+        R-MOD F1 (06/10): the attempt number is the SAME for the body and for its previous forms
+        (the request at the requested cap, before the output limit was fitted): an attempt is
+        closed only when every form recorded at that attempt is settled/released, so a resume
+        always finds an open attempt journaled under any of the forms."""
         attempt = 0
+        bodies = [body, *(f for f in forme if f != body)]
         with self._db() as db:
             while True:
                 current = {**labels, **({"attempt": attempt} if attempt else {})}
-                key = sha256(_json({"request": body, "scope": current}).encode()).hexdigest()
-                row = db.execute("SELECT state FROM requests WHERE key=?", (key,)).fetchone()
-                if row is None or row["state"] not in ("settled", "released"):
+                states = []
+                for candidate in bodies:
+                    key = sha256(_json({"request": candidate, "scope": current}).encode()).hexdigest()
+                    row = db.execute("SELECT state FROM requests WHERE key=?", (key,)).fetchone()
+                    if row is not None:
+                        states.append(row["state"])
+                if not states or any(state not in ("settled", "released") for state in states):
                     return current
                 attempt += 1
 
-    def prepare(self, body, scope):
-        """Return (request_id, exact wire body, saved response or None)."""
+    def prepare(self, body, scope, *, forme_precedenti=()):
+        """Return (request_id, exact wire body, saved response or None).
+
+        ``forme_precedenti`` (MOD-CAP 06/10): the same request as the caller asked for it,
+        before llm_client fitted max_tokens to the provider's output limit. A row already
+        journaled under that form (sent, paid or unresolved) is replayed or blocks with its
+        original body, exactly like the legacy forms below: never resent with another body.
+        A form closed as settled/released is a new attempt and is not matched."""
         labels = {key: scope.get(key) for key in ("phase", "agent", "round_n")}
-        labels = self._attempt_labels(body, labels)
+        labels = self._attempt_labels(body, labels, forme_precedenti)
         source = _json(body)
         key = sha256(_json({"request": body, "scope": labels}).encode()).hexdigest()
         candidates = [(key, source)]
+        for previous in forme_precedenti:
+            if previous != body:
+                candidates.append((sha256(_json({"request": previous, "scope": labels}).encode()).hexdigest(),
+                                   _json(previous)))
         # A cap upgrade must not repay a completed side-stage after a crash.
         # Only these known policy transitions may match an old, otherwise exact
         # request. _replay still verifies its receipt, cost and terminal state.
@@ -345,14 +389,16 @@ class RequestJournal:
         # effort variable can put on the wire, or none) is the same paid work: replayed with
         # its original body, never paid a second time.
         if labels["phase"] == "capo":
-            for old_reasoning in _CAPO_REASONING_ON_WIRE:
-                if old_reasoning == body.get("reasoning"):
-                    continue
-                old_body = {k: v for k, v in body.items() if k != "reasoning"}
-                if old_reasoning is not None:
-                    old_body["reasoning"] = old_reasoning
-                old_key = sha256(_json({"request": old_body, "scope": labels}).encode()).hexdigest()
-                candidates.append((old_key, _json(old_body)))
+            # MOD-CAP: also around the form at the requested cap (same paid work, other cap).
+            for capo_body in [body, *(f for f in forme_precedenti if f != body)]:
+                for old_reasoning in _CAPO_REASONING_ON_WIRE:
+                    if old_reasoning == capo_body.get("reasoning"):
+                        continue
+                    old_body = {k: v for k, v in capo_body.items() if k != "reasoning"}
+                    if old_reasoning is not None:
+                        old_body["reasoning"] = old_reasoning
+                    old_key = sha256(_json({"request": old_body, "scope": labels}).encode()).hexdigest()
+                    candidates.append((old_key, _json(old_body)))
         with self._lock, self._db() as db:
             found = self._find(db, candidates)
             if found is not None:

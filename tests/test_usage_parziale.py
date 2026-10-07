@@ -336,7 +336,7 @@ def test_trade_idea_review_checkpoint_is_bound_to_exact_model_generation(monkeyp
         current_facts_block=lambda: ""), raising=False)
     bb = Blackboard()
     bb.run_scope, bb.target_ticker = "trade_idea", "TEST"
-    bb.budget_gate = SimpleNamespace(wrap_client=lambda client, **scope: client)
+    bb.budget_gate = SimpleNamespace(catalog_snapshot=__import__('_trade_idea_contratto').contratto_default(), wrap_client=lambda client, **scope: client)
     bb.persist_run_checkpoint = lambda event, payload: None
     calls = []
     def create(**kwargs):

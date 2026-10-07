@@ -45,7 +45,7 @@ DEFAULT_TARATURA = {
 # configurazione consigliata, NON un default nel codice (assente = errore col nome).
 MODELLI_OPENROUTER = re.compile(r"^(?:CHAT_[A-Z]+_MODEL|CHAT_MODEL|CONSIGLIERE_[A-Z0-9]+_MODEL|"
                                 r"CONSIGLIERE_MODEL|CAPO_MODEL|RED_TEAM_MODEL|REFLECTION_MODEL|"
-                                r"ACTION_EXTRACTOR_MODEL|BRIEFING_MODEL|NEWS_CLASSIFIER_MODEL|"
+                                r"ACTION_EXTRACTOR_MODEL|BRIEFING_MODEL|NEWS_CLASSIFIER_MODEL|TRADE_IDEA_[A-Z_]+_MODEL|"
                                 r"CHAT_MAX_TOKENS)$")
 SLUG_OPENROUTER = re.compile(r"^[a-z0-9.-]+/[A-Za-z0-9._:-]+$")
 

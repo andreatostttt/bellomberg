@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from _trade_idea_contratto import contratto_default  # MOD-TI 06/10: contratto dei gate finti
 
 from bellomberg.agents import trade_idea
 from bellomberg.agents.specialists.base import Specialist
@@ -16,7 +17,7 @@ PEERS = ("macro", "eventdesk", "crypto", "quant", "options")
 def install_rows(board, *, failed=()):
     board.source_qualification = {"fingerprint": "qualified-source", "source_report": {
         "documents": [{"id": "source-document"}]}}
-    board.budget_gate = SimpleNamespace(wrap_client=lambda client, role: client,
+    board.budget_gate = SimpleNamespace(catalog_snapshot=contratto_default(), wrap_client=lambda client, role: client,
         run_id="isolated-consultation", store=SimpleNamespace(get_run=lambda _id: {
             "run": {"authorization": {"activities": ["model_preparation"]}}}))
     board.data["_model_input_draft"] = {"model": {}, "scenarios": {}}

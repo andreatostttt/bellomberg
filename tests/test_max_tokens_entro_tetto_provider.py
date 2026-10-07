@@ -9,9 +9,11 @@ il Red Team dopo R0 e R1 gia' pagati. Qui il confronto si fa PRIMA, per ogni cop
 (tests/fixtures/openrouter_models_snapshot.json, GET gratuita) e i modelli dal .env.example
 (e dal .env del PM, letto SOLO per gli slug *_MODEL).
 
-Il valore confrontato e' quello che parte sul FILO: per il Red Team settimanale il codice
-abbassa il tetto al limite del provider (red_team._cap_del_provider, 93a71a9) e si misura
-QUEL numero, letto con la stessa fixture; la costante nel codice resta 128000 e lo si dice.
+Il valore confrontato e' quello che parte sul FILO. MOD-CAP (06/10, decisione PM «di default
+128.000, ma si adatta al tetto del modello»): ogni chiamata del client passa dal punto unico
+llm_client.tetto_uscita, che abbassa il richiesto al limite del provider; si misura QUEL numero,
+col tetto della stessa fixture. La Trade Idea ha contabilita' propria (il client non tocca il suo
+corpo): li' si confronta il valore della costante, finche' il suo gate non adatta.
 Un tetto nuovo nel codice senza riga qui fa fallire il censimento: va mappato al suo ruolo."""
 import ast
 from pathlib import Path
@@ -39,17 +41,12 @@ def _trade_idea(ruolo):
     return "trade_idea:" + ruolo, MODEL_IDS[ruolo]
 
 
-def _valore_red_settimanale():
-    """Il cap che il Red Team settimanale manda davvero (abbassato al tetto del provider)."""
-    from bellomberg.agents import red_team
-
-    def sul_filo(slug):
-        meta, _ = ff.metadati(CATALOGO, slug)
-        taglia = getattr(red_team, "_cap_del_provider", None)
-        if taglia is None:   # albero prima di 93a71a9: nessun abbassamento
-            return red_team.WEEKLY_RED_MAX_TOKENS
-        return taglia(red_team.WEEKLY_RED_MAX_TOKENS, slug, metadata_fn=lambda m: dict(meta))
-    return sul_filo
+def _sul_filo(richiesti, slug, ruolo):
+    """Il max_tokens che il client manda davvero: il punto unico del tetto, con la fixture."""
+    from bellomberg.core import llm_client
+    meta, _ = ff.metadati(CATALOGO, slug)
+    tetto = meta["top_provider"]["max_completion_tokens"]
+    return llm_client.tetto_uscita(slug, richiesti, ruolo=ruolo, tetto_provider=tetto)
 
 
 # (nome del tetto, file:costante o variabile .env, valore o funzione slug->valore, ruoli)
@@ -66,7 +63,7 @@ def _tetti():
         ("CHAT_MAX_TOKENS (.env.example)", int(ESEMPIO["CHAT_MAX_TOKENS"]),
          ["CHAT_MODEL"] + ["CHAT_%s_MODEL" % a for a in _CHAT]),
         ("capo.CAPO_MAX_TOKENS", capo.CAPO_MAX_TOKENS, ["CAPO_MODEL", _trade_idea("capo")]),
-        ("red_team.WEEKLY_RED_MAX_TOKENS (sul filo)", _valore_red_settimanale(), ["RED_TEAM_MODEL"]),
+        ("red_team.WEEKLY_RED_MAX_TOKENS", red_team.WEEKLY_RED_MAX_TOKENS, ["RED_TEAM_MODEL"]),
         ("red_team.TRADE_IDEA_RED_MAX_TOKENS", red_team.TRADE_IDEA_RED_MAX_TOKENS, [_trade_idea("red_team")]),
         ("reflection.REFLECTION_MAX_TOKENS", reflection.REFLECTION_MAX_TOKENS, ["REFLECTION_MODEL"]),
         ("action_table_extract.ACTION_EXTRACT_MAX_TOKENS", action_table_extract.ACTION_EXTRACT_MAX_TOKENS,
@@ -130,6 +127,6 @@ def test_tetto_entro_il_limite_del_provider(nome, valore, ruolo, slug):
     assert meta is not None, "%s = %s: modello senza riga nella fixture della Models API" % (ruolo, slug)
     tetto = meta["top_provider"]["max_completion_tokens"]
     assert type(tetto) is int and tetto > 0, (slug, tetto)
-    richiesti = valore(slug) if callable(valore) else valore
+    richiesti = valore if ruolo.startswith("trade_idea:") else _sul_filo(valore, slug, ruolo)
     assert richiesti <= tetto, ("%s = %d supera il tetto del provider %d di %s (%s; Models API, "
                                 "top_provider.max_completion_tokens)" % (nome, richiesti, tetto, slug, ruolo))

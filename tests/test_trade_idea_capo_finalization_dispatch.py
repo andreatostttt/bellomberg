@@ -9,6 +9,7 @@ from threading import RLock
 from types import SimpleNamespace
 
 import pytest
+from _trade_idea_contratto import contratto_default  # MOD-TI 06/10: contratto dei gate finti
 
 from bellomberg.agents import trade_idea, chat_tools
 from bellomberg.agents.specialists import Blackboard
@@ -68,7 +69,7 @@ def research_board(monkeypatch):
     data['_research_review'] = {'research_ref': reference,
         'desks': deepcopy(data['_desk_research_reviews']),
         'red_team': deepcopy(data['_red_research_review']), 'objections': deepcopy(data['_objections'])}
-    board.budget_gate = SimpleNamespace(wrap_client=lambda raw, role: raw)
+    board.budget_gate = SimpleNamespace(catalog_snapshot=contratto_default(), wrap_client=lambda raw, role: raw)
     return board
 
 

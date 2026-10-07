@@ -18,6 +18,9 @@ def test_configured_preparer_cap_preserves_specialists_model_and_budget(tmp_path
     from bellomberg.valuation.preparation_ai import configured_proposer
     model = llm_client.MUSE_STANDARD if muse else 'synthetic/other-model'
     monkeypatch.setattr(llm_client, 'modello', lambda *args: model)
+    # MOD-CAP: il tetto si legge dalla Models API; qui un listino finto (nessuna rete).
+    monkeypatch.setattr(llm_client, '_listino_fuori_run',
+                        lambda m: {"id": m, "top_provider": {"max_completion_tokens": 200000}})
     proposer = configured_proposer(tmp_path / 'configured.sqlite3', authorized_usd='1.25')
     assert proposer.max_tokens == expected_cap
     # G7/C2: valore FISSATO (non la stessa funzione richiamata): default di Andrea = high.
@@ -33,6 +36,8 @@ def test_preparer_effort_ha_la_sua_variabile_e_non_segue_i_desk(tmp_path, monkey
     from bellomberg.core import llm_client
     from bellomberg.valuation.preparation_ai import configured_proposer
     monkeypatch.setattr(llm_client, 'modello', lambda *args: 'synthetic/other-model')
+    monkeypatch.setattr(llm_client, '_listino_fuori_run',
+                        lambda m: {"id": m, "top_provider": {"max_completion_tokens": 200000}})
     for nome in llm_client.DEFAULT_EFFORT:
         monkeypatch.delenv(nome, raising=False)
     monkeypatch.setenv("CONSIGLIERE_FUNDAMENTALS_EFFORT", "low")

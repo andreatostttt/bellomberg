@@ -1709,7 +1709,13 @@ def configured_proposer(journal, *, authorized_usd):
     # desks' variables: it is VALUATION_PREPARER_EFFORT (default high, the contributor's
     # value). Already paid preparations under another effort are still recognised
     # by _existing, never bought again.
-    output_limit = 128000
+    # MOD-CAP (06/10): 128000 di default, adattato al tetto del provider del modello (stesso
+    # punto del client, llm_client.tetto_uscita, dichiarato). Il preparer gira con contabilita'
+    # propria (request_scope(None)): il client non tocca il suo corpo, quindi si adatta qui,
+    # prima della chiave della richiesta. Listino non letto: resta 128000 e il preventivo del
+    # preparer (preparation_price_ceiling) decide prima di qualsiasi spesa.
+    from bellomberg.core.llm_client import tetto_uscita
+    output_limit = tetto_uscita(model, 128000, ruolo="valuation_preparer")
     return BudgetedProposer(journal, authorized_usd=authorized_usd, model=model,
                             max_tokens=output_limit,
                             thinking=thinking_fase("valuation_preparer"),

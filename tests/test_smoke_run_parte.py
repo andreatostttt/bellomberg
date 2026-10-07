@@ -337,4 +337,33 @@ def test_ripresa_col_checkpoint_red_team_al_cap_vecchio(tmp_path):
     tetto = CATALOGO[esempio["RED_TEAM_MODEL"].partition(":")[0]]["top_provider"]["max_completion_tokens"]
     red = [r for r in ripresa["fornitore"] if r["model"] == esempio["RED_TEAM_MODEL"] and r["max_tokens"] != 2048]
     assert red and all(r["max_tokens"] == tetto for r in red), red
-    assert "checkpoint al cap 128000 mai inviato" in proc.stdout
+    # MOD-CAP: il contratto salvato (128000, mai inviato) resta quello; il client lo adatta sul filo.
+    assert ("red_team/_red_team/R1: richiesti 128000 token, %s ne accetta %d: uso %d"
+            % (esempio["RED_TEAM_MODEL"], tetto, tetto)) in proc.stdout, proc.stdout[-3000:]
+
+
+# ----------------------------------------------------------------------------- 3. tetto adattivo
+GEMINI_FLASH = "google/gemini-3.8-flash"
+
+
+def test_run_settimanale_tutti_i_ruoli_su_gemini_flash_arriva_al_pdf(tmp_path):
+    """MOD-CAP (06/10, decisione PM «di default 128.000, ma se lancio un modello con un tetto minore
+    si adatta in automatico»): chi scarica la repo e mette gemini-3.8-flash (tetto di uscita 65536
+    nella Models API) in TUTTI i ruoli deve arrivare al PDF. Prima: ogni chiamata a 128000 era
+    rifiutata dal controllo prezzi (desk, Red Team, Capo). Nessuna richiesta oltre il tetto arriva
+    al fornitore; l'adattamento e' DICHIARATO una volta per ruolo."""
+    tetto = CATALOGO[GEMINI_FLASH]["top_provider"]["max_completion_tokens"]
+    assert tetto < 128000
+    esempio = ff.variabili_env(ENV_EXAMPLE, suffisso="")
+    tutti = {k: (GEMINI_FLASH if k.endswith("_MODEL") and v else v) for k, v in esempio.items()}
+    esito, proc = esegui_run_isolata(tutti, tmp_path, fino="pdf", send_email=True)
+    problemi = problemi_della_run(esito) + problemi_della_consegna(esito, tmp_path)
+    assert not problemi, ("TUTTO GEMINI FLASH NON ARRIVA AL PDF (log: %s):\n- " % (tmp_path / "esito.log")) + "\n- ".join(problemi)
+    filo = esito["fornitore"]
+    assert filo and {r["model"] for r in filo} == {GEMINI_FLASH}
+    assert max(r["max_tokens"] for r in filo) == tetto      # i 128000 sono arrivati come 65536
+    for ruolo in ("capo/capo/R3", "red_team/_red_team/R1"):
+        assert ("%s: richiesti 128000 token, %s ne accetta %d: uso %d" % (ruolo, GEMINI_FLASH, tetto, tetto)
+                in proc.stdout), (ruolo, proc.stdout[-3000:])
+    assert "ne accetta %d" % tetto in proc.stdout and "SONDA" in proc.stdout
+    assert "tetto di uscita %d" % tetto in proc.stdout       # la sonda riporta tetto e adattamento

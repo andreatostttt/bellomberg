@@ -3,11 +3,16 @@ alla Models API a meta' run, oltre a quella del controllo prezzi del registro ri
 (che possono dare tetti diversi) e una chiamata di rete vera dentro il replay offline.
 Ora il Red Team legge il listino dal registro richieste della run (la stessa memoria che la sonda
 dei modelli e il controllo prezzi riempiono): una sola lettura per modello e per run.
+MOD-CAP (06/10): il tetto ora si adatta nel punto UNICO del client (llm_client.tetto_uscita, letto
+dal listino del registro richieste dentro una run): le stesse garanzie si provano li'.
 Modelli e numeri inventati."""
+import json
+
 import pytest
 import requests
 
 from bellomberg.agents import red_team
+from bellomberg.core import llm_client
 from bellomberg.core.request_journal import RequestJournal, request_scope
 from bellomberg.valuation import preparation_ai
 
@@ -17,6 +22,13 @@ MODELLO = "zz/finto-flash-9"
 def _listino(model):
     return {"id": model, "context_length": 900_000, "top_provider": {"max_completion_tokens": 65536},
             "pricing": {"prompt": "0.000001", "completion": "0.000002"}}
+
+
+@pytest.fixture(autouse=True)
+def dichiarazioni_nuove(monkeypatch):
+    # Le dichiarazioni del tetto sono UNA per (ruolo, modello) per processo: ogni test riparte.
+    monkeypatch.setattr(llm_client, "_TETTI_DICHIARATI", set())
+    monkeypatch.setattr(llm_client, "_LISTINO_PROCESSO", {})
 
 
 @pytest.fixture
@@ -38,10 +50,10 @@ def test_listino_letto_dalla_sonda_riusato_senza_rete(tmp_path, capsys, niente_r
     registro._quote({"model": MODELLO, "max_tokens": 1000})       # la sonda dei modelli
     assert letture == [MODELLO]
     with request_scope(registro, phase="red_team", agent="_red_team", round_n=1):
-        assert red_team._cap_del_provider(128000, MODELLO) == 65536
+        assert llm_client.tetto_uscita(MODELLO, 128000, ruolo="red_team") == 65536
     assert letture == [MODELLO]                                    # nessuna seconda lettura
     out = capsys.readouterr().out
-    assert "128000 -> 65536" in out and "gia' letto in questa run" in out
+    assert "richiesti 128000 token" in out and "uso 65536" in out and "[listino della run]" in out
 
 
 def test_ripresa_senza_sonda_una_sola_lettura_condivisa_col_controllo_prezzi(tmp_path, capsys,
@@ -50,9 +62,10 @@ def test_ripresa_senza_sonda_una_sola_lettura_condivisa_col_controllo_prezzi(tmp
     letture = []
     registro = _registro(tmp_path, lambda m: letture.append(m) or _listino(m))
     with request_scope(registro, phase="red_team", agent="_red_team", round_n=1):
-        cap = red_team._cap_del_provider(128000, MODELLO)
+        cap = llm_client.tetto_uscita(MODELLO, 128000, ruolo="red_team")
     assert cap == 65536 and letture == [MODELLO]
-    assert "letto ora" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "[listino della run]" in out
     registro._quote({"model": MODELLO, "max_tokens": cap})         # il controllo prezzi del Red Team
     assert letture == [MODELLO]                                    # lo stesso listino, non riletto
 
@@ -62,17 +75,18 @@ def test_catalogo_irraggiungibile_dichiarato_senza_crash(tmp_path, capsys, nient
         raise requests.ConnectionError("rete giu' (sintetico)")
     registro = _registro(tmp_path, giu)
     with request_scope(registro, phase="red_team", agent="_red_team", round_n=1):
-        assert red_team._cap_del_provider(128000, MODELLO) == 128000
+        assert llm_client.tetto_uscita(MODELLO, 128000, ruolo="red_team") == 128000
     out = capsys.readouterr().out
-    assert "tetto del provider non letto (ConnectionError)" in out and "resta 128000" in out
+    assert "listino non letto (ConnectionError)" in out and "uso i 128000 richiesti" in out
     assert "rete giu'" not in out                                  # solo il tipo, mai il testo
 
 
 def test_senza_registro_lettura_diretta_come_prima(monkeypatch):
     letture = []
     monkeypatch.setattr(preparation_ai, "live_metadata", lambda m: letture.append(m) or _listino(m))
-    assert red_team._cap_del_provider(128000, MODELLO) == 65536
-    assert letture == [MODELLO]
+    assert llm_client.tetto_uscita(MODELLO, 128000, ruolo="chat") == 65536
+    assert llm_client.tetto_uscita(MODELLO, 128000, ruolo="chat") == 65536
+    assert letture == [MODELLO]                    # fuori run: cache di processo (TTL monotonico)
 
 
 from test_pipeline_replay_artifacts import replay, replay_loop, run_offline, db  # noqa: E402,F401
@@ -83,7 +97,9 @@ def test_replay_completo_red_team_al_tetto_con_una_lettura(replay, run_offline, 
     monkeypatch.setattr(cm, "_weekly_contract", run_offline.native_weekly_contract)
     cm.run_multi_agent(language="it")
     rossi = [c for c in replay.side_calls if "RISK MANAGER SCETTICO" in str(c.get("system"))]
-    assert rossi and {c["max_tokens"] for c in rossi} == {65536}
+    # MOD-CAP: il Red Team chiede il cap del contratto; il client vero lo adatta sul filo
+    # (qui il client e' finto ad alto livello: l'adattamento si prova in test_tetto_uscita_adattivo).
+    assert rossi and {c["max_tokens"] for c in rossi} == {red_team.WEEKLY_RED_MAX_TOKENS}
     modello = rossi[0]["model"]
     assert replay.catalog_reads.count(modello) == 1      # una sola lettura per run
     assert not replay.network
@@ -100,10 +116,15 @@ def _senza_preventivo():
 
 def test_preventivo_cap_oltre_il_tetto_e_lacuna_per_tipo(tmp_path):
     registro = _registro(tmp_path, _listino)
+    # MOD-CAP: il preventivo valida il cap che partira' sul filo (adattato al tetto); il rifiuto
+    # per prezzo/contesto resta lacuna per tipo.
     with request_scope(registro, phase="red_team", agent="_red_team", round_n=1):
-        with pytest.raises(_senza_preventivo(), match="requested completion cap exceeds"):
+        assert red_team._preventivo_prima_dell_invio(MODELLO, 128000) == 65536
+        assert red_team._preventivo_prima_dell_invio(MODELLO, 65536) == 65536
+    stretto = lambda m: {**_listino(m), "context_length": 60000}
+    with request_scope(_registro(tmp_path / "b", stretto), phase="red_team", agent="_red_team", round_n=1):
+        with pytest.raises(_senza_preventivo(), match="context or completion cap"):
             red_team._preventivo_prima_dell_invio(MODELLO, 128000)
-        red_team._preventivo_prima_dell_invio(MODELLO, 65536)          # entro il tetto: passa
 
 
 def test_preventivo_catalogo_giu_solo_il_tipo_nel_messaggio(tmp_path):
@@ -307,18 +328,20 @@ def test_RD_flap_del_catalogo_il_cap_viene_dal_listino_del_preventivo(tmp_path, 
             raise requests.ConnectionError("giu' (sintetico)")
         return _listino(model)
     with request_scope(_registro(tmp_path, flap), phase="red_team", agent="_red_team", round_n=1):
-        cap = red_team._cap_del_provider(128000, MODELLO)
-        assert cap == 128000
-        assert red_team._preventivo_prima_dell_invio(MODELLO, cap, ricalcola_cap=True) == 65536
+        cap = llm_client.tetto_uscita(MODELLO, 128000, ruolo="red_team")
+        assert cap == 128000                                       # prima lettura giu': dichiarato
+        assert red_team._preventivo_prima_dell_invio(MODELLO, cap) == 65536
     assert letture["n"] == 2
-    assert "128000 -> 65536" in capsys.readouterr().out
+    assert "uso 65536" in capsys.readouterr().out
 
 
-def test_RD_checkpoint_gia_salvato_il_cap_non_si_cambia(tmp_path):
-    # Con un checkpoint salvato il contratto e' fissato: niente ricalcolo, il rifiuto e' lacuna.
-    with request_scope(_registro(tmp_path, _listino), phase="red_team", agent="_red_team", round_n=1):
-        with pytest.raises(_senza_preventivo(), match="exceeds"):
-            red_team._preventivo_prima_dell_invio(MODELLO, 128000, ricalcola_cap=False)
+def test_RD_tetto_sopra_il_contesto_e_lacuna(tmp_path):
+    # MOD-CAP: il contratto salvato non cambia (lo adatta il client); un listino il cui contesto
+    # non contiene nemmeno il cap adattato resta rifiutato PRIMA dell'invio, lacuna per tipo.
+    stretto = lambda m: {**_listino(m), "context_length": 1000}
+    with request_scope(_registro(tmp_path, stretto), phase="red_team", agent="_red_team", round_n=1):
+        with pytest.raises(_senza_preventivo(), match="cap unavailable"):
+            red_team._preventivo_prima_dell_invio(MODELLO, 128000)
 
 
 def test_RE_comitato_non_calcolato_non_dice_red_team_mancante():
@@ -432,8 +455,9 @@ def test_metadati_modello_restituisce_una_copia(tmp_path):
 
 def test_R3_ripresa_con_tetto_sceso_non_cambia_il_contratto_pagato(run_offline, monkeypatch):
     # Checkpoint 'running' a 128000 (gia' pagato un giro); alla ripresa il fornitore dichiara un
-    # tetto piu' basso: il contratto salvato NON si ricalcola (corpi diversi = nuova spesa), il
-    # preventivo lo rifiuta -> lacuna dichiarata, nessun invio.
+    # tetto piu' basso. MOD-CAP: il contratto salvato NON cambia e il giro pagato NON si rimanda
+    # (nessun secondo corpo a 128000 ne' a 65536 per la stessa iterazione); il giro SUCCESSIVO,
+    # mai inviato, parte col cap adattato e la critica si completa (niente lacuna).
     from bellomberg.agents import consigliere_multi as cm, weekly_lifecycle
     from test_weekly_recovery import _store
     inviate, tool_calls, _ = setup_provider(monkeypatch)
@@ -460,9 +484,49 @@ def test_R3_ripresa_con_tetto_sceso_non_cambia_il_contratto_pagato(run_offline, 
         "pricing": {"prompt": "0.000001", "completion": "0.000002"}})
     result = cm.run_multi_agent(resume_memo_id=store.memo_id, authorize_new_ai=True, send_email=False)
     assert result["status"] == "completed", result.get("last_error")
-    assert [r["max_tokens"] for r in inviate] == [128000]         # nessun corpo nuovo
-    gap = _store().get("red_team")["gap"]
-    assert gap.startswith("RedTeamSenzaPreventivo") and "exceeds" in gap
+    assert [r["max_tokens"] for r in inviate] == [128000, 65536]  # giro 1 pagato una volta, giro 2 adattato
+    assert len({json.dumps(r["messages"], sort_keys=True) for r in inviate}) == 2   # due giri diversi
+    assert _store().get("red_team").get("gap") is None
+
+
+def test_R3_checkpoint_del_codice_0506_col_cap_gia_tagliato_ripreso(run_offline, monkeypatch, capsys):
+    # MOD-CAP: il codice 05-06/10 (_cap_del_provider) salvava il contratto al cap GIA' tagliato
+    # (65536). Oggi il contratto e' 128000 e il taglio lo fa il client: lo stesso corpo sul filo.
+    # Quel checkpoint resta riprendibile (nessun «contract changed»), dichiarato, e il giro gia'
+    # pagato non si rimanda.
+    from bellomberg.agents import consigliere_multi as cm, weekly_lifecycle
+    from test_weekly_recovery import _store
+    inviate, tool_calls, _ = setup_provider(monkeypatch)
+    listino = lambda model: {"id": model, "context_length": 1_000_000,
+                             "top_provider": {"max_completion_tokens": 65536},
+                             "pricing": {"prompt": "0.000001", "completion": "0.000002"}}
+    monkeypatch.setattr(preparation_ai, "live_metadata", listino)
+    monkeypatch.setattr(red_team, "WEEKLY_RED_MAX_TOKENS", 65536)      # = contratto del codice 05-06/10
+    native_bind = weekly_lifecycle.bind_blackboard
+    crashed = []
+
+    def bind(bb, store):
+        native_bind(bb, store)
+        persist = bb.persist_run_checkpoint
+
+        def save(event, payload):
+            persist(event, payload)
+            if event == "red_team_tool" and not crashed:
+                crashed.append(True)
+                raise Crash("hard crash after durable Red Team tool result")
+        bb.persist_run_checkpoint = save
+    monkeypatch.setattr(weekly_lifecycle, "bind_blackboard", bind)
+    with pytest.raises(Crash):
+        cm.run_multi_agent(send_email=False)
+    store = _store()
+    assert [r["max_tokens"] for r in inviate] == [65536]
+    monkeypatch.setattr(red_team, "WEEKLY_RED_MAX_TOKENS", 128000)     # codice di oggi
+    capsys.readouterr()
+    result = cm.run_multi_agent(resume_memo_id=store.memo_id, authorize_new_ai=True, send_email=False)
+    assert result["status"] == "completed", result.get("last_error")
+    assert [r["max_tokens"] for r in inviate] == [65536, 65536]
+    assert _store().get("red_team").get("gap") is None
+    assert "checkpoint col cap gia' adattato al provider (65536" in capsys.readouterr().out
 
 
 def test_R3_checkpoint_mai_inviato_misurato_sul_registro_ripreso_col_tetto(run_offline, monkeypatch):
@@ -500,20 +564,11 @@ def test_R3_checkpoint_mai_inviato_misurato_sul_registro_ripreso_col_tetto(run_o
     assert _store().get("red_team").get("gap") is None
 
 
-def test_red_team_mai_inviato_misurato_sul_registro():
-    from types import SimpleNamespace
-    sonda = {"agent": "_probe", "state": "settled"}
-    assert red_team._red_team_mai_inviato() is False                         # senza registro: non provato
-    for righe, atteso in (([sonda], True), ([sonda, {"agent": "_red_team", "state": "settled"}], False),
-                          (None, False)):
-        registro = SimpleNamespace(summary=lambda r=righe: {"requests": r})
-        with request_scope(registro, phase="red_team", agent="_red_team", round_n=1):
-            assert red_team._red_team_mai_inviato() is atteso
-
-    def rotto():
-        raise OSError("registro illeggibile")
-    with request_scope(SimpleNamespace(summary=rotto), phase="red_team", agent="_red_team", round_n=1):
-        assert red_team._red_team_mai_inviato() is False
+def test_un_solo_meccanismo_del_tetto():
+    # MOD-CAP: il taglio e la misura «mai inviato» del Red Team vivono nel punto centrale
+    # (llm_client + RequestJournal.prepare forme_precedenti): nessun secondo meccanismo qui.
+    assert not hasattr(red_team, "_cap_del_provider")
+    assert not hasattr(red_team, "_red_team_mai_inviato")
 
 
 # ------------------------------------------------------------ decisioni main 06/10 (punti 1-3)

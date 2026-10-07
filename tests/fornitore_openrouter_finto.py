@@ -14,7 +14,8 @@ Qui il fornitore li RIPRODUCE leggendo i limiti dalla fixture `openrouter_models
 Due superfici, entrambe di trasporto:
   - POST /chat/completions -> `httpx.MockTransport(fornitore.gestisci)` (llm_client vero, sonda vera,
     journal vero, streaming SSE vero);
-  - GET /models -> adattatore `requests` (preparation_ai.live_metadata vero, red_team._cap_del_provider vero).
+  - GET /models -> adattatore `requests` (preparation_ai.live_metadata vero, tetto di uscita del client vero:
+    llm_client.tetto_uscita, MOD-CAP 06/10).
 
 Eseguito come script (`python -B fornitore_openrouter_finto.py <config.json>`) fa girare la run
 settimanale VERA fino al Capo compreso in un processo isolato: BELLOMBERG_DATA_DIR in una cartella
@@ -481,12 +482,12 @@ def esegui_run(config):
             return (221, b"bye")
     smtplib.SMTP_SSL = _SMTPFinto
 
-    # ---- simulazione del cap VECCHIO del Red Team (prima di 93a71a9): niente taglio al tetto del provider
+    # ---- simulazione del codice delle 21:00 del 05/10: niente adattamento del tetto di uscita
+    # (MOD-CAP 06/10: il taglio vive nel punto unico del client) e niente preventivo anticipato.
     if config.get("red_cap_vecchio"):
         from bellomberg.agents import red_team as _rt
-        _rt._cap_del_provider = lambda richiesti, model, metadata_fn=None: richiesti
+        llm_client._corpo_al_tetto = lambda body, scope, trasporto_di_prova: body
         if hasattr(_rt, "_preventivo_prima_dell_invio"):   # controllo anticipato: il codice delle 21:00 non l'aveva
-            # V0-REDTEAM (06/10): il preventivo restituisce il max_tokens da usare (ricalcola_cap).
             _rt._preventivo_prima_dell_invio = lambda model, max_tokens, **_k: max_tokens
     # ---- fermo (facoltativo) subito DOPO il checkpoint del Capo (memo validato da validate_memo)
     fino = config.get("fino", "capo")

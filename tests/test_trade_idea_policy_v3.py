@@ -66,7 +66,9 @@ def _catalog(capo_max):
     return {'models': rows}
 
 
-@pytest.mark.parametrize('capo_max, blocked', [(128000, False), (64000, True)])
+# MOD-CAP (06/10, decisione PM): un Capo sopra il massimo del provider si ADATTA (non e' piu' un
+# rifiuto del preflight); resta rifiutato un tetto che il catalogo non dichiara.
+@pytest.mark.parametrize('capo_max, blocked', [(128000, False), (64000, False), (None, True)])
 def test_preflight_refuses_a_capo_cap_above_the_provider_maximum_before_spending(capo_max, blocked):
     checked = trade_idea.preflight_trade_idea(
         'ACME', 'Thesis', 'manual', '10', catalog_fetcher=lambda: _catalog(capo_max),

@@ -327,6 +327,29 @@ def test_p_g7_v3_capo_call_must_use_the_v3_cap(migrated):
         budget._reserve(call, 'capo')
 
 
+def test_p_g7_v3_capo_cap_adattato_al_tetto_del_contratto(migrated):
+    # MOD-CAP (06/10, decisione PM): la policy chiede 128000, il modello del contratto ne accetta
+    # 65536 -> il Capo parte a 65536 (il cap della policy ADATTATO); ogni altro cap resta rifiutato.
+    current, _, cp, *_ = case(migrated)
+    payload = v2_request()
+    payload['execution_policy'] = V3['execution_policy']
+    payload['models']['capo']['reasoning_effort'] = 'medium'
+    ident = current.create_run(payload, idempotency_key='p-g7-tetto')['run']['id']
+    token = current.claim_run(ident)
+    save_cp(current, ident, token, cp)
+    snapshot = catalog()
+    snapshot['models']['capo']['max_completion_tokens'] = 65536      # contratto del gate
+    budget = trade_idea.TradeIdeaBudgetGate(current, ident, token, snapshot, catalog_fetcher=lambda: snapshot)
+    call = {**_capo_call(), 'thinking': {'type': 'effort', 'effort': 'medium'}}
+    with pytest.raises(ValueError, match='differs from the accepted execution policy'):
+        budget._reserve({**call, 'max_tokens': 40000}, 'capo')
+    # Il cap adattato supera il controllo della policy; si ferma solo piu' avanti, al confronto col
+    # checkpoint del Capo di questo caso sintetico (salvato a 32768): non e' il controllo in prova.
+    from bellomberg.storage.trade_idea_store import RunConflict
+    with pytest.raises(RunConflict, match='Capo request checkpoint'):
+        budget._reserve({**call, 'max_tokens': 65536}, 'capo')
+
+
 # T2 ---------------------------------------------------------------------------------
 def test_p_t2_v3_finalization_grant_keeps_medium_and_full_room(migrated, monkeypatch):
     import test_trade_idea_paid_capo_checkpoint as paid
@@ -344,3 +367,27 @@ def test_p_t2_v3_finalization_grant_keeps_medium_and_full_room(migrated, monkeyp
     accepted = current.accepted_capo_finalization(child['run']['id'])
     assert accepted['thinking'] == {'type': 'effort', 'effort': 'medium'}
     assert accepted['max_tokens'] >= body['max_tokens']
+
+
+def test_p_g7_finalizzazione_capo_al_cap_adattato(migrated):
+    # R-MOD F3 (06/10): la finalizzazione autorizzata del Capo (128000) con un modello del contratto
+    # a tetto 65536 parte a 65536 (adattato); ogni altro cap resta rifiutato dalla guardia.
+    current, _, cp, *_ = case(migrated)
+    payload = v2_request()
+    payload['execution_policy'] = V3['execution_policy']
+    payload['models']['capo']['reasoning_effort'] = 'medium'
+    ident = current.create_run(payload, idempotency_key='p-g7-fin')['run']['id']
+    token = current.claim_run(ident)
+    save_cp(current, ident, token, cp)
+    snapshot = catalog()
+    snapshot['models']['capo']['max_completion_tokens'] = 65536
+    budget = trade_idea.TradeIdeaBudgetGate(current, ident, token, snapshot, catalog_fetcher=lambda: snapshot)
+    thinking = {'type': 'effort', 'effort': 'medium'}
+    budget.capo_finalization = lambda: {'max_tokens': 128000, 'thinking': thinking}
+    call = {**_capo_call(), 'thinking': thinking}
+    with pytest.raises(ValueError, match='Authorized finalization permits only'):
+        budget._reserve({**call, 'max_tokens': 40000}, 'capo')
+    try:
+        budget._reserve({**call, 'max_tokens': 65536}, 'capo')
+    except Exception as exc:     # si ferma piu' avanti (checkpoint sintetico), non sulla finalizzazione
+        assert 'finalization' not in str(exc), exc

@@ -4,6 +4,7 @@ from functools import partial
 import json
 from types import SimpleNamespace
 import pytest
+from _trade_idea_contratto import contratto_default  # MOD-TI 06/10: contratto dei gate finti
 from bellomberg.agents import trade_idea,red_team
 from bellomberg.core import llm_client
 from bellomberg.core.llm_client import Messaggio,TextBlock,ThinkingBlock,Usage
@@ -95,7 +96,7 @@ def native(review_board,monkeypatch,corrected,*,stop="end_turn",text=True,cost=0
     response=Messaggio("received-native-corrector",model,[ThinkingBlock("synthetic reasoning never printed")]+([TextBlock(json.dumps(corrected))] if text else []),
         stop,usage=Usage(10,5,0,0,reasoning_tokens=0,cost_usd=cost))
     def create(**kwargs):calls.append(kwargs);return response
-    review_board.budget_gate=SimpleNamespace(wrap_client=lambda client,role:roles.append(role) or client)
+    review_board.budget_gate=SimpleNamespace(catalog_snapshot=contratto_default(), wrap_client=lambda client,role:roles.append(role) or client)
     monkeypatch.setattr(llm_client,"OpenRouterClient",lambda **kw:SimpleNamespace(messages=SimpleNamespace(create=create)))
     original=json.dumps(review())
     result=trade_idea._run_exact_model_red_team(review_board,None,partial(red_team.run_red_team,citation_correction=original))

@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from _trade_idea_contratto import contratto_default  # MOD-TI 06/10: contratto dei gate finti
 
 from bellomberg.agents import trade_idea
 from bellomberg.agents.specialists.base import Blackboard, Specialist
@@ -102,7 +103,7 @@ def test_independent_research_hides_every_other_desk(tmp_path, round_n, desk):
 def test_independent_research_cannot_read_another_desk_through_tool(tmp_path, round_n, desk):
     board = Blackboard(memory_db=None, memo_id=None, heartbeat_path=tmp_path / "hb.json",
                        run_scope="trade_idea", run_id="isolated", target_ticker="TEST",
-                       budget_gate=SimpleNamespace(wrap_client=lambda client, role: client))
+                       budget_gate=SimpleNamespace(catalog_snapshot=contratto_default(), wrap_client=lambda client, role: client))
     board.independent_round = 1
     board.current_round = round_n
     board.model_phase = "research"
@@ -157,7 +158,7 @@ def test_revision_tool_never_mutates_or_regenerates_the_model(tmp_path, monkeypa
     from bellomberg.agents import chat_tools
     board = Blackboard(memory_db=None, memo_id=None, heartbeat_path=tmp_path / "hb.json",
         run_scope="trade_idea", run_id="isolated", target_ticker="TEST",
-        budget_gate=SimpleNamespace(wrap_client=lambda client, role: client))
+        budget_gate=SimpleNamespace(catalog_snapshot=contratto_default(), wrap_client=lambda client, role: client))
     board.valuation_results["TEST"] = {"ticker": "TEST", "snapshot_id": "original",
         "generation_id": "g-original", "valuation_usability": {"usable": True},
         "request_origin": "trade-idea-orchestrator"}
@@ -302,7 +303,7 @@ def test_red_team_retrieval_has_a_real_bound_receipt(tmp_path, monkeypatch):
         "ok": True, "data": {"var_99_1d_pct": -1.2, "as_of": "2026-09-27"}, "_source": "synthetic EUR history"})
     board = Blackboard(memory_db=None, memo_id=None, heartbeat_path=tmp_path / "hb.json",
         run_scope="trade_idea", run_id="isolated", target_ticker="TEST",
-        budget_gate=SimpleNamespace(wrap_client=lambda client, role: client))
+        budget_gate=SimpleNamespace(catalog_snapshot=contratto_default(), wrap_client=lambda client, role: client))
     board.write("fundamentals", 1, "Independent synthetic analysis")
     assert red_team.run_red_team(board)
     assert len(calls) == 2

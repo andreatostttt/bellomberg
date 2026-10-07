@@ -8,6 +8,7 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
+from _trade_idea_contratto import contratto_default  # MOD-TI 06/10: contratto dei gate finti
 
 from bellomberg.agents import trade_idea
 from bellomberg.core.language import language_context
@@ -332,7 +333,7 @@ def test_short_no_tool_specialist_response_has_no_paid_retry(tmp_path, monkeypat
                 stop_reason="end_turn", usage=Usage(input_tokens=10, output_tokens=8,
                     cache_read_input_tokens=0, cache_creation_input_tokens=0, cost_usd=0.0001))
 
-    gate = SimpleNamespace(wrap_client=lambda client, role: client)
+    gate = SimpleNamespace(catalog_snapshot=contratto_default(), wrap_client=lambda client, role: client)
     board = Blackboard(memory_db=None, memo_id=None,
         heartbeat_path=tmp_path / "heartbeat.json", run_scope="trade_idea",
         run_id="synthetic", target_ticker="TEST", pm_view="Thesis",
@@ -660,7 +661,7 @@ def test_capo_without_exact_reviewed_excel_stops_before_any_provider_call(tmp_pa
         payload.pop(key, None)
     stream_calls = []
     client = SimpleNamespace(messages=SimpleNamespace(stream=lambda **kwargs: stream_calls.append(kwargs)))
-    gate = SimpleNamespace(wrap_client=lambda client, role: client)
+    gate = SimpleNamespace(catalog_snapshot=contratto_default(), wrap_client=lambda client, role: client)
     monkeypatch.setattr(mandato_pm, "blocco_prompt", lambda mandate: "Synthetic mandate")
     monkeypatch.setattr(chat_tools, "_compatta_portfolio_live", lambda portfolio: {"status": "synthetic"})
     with language_context("en"):
@@ -711,7 +712,7 @@ def test_capo_native_timeout_follows_cap_and_injected_client_is_untouched(model_
         raise ReachedBudgetGate("No provider dispatch in this constructor test")
 
     monkeypatch.setattr(trade_idea, "OpenRouterClient", constructor)
-    model_board.budget_gate = SimpleNamespace(wrap_client=wrap)
+    model_board.budget_gate = SimpleNamespace(catalog_snapshot=contratto_default(), wrap_client=wrap)
     with pytest.raises(ReachedBudgetGate):
         trade_idea.run_trade_idea_capo(model_board, portfolio={}, mandate={},
             client=supplied if injected else None)

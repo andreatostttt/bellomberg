@@ -85,12 +85,14 @@ def test_weekly_64k_request_cannot_exceed_provider_completion_cap(tmp_path):
             'top_provider': {'max_completion_tokens': 32768},
             'pricing': {'prompt': '0.000001', 'completion': '0.000002'}})
     client = OpenRouterClient(api_key='offline', trasporto=httpx.MockTransport(send))
+    # MOD-CAP (06/10, decisione PM): il cap richiesto oltre il tetto del provider non e' piu'
+    # rifiutato: si ADATTA (dichiarato) e non supera mai il tetto sul filo.
     with request_scope(journal, phase='weekly', agent='fundamentals', round_n=1):
-        with pytest.raises(ValueError, match='completion|cap|output'):
-            client.messages.create(model='test/review-model', max_tokens=64000,
-                                   messages=[{'role': 'user', 'content': 'Frozen source context'}])
-    assert not dispatches
-    assert journal.summary()['request_count'] == 0
+        client.messages.create(model='test/review-model', max_tokens=64000,
+                               messages=[{'role': 'user', 'content': 'Frozen source context'}])
+    import json
+    assert [json.loads(r.content)['max_tokens'] for r in dispatches] == [32768]
+    assert journal.summary()['request_count'] == 1
 
 
 def test_trade_idea_source_pin_and_dossier_cannot_regress_after_delayed_callback(tmp_path, monkeypatch):
@@ -121,7 +123,7 @@ def test_trade_idea_source_pin_and_dossier_cannot_regress_after_delayed_callback
     board = SimpleNamespace(run_id='trade-idea-concurrent-sources', source_admission=admission,
         source_qualification=deepcopy(admission), data={}, _lock=RLock(), current_round=0,
         model_roots=[tmp_path / 'run'], valuation_results={},
-        budget_gate=SimpleNamespace(store=SimpleNamespace(get_run=lambda run_id: {'run': {}})))
+        budget_gate=SimpleNamespace(catalog_snapshot=__import__('_trade_idea_contratto').contratto_default(), store=SimpleNamespace(get_run=lambda run_id: {'run': {}})))
     board.persist_run_checkpoint = lambda event: snapshots.append(deepcopy(board.data))
     transport = FrozenTransport({
         '/investors/report.html': (html(TEXT), 'text/html'),

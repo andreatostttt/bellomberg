@@ -1199,11 +1199,146 @@ CHECKPOINT_GRUPPO_S = 2.0
 DURATA_MAX_STREAM_S = 7200.0
 
 
+# ============================================================================ tetto di uscita
+# DECISIONE PM 06/10 (MOD-CAP, Opus 5.5): «di default 128.000, ma se lancio un modello con un
+# tetto minore si adatta in automatico nella chiamata». Chi mette in .env un modello con
+# top_provider.max_completion_tokens < richiesti (es. google/gemini-3.8-flash, 65536) si
+# vedeva rifiutare OGNI chiamata dal controllo prezzi (o dal fornitore). Punto UNICO: ogni
+# richiesta del client passa di qui prima del preventivo del registro e dell'invio.
+#   - dentro una run: listino dal registro richieste (metadati_modello: UNA lettura per run,
+#     lo stesso listino del controllo prezzi);
+#   - fuori run (chat, notizie...): Models API letta e memorizzata per processo, TTL su
+#     orologio monotonico; un guasto di lettura si memorizza per poco e si DICHIARA: resta il
+#     valore richiesto (nessun preventivo a valle: decide il fornitore);
+#   - proprietario ESTERNO della contabilita' (request_scope(None, ...): Trade Idea, preparer):
+#     il corpo e' gia' fissato dal suo contratto e dal suo hash, qui non si tocca; quel
+#     proprietario adatta col suo listino congelato (tetto_uscita(..., tetto_provider=)).
+# Dichiarato UNA volta per (ruolo, modello) per processo.
+TETTO_USCITA_DEFAULT = 128000      # il default del PM per comitato/Capo/Red Team/Trade Idea
+LISTINO_TTL_S = 900.0
+LISTINO_GUASTO_TTL_S = 60.0
+_LISTINO_PROCESSO = {}            # modello -> (istante monotonico, metadati | None, tipo eccezione)
+_LISTINO_LOCK = __import__("threading").Lock()
+_TETTI_DICHIARATI = set()
+
+
+def _dichiara_tetto(chiave, riga):
+    with _LISTINO_LOCK:
+        if chiave in _TETTI_DICHIARATI:
+            return
+        _TETTI_DICHIARATI.add(chiave)
+    try:
+        print("[llm_client] " + riga)
+    except OSError:
+        pass
+
+
+def _listino_fuori_run(model):
+    """Metadati del modello dalla Models API, memorizzati per processo (TTL monotonico).
+    Solleva l'eccezione della lettura (anche quella memorizzata, finche' dura il suo TTL)."""
+    adesso = time.monotonic()
+    with _LISTINO_LOCK:
+        voce = _LISTINO_PROCESSO.get(model)
+    if voce is not None:
+        istante, meta, guasto = voce
+        if meta is not None and adesso - istante < LISTINO_TTL_S:
+            return meta
+        if meta is None and adesso - istante < LISTINO_GUASTO_TTL_S:
+            raise LookupError("lettura del listino fallita da poco (" + guasto + ")")
+    from bellomberg.valuation.preparation_ai import live_metadata
+    try:
+        meta = live_metadata(model)
+    except Exception as exc:
+        with _LISTINO_LOCK:
+            _LISTINO_PROCESSO[model] = (time.monotonic(), None, type(exc).__name__)
+        raise
+    with _LISTINO_LOCK:
+        _LISTINO_PROCESSO[model] = (time.monotonic(), meta, None)
+    return meta
+
+
+def _ruolo_dello_scope(scope):
+    if not scope:
+        return "chiamata fuori run"
+    parti = [str(scope.get(k)) for k in ("phase", "agent") if scope.get(k) not in (None, "")]
+    if scope.get("round_n") is not None:
+        parti.append("R" + str(scope.get("round_n")))
+    return "/".join(parti) or "run"
+
+
+def tetto_provider_letto(model):
+    """(tetto, origine) del modello: tetto = top_provider.max_completion_tokens (int > 0) o None;
+    origine dice da dove (o perche' manca). Dentro una run dal registro richieste, fuori dalla
+    cache di processo. Non solleva: il guasto e' nell'origine (solo il tipo, mai il testo)."""
+    scope = current_request_scope()
+    registro = (scope or {}).get("journal")
+    try:
+        if registro is not None and hasattr(registro, "tetto_congelato"):
+            # R-MOD F1: tetto CONGELATO per la run al primo uso (riprese = stesso corpo).
+            tetto, gia = registro.tetto_congelato(model)
+            meta = {"top_provider": {"max_completion_tokens": tetto}}
+            origine = "listino della run" + (" (congelato)" if gia else "")
+        elif registro is not None:
+            meta, gia_letto = registro.metadati_modello(model)
+            origine = "listino della run, non congelato" + (" (gia' letto)" if gia_letto else "")
+        else:
+            meta = _listino_fuori_run(model)
+            origine = "Models API (cache di processo)"
+    except Exception as exc:
+        return None, "listino non letto (" + type(exc).__name__ + ")"
+    tetto = ((meta or {}).get("top_provider") or {}).get("max_completion_tokens") if isinstance(meta, dict) else None
+    if type(tetto) is not int or tetto <= 0:
+        return None, "listino senza top_provider.max_completion_tokens"
+    return tetto, origine
+
+
+def tetto_uscita(model, richiesti, *, ruolo, tetto_provider=None):
+    """max_tokens effettivo = min(richiesti, tetto del provider). Con `tetto_provider` (int, es.
+    il listino congelato nel contratto di una Trade Idea) non legge nulla. Tetto non leggibile:
+    resta `richiesti`, DICHIARATO (dentro una run il preventivo del registro decide comunque
+    prima di qualsiasi spesa)."""
+    if type(richiesti) is not int or richiesti <= 0:
+        raise TypeError("max_tokens deve essere un intero positivo, non " + repr(richiesti))
+    if tetto_provider is None:
+        tetto, origine = tetto_provider_letto(model)
+    elif type(tetto_provider) is int and tetto_provider > 0:
+        tetto, origine = tetto_provider, "listino del contratto"
+    else:
+        raise TypeError("tetto_provider deve essere un intero positivo, non " + repr(tetto_provider))
+    if tetto is None:
+        _dichiara_tetto((ruolo, model, "n.d."), str(ruolo) + ": tetto di uscita di " + str(model)
+                        + " non verificato (" + origine + "): uso i " + str(richiesti) + " richiesti")
+        return richiesti
+    if tetto < richiesti:
+        _dichiara_tetto((ruolo, model, richiesti, tetto), str(ruolo) + ": richiesti " + str(richiesti)
+                        + " token, " + str(model) + " ne accetta " + str(tetto) + ": uso " + str(tetto)
+                        + " [" + origine + "]")
+        return tetto
+    return richiesti
+
+
+def _corpo_al_tetto(body, scope, trasporto_di_prova):
+    """Il corpo con max_tokens adattato al tetto del provider (copia), o il corpo stesso."""
+    if scope is not None and scope.get("journal") is None:
+        return body   # proprietario esterno: il suo contratto fissa il corpo (vedi sopra)
+    richiesti = body.get("max_tokens")
+    if type(richiesti) is not int or richiesti <= 0:
+        return body
+    if scope is None and trasporto_di_prova:
+        # Client costruito con trasporto=MockTransport (solo test): fuori run nessuna lettura
+        # della Models API vera. In produzione `trasporto` e' sempre None.
+        return body
+    effettivo = tetto_uscita(body.get("model"), richiesti, ruolo=_ruolo_dello_scope(scope))
+    return body if effettivo == richiesti else {**body, "max_tokens": effettivo}
+
+
 class _RequestAttempt:
     """Bind the existing SDK surface to its durable accounting owner."""
-    def __init__(self, body):
+    def __init__(self, body, trasporto_di_prova=False):
         scope = current_request_scope()
         self.journal = scope.get("journal") if scope else None
+        richiesto = body
+        body = _corpo_al_tetto(body, scope, trasporto_di_prova)
         self.request_id, self.body, self.saved = None, body, None
         self.finished = False
         self.released = None  # KA: secondi d'attesa se chiusa come certamente non fatturata
@@ -1214,7 +1349,11 @@ class _RequestAttempt:
         self._pending = []
         self._last_flush = time.monotonic()
         if self.journal is not None:
-            self.request_id, self.body, self.saved = self.journal.prepare(body, scope)
+            # Una richiesta gia' registrata col max_tokens RICHIESTO (inviata/pagata prima che
+            # il tetto si adattasse) si rigioca o blocca col suo corpo: mai rimandata diversa.
+            precedenti = [richiesto] if body is not richiesto else []
+            self.request_id, self.body, self.saved = self.journal.prepare(
+                body, scope, **({"forme_precedenti": precedenti} if precedenti else {}))
             self.finished = self.saved is not None
 
     def flush(self):
@@ -1376,7 +1515,7 @@ class _Messages:
         corpo_base = costruisci_corpo(stream=False, **kw)
         rilasciati = []
         while True:  # KA: al piu' UN nuovo tentativo, solo dopo un guasto certamente non fatturato
-            attempt = _RequestAttempt(corpo_base)
+            attempt = _RequestAttempt(corpo_base, getattr(self._c, "_trasporto_di_prova", True))
             corpo = attempt.body
             forzato = _voleva_spento(kw) and corpo.get("reasoning") == REASONING_MINIMO
             data = None
@@ -1418,6 +1557,7 @@ class OpenRouterClient:
         self.timeout = float(timeout)
         self.max_retries = int(max_retries)
         self._http = _nuovo_client_http(self.timeout, trasporto)
+        self._trasporto_di_prova = trasporto is not None   # solo test (vedi _corpo_al_tetto)
         self.messages = _Messages(self)
 
     # -- una POST con retry sugli status/errori transitori; ritorna la Response (status < 400)
@@ -1483,7 +1623,7 @@ class _StreamSync:
         rilasciati = []
         while True:  # KA: al piu' UN nuovo tentativo, solo dopo un guasto certamente non fatturato
             if self._attempt is None:
-                self._attempt = _RequestAttempt(self._corpo_base)
+                self._attempt = _RequestAttempt(self._corpo_base, getattr(self._c, "_trasporto_di_prova", True))
                 self._corpo = self._attempt.body
             if self._attempt.saved is not None:
                 self._resp = _saved_stream_response(self._attempt.saved)
@@ -1580,7 +1720,10 @@ class _MessagesAsync:
         corpo_base = costruisci_corpo(stream=False, **kw)
         rilasciati = []
         while True:  # KA: al piu' UN nuovo tentativo, solo dopo un guasto certamente non fatturato
-            attempt = _RequestAttempt(corpo_base)
+            # R-MOD F2: la lettura del listino (rete, fino a 30 s) e il registro non girano sul
+            # thread del loop di eventi (chat SSE del backend): thread a parte, contesto copiato.
+            attempt = await asyncio.to_thread(_RequestAttempt, corpo_base,
+                                              getattr(self._c, "_trasporto_di_prova", True))
             corpo = attempt.body
             forzato = _voleva_spento(kw) and corpo.get("reasoning") == REASONING_MINIMO
             data = None
@@ -1622,6 +1765,7 @@ class AsyncOpenRouterClient:
         self.timeout = float(timeout)
         self.max_retries = int(max_retries)
         self._http = _nuovo_client_http_async(self.timeout, trasporto)
+        self._trasporto_di_prova = trasporto is not None   # solo test (vedi _corpo_al_tetto)
         self.messages = _MessagesAsync(self)
 
     async def _invia(self, corpo, stream=False, retry=None):
@@ -1686,7 +1830,8 @@ class _StreamAsync:
         rilasciati = []
         while True:  # KA: al piu' UN nuovo tentativo, solo dopo un guasto certamente non fatturato
             if self._attempt is None:
-                self._attempt = _RequestAttempt(self._corpo_base)
+                self._attempt = await asyncio.to_thread(   # R-MOD F2 (vedi create)
+                    _RequestAttempt, self._corpo_base, getattr(self._c, "_trasporto_di_prova", True))
                 self._corpo = self._attempt.body
             if self._attempt.saved is not None:
                 self._resp = _saved_stream_response(self._attempt.saved)
@@ -1806,6 +1951,10 @@ def _sonda_modelli(slugs, client, max_tokens, timeout_s):
         return esiti
     if client is None:
         client = OpenRouterClient(timeout=timeout_s, max_retries=0)
+    # MOD-CAP: il tetto di uscita letto per ogni modello (listino della run, o Models API col
+    # client vero) e l'adattamento che subiranno le richieste al default del PM.
+    leggi_tetto = ((current_request_scope() or {}).get("journal") is not None
+                   or not getattr(client, "_trasporto_di_prova", True))
     for s in distinti:
         t0 = time.perf_counter()
         try:
@@ -1824,6 +1973,13 @@ def _sonda_modelli(slugs, client, max_tokens, timeout_s):
                         "request_id": getattr(e, "request_id", None), "cost_usd": None,
                         "motivo": (type(e).__name__ + ": " + str(e))[:300],
                         "durata_s": round(time.perf_counter() - t0, 2)}
+        if leggi_tetto:
+            tetto, origine = tetto_provider_letto(s)
+        else:
+            tetto, origine = None, "non letto (client di prova senza registro)"
+        esiti[s].update(tetto_uscita=tetto, tetto_origine=origine, adattamento=(
+            "richieste oltre %d token ridotte a %d (default %d -> %d)" % (tetto, tetto, TETTO_USCITA_DEFAULT, tetto)
+            if tetto is not None and tetto < TETTO_USCITA_DEFAULT else None))
     return esiti
 
 
@@ -1831,8 +1987,15 @@ def righe_log_sonda(esiti):
     """Righe di log '[OK] slug (0.8s)' / '[KO] slug: motivo', una per slug."""
     righe = []
     for s, e in (esiti or {}).items():
-        if e.get("ok"):
-            righe.append("[OK] modello %s (%ss)" % (s, e.get("durata_s", "?")))
+        if "tetto_origine" not in e:
+            tetto = ""
+        elif e.get("tetto_uscita") is None:
+            tetto = " - tetto di uscita n.d. (%s)" % e.get("tetto_origine")
         else:
-            righe.append("[KO] modello %s: %s" % (s, e.get("motivo") or "causa n.d."))
+            tetto = " - tetto di uscita %d [%s]%s" % (e["tetto_uscita"], e.get("tetto_origine"),
+                                                     ": " + e["adattamento"] if e.get("adattamento") else "")
+        if e.get("ok"):
+            righe.append("[OK] modello %s (%ss)%s" % (s, e.get("durata_s", "?"), tetto))
+        else:
+            righe.append("[KO] modello %s: %s%s" % (s, e.get("motivo") or "causa n.d.", tetto))
     return righe
