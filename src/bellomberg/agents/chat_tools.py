@@ -533,6 +533,99 @@ def _stamp(payload: Any, source: str) -> Dict[str, Any]:
     return result
 
 
+def _con_ultimo_periodo(payload: Any, ticker: str, as_of: Any = None, caller: Any = None) -> Any:
+    """FRESCHEZZA (06/10/2026): numeri dell'ULTIMO periodo pubblicato (cascata SEC / archivio Filing /
+    comunicato dell'emittente / fornitore dati) con fonte, period_end e filing_date nella ricevuta del
+    tool: cosi' il desk li cita come attestati. Mai solleva; una lacuna arriva dichiarata."""
+    if not isinstance(payload, dict):
+        return payload
+    from bellomberg.market_data.freschezza_trimestrale import blocco_per_tool, _data
+    # R-CASCATA (07/10): IN TESTA, perche' il taglio del tetto cade in coda. Il cancello della Trade Idea
+    # (trade_idea._bound_evidence_details) per questi due tool cerca data E numero solo dentro questo blocco
+    # e solo con stato «aggiornato»: il TTM di yfinance o i ricavi di un anno vecchio non si legano alla data.
+    # main 07/10: nelle run (desk, Red Team) nessun tetto complessivo; solo la chat ha il tetto
+    in_run = isinstance(caller, str) and (caller.startswith("specialista-run") or caller == "red-team")
+    blocco = blocco_per_tool(ticker, oggi=_data(as_of) if as_of else None, in_run=in_run)
+    if isinstance(blocco, dict):
+        # dichiarato: a quale data e' calcolato (la weekly non ha un cutoff: oggi). Chiave non economica.
+        blocco["calcolato_al"] = (str(as_of)[:10] + " (cutoff della run)" if as_of
+                                  else datetime.now().date().isoformat() + " (oggi: nessun cutoff della run passato al tool)")
+    return _compatta_financial_history({"ultimo_periodo_pubblicato": blocco,
+                                        **{k: v for k, v in payload.items() if k != "ultimo_periodo_pubblicato"}})
+
+
+# La funzione vive in freschezza_trimestrale (SUITE-PRE 07/10): i chiamanti (desk, Red Team) la importano
+# da li', cosi' un chat_tools finto nei test non manda tutto al dispatcher legacy. Qui resta il nome.
+from bellomberg.market_data.freschezza_trimestrale import as_of_freschezza  # noqa: E402,F401
+
+
+# Ordine in cui si dimagrisce una ricevuta di get_financial_history / get_fundamentals (R-CASCATA, 07/10,
+# ordine deciso da main): anni oltre gli ultimi 4 -> derived -> tags_used/units -> SOLO per ultimi i
+# trimestri oltre gli ultimi 4 (i trimestri sono lo scopo del lavoro). Il blocco ultimo_periodo_pubblicato
+# resta sempre intero; da_cache, companyfacts_letto_il, index_note (l'eta' del dato) non si toccano mai.
+# Obiettivo: 85% del tetto, perche' una ricevuta al 99% si rompe al primo dato in piu'.
+_ANNI_MINIMI = 4
+_TRIMESTRI_MINIMI = 4
+QUOTA_TETTO_FH = 0.85
+
+
+def _compatta_financial_history(r: Dict[str, Any]) -> Dict[str, Any]:
+    obiettivo = int(TETTO_TOOL_RESULT * QUOTA_TETTO_FH)
+    if _e_errore(r) or _peso_json(r) + _BUSTA_STAMP <= obiettivo:
+        return r
+    # `_vista` subito dopo il blocco datato: entrambi in testa, prima di qualsiasi taglio in coda
+    out: Dict[str, Any] = {}
+    if "ultimo_periodo_pubblicato" in r:
+        out["ultimo_periodo_pubblicato"] = r["ultimo_periodo_pubblicato"]
+    out["_vista"] = ""
+    out.update({k: v for k, v in r.items() if k != "ultimo_periodo_pubblicato"})
+    tolti: List[str] = []
+
+    def sta():
+        out["_vista"] = ("COMPATTA per gli agenti (la ricevuta piena supera l'85%% del tetto di %d char): tolti %s."
+                         % (TETTO_TOOL_RESULT, "; ".join(tolti) or "nulla"))
+        return _peso_json(out) + _BUSTA_STAMP <= obiettivo
+
+    def anni():
+        tenuti = sorted(out["years"])[-_ANNI_MINIMI:]
+        chiavi = set(tenuti) | {str(y) for y in tenuti}
+        out["items"] = {k: {y: v for y, v in serie.items() if y in chiavi}
+                        for k, serie in out["items"].items() if isinstance(serie, dict)}
+        if isinstance(out.get("derived"), dict):
+            out["derived"] = {k: {y: v for y, v in serie.items() if y in chiavi}
+                              for k, serie in out["derived"].items() if isinstance(serie, dict)}
+        out["years"] = tenuti
+
+    def trimestri():
+        tenuti = sorted(out["quarter_ends"])[-_TRIMESTRI_MINIMI:]
+        out["quarters"] = {k: {e: v for e, v in serie.items() if e in tenuti} for k, serie in out["quarters"].items()}
+        out["quarter_ends"] = tenuti
+
+    passi = []
+    if isinstance(out.get("items"), dict) and isinstance(out.get("years"), list) and len(out["years"]) > _ANNI_MINIMI:
+        passi.append(("anni anteriori agli ultimi %d in items/derived (non presenti in questa ricevuta)"
+                      % _ANNI_MINIMI, anni))
+    if "derived" in out:
+        passi.append(("`derived` (margini/payout/FCF degli anni restanti: ricalcolabili da items)",
+                      lambda: out.pop("derived", None)))
+    if "tags_used" in out:
+        # `units` (la valuta delle voci) non si toglie MAI, come l'eta' del dato (R-CASCATA N3)
+        passi.append(("`tags_used` (tag XBRL per voce)", lambda: out.pop("tags_used", None)))
+    if isinstance(out.get("quarters"), dict) and len(out.get("quarter_ends") or []) > _TRIMESTRI_MINIMI:
+        passi.append(("trimestri anteriori agli ultimi %d" % _TRIMESTRI_MINIMI, trimestri))
+    for frase, azione in passi:
+        if sta():
+            break
+        azione()
+        tolti.append(frase)
+    if not sta():
+        out["_vista"] += (" ATTENZIONE: supera COMUNQUE l'85%% del tetto (%d char su %d)%s."
+                          % (_peso_json(out) + _BUSTA_STAMP, TETTO_TOOL_RESULT,
+                             ": la coda sara' TAGLIATA a valle" if _peso_json(out) + _BUSTA_STAMP > TETTO_TOOL_RESULT
+                             else ""))
+    return out
+
+
 def _error(msg: str, source: str) -> Dict[str, Any]:
     return {
         "_source": source,
@@ -1598,22 +1691,30 @@ def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
         if tool_name == "get_fundamentals":
             from bellomberg.agents.agent_tools import tool_get_fundamentals
             r = tool_get_fundamentals(ticker=tool_input["ticker"])
+            r = _con_ultimo_periodo(r, tool_input["ticker"], as_of, caller)
             return _stamp(r, f"yfinance via agent_tools.get_fundamentals({tool_input['ticker']})")
 
         if tool_name == "get_financial_history":
             from bellomberg.market_data.sec_xbrl import get_financial_history
-            r = get_financial_history(tool_input["ticker"], years=int(tool_input.get("years", 10)))
-            # V3 §9-sexies n.3: fallback DICHIARATO all'ESEF per i nomi EU senza SEC
-            if isinstance(r, dict) and r.get("error"):
+            # R-CASCATA (07/10): il cutoff della run (as_of) filtra anche i trimestri SEC del tool
+            r = get_financial_history(tool_input["ticker"], years=int(tool_input.get("years", 10)),
+                                      **({"fino_al": str(as_of)[:10]} if as_of else {}))
+            # V3 §9-sexies n.3: fallback DICHIARATO all'ESEF per i nomi EU senza SEC.
+            # Il blocco dell'ultimo periodo si aggiunge UNA volta, sul payload che esce (prima: due giri).
+            if not (isinstance(r, dict) and r.get("error")):
+                r = _con_ultimo_periodo(r, tool_input["ticker"], as_of, caller)
+            else:
                 try:
                     from bellomberg.market_data.esef import get_esef_history
                     r2 = get_esef_history(tool_input["ticker"], years=int(tool_input.get("years", 10)))
                     if not r2.get("error"):
                         r2["sec_note"] = "SEC non copre il ticker (%s): fonte ESEF" % r["error"]
+                        r2 = _con_ultimo_periodo(r2, tool_input["ticker"], as_of, caller)
                         return _stamp(r2, "ESEF filings.xbrl.org (" + str(tool_input["ticker"]) + ")")
                     r["esef_note"] = "anche ESEF senza dati: " + str(r2.get("error"))
                 except Exception as _e2:
                     r["esef_note"] = "fallback ESEF fallito (%s)" % type(_e2).__name__
+                r = _con_ultimo_periodo(r, tool_input["ticker"], as_of, caller)
             return _stamp(r, "SEC XBRL companyfacts (" + str(tool_input["ticker"]) + ")")
 
         if tool_name == "get_dat_metrics":

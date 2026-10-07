@@ -41,7 +41,24 @@ _TIPI_PERIODO = {'annuale': 'annuale', 'semestrale': 'semestrale', 'trimestrale'
 _FORMA_PERIODO = {'10-K': 'annuale', '10-K/A': 'annuale', '20-F': 'annuale', '20-F/A': 'annuale',
                   '40-F': 'annuale', '10-Q': 'trimestrale', '10-Q/A': 'trimestrale'}
 _CAMPI_CANDIDATO = ('url', 'path', 'sha256', 'filed_date', 'report_date', 'form', 'fonte', 'origine',
-                    'metadati', 'filing_verification')
+                    'metadati', 'filing_verification', 'regola_verifica', 'identita_verifica', 'variante',
+                    'periodo_stato', 'periodi_visti', 'etichetta', 'tipo_documento', 'via_host',
+                    'periodo_fiscale', 'sito_ir', 'sito_ir_origine')
+# APERTO-TI (decisione PM 06/10 «piu' aperti»): un documento scaricato ma NON verificato entra con
+# l'etichetta «non verificato: <motivo>» invece di restare fuori. Restano fuori SOLO: identita'
+# (mai documenti di un'altra societa'), l'altra lingua dello stesso deposito, i duplicati e i
+# candidati senza byte. Un non verificato NON conta come fonte primaria verificata.
+REGOLA_NON_VERIFICATI = ("documenti scaricati ma non verificati, piu' recenti dell'ultimo verificato scelto "
+                         "(al massimo %d): ammessi con etichetta «non verificato: <motivo>», mai fonte primaria "
+                         "verificata; esclusi identita' diversa, altra lingua, duplicati e righe senza byte; gli avvisi "
+                         "«non applicabile» occupano un posto solo dopo le relazioni non verificate")
+MAX_NON_VERIFICATI = 2
+_STATI_NON_VERIFICATI = ('non_verificato', 'non_applicabile', 'versione_ambigua', 'periodo_da_confermare')
+_MOTIVI_IDENTITA = ('emittente', 'registrante', 'identificatore xbrl', "altra entita'", 'altro soggetto',
+                    'lei nel documento', 'isin nel documento', 'collegamento da confermare',
+                    "identita' non provata")
+_MOTIVI_ALTRA_LINGUA = ('lingua catalogo', 'lingua html diversa', 'lingua del catalogo diversa',
+                        "l'altra lingua")
 
 
 def _json(value):
@@ -79,37 +96,73 @@ def _ordine(candidato):
             str(candidato.get('url') or ''), str(candidato.get('sha256') or ''))
 
 
+def _motivo_non_verificato(c):
+    """(etichetta, None) se il documento non verificato entra; (None, motivo) se resta fuori."""
+    motivi = '; '.join(map(str, c.get('motivi') or []))
+    basso = motivi.lower()
+    if not c.get('url') or not c.get('path') or not c.get('sha256'):
+        return None, "byte non conservati dall'archivio (URL, percorso o impronta assenti)"
+    if any(m in basso for m in _MOTIVI_IDENTITA):
+        return None, "identita' dell'emittente non provata: mai documenti di un'altra societa' (" + motivi[:200] + ')'
+    if any(m in basso for m in _MOTIVI_ALTRA_LINGUA):
+        return None, 'altra lingua dello stesso deposito: ' + motivi[:200]
+    if c.get('stato') == 'verificato':
+        return 'non verificato: verificato con riserve: ' + motivi[:300], None
+    return 'non verificato: ' + (motivi[:300] or 'stato ' + str(c.get('stato')) + ' senza motivo dichiarato'), None
+
+
+def _ordine_nv(candidato):
+    return (str(_periodo(candidato) or candidato.get('filed_date') or ''), str(candidato.get('filed_date') or ''),
+            str(candidato.get('url') or ''), str(candidato.get('sha256') or ''))
+
+
 def _seleziona(candidati):
     """(selezionati, non_selezionati, esclusi) in ordine deterministico."""
-    validi, esclusi = [], []
+    validi, esclusi, non_verificati = [], [], []
     for c in candidati if isinstance(candidati, list) else []:
         if not isinstance(c, dict):
             esclusi.append({'url': None, 'sha256': None, 'motivo': 'riga candidato non strutturata'})
             continue
         riga = {k: deepcopy(c[k]) for k in _CAMPI_CANDIDATO if k in c}
-        if c.get('stato') != 'verificato':
+        if c.get('stato') != 'verificato' or c.get('motivi'):
+            etichetta, fuori = (_motivo_non_verificato(c)
+                                if c.get('stato') in (*_STATI_NON_VERIFICATI, 'verificato') else (None, None))
+            if etichetta is not None:
+                non_verificati.append({**riga, 'verifica': 'non_verificato', 'etichetta_verifica': etichetta,
+                                       'periodo_stato': ('certo' if c.get('stato') == 'verificato' and _periodo(c)
+                                                         else 'da_confermare'), 'stato_archivio': c.get('stato')})
+                continue
             esclusi.append({'url': c.get('url'), 'sha256': c.get('sha256'), 'periodo': _periodo(c),
-                            'motivo': 'non verificato dall\'archivio Filing (stato ' + str(c.get('stato')) + ')'
-                            + (': ' + '; '.join(map(str, c.get('motivi') or []))[:300] if c.get('motivi') else '')})
-        elif c.get('motivi'):
-            esclusi.append({'url': c.get('url'), 'sha256': c.get('sha256'), 'periodo': _periodo(c),
-                            'motivo': 'verificato con riserve: ' + '; '.join(map(str, c['motivi']))[:300]})
+                            'motivo': (fuori + ' (stato ' + str(c.get('stato')) + ')') if fuori else (
+                                "non verificato dall'archivio Filing (stato " + str(c.get('stato')) + ')'
+                                + (': ' + '; '.join(map(str, c.get('motivi') or []))[:300] if c.get('motivi') else ''))})
         elif not _periodo(c) or not c.get('url') or not c.get('path') or not c.get('sha256'):
             esclusi.append({'url': c.get('url'), 'sha256': c.get('sha256'), 'periodo': _periodo(c),
                             'motivo': 'periodo, URL, percorso o impronta assenti nella riga dell\'archivio'})
         else:
             validi.append(riga)
     validi.sort(key=_ordine, reverse=True)
-    if not validi:
-        return [], [], esclusi
-    scelti = [validi[0]]
-    if (validi[0].get('metadati') or {}).get('tipo') != 'annuale':
+    non_verificati.sort(key=_ordine_nv, reverse=True)
+    scelti = [validi[0]] if validi else []
+    if validi and (validi[0].get('metadati') or {}).get('tipo') != 'annuale':
         annuale = next((v for v in validi[1:] if (v.get('metadati') or {}).get('tipo') == 'annuale'), None)
         if annuale is not None:
             scelti.append(annuale)
     altri = [{'url': v['url'], 'sha256': v['sha256'], 'periodo': _periodo(v),
               'motivo': 'verificato ma non selezionato (regola del ponte)'} for v in validi if v not in scelti]
-    return scelti, altri, esclusi
+    # Non verificati: solo quelli PIU' RECENTI dell'ultimo verificato scelto (colmano il buco), con tetto.
+    soglia = _ordine_nv(validi[0])[:2] if validi else None
+    recenti = [n for n in non_verificati if soglia is None or _ordine_nv(n)[:2] > soglia]
+    # R-FASE B3: i «non applicabile» (6-K di avvisi: dividendi, nomine) prendono un posto solo se ne resta uno
+    # libero dopo i non verificati veri (relazioni, periodo da confermare); ordinamento stabile, dichiarato.
+    recenti.sort(key=lambda n: n.get('stato_archivio') == 'non_applicabile')
+    for n in non_verificati:
+        if n not in recenti[:MAX_NON_VERIFICATI]:
+            altri.append({'url': n['url'], 'sha256': n['sha256'], 'periodo': _periodo(n),
+                          'motivo': n['etichetta_verifica'][:200] + ' - non selezionato: '
+                          + ("non piu' recente dell'ultimo verificato" if n not in recenti
+                             else 'oltre il tetto di %d non verificati' % MAX_NON_VERIFICATI)})
+    return recenti[:MAX_NON_VERIFICATI] + scelti, altri, esclusi
 
 
 def _tipo_strumento(registro, ticker):
@@ -140,6 +193,14 @@ def _verificati_non_usati(filing_store, ticker, tipo):
             'documenti': [{'url': c.get('url'), 'sha256': c.get('sha256'), 'periodo': _periodo(c)} for c in righe]}
 
 
+def _frase_pre_run(voce):
+    """APERTO-NUOVI: senza documenti, il perche' dell'aggiornamento pre-run fallito va nei motivi (e nell'issue)."""
+    agg = voce.get('aggiornamento_pre_run') or {}
+    if agg.get('stato') != 'non_aggiornato' or not agg.get('motivo'):
+        return []
+    return ['aggiornamento prima della run non riuscito: ' + str(agg['motivo'])[:400]]
+
+
 def selezione_ponte(filing_store, tickers, *, as_of, esiti=None, archive_root, registro_veicoli=None):
     """Funzione pura (sola lettura dell'archivio Filing): esito dichiarato per ogni titolo.
 
@@ -167,7 +228,7 @@ def selezione_ponte(filing_store, tickers, *, as_of, esiti=None, archive_root, r
             profilo = filing_store.get_profile(ticker)
             if profilo is None:
                 voce.update(esito='nessun_profilo', motivi=['archivio Filing: nessun profilo per questo titolo']
-                            + ([tipo_nd] if tipo_nd else []))
+                            + ([tipo_nd] if tipo_nd else []) + _frase_pre_run(voce))
                 voci[ticker] = voce
                 continue
             voce['profilo_attivo'] = bool(profilo.get('enabled'))
@@ -184,6 +245,7 @@ def selezione_ponte(filing_store, tickers, *, as_of, esiti=None, archive_root, r
             voce.update(esito='nessun_run_riuscito', motivi=['archivio Filing: nessun run concluso con documenti'
                         + ('; ultimo run in ' + str(ultimo.get('status')) + ': ' + str(ultimo.get('reason'))[:200]
                            if ultimo is not None else '')])
+            voce['motivi'] += _frase_pre_run(voce)
             voci[ticker] = voce
             continue
         voce['run_usato'] = {k: riuscito.get(k) for k in ('id', 'status', 'finished_at', 'reason')}
@@ -201,7 +263,9 @@ def selezione_ponte(filing_store, tickers, *, as_of, esiti=None, archive_root, r
             voce['motivi'].append('run Filing ' + str(riuscito.get('status')) + ': ' + str(riuscito['reason'])[:300])
         if isinstance(risultato.get('freschezza'), dict):
             voce['freschezza'] = {k: deepcopy(risultato['freschezza'].get(k)) for k in ('stato', 'ultimo_periodo', 'checked_at')}
-        scelti, altri, esclusi = _seleziona(risultato.get('candidati'))
+        # APERTO-TI: anche i candidati delle varianti non primarie (es. il 20-F accanto ai 6-K).
+        candidati = list(risultato.get('candidati') or []) + list(risultato.get('candidati_varianti') or [])
+        scelti, altri, esclusi = _seleziona(candidati)
         ammessi = []
         for doc in scelti:
             doc['base_origine'] = base_origine(doc)
@@ -211,24 +275,42 @@ def selezione_ponte(filing_store, tickers, *, as_of, esiti=None, archive_root, r
             try:
                 # Byte ed estrazione verificati UNA volta qui (pre-R0): il sigillo tiene solo le impronte.
                 ammessi.append(_verifica(doc, archive_root, as_of))
-            except (ValueError, TypeError, KeyError, OSError) as exc:
+            except ValueError as exc:
+                if not str(exc).startswith(_PAGINE_MUTE) or doc.get('verifica') == 'non_verificato':
+                    esclusi.append({'url': doc.get('url'), 'sha256': doc.get('sha256'), 'periodo': doc.get('periodo'),
+                                    'motivo': "verifica all'ammissione fallita: " + str(exc)[:300]})
+                    continue
+                # PM 06/10 «piu' aperti»: PDF con qualche pagina senza testo = testo incompleto, ammesso
+                # con etichetta (mai fonte primaria verificata), non scartato.
+                ridotto = {**doc, 'verifica': 'non_verificato', 'stato_archivio': 'verificato',
+                           'etichetta_verifica': 'non verificato: ' + str(exc)[:200] + ' (testo incompleto)',
+                           'periodo_stato': 'certo' if doc.get('periodo') else 'da_confermare'}
+                try:
+                    ammessi.append(_verifica(ridotto, archive_root, as_of))
+                except (ValueError, TypeError, KeyError, OSError) as exc2:
+                    esclusi.append({'url': doc.get('url'), 'sha256': doc.get('sha256'), 'periodo': doc.get('periodo'),
+                                    'motivo': "verifica all'ammissione fallita: " + str(exc2)[:300]})
+            except (TypeError, KeyError, OSError) as exc:
                 esclusi.append({'url': doc.get('url'), 'sha256': doc.get('sha256'), 'periodo': doc.get('periodo'),
                                 'motivo': "verifica all'ammissione fallita: " + str(exc)[:300]})
         voce.update(documenti=ammessi, non_selezionati=altri, esclusi=esclusi)
         voce['esito'] = ('ammesso' if ammessi else 'verifica_fallita' if scelti
                          else 'nessun_documento_verificato')
+        if any(d.get('verifica') == 'non_verificato' for d in ammessi):
+            voce['documenti_non_verificati'] = sum(1 for d in ammessi if d.get('verifica') == 'non_verificato')
         if not scelti:
             voce['motivi'].append('archivio Filing: nessun documento verificato e completo nel run usato')
         elif not ammessi:
             voce['motivi'].append('archivio Filing: i documenti selezionati non superano la verifica dei byte')
         else:
-            voce['periodo_piu_recente'] = ammessi[0]['periodo']
+            voce['periodo_piu_recente'] = max((d['periodo'] for d in ammessi if d.get('periodo')), default=None)
         voci[ticker] = voce
     registro = ({'origine': 'non_consultato', 'motivo': None} if not isinstance(registro_veicoli, dict) else
                 {'origine': (registro_veicoli.get('origine') if registro_veicoli.get('origine') in ('assente', 'illeggibile')
                              else Path(str(registro_veicoli.get('origine'))).name), 'motivo': registro_veicoli.get('motivo')})
     return _sigilla({'contract': CONTRATTO, 'as_of': as_of, 'archive_root': str(Path(archive_root).resolve()),
                      'regola_selezione': REGOLA_SELEZIONE, 'soglie_eta': dict(SOGLIE_ETA),
+                     'regola_non_verificati': REGOLA_NON_VERIFICATI % MAX_NON_VERIFICATI,
                      'registro_veicoli': registro, 'stato': 'ok', 'tickers': voci})
 
 
@@ -247,7 +329,13 @@ def _eta(periodo, as_of, *, tipo=None, form=None):
 
     Nessuna soglia di giudizio: «esercizio successivo chiuso» e' un fatto di calendario (fine periodo
     + 1 anno <= cutoff), non un verdetto di obsolescenza (la soglia la decide il PM)."""
-    fine, cutoff = date.fromisoformat(periodo), date.fromisoformat(as_of)
+    cutoff = date.fromisoformat(as_of)
+    if not periodo:
+        # Periodo non noto (documento non verificato): eta' non valutabile, dichiarata.
+        return {'periodo_fine': None, 'eta_giorni_al_cutoff': None, 'esercizio_successivo_chiuso': None,
+                'fine_esercizio_successivo': None, 'tipo_periodo': None, 'soglia_mesi': None,
+                'corrente_fino_al': None, 'corrente': None}
+    fine = date.fromisoformat(periodo)
     try:
         omologo = fine.replace(year=fine.year + 1)
     except ValueError:      # 29 febbraio
@@ -284,23 +372,57 @@ def _leggi_byte(archive_root, relativo, atteso):
     return percorso, grezzo
 
 
+_PAGINE_MUTE = 'documento con pagine senza testo estraibile'
+# Decisione PM 07/10 («piu' aperti»): un PDF VERIFICATO dalla pipeline (prove di emittente, periodo e tipo nelle
+# pagine con testo, riverificate qui) resta verificato con copertine/divisorie in immagine: le pagine senza testo
+# sono una NOTA. Resta «non verificato» se le prove non reggono o se le pagine senza testo superano questa quota.
+SOGLIA_PAGINE_MUTE = 0.5
+
+
+def nota_pagine_mute(estratto):
+    mute = estratto.get('pagine_senza_testo') or []
+    return ('%d pagine senza testo (immagini) su %s: %s; prove della verifica nelle pagine con testo'
+            % (len(mute), estratto.get('pagine') or 'n.d.', str(mute[:20])))
+
+
 def _testo_verificato(doc, percorso, grezzo):
     estratto = _estrai(percorso, grezzo)
     testo = estratto.get('testo', '')
     if estratto.get('stato') not in ('ok', 'parziale') or not testo.strip():
         raise ValueError('testo non estraibile: ' + str(estratto.get('motivo')))
-    if estratto.get('pagine_senza_testo'):
-        raise ValueError('documento con pagine senza testo estraibile: ' + str(estratto['pagine_senza_testo'][:20]))
+    mute = estratto.get('pagine_senza_testo') or []
+    if mute:
+        if doc.get('verifica') == 'non_verificato':
+            return testo, estratto      # gia' dichiarato «testo incompleto»: nessuna verifica PDF del filing
+        quota = len(mute) / max(1, int(estratto.get('pagine') or 0))
+        if doc.get('filing_verification') is None:
+            raise ValueError(_PAGINE_MUTE + ': ' + str(mute[:20]) + ' (nessuna verifica PDF del filing)')
+        if quota > SOGLIA_PAGINE_MUTE:
+            raise ValueError(_PAGINE_MUTE + ': ' + str(mute[:20]) + ' (%d su %s, oltre la soglia del %d%%)'
+                             % (len(mute), estratto.get('pagine'), int(SOGLIA_PAGINE_MUTE * 100)))
     if doc.get('filing_verification') is not None:
         from bellomberg.valuation.filing_pdf_evidence import verify_filing_pdf, SCHEMA
         if estratto.get('formato') != 'pdf':
             raise ValueError('verifica PDF del filing senza byte PDF originali')
         metadati = dict(doc.get('metadati') or {})
-        metadati.update(report_start=metadati.get('periodo_inizio'), filing_verification=SCHEMA)
-        verify_filing_pdf({'id': doc['sha256'], 'url': doc['url'], 'document_sha256': doc['sha256'], 'text': testo,
-            'metadata': metadati, 'filing_verification': doc['filing_verification'],
-            'page_references': [{'pagina': p['pagina'], 'inizio': p['inizio'], 'fine': p['fine'],
-                'sha256': sha256(p['testo'].encode('utf-8')).hexdigest()} for p in estratto['riferimenti']]})
+        # APERTO-NUOVI 07/10: i metadati della verifica Filing hanno periodo_fine, non report_date, e il
+        # candidato non porta la disponibilita': senza questi ogni PDF verificato (sito IR) era scartato.
+        metadati.update(report_start=metadati.get('periodo_inizio'), filing_verification=SCHEMA,
+                        report_date=metadati.get('report_date') or metadati.get('periodo_fine'))
+        disponibile = (doc.get('available_at') or doc.get('filed_date')
+                       or (str(doc['run_concluso_il'])[:10] if doc.get('run_concluso_il') else None))
+        try:
+            # verify_filing_pdf esige ogni prova DENTRO una pagina col testo: con pagine mute e' la prova richiesta.
+            verify_filing_pdf({'id': doc['sha256'], 'url': doc['url'], 'document_sha256': doc['sha256'], 'text': testo,
+                'available_at': disponibile,
+                'metadata': metadati, 'filing_verification': doc['filing_verification'],
+                'page_references': [{'pagina': p['pagina'], 'inizio': p['inizio'], 'fine': p['fine'],
+                    'sha256': sha256(p['testo'].encode('utf-8')).hexdigest()} for p in estratto['riferimenti']]})
+        except ValueError as exc:
+            if not mute:
+                raise
+            raise ValueError(_PAGINE_MUTE + ': ' + str(mute[:20]) + '; verifica PDF non superata: '
+                             + str(exc)[:160]) from exc
     return testo, estratto
 
 
@@ -312,6 +434,11 @@ def _disponibilita(doc):
     return {'published_at': None, 'availability_basis': 'observed_download',
             'available_at': concluso.date().isoformat(),
             'retrieval': {'url': doc['url'], 'document_sha256': doc['id'], 'retrieved_at': concluso.isoformat()}}
+
+
+_CAMPI_ETICHETTA = ('verifica', 'etichetta_verifica', 'periodo_stato', 'stato_archivio', 'regola_verifica',
+                    'identita_verifica', 'variante', 'periodi_visti', 'etichetta', 'tipo_documento', 'via_host',
+                    'periodo_fiscale', 'sito_ir', 'sito_ir_origine', 'nota_pagine_senza_testo')
 
 
 def _verifica(doc, archive_root, as_of):
@@ -333,6 +460,12 @@ def _verifica(doc, archive_root, as_of):
         **_eta(doc['periodo'], as_of, tipo=(doc.get('metadati') or {}).get('tipo'), form=doc.get('form'))}
     if doc.get('filing_verification') is not None:
         ricevuta['filing_verification'] = deepcopy(doc['filing_verification'])
+    if estratto.get('pagine_senza_testo') and doc.get('verifica') != 'non_verificato':
+        ricevuta['nota_pagine_senza_testo'] = nota_pagine_mute(estratto)   # PM 07/10: nota, non declassamento
+    # APERTO-TI: regola ed etichette dichiarate dall'archivio (6-K standard, sito emittente, non verificati).
+    ricevuta.update({k: deepcopy(doc[k]) for k in _CAMPI_ETICHETTA if doc.get(k) is not None})
+    if (doc.get('metadati') or {}).get('periodo_stato') and 'periodo_stato' not in ricevuta:
+        ricevuta['periodo_stato'] = doc['metadati']['periodo_stato']
     ricevuta.update(_disponibilita(ricevuta))
     from bellomberg.valuation.document_evidence import source_dates
     source_dates({'published_at': ricevuta['published_at'], 'availability_basis': ricevuta['availability_basis'],
@@ -418,18 +551,88 @@ def ammetti_archivio_filing(bb, store, *, esiti=_NON_LETTI, aggiornamento=None, 
     return record
 
 
-def ponte_non_eseguito(bb, exc, *, log=None):
-    """Guasto del ponte: lacuna dichiarata per ogni titolo, la run prosegue (non persistita: la ripresa ritenta)."""
-    motivo = 'ponte non eseguito: ' + type(exc).__name__
+def ponte_non_eseguito(bb, exc, *, log=None, tickers=None, as_of=None, mantieni_esistente=False):
+    """Guasto del ponte: lacuna dichiarata per ogni titolo, la run prosegue.
+
+    Weekly: la ricevuta d'errore non va nel checkpoint del ponte, quindi la ripresa ritenta. Trade Idea: la ricevuta
+    vive nei dati della run, quindi nel checkpoint, e la ripresa la RIUSA (nessun nuovo tentativo).
+    ``mantieni_esistente`` (Trade Idea): una ricevuta GIA' presente e valida non viene MAI sovrascritta (revisione
+    R-FASE 07/10: in ripresa, dopo il sigillo, il dossier perdeva i documenti del ponte); si tiene quella e il guasto
+    si dichiara nel log. La weekly non lo usa: li' la ricevuta sulla lavagna puo' essere quella appena scritta da un
+    tentativo il cui checkpoint e' fallito, che va dichiarato «non eseguito» (la ripresa ritenta).
+    ``tickers``/``as_of`` (Trade Idea, APERTO-NUOVI): il titolo della Trade Idea, che non e' in research_tickers."""
     try:
-        as_of = bb.weekly_store.context['research_started_at'][:10]
+        esistente = _ricevuta_board(bb) if mantieni_esistente else None
     except Exception:
-        as_of = None
-    record = _ricevuta_errore(as_of, getattr(bb, 'research_tickers', ()) or (), 'non_eseguito', motivo)
+        esistente = None          # ricevuta assente, modificata o di altro contratto: si sostituisce, dichiarato
+    if esistente is not None:
+        if log is not None:
+            log('  [!] Ponte Filing: ' + type(exc).__name__ + ' dopo una ricevuta gia\' valida: ricevuta mantenuta')
+        return esistente
+    motivo = 'ponte non eseguito: ' + type(exc).__name__
+    if as_of is None:
+        try:
+            as_of = bb.weekly_store.context['research_started_at'][:10]
+        except Exception:
+            as_of = None
+    record = _ricevuta_errore(as_of, tickers if tickers is not None else (getattr(bb, 'research_tickers', ()) or ()),
+                              'non_eseguito', motivo)
     with bb._lock:
         bb.data[CHIAVE_BOARD] = record
     if log is not None:
         log('  [!] Ponte Filing -> dossier: ' + motivo + ' (lacuna dichiarata nel dossier)')
+    return record
+
+
+def ricevuta_minima(tickers, motivo):
+    """Ultima difesa (APERTO-NUOVI 07/10): ricevuta sigillata «ponte non eseguito» senza leggere la run."""
+    return _ricevuta_errore(None, list(tickers or ()), 'non_eseguito', str(motivo))
+
+
+MOTIVO_TRADE_IDEA = ("Trade Idea: nessun aggiornamento Filing prima della run; documenti dall'ultimo run "
+                     "Filing riuscito dell'archivio")
+
+
+def ammetti_per_trade_idea(bb, *, as_of, servizio_factory=None, registro_factory=None, log=None,
+                           aggiornamento=None):
+    """Passo pre-R0 della Trade Idea (modalita' ricerca): stesso contratto e stessa ricevuta della weekly.
+
+    La ricevuta vive nei dati della run (``bb.data['_filing_bridge']``) e quindi nel checkpoint nativo:
+    la ripresa la RIUSA, mai ricalcola. Una run ripresa con la ricerca GIA' sigillata senza ponte
+    (codice precedente) resta com'era: None, nessun documento aggiunto dopo il sigillo.
+    Mai solleva: un guasto diventa la ricevuta dichiarata «archivio in errore»."""
+    with bb._lock:
+        esistente = bb.data.get(CHIAVE_BOARD)
+        sigillata = bb.data.get('_research_thesis') is not None
+    if esistente is not None:
+        _ricevuta_board(bb)     # ripresa: ricevuta intatta o errore dichiarato, mai ricalcolo
+        return esistente
+    if sigillata:
+        return None
+    ticker = getattr(bb, 'target_ticker', None)
+    try:
+        registro = (registro_factory or _registro_predefinito)()
+    except Exception as exc:
+        registro = {'origine': 'illeggibile', 'veicoli': {}, 'motivo': type(exc).__name__}
+    try:
+        if not isinstance(ticker, str) or not ticker:
+            raise ValueError('titolo della Trade Idea assente')
+        if servizio_factory is None:
+            from bellomberg.api.filing_routes import default_service as servizio_factory
+        servizio = servizio_factory()
+        record = selezione_ponte(servizio.store, [ticker], as_of=as_of,
+                                 # APERTO-NUOVI: esito della fase documenti pre-R0 (attivazione + run Filing)
+                                 esiti={ticker: deepcopy(aggiornamento) if isinstance(aggiornamento, dict)
+                                        else {'stato': 'non_eseguito', 'motivo': MOTIVO_TRADE_IDEA}},
+                                 archive_root=servizio.archive_root, registro_veicoli=registro)
+    except Exception as exc:
+        record = _ricevuta_errore(as_of, [ticker] if isinstance(ticker, str) and ticker else [], 'errore',
+            'archivio Filing non disponibile: ' + type(exc).__name__ + ': ' + str(exc)[:200], registro)
+    with bb._lock:
+        bb.data[CHIAVE_BOARD] = deepcopy(record)
+    if log is not None:
+        n = sum(len(v.get('documenti') or []) for v in (record.get('tickers') or {}).values())
+        log('  Ponte Filing -> dossier (Trade Idea): %d documenti (%s)' % (n, record.get('stato')))
     return record
 
 
@@ -464,6 +667,9 @@ def documenti_ponte(board, ticker):
             'run_filing': doc['run_filing'], 'run_concluso_il': doc['run_concluso_il'], 'periodo': doc['periodo'],
             'path_relativo': doc['path_relativo'], 'formato': doc.get('formato'), 'pagine': doc.get('pagine'),
             'text_chars': doc['text_chars'], 'periodo_fine': doc['periodo_fine'],
+            **{k: deepcopy(doc[k]) for k in _CAMPI_ETICHETTA if k in doc},
+            # Un documento non verificato si legge e si cita ma NON e' fonte primaria verificata.
+            **({'fonte_primaria_verificata': False} if doc.get('verifica') == 'non_verificato' else {}),
             'eta_giorni_al_cutoff': doc['eta_giorni_al_cutoff'],
             'esercizio_successivo_chiuso': doc['esercizio_successivo_chiuso'],
             'fine_esercizio_successivo': doc['fine_esercizio_successivo'],
@@ -486,7 +692,11 @@ def documenti_ponte(board, ticker):
         'periodo_piu_recente': voce.get('periodo_piu_recente'), 'freschezza': deepcopy(voce.get('freschezza')),
         'documenti': [{'id': d['id'], 'periodo': d['metadata']['filing_bridge']['periodo'],
                        'eta_giorni_al_cutoff': d['metadata']['filing_bridge']['eta_giorni_al_cutoff'],
-                       'base_origine': d['metadata']['filing_bridge']['base_origine']} for d in documenti],
+                       'base_origine': d['metadata']['filing_bridge']['base_origine'],
+                       **({'verifica': 'non_verificato',
+                           'etichetta_verifica': d['metadata']['filing_bridge']['etichetta_verifica']}
+                          if d['metadata']['filing_bridge'].get('verifica') == 'non_verificato' else {})}
+                      for d in documenti],
         'motivi': list(voce.get('motivi') or []), 'esclusi': deepcopy(voce.get('esclusi') or []),
         'non_selezionati': deepcopy(voce.get('non_selezionati') or [])}
     return documenti, dichiarazione
@@ -512,8 +722,9 @@ def testo_documento(board, documento):
         if testo is None:
             sorgente = next((d for v in (record.get('tickers') or {}).values() for d in v.get('documenti') or []
                              if d['id'] == chiave), {})
-            testo, _ = _testo_verificato({'sha256': chiave, 'url': documento['url'],
-                'metadati': sorgente.get('metadati'), 'filing_verification': sorgente.get('filing_verification')},
+            testo, _ = _testo_verificato({'sha256': chiave, 'url': documento['url'], 'verifica': sorgente.get('verifica'),
+                'metadati': sorgente.get('metadati'), 'filing_verification': sorgente.get('filing_verification'),
+                'available_at': sorgente.get('available_at')},
                 percorso, grezzo)
         if sha256(testo.encode('utf-8')).hexdigest() != documento['sha256']:
             raise ValueError('testo estratto diverso da quello sigillato (sha256 atteso ' + documento['sha256'] + ')')
@@ -527,6 +738,16 @@ def testo_documento(board, documento):
 
 
 _TRONCA = 200
+
+
+def eta_dichiarata(fb):
+    """Eta' in giorni, oppure la frase dichiarata quando il periodo non ha una data (mai «n.d.» nudo
+    se l'esercizio non solare e' noto: APERTO-SITI, «Q4 FY2026» senza data inventata)."""
+    if fb.get('eta_giorni_al_cutoff') is not None:
+        return fb['eta_giorni_al_cutoff']
+    if fb.get('periodo_fiscale'):
+        return "n.d. (esercizio non solare: " + str(fb['periodo_fiscale']) + ")"
+    return 'n.d.'
 
 
 def indice_compatto(dossier):
@@ -550,9 +771,15 @@ def indice_compatto(dossier):
         fb = (d.get('metadata') or {}).get('filing_bridge')
         if fb:
             documenti.append({'id': d['id'], 'tipo': d['metadata'].get('form') or d['metadata'].get('tipo'),
-                'periodo': fb['periodo'], 'eta_giorni': fb['eta_giorni_al_cutoff'],
+                'periodo': fb['periodo'], 'eta_giorni': eta_dichiarata(fb),
                 'esercizio_successivo_chiuso': fb['esercizio_successivo_chiuso'],
                 **({'corrente': fb['corrente']} if 'corrente' in fb else {}),
+                **({'verificato': False, 'etichetta': fb.get('etichetta_verifica'),
+                    'fonte_primaria_verificata': False} if fb.get('verifica') == 'non_verificato' else {}),
+                **({'periodo_stato': fb['periodo_stato']} if fb.get('periodo_stato') else {}),
+                **({'regola_verifica': fb['regola_verifica']} if fb.get('regola_verifica') else {}),
+                **{k: fb[k] for k in ('periodo_fiscale', 'sito_ir', 'sito_ir_origine', 'nota_pagine_senza_testo')
+                   if fb.get(k)},
                 'pubblicato': d.get('published_at') or 'n.d.', 'origine': fb['base_origine']})
         else:
             documenti.append({'id': d.get('id'), 'pubblicato': d.get('published_at') or 'n.d.',
@@ -563,4 +790,9 @@ def indice_compatto(dossier):
         out['esclusi'] = len(ponte['esclusi'])
     if ponte.get('non_selezionati'):
         out['non_selezionati'] = len(ponte['non_selezionati'])
+    # Agente FRESCHEZZA (06/10): l'ultimo periodo pubblicato (cascata di fonti) arriva anche a Capo/R2/Red Team.
+    upp = dossier.get('ultimo_periodo_pubblicato')
+    if isinstance(upp, dict):
+        out['ultimo_periodo_pubblicato'] = {k: upp.get(k) for k in ('periodo_atteso', 'periodo_trovato', 'livello',
+                                                                    'etichetta', 'filing_date', 'lacuna', 'istruzione')}
     return out

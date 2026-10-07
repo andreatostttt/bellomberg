@@ -82,7 +82,7 @@ RESEARCH_NOTES_DIR = str(_RESEARCH_NOTES_DIR)
 # Peggio del taglio: la riga faceva `[:120] + "\""`, rimettendo la virgoletta di
 # CHIUSURA dopo il taglio — il troncamento si travestiva da citazione completa, e
 # il Capo nella run non ha tool per recuperare la coda.
-MAX_CHAR_FEEDBACK_PM = 2000   # stessa policy di current_facts.MAX_CHAR_TESI: sono le stesse parole
+MAX_CHAR_FEEDBACK_PM = 2000   # limite dei feedback del PM (le tesi in current_facts.MAX_CHAR_TESI sono a 4000 dal 06/10)
 # 04/10 (G6, REV2 N1/N2): marcatore della chiusura fatta dal GATE DI PUBBLICAZIONE (non dal PM)
 # quando il memo pubblicato dichiara non operativa una proposta che il registro aveva OPERATIVE.
 MARCA_CHIUSA_DAL_GATE = "[NON OPERATIVA NEL MEMO PUBBLICATO:"

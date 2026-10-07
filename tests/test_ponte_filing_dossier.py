@@ -77,7 +77,7 @@ def archivio(tmp_path):
         'candidati': [
             _cand(*q1, base_url % (2, 'zz-q1.htm'), periodo='2029-03-31', tipo='trimestrale', filed='2029-05-02', form='10-Q'),
             _cand(*bad, base_url % (4, 'zz-press.htm'), periodo='2029-07-20', tipo='trimestrale', filed='2029-07-21',
-                  form='6-K', stato='non_applicabile', motivi=['ValueError: periodo testuale assente o ambiguo']),
+                  form='6-K', stato='non_applicabile', motivi=['ValueError: emittente: prova testuale assente']),
             # stato non 'verificato' SENZA motivi e col periodo piu' recente: se entrasse, sarebbe il primo
             _cand(*dup, base_url % (5, 'zz-dup.htm'), periodo='2029-09-30', tipo='trimestrale', filed='2029-11-02',
                   form='10-Q', stato='duplicato'),
@@ -99,7 +99,8 @@ def archivio(tmp_path):
     junk = _doc(root, 'ZZVUOTO', 'zzv.htm', '<html><body>ZZVUOTO</body></html>')
     _run(store, 'ZZVUOTO', 'parziale', {'stato': 'parziale', 'motivi': [], 'candidati': [
         _cand(*junk, base_url % (7, 'zzv.htm'), periodo='2029-06-30', tipo='trimestrale', filed='2029-08-02',
-              form='6-K', stato='non_applicabile', motivi=['ValueError: tipo: prova testuale assente'])]})
+              form='6-K', stato='non_applicabile',
+              motivi=['lingua catalogo de diversa dal profilo en: documento non scaricato, nessuna traduzione'])]})
     return SimpleNamespace(store=store, archive_root=root, db=db)
 
 
@@ -158,7 +159,7 @@ def test_selezione_dichiara_un_esito_per_ogni_titolo(archivio):
     assert [d['periodo'] for d in zz['documenti']] == ['2029-06-30', '2028-12-31']
     assert [d['periodo'] for d in zz['non_selezionati']] == ['2029-03-31']
     assert [e['url'].rsplit('/', 1)[1] for e in zz['esclusi']] == ['zz-press.htm', 'zz-dup.htm']
-    assert 'non verificato' in zz['esclusi'][0]['motivo'] and 'periodo testuale' in zz['esclusi'][0]['motivo']
+    assert "identita'" in zz['esclusi'][0]['motivo'] and 'emittente' in zz['esclusi'][0]['motivo']
     assert 'stato duplicato' in zz['esclusi'][1]['motivo']
     assert any('NON AGGIORNATO' in m and 'oltre i 60 s' in m for m in zz['motivi'])
     err = voci['ZZERR']
@@ -212,7 +213,7 @@ def test_il_sigillo_vede_i_documenti_per_riferimento_e_le_lacune_dichiarate(arch
     none = dossiers['ZZNONE']
     assert none['status'] == 'research_required' and none['documents'] == []
     assert none['issues'][-1]['code'] == 'filing_archive_nessun_profilo'
-    assert dossiers['ZZVUOTO']['filing_bridge']['esclusi'][0]['motivo'].startswith('non verificato')
+    assert dossiers['ZZVUOTO']['filing_bridge']['esclusi'][0]['motivo'].startswith('altra lingua')
     assert research_reference(board)['dossier_sha256'] == sealed['dossier_sha256']
 
 
@@ -416,12 +417,17 @@ def test_pdf_dal_sito_dell_emittente(tmp_path):
               filing_verification={'schema': 'finto'})]})
     record = ponte.selezione_ponte(store, ['QQPDF.MI'], as_of='2030-01-15', archive_root=root)
     voce = record['tickers']['QQPDF.MI']
-    assert [d['periodo'] for d in voce['documenti']] == ['2029-06-30']
+    # Regola nuova (PM 06/10, APERTO-TI): l'annuale col PDF a pagina muta ENTRA, dichiarato
+    # «non verificato: ... pagine senza testo ... (testo incompleto)», mai fonte primaria verificata.
+    assert [(d['periodo'], d.get('verifica', 'verificato')) for d in voce['documenti']] == [
+        ('2029-06-30', 'verificato'), ('2028-06-30', 'non_verificato')]
+    assert 'pagine senza testo' in voce['documenti'][1]['etichetta_verifica']
+    assert 'testo incompleto' in voce['documenti'][1]['etichetta_verifica']
     doc = voce['documenti'][0]
     assert doc['formato'] == 'pdf' and doc['pagine'] == 2 and doc['base_origine'] == 'sito_emittente_non_archivio_ufficiale'
     assert doc['published_at'] is None and doc['availability_basis'] == 'observed_download'
-    # l'annuale col PDF a pagina muta e' escluso col motivo; il semestrale 2027 e' «non selezionato»
-    assert any('pagine senza testo' in e['motivo'] for e in voce['esclusi'])
+    # il semestrale 2027 e' «non selezionato»; nessun documento escluso per pagine mute
+    assert not any('pagine senza testo' in e['motivo'] for e in voce['esclusi'])
     # filing_verification falsa: la verifica del PDF lo rifiuta col motivo
     record2 = ponte.selezione_ponte(store, ['QQPDF.MI'], as_of='2030-01-15', archive_root=root)
     assert record2 == record

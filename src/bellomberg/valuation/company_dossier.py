@@ -173,6 +173,17 @@ def _research_dossier_for_board(blackboard, ticker):
             admitted_catalog = _catalog(documents, as_of) if documents else {}
             if expected_catalog != admitted_catalog:
                 raise ValueError('Research document revision differs from the admitted source dossier')
+        # APERTO-TI: ponte Filing anche nella Trade Idea (ricevuta nei dati della run, pre-R0).
+        # None = run senza ponte (codice precedente): dossier di prima, byte per byte.
+        from bellomberg.agents.ponte_filing_dossier import documenti_ponte
+        bridge = documenti_ponte(blackboard, ticker)
+        if bridge is not None:
+            bridge_documents, bridge_declaration = bridge
+            if bridge_documents and as_of != blackboard.data['_filing_bridge']['as_of']:
+                raise ValueError('Filing bridge cutoff differs from the accepted research admission')
+            acquired = {doc.get('id') for doc in documents}
+            bridge_declaration['gia_acquisiti_dal_desk'] = [doc['id'] for doc in bridge_documents if doc['id'] in acquired]
+            bridge_refs = [doc for doc in bridge_documents if doc['id'] not in acquired]
     else:
         # V1-PONTE: documenti gia' verificati dall'archivio Filing, ammessi prima di R0 con ricevuta.
         # None = run senza ponte (codice precedente) o titolo fuori perimetro: dossier di prima.
@@ -220,7 +231,7 @@ def _research_dossier_for_board(blackboard, ticker):
         result['research_revision'] = {key: deepcopy(snapshot.get(key)) for key in
             ('revision_id', 'revision_sha256', 'parent_grant_fingerprint')}
         result = _with_acquisition_diagnostics(result, snapshot)
-    if qualification is None and bridge is not None:
+    if bridge is not None:
         result['filing_bridge'] = bridge_declaration
         if not catalog and bridge_declaration['esito'] == 'non_applicabile':
             # Decisione PM 06/10: ETF/ETN/fondi non hanno un bilancio societario: non e' una ricerca mancante.
@@ -245,6 +256,21 @@ def _research_dossier_for_board(blackboard, ticker):
                           + ' (periodo piu\' recente ammesso: ' + str(bridge_declaration['periodo_piu_recente']) + ')'})
         for doc in bridge_refs:
             eta = doc['metadata']['filing_bridge']
+            if eta.get('verifica') == 'non_verificato':
+                # Decisione PM 06/10: ammesso con etichetta, leggibile e citabile, mai fonte primaria verificata.
+                result['issues'].append({'field': 'documents', 'code': 'filing_archive_documento_non_verificato',
+                    'document_id': doc['id'], 'reason': ('Documento %s del periodo %s ammesso ma %s; leggibile e '
+                    "citabile come tale, NON conta come fonte primaria verificata per la proposta operativa."
+                    % (doc['metadata'].get('form') or eta.get('tipo_documento') or 'archiviato',
+                       eta.get('periodo') or 'n.d.' if eta.get('periodo_stato') != 'da_confermare'
+                       else str(eta.get('periodo') or 'n.d.') + ' (periodo da confermare)',
+                       eta.get('etichetta_verifica') or 'non verificato'))})
+            if eta.get('eta_giorni_al_cutoff') is None:
+                from bellomberg.agents.ponte_filing_dossier import eta_dichiarata
+                result['issues'].append({'field': 'documents', 'code': 'filing_archive_eta_non_valutabile',
+                    'document_id': doc['id'], 'reason': 'Documento senza data di fine periodo: eta\' '
+                    + str(eta_dichiarata(eta)) + '; soglia di eta\' PM 06/10 non applicabile.'})
+                continue
             if eta['esercizio_successivo_chiuso']:
                 # Fatto di calendario, nessuna soglia di giudizio: la soglia di obsolescenza la decide il PM.
                 result['issues'].append({'field': 'documents', 'code': 'filing_archive_esercizio_successivo_chiuso',
@@ -275,6 +301,21 @@ def _research_dossier_for_board(blackboard, ticker):
                     'reason': row.get('reason'), 'recovery_instruction':
                         'This PM source remains unverified and outside the admitted catalog. '
                         'Report the gap; further research cannot infer financial facts from this pointer.'})
+    # FRESCHEZZA (06/10/2026): ultimo periodo pubblicato dalla cascata della fase documenti pre-R0
+    # (record nel checkpoint). Record assente o di un altro titolo: dossier di prima, byte per byte.
+    fase = (getattr(blackboard, 'data', None) or {}).get('_filing_titolo_nuovo')
+    if isinstance(fase, dict) and fase.get('ticker') == ticker:
+        from bellomberg.market_data.freschezza_trimestrale import sezione_dossier
+        sezione = sezione_dossier((fase.get('passi') or {}).get('freschezza'))
+        if sezione is not None:
+            result['ultimo_periodo_pubblicato'] = sezione
+            if sezione.get('lacuna'):
+                result['issues'].append({'field': 'latest_period', 'code': 'ultimo_periodo_lacuna',
+                    'reason': 'Ultimo periodo pubblicato non trovato: ' + str(sezione['lacuna'])})
+            elif sezione.get('livello') == 4:
+                result['issues'].append({'field': 'latest_period', 'code': 'ultimo_periodo_da_fornitore',
+                    'reason': 'Numeri del periodo %s dal fornitore dati (non filing): citarli con questa etichetta.'
+                              % sezione.get('periodo_trovato')})
     return result
 
 
@@ -387,6 +428,13 @@ def _read_document(catalog, input_, max_chars, fingerprint):
     metadata = {key: document.get(key) for key in ('sha256', 'url', 'published_at')}
     metadata.update(document_id=document['id'], source_fingerprint=fingerprint,
                     provenance='Exact admitted primary text; no new acquisition or economic approval')
+    ponte = (document.get('metadata') or {}).get('filing_bridge') or {}
+    if ponte.get('verifica') == 'non_verificato':
+        # APERTO-TI: etichetta onesta in ogni pagina letta; la ricevuta del tool non attesta numeri operativi.
+        metadata.update(fonte_primaria_verificata=False, etichetta=ponte.get('etichetta_verifica'),
+                        periodo_stato=ponte.get('periodo_stato'),
+                        provenance='Archived issuer document NOT verified (' + str(ponte.get('etichetta_verifica'))
+                                   + '); readable and citable as such, not verified primary evidence')
     return _page(text, input_, metadata, max_chars)
 
 

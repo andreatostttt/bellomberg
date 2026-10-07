@@ -1302,6 +1302,17 @@ def _calcola_guardrail_beta():
     return rb
 
 
+def _ferma_preriscaldamento():
+    """FRESCHEZZA (07/10): a fine run il preriscaldamento si ferma (niente cache ne' log dopo la fine)."""
+    try:
+        from bellomberg.market_data.freschezza_trimestrale import ferma_preriscaldamenti
+        vivi = ferma_preriscaldamenti()
+        if vivi:
+            _log("  Freschezza: preriscaldamento fermato a fine run (%d ancora in corso)" % vivi)
+    except Exception as exc:
+        _log("  [!] Freschezza: arresto del preriscaldamento non riuscito: " + type(exc).__name__)
+
+
 @scoped_language
 @paid_run_exclusive
 def run_multi_agent(*, resume_memo_id=None, delivery_only=False,
@@ -1384,9 +1395,11 @@ def run_multi_agent(*, resume_memo_id=None, delivery_only=False,
                 raise
     except BaseException:
         _chiudi_prerun_filing()  # run interrotta: nessun aggiornamento filing ancora in coda
+        _ferma_preriscaldamento()
         _LAST_WEEKLY_OUTCOME.update(store.status())
         _weekly_terminal_heartbeat(store)
         raise
+    _ferma_preriscaldamento()
     result = store.status()
     _weekly_terminal_heartbeat(store)
     _LAST_WEEKLY_OUTCOME.update(result)
@@ -1509,6 +1522,13 @@ def _run_multi_agent(store, db, *, send_email=True):
         except Exception as exc:
             bb.data["_filing_context"] = ("ARCHIVIO FILING NON DISPONIBILE: "
                                           + type(exc).__name__ + ": " + str(exc)[:200])
+        # FRESCHEZZA (07/10): preriscaldamento dell'ultimo periodo pubblicato dei titoli della run, in
+        # background (4 worker): i desk leggono dalla cache. Non blocca e non fa mai fallire la run.
+        try:
+            from bellomberg.market_data.freschezza_trimestrale import preriscalda_in_background
+            preriscalda_in_background(_filing_tickers(portfolio), as_of=bb.data.get("_data_cutoff"), log=_log)
+        except Exception as exc:
+            _log("  [!] Freschezza: preriscaldamento non avviato: " + type(exc).__name__)
         if is_research_mode(bb):
             # V1-PONTE: documenti gia' verificati dall'archivio Filing nel dossier, prima di R0 (no rete/AI).
             # Esiti del pre-run letti UNA volta (gli stessi del contesto Filing); guasto = lacuna dichiarata.
@@ -1521,8 +1541,18 @@ def _run_multi_agent(store, db, *, send_email=True):
                 _log("  [!] Ponte Filing -> dossier non eseguito: " + type(exc).__name__)
                 try:
                     _ponte.ponte_non_eseguito(bb, exc)
-                except Exception:
-                    pass
+                except Exception as exc2:
+                    # APERTO-NUOVI 07/10: mai piu' `pass` muto. Log col tipo e dichiarazione minima nel dossier.
+                    _log("  [!] Ponte Filing: lacuna non registrata dal ponte (" + type(exc2).__name__
+                         + "): dichiarazione minima nel dossier")
+                    try:
+                        bb.data[_ponte.CHIAVE_BOARD] = _ponte.ricevuta_minima(
+                            list(getattr(bb, "research_tickers", ()) or ()),
+                            "ponte non eseguito: " + type(exc).__name__ + "; lacuna registrata in forma minima ("
+                            + type(exc2).__name__ + ")")
+                    except Exception as exc3:
+                        _log("  [!] Ponte Filing: nemmeno la dichiarazione minima e' stata scritta ("
+                             + type(exc3).__name__ + "): dossier senza esito del ponte")
 
         # HEALTH-CHECK PRE-RUN (audit/07 §3, P1): il giorno del memo #42 var_contribution
         # rispondeva "insufficient history: 0 obs" e la run e' partita comunque, senza

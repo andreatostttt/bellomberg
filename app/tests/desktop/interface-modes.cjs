@@ -31,6 +31,12 @@ function fixtureData() {
       pl_eur: n * 10 - 80, pl_pct: n - 8, peso_pct: weights[i],
       prev_close: prezzoLive - 1, prev_close_ts: '2026-09-25T16:30:00Z',
       prev_close_source: 'position_prices', fx_to_eur: 1,
+      ...(n === 1 ? { tesi: 'Synthetic thesis for the detail panel.\n\nSecond paragraph, fixture only.' } : {}),
+      // Advisor limit is 4000 code points (current_facts.MAX_CHAR_TESI, Python len()). The leading
+      // emoji is 1 code point but 2 UTF-16 units: SYN02 (4001 points) is cut, SYN03 (4000 points,
+      // 4001 units) is not. SYN04 has no thesis.
+      ...(n === 2 ? { tesi: '\u{1F4C8}' + 'x'.repeat(4000) } : {}),
+      ...(n === 3 ? { tesi: '\u{1F4C8}' + 'x'.repeat(3999) } : {}),
     };
   });
   const invested = Math.round(positions.reduce((sum, p) => sum + p.valore_mercato, 0) * 100) / 100;
@@ -742,9 +748,11 @@ const { app, BrowserWindow } = require('electron');
     await waitRequestCount('/market/ohlc', ohlcBefore);
     const detail = await js(() => ({ title: document.querySelector('[data-testid="stock-detail"] .bbn-drawer-title')?.innerText || '',
       stats: document.querySelectorAll('[data-testid="stock-detail"] .bbn-stats div').length,
+      thesis: document.querySelector('[data-testid="stock-detail-thesis"] .bbn-tesi-testo')?.innerText || '',
       focusInside: document.querySelector('[data-testid="stock-detail"]').contains(document.activeElement) }));
     assert.match(detail.title, /Synthetic holding 1[\s\S]*SYN01/);
     assert.equal(detail.stats, 4);
+    assert.match(detail.thesis, /^Synthetic thesis for the detail panel\.\n\nSecond paragraph/, 'the panel shows the position thesis the advisor reads, line breaks kept');
     assert.ok(detail.focusInside, 'focus moves into the detail panel');
     const chartRequest = (await fixtureControl()).requests.filter(r => r.route === '/market/ohlc').at(-1);
     assert.equal(chartRequest?.query.ticker, 'SYN01', 'the panel fetched the selected ticker’s candles');
@@ -774,6 +782,27 @@ const { app, BrowserWindow } = require('electron');
     window.setContentSize(1440, 1100);
     await new Promise(resolve => setTimeout(resolve, 300));
     scenarios.push('a position opens its detail panel: candles for that ticker, wheel zoom, resize keeps the range, Escape returns focus');
+
+    // Thesis card states: cut beyond the advisor limit (counted in code points), within it, none.
+    const thesisNotes = {};
+    for (const ticker of ['SYN02', 'SYN03', 'SYN04']) {
+      await click(`[data-testid="dashboard-positions"] .bbn-row[data-ticker="${ticker}"]`);
+      await wait(t => (document.querySelector('[data-testid="stock-detail"] .bbn-drawer-title')?.innerText || '').includes(t)
+        && !!document.querySelector('[data-testid="stock-detail-thesis"] .bbn-drawer-note'), `stock detail for ${ticker}`, 10000, ticker);
+      thesisNotes[ticker] = await js(() => ({
+        text: document.querySelector('[data-testid="stock-detail-thesis"] .bbn-tesi-testo')?.innerText ?? null,
+        note: document.querySelector('[data-testid="stock-detail-thesis"] .bbn-drawer-note')?.innerText || '' }));
+      await js(() => document.querySelector('[data-testid="stock-detail"]').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })));
+      await wait(() => !document.querySelector('[data-testid="stock-detail"]'), `detail for ${ticker} closes`, 5000);
+    }
+    assert.match(thesisNotes.SYN02.note, /first 4[,.   ]?000 of 4[,.   ]?001 characters/,
+      `a 4001-code-point thesis declares the advisor's cut: ${JSON.stringify(thesisNotes.SYN02.note)}`);
+    assert.doesNotMatch(thesisNotes.SYN03.note, /first .* characters/, 'a 4000-code-point thesis (4001 UTF-16 units) is not cut');
+    assert.match(thesisNotes.SYN03.note, /reads on every run/, 'within the limit the card shows the usual hint');
+    assert.equal(thesisNotes.SYN04.text, null, 'no thesis, no thesis text');
+    assert.match(thesisNotes.SYN04.note, /^No thesis recorded for this stock: the advisor gets at most your latest comment on a trade \(Movements\)\./,
+      'without a thesis the card says the advisor may still get the latest trade comment');
+    scenarios.push('thesis card: cut declared beyond 4000 code points, hint within, trade-comment note without a thesis');
 
     // Theme: Light ⇄ Dark only repaints — no reads, no timers, no remount.
     const rootBefore = await js(() => { window.__bbRoot = document.querySelector('.bbn-dashboard'); return true; });

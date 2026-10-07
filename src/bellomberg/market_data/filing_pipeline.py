@@ -466,6 +466,24 @@ def _esegui_singolo(profilo, *, archivio, oggi=None, max_documenti=20):
                 from bellomberg.market_data.filing_verifica import verifica_documento
                 verifica = verifica_documento(snapshot["path"], url=item["url"], profilo=profilo,
                                                catalogo=catalogo)
+            if (verifica.get("stato") != "ok" and profilo.get("forme_sec") == ["6-K"]
+                    and item["fonte"] == "SEC EDGAR"):
+                # APERTO-TI 06/10: allegato 6-K FPI («quarter ended ...»), regola standard dichiarata;
+                # identita' del profilo invariata. I motivi del profilo restano accanto.
+                from bellomberg.market_data.filing_verifica import verifica_6k_standard
+                standard = verifica_6k_standard(snapshot["path"], url=item["url"], profilo=profilo,
+                                                catalogo=catalogo)
+                if standard.get("stato") in ("ok", "periodo_da_confermare"):
+                    c["motivi_profilo"] = list(verifica.get("motivi", []))
+                    c.update({k: deepcopy(standard[k]) for k in ("regola_verifica", "identita_verifica",
+                                                                 "periodo_stato", "periodi_visti") if k in standard})
+                    verifica = standard
+                    if standard["stato"] == "periodo_da_confermare":
+                        # Relazione dell'emittente con periodo non certo: byte conservati, dichiarata,
+                        # fuori dal confronto (non e' «ultimo non verificato» ne' un verificato).
+                        c.update(stato="periodo_da_confermare")
+                        c["motivi"].extend(standard["motivi"])
+                        continue
             c["motivi"].extend(verifica.get("motivi", []))
             if verifica.get("stato") != "ok" and profilo.get("forme_sec") == ["6-K"]:
                 # 6-K di altra natura (produzione, avvisi): non e' la relazione cercata.
@@ -512,7 +530,7 @@ def _esegui_singolo(profilo, *, archivio, oggi=None, max_documenti=20):
     unici.sort(key=lambda pair: pair[0]["metadati"]["periodo_fine"], reverse=True)
     ultimo = unici[0][0]["metadati"]["periodo_fine"] if unici else None
     for c in out["candidati"]:
-        if c["stato"] not in ("verificato", "duplicato", "non_applicabile"):
+        if c["stato"] not in ("verificato", "duplicato", "non_applicabile", "periodo_da_confermare"):
             periodo = c.get("report_date") or c.get("period_end") or c.get("metadati", {}).get("periodo_fine")
             if not periodo or not ultimo or periodo >= ultimo:
                 out["ultimo_non_verificato"] = True
@@ -656,6 +674,10 @@ def esegui_profilo(profilo, *, archivio, oggi=None, max_documenti=20, numeri_fn=
             **({} if i == indice else {"coppia": r.get("coppia"),
                                         "confronto": r.get("confronto_corrente") or r.get("confronto_storico")})}
             for i, (t, r) in enumerate(esiti)]}
+        # APERTO-TI 06/10: i candidati delle varianti NON primarie non si buttano (il 20-F di un
+        # titolo con 6-K primario spariva): restano accanto, etichettati con la loro variante.
+        out["candidati_varianti"] = [{**deepcopy(c), "variante": t} for i, (t, r) in enumerate(esiti)
+                                     if i != indice for c in r.get("candidati") or []]
         altre = sorted((r for i, (_, r) in enumerate(esiti) if i != indice and r.get("coppia")),
                        key=fine_dopo, reverse=True)
     cik = profilo.get("cik") if isinstance(profilo, dict) else None

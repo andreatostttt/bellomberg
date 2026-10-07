@@ -25,6 +25,7 @@ from bellomberg.core.llm_client import OpenRouterClient, modello as _modello_llm
 _OPENROUTER_CLIENT_CLASS = OpenRouterClient
 from bellomberg.core.llm_client import thinking_consigliere, request_scope, ConfigurazioneLLMMancante
 from bellomberg.core.trade_idea_policy import role_thinking
+from bellomberg.market_data.freschezza_trimestrale import as_of_freschezza as _as_of_freschezza  # cutoff della run (R-CASCATA 07/10)
 from bellomberg.storage.memory_db import DB_DIR   # B4 (02/09): heartbeat e rescue sotto la cartella dati
 from bellomberg.core.llm_refusal import REFUSAL_TAG, refusal_reason as _refusal_reason
 from bellomberg.core.language import capture_language, prompt_for_language, scoped_language
@@ -1899,7 +1900,9 @@ class Specialist:
                         except Exception as exc:
                             payload["research_snapshot_error"] = type(exc).__name__ + ": " + str(exc)
                     return result
-                return chat_tools.dispatch(name, input_, caller="specialista-run:" + self.name)
+                # R-CASCATA (07/10): l'ultimo periodo pubblicato si calcola al cutoff della run, non a «oggi»
+                return chat_tools.dispatch(name, input_, caller="specialista-run:" + self.name,
+                                           **_as_of_freschezza(name, self.blackboard))
             except Exception as e:
                 if getattr(self.blackboard, "run_scope", "weekly") == "trade_idea":
                     return {"ok": False, "error": "Trade Idea tool unavailable: "

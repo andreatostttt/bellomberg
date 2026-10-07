@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from functools import wraps
 import json
+import logging
 import os
 import re
 import threading
@@ -3604,6 +3605,11 @@ def official_documents_gaps(blackboard):
     if not isinstance(dossier, dict):
         return ["copertura documentale non verificabile: dossier del titolo assente dal sigillo della ricerca"]
     if dossier.get("documents"):
+        # APERTO-TI: documenti ammessi ma tutti «non verificati» (PM 06/10): si leggono, non sono filing verificati.
+        if all(((doc.get("metadata") or {}).get("filing_bridge") or {}).get("verifica") == "non_verificato"
+               for doc in dossier["documents"]):
+            return ["solo documenti dell'emittente NON verificati nel dossier (ammessi con etichetta): l'analisi "
+                    "li legge, ma non poggia su filing primari verificati"]
         return []
     return ["nessun bilancio o documento ufficiale dell'emittente ammesso alla ricerca "
             "(verifica fonti e ricerca R0 senza esito): l'analisi non poggia su filing primari verificati"]
@@ -3938,6 +3944,20 @@ def review_evidence_catalog(blackboard):
                     "sha256": doc.get("sha256"), "source_fingerprint": fingerprint}
                    for doc in documents if isinstance(doc, dict) and isinstance(doc.get("id"), str))
     if is_research_mode(blackboard):
+        # APERTO-TI: i documenti del ponte Filing sono nel dossier sigillato, quindi citabili; il non
+        # verificato porta la sua etichetta e non e' fonte primaria verificata.
+        from bellomberg.agents.ponte_filing_dossier import documenti_ponte
+        bridge = documenti_ponte(blackboard, getattr(blackboard, "target_ticker", None))
+        known = {row["id"] for row in catalog}
+        for doc in (bridge or ((), None))[0]:
+            fb = doc["metadata"]["filing_bridge"]
+            if doc["id"] not in known:
+                catalog.append({"id": doc["id"], "kind": "admitted_document", "origin": "filing_archive",
+                    "form": doc["metadata"].get("form"), "period": fb.get("periodo"), "sha256": doc.get("sha256"),
+                    "source_fingerprint": fingerprint,
+                    **({"verified": False, "label": fb.get("etichetta_verifica"),
+                        "scope": "Unverified archived issuer document: readable and citable, not verified primary evidence"}
+                       if fb.get("verifica") == "non_verificato" else {"verified": True})})
         if blackboard.data.get('_research_thesis') is not None:
             reference = research_reference(blackboard)
             catalog.append({'id': 'research-' + reference['thesis_sha256'], 'kind': 'research_thesis',
@@ -5006,17 +5026,59 @@ def _sizing_valid(result, sizing, portfolio, *, policy=None, mandate=None, accep
     return False
 
 
+_NON_VERIFICATO = re.compile(r'"fonte_primaria_verificata"\s*:\s*false')
+_ANNO = re.compile(r"-?(?:19|20)\d\d")
+
+
+def _numero_intero(n):
+    """Il numero n come token intero: ne' cifre/segno prima, ne' cifre (o decimali) dopo.
+    R-CASCATA 3a verifica: senza il «-» una perdita -123.45 attestava «Utile 123.45»."""
+    return re.compile(r"(?<![\d.,-])" + re.escape(n) + r"(?![\d]|[.,]\d)")
+
+
+# R-CASCATA: tool la cui ricevuta lega una data solo ai numeri del sotto-oggetto che la contiene
+_TOOL_BLOCCO_DATATO = frozenset({"get_fundamentals", "get_financial_history"})
+
+
 def _bound_evidence_details(result, blackboard, ticker, cutoff):
     """Return exact candidate receipts backing declared evidence IDs."""
     economic_date_keys = {"as_of", "price_asof", "valuation_date", "fiscal_date",
                           "period_end", "reported_at", "filing_date", "observed_at"}
 
-    def economic_dates(output):
+    def economic_dates(output, tool=None):
+        """{data economica: testi in cui cercare i numeri dell'Evidence}."""
         try:
             parsed = json.loads(output)
         except (TypeError, ValueError):
-            return set()
+            return {}
         payload = parsed.get("data", parsed) if isinstance(parsed, dict) else parsed
+        if tool in _TOOL_BLOCCO_DATATO:
+            # R-CASCATA (07/10/2026): per questi tool una data vale SOLO per i numeri del sotto-oggetto
+            # che la contiene (blocco ultimo_periodo_pubblicato, solo se aggiornato; latest_period SEC;
+            # un gruppo ESEF datato). Il TTM di yfinance o i ricavi di un anno vecchio della stessa
+            # ricevuta non si legano alla data dell'ultimo trimestre. Una data al livello principale data
+            # l'intero payload (contratto di prima; le ricevute vere di questi tool non ne hanno).
+            gruppi = {}
+
+            def gruppo(node, nome, depth):
+                if depth > 6:
+                    return
+                if isinstance(node, dict):
+                    if not (nome == "ultimo_periodo_pubblicato" and node.get("stato") != "aggiornato"):
+                        testo = None
+                        for key in economic_date_keys:
+                            if isinstance(node.get(key), str):
+                                testo = testo or (output if depth == 0 else json.dumps(node, ensure_ascii=False))
+                                gruppi.setdefault(node[key][:10], []).append(testo)
+                    for key, value in node.items():
+                        if isinstance(value, (dict, list)):
+                            gruppo(value, key, depth + 1)
+                elif isinstance(node, list):
+                    for value in node[:100]:
+                        gruppo(value, nome, depth + 1)
+
+            gruppo(payload, None, 0)
+            return {day: "\n".join(testi) for day, testi in gruppi.items()}
         dates = set()
 
         def visit(node, depth):
@@ -5033,7 +5095,7 @@ def _bound_evidence_details(result, blackboard, ticker, cutoff):
                     visit(value, depth + 1)
 
         visit(payload, 0)
-        return dates
+        return {day: output for day in dates}
 
     used = {ident for section in result.get("dossier", [])
             for ident in section.get("evidence_ids", [])}
@@ -5042,7 +5104,9 @@ def _bound_evidence_details(result, blackboard, ticker, cutoff):
     receipts = [row for row in blackboard.tool_receipts if row.get("success")
                 and not row.get("truncated")
                 and isinstance(row.get("input"), dict)
-                and row["input"].get("ticker") == ticker]
+                and row["input"].get("ticker") == ticker
+                # APERTO-TI: la lettura di un documento NON verificato non attesta numeri operativi.
+                and not _NON_VERIFICATO.search(str(row.get("output") or ""))]
     model_generations = {reference.get("generation_id") for reference in result.get("valuation_refs") or []}
     if model_generations:
         current_receipts = []
@@ -5073,14 +5137,18 @@ def _bound_evidence_details(result, blackboard, ticker, cutoff):
             continue
         for receipt in receipts:
             output = receipt.get("output") or ""
-            if receipt.get("tool") != tool or observed not in economic_dates(output):
+            scopes = economic_dates(output, tool) if receipt.get("tool") == tool else {}
+            if observed not in scopes:
                 continue
             url = evidence.get("url")
             if url and url not in output:
                 continue
             numbers = re.findall(r"(?<!\w)-?\d+(?:[.,]\d+)?", evidence.get("summary") or "")
             numbers = [n for n in numbers if len(n) >= 3 or "." in n or "," in n]
-            measured = bool(numbers and any(n in output for n in numbers)
+            # R-CASCATA 2a verifica: un anno (1900-2100) non e' una misura (sta in ogni period_end) e un
+            # numero si confronta INTERO, non come sottostringa («23.45» non e' dentro «123.45»).
+            numbers = [n for n in numbers if not _ANNO.fullmatch(n)]
+            measured = bool(numbers and any(_numero_intero(n).search(scopes[observed]) for n in numbers)
                             and re.search(r"(?:%|€|\$|\b(?:EUR|USD|GBP|GBX|bps|pp|azioni|shares)\b)",
                                           evidence["summary"], re.I))
             bound[evidence["id"]] = {"tool": tool, "output": output,
@@ -6126,6 +6194,122 @@ def _numeric_gaps_phrase(numeric_gaps, result):
                if capped else "") + ".")
 
 
+def _filing_isolato_assente():
+    raise RuntimeError("DB alternativo: archivio Filing isolato non fornito (filing_service_factory)")
+
+
+_log_fase = logging.getLogger(__name__ + ".fase_documenti")
+
+
+def _servizio_non_importabile(exc):
+    def fabbrica():
+        raise RuntimeError("archivio Filing predefinito non importabile: " + type(exc).__name__)
+    return fabbrica
+
+
+class TempoPonteScaduto(RuntimeError):
+    """R-FASE B1: il ponte (rilettura e riverifica dei byte) ha superato il suo tetto dichiarato."""
+
+
+def _riga_fase(messaggio):
+    # R-FASE B4: le righe della fase documenti (profili creati compresi) vanno nel log della run, non solo nel logger.
+    print("[TRADE_IDEA]" + messaggio, flush=True)
+    _log_fase.info(messaggio)
+
+
+def _ponte_col_tetto(blackboard, ponte, fase, *, as_of, servizio_factory, record):
+    """Ponte su una lavagna d'appoggio in un thread col tetto SEPARATO fase.TEMPO_MAX_PONTE_S: la ricevuta entra
+    nella run solo se il ponte finisce in tempo (un thread tardivo non scrive mai nella lavagna vera)."""
+    import time
+    from types import SimpleNamespace
+    with blackboard._lock:
+        dati = {k: deepcopy(blackboard.data[k]) for k in (ponte.CHIAVE_BOARD, "_research_thesis")
+                if k in blackboard.data}
+    ombra = SimpleNamespace(data=dati, _lock=threading.RLock(),
+                            target_ticker=getattr(blackboard, "target_ticker", None))
+    esito = {}
+
+    def corpo():
+        try:
+            ponte.ammetti_per_trade_idea(ombra, as_of=as_of, servizio_factory=servizio_factory,
+                aggiornamento=fase.aggiornamento_per_ponte(record), registro_factory=fase.registro_con_tipo(record))
+        except BaseException as exc:
+            esito["eccezione"] = exc
+    inizio = time.monotonic()
+    filo = threading.Thread(target=corpo, name="trade-idea-ponte", daemon=True)
+    filo.start()
+    filo.join(fase.TEMPO_MAX_PONTE_S)
+    durata = round(time.monotonic() - inizio, 1)
+    with blackboard._lock:
+        blackboard.data["_filing_ponte_misura"] = {"durata_s": durata, "tetto_s": fase.TEMPO_MAX_PONTE_S,
+            "regola": "tetto separato del ponte (rilettura e riverifica dei byte), dichiarato; la fase ha il suo",
+            "esito": "tempo_scaduto" if filo.is_alive() else ("errore" if "eccezione" in esito else "ok")}
+    if filo.is_alive():
+        raise TempoPonteScaduto("ponte oltre %s s" % fase.TEMPO_MAX_PONTE_S)
+    if "eccezione" in esito:
+        raise esito["eccezione"]
+    if ponte.CHIAVE_BOARD in ombra.data:
+        with blackboard._lock:
+            blackboard.data[ponte.CHIAVE_BOARD] = deepcopy(ombra.data[ponte.CHIAVE_BOARD])
+
+
+def _fase_documenti_e_ponte(blackboard, *, as_of, servizio_factory, nome, preferenze_predefinite, stop_fn=None):
+    """APERTO-NUOVI (PM 06/10): fase documenti pre-R0 (profilo Filing attivato per un titolo nuovo, run
+    Filing del solo titolo, passi extra) e poi il ponte. Vincolo PM: MAI bloccare la run. Tempo massimo
+    duro dentro la fase; qualsiasi guasto qui = lacuna dichiarata (tipo e motivo), mai un'eccezione alla run."""
+    from bellomberg.agents import ponte_filing_dossier as ponte
+    from bellomberg.market_data import filing_titolo_nuovo as fase
+    record = None
+    aperto = []
+    if servizio_factory is None:
+        # PRODUZIONE (revisione R-FASE 07/10): execute_trade_idea passa None col DB predefinito. Senza questa
+        # risoluzione servizio_una_volta chiamava None() -> nessuna attivazione e nessun documento (in silenzio).
+        try:
+            from bellomberg.api.filing_routes import default_service as servizio_factory
+        except Exception as exc:
+            _log_fase.warning("archivio Filing predefinito non importabile: %s", type(exc).__name__)
+            servizio_factory = _servizio_non_importabile(exc)
+
+    def servizio_una_volta():
+        # Fase e ponte usano lo STESSO archivio Filing (aperto una volta; un guasto si ripete uguale).
+        if not aperto:
+            try:
+                aperto.append(("ok", servizio_factory()))
+            except Exception as exc:
+                aperto.append(("errore", exc))
+        esito, valore = aperto[0]
+        if esito == "errore":
+            raise valore
+        return valore
+    try:
+        record = fase.fase_documenti_trade_idea(blackboard, as_of=as_of, servizio_factory=servizio_una_volta,
+            nome=nome, preferenze_predefinite=preferenze_predefinite, log=_riga_fase, stop_fn=stop_fn,
+            # DB alternativo (isolato): niente fonti vive implicite nei passi extra, lacuna dichiarata.
+            passi_extra=None if preferenze_predefinite else fase.passi_isolati())
+    except Exception as exc:
+        _log_fase.warning("fase documenti non eseguita: %s", type(exc).__name__)
+        record = {"stato": "non_aggiornato", "motivo": "fase documenti non eseguita: " + type(exc).__name__
+                  + ": " + str(exc)[:200]}
+    try:
+        with blackboard._lock:
+            ripresa = (ponte.CHIAVE_BOARD in blackboard.data or blackboard.data.get("_research_thesis") is not None)
+        if ripresa:
+            # R-FASE 07/10: ricevuta gia' presente o tesi gia' sigillata = si riusa, nessun thread ne' tetto
+            # (un tetto scaduto qui cancellava una ricevuta valida dopo il sigillo).
+            ponte.ammetti_per_trade_idea(blackboard, as_of=as_of, servizio_factory=servizio_una_volta,
+                aggiornamento=fase.aggiornamento_per_ponte(record), registro_factory=fase.registro_con_tipo(record))
+        else:
+            _ponte_col_tetto(blackboard, ponte, fase, as_of=as_of, servizio_factory=servizio_una_volta, record=record)
+    except Exception as exc:
+        _log_fase.warning("ponte Filing non eseguito: %s", type(exc).__name__)
+        try:
+            ticker = getattr(blackboard, "target_ticker", None)
+            ponte.ponte_non_eseguito(blackboard, exc, as_of=as_of, mantieni_esistente=True,
+                                     tickers=[ticker] if isinstance(ticker, str) and ticker else [])
+        except Exception as exc2:
+            _log_fase.warning("lacuna del ponte non registrata: %s", type(exc2).__name__)
+
+
 def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                        output_dir=None, portfolio_loader=None, mandate_loader=None,
                        preparer_binder=None, round_runner=None, red_runner=None,
@@ -6135,7 +6319,7 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                        catalog_fetcher=None, isolated_tool_dispatcher=None,
                        isolated_facts_loader=None, source_qualifier=None,
                        model_reviser=None, document_archive_root=None, model_input_loader=None,
-                       source_session_factory=None, market_pack_loader=None):
+                       source_session_factory=None, market_pack_loader=None, filing_service_factory=None):
     """Claim one accepted candidate and run R0/R1/Red/R2/Capo exactly once."""
     from bellomberg.storage.trade_idea_store import TradeIdeaStore
     from bellomberg.core import mandato_pm
@@ -6302,6 +6486,16 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                     _bind_trade_idea_source_research(blackboard,
                         archive_root=document_archive_root or (DATA_DIR / 'filing_archive'),
                         artifact_dir=artifact_dir, session_factory=source_session_factory)
+                if is_research_mode(run):
+                    # APERTO-TI (PM 06/10): documenti dell'archivio Filing nel dossier PRIMA dei desk, con la
+                    # ricevuta del ponte nei dati della run (la ripresa la riusa). DB alternativo senza
+                    # archivio isolato = lacuna dichiarata, mai l'archivio vero.
+                    _fase_documenti_e_ponte(blackboard, as_of=qualification.get("as_of") or source_as_of,
+                        servizio_factory=(filing_service_factory if filing_service_factory is not None
+                                          or default_risk_db_matches else _filing_isolato_assente),
+                        nome=run.get("company_name"), preferenze_predefinite=default_risk_db_matches,
+                        # R-FASE B4: lo stop del PM e' ascoltato anche durante la fase documenti
+                        stop_fn=lambda: bool(store.get_run(run_id)["run"]["stop_requested"]))
                 store.update_progress(run_id, token, "preparation", _progress(blackboard, "preparation"))
 
                 def check_stop():

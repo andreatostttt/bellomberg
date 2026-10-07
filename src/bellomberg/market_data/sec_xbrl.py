@@ -239,7 +239,154 @@ def _annual_series(facts: Dict[str, Any], tags_gaap: List[str], tags_ifrs: List[
     return None, None, None
 
 
-def get_financial_history(ticker: str, years: int = 10) -> Dict[str, Any]:
+# FRESCHEZZA (06/10/2026, Opus 5.5): i TRIMESTRI dei 10-Q. Prima get_financial_history dava solo
+# fp=FY e un desk non vedeva mai l'ultimo trimestre depositato (richiesta PM «dati aggiornati, non al 2024»).
+QUARTER_FORMS = ("10-Q", "10-Q/A")
+INSTANT_ITEMS = {"total_assets", "current_assets", "cash", "inventory", "receivables", "ppe_net",
+                 "goodwill", "total_liabilities", "current_liabilities", "lt_debt", "equity"}
+# voci di cassa: nei 10-Q il rendiconto finanziario e' CUMULATO da inizio esercizio (6 o 9 mesi)
+YTD_ITEMS = {"cfo", "capex", "dep_amort", "dividends_paid", "buyback", "sbc"}
+QUARTER_CORE = ("revenue", "operating_income", "net_income", "eps_diluted", "cash", "lt_debt", "equity")
+
+
+def _giorni(ob) -> Optional[int]:
+    try:
+        return (datetime.fromisoformat(ob["end"]) - datetime.fromisoformat(ob["start"])).days
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _osservazioni(facts: Dict[str, Any], tags_gaap: List[str], tags_ifrs: List[str]):
+    """(tassonomia:tag, unita', osservazioni) di ogni tag presente, nell'ordine di CANONICAL."""
+    for taxo, tags in (("us-gaap", tags_gaap), ("ifrs-full", tags_ifrs)):
+        node = facts.get(taxo) or {}
+        for tag in tags:
+            units = (node.get(tag) or {}).get("units") or {}
+            if not units:
+                continue
+            unit = max(units.keys(), key=lambda u: (len(units[u]), 1 if u == "USD" else 0))
+            yield f"{taxo}:{tag}", unit, units[unit]
+
+
+def _fine_per_accession(facts: Dict[str, Any], fino_al: Optional[str]) -> Dict[str, str]:
+    """{accession: fine del periodo del deposito} = la fine piu' recente fra i suoi fatti (le voci
+    canoniche). Un 10-Q riporta anche i comparativi (fine esercizio precedente, stesso trimestre
+    dell'anno prima): sono fatti di QUEL deposito ma non del suo periodo (R-CASCATA, 07/10)."""
+    fine: Dict[str, str] = {}
+    for _canon, (tg, ti) in CANONICAL.items():
+        for _tag, _unit, obs in _osservazioni(facts, tg, ti):
+            for ob in obs:
+                a, e = ob.get("accn"), ob.get("end") or ""
+                if a and len(e) == 10 and (not fino_al or e <= fino_al) and e > fine.get(a, ""):
+                    fine[a] = e
+    return fine
+
+
+REGOLA_Q4 = ("Q4 = esercizio (10-K) meno i tre trimestri dei 10-Q dello stesso esercizio (derivato, "
+             "non depositato come trimestre); saldi a fine esercizio dal 10-K")
+Q4_DERIVABILI = ("revenue", "operating_income", "net_income")   # l'EPS non si somma: Q4 dichiarato mancante
+
+
+def quarterly_history(facts: Dict[str, Any], quarters: int = 8, fino_al: Optional[str] = None) -> Dict[str, Any]:
+    """Trimestri dai 10-Q (fp Q1-Q3) piu' il Q4 derivato, e ultimo periodo depositato (10-Q o annuale).
+
+    Si usano solo i fatti del periodo del deposito (mai i comparativi). `quarters`: {voce: {period_end:
+    valore}} con flussi di 3 mesi (80-100 giorni) e saldi; il Q4 dei flussi e' FY - (Q1+Q2+Q3) e lo
+    dichiara `q4` (derivati e non derivabili), mai una somma su trimestri incompleti.
+    `latest_period`: il periodo piu' recente con period_end, filing_date, form, accession e i valori
+    di quel periodo; le voci di cassa dei 10-Q sono cumulate da inizio esercizio e lo dicono.
+    `fino_al` (ISO): solo depositi con filed <= fino_al (cutoff della Trade Idea, mai il futuro)."""
+    fine_accn = _fine_per_accession(facts, fino_al)
+    per_end: Dict[str, Dict[str, Any]] = {}
+    serie: Dict[str, Dict[str, Any]] = {}
+    valori_per_end: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for canon, (tg, ti) in CANONICAL.items():
+        # tutti i tag alternativi: il primo comanda a parita' di periodo, i successivi riempiono
+        # i periodi mancanti (un emittente che cambia tag non perde l'ultimo trimestre)
+        for priorita, (tag, unit, obs) in enumerate(_osservazioni(facts, tg, ti)):
+            for ob in obs:
+                form, end = ob.get("form"), ob.get("end") or ""
+                trimestrale = form in QUARTER_FORMS and ob.get("fp") in ("Q1", "Q2", "Q3")
+                annuale = form in ANNUAL_FORMS and ob.get("fp") in ("FY", None, "")
+                if not (trimestrale or annuale) or len(end) != 10:
+                    continue
+                if fino_al and (end > fino_al or str(ob.get("filed") or "9999") > fino_al):
+                    continue
+                if fine_accn.get(ob.get("accn"), end) != end:
+                    continue                      # comparativo di un altro periodo
+                durata = _giorni(ob)
+                if canon in INSTANT_ITEMS:
+                    if ob.get("start"):
+                        continue
+                elif durata is None:
+                    continue
+                elif trimestrale and not (80 <= durata <= 100) and not (canon in YTD_ITEMS and durata <= 290):
+                    continue
+                elif annuale and not (300 <= durata <= 400):
+                    continue
+                meta = per_end.get(end)
+                if meta is None or str(ob.get("filed", "")) > str(meta.get("filing_date", "")):
+                    per_end[end] = {"period_end": end, "filing_date": ob.get("filed"), "form": form,
+                                    "fp": ob.get("fp"), "fy": ob.get("fy"), "accession": ob.get("accn"),
+                                    "tipo": "trimestre" if trimestrale else "esercizio"}
+                cella = valori_per_end.setdefault(end, {}).get(canon)
+                # a parita' di fine periodo vince il flusso di 3 mesi, poi il deposito piu' recente
+                chiave = (0 if trimestrale and (durata or 0) > 100 else 1, -priorita, str(ob.get("filed", "")))
+                if cella is None or chiave > cella["_chiave"]:
+                    valori_per_end[end][canon] = {"_chiave": chiave, "valore": ob.get("val"), "unita": unit,
+                                                  "tag": tag, "durata_giorni": durata}
+                if trimestrale and (canon in INSTANT_ITEMS or (durata is not None and 80 <= durata <= 100)):
+                    prev = serie.setdefault(canon, {}).get(end)
+                    if prev is None or (-priorita, str(ob.get("filed", ""))) >= prev[1]:
+                        serie[canon][end] = (ob.get("val"), (-priorita, str(ob.get("filed", ""))))
+    # Q4: per ogni esercizio con i tre 10-Q dello stesso esercizio (R-CASCATA, 07/10)
+    q4_derivati: Dict[str, List[str]] = {}
+    q4_mancanti: Dict[str, List[str]] = {}
+    for fine_fy, meta in per_end.items():
+        if meta["tipo"] != "esercizio":
+            continue
+        d_fy = datetime.fromisoformat(fine_fy)
+        celle = valori_per_end.get(fine_fy, {})
+        for canon in QUARTER_CORE:
+            cella = celle.get(canon)
+            if cella is None:
+                continue
+            if canon in INSTANT_ITEMS:
+                serie.setdefault(canon, {})[fine_fy] = (cella["valore"], (0, "fy"))
+                continue
+            tre = [v[0] for e, v in (serie.get(canon) or {}).items()
+                   if e != fine_fy and 0 < (d_fy - datetime.fromisoformat(e)).days < 300]
+            if (canon in Q4_DERIVABILI and len(tre) == 3 and all(isinstance(x, (int, float)) for x in tre)
+                    and isinstance(cella["valore"], (int, float))):
+                serie.setdefault(canon, {})[fine_fy] = (cella["valore"] - sum(tre), (0, "q4"))
+                q4_derivati.setdefault(fine_fy, []).append(canon)
+            else:
+                q4_mancanti.setdefault(fine_fy, []).append(canon)
+    fine_trimestri = sorted({e for s in serie.values() for e in s})[-quarters:]
+    # R-CASCATA (07/10): solo le voci core e al massimo 8 trimestri: la ricevuta del tool ha un tetto
+    out_q = {k: {e: v[0] for e, v in sorted(s.items()) if e in fine_trimestri}
+             for k, s in serie.items() if k in QUARTER_CORE}
+    out_q = {k: v for k, v in out_q.items() if v}
+    q4 = {"regola": REGOLA_Q4,
+          "derivati": {e: v for e, v in sorted(q4_derivati.items()) if e in fine_trimestri},
+          "non_derivabili": {e: v for e, v in sorted(q4_mancanti.items()) if e in fine_trimestri}}
+    latest = None
+    if per_end:
+        end = max(per_end)
+        latest = dict(per_end[end])
+        celle = sorted(valori_per_end.get(end, {}).items())
+        latest["values"] = {k: c["valore"] for k, c in celle}
+        unita = {k: c["unita"] for k, c in celle if c["unita"] != "USD"}
+        if unita:
+            latest["units_non_usd"] = unita
+        cumulati = {k: c["durata_giorni"] for k, c in celle
+                    if latest["tipo"] == "trimestre" and (c.get("durata_giorni") or 0) > 100}
+        if cumulati:
+            latest["cumulati_da_inizio_esercizio_giorni"] = cumulati
+    return {"quarters": out_q, "quarter_ends": fine_trimestri, "q4": q4, "latest_period": latest}
+
+
+def get_financial_history(ticker: str, years: int = 10, fino_al: Optional[str] = None) -> Dict[str, Any]:
     """Storico annuale riga-per-riga dai filing SEC (10-K/20-F). ~30 voci canoniche + derivate."""
     try:
         from bellomberg.market_data.sec_edgar import lookup_cik, ticker_ambiguo_per_cik
@@ -295,13 +442,17 @@ def get_financial_history(ticker: str, years: int = 10) -> Dict[str, Any]:
         if cfo is not None and capex is not None:
             derived["fcf"][y] = cfo - abs(capex)
     derived = {k: v for k, v in derived.items() if v}
+    # FRESCHEZZA: trimestri dei 10-Q e ultimo periodo depositato con period_end/filing_date (ricevuta attestabile)
+    trimestri = quarterly_history(facts, fino_al=fino_al)   # cutoff della run: mai un deposito successivo
 
     return {"ticker": ticker.upper(), "cik": cik,
+            "quarters": trimestri["quarters"], "quarter_ends": trimestri["quarter_ends"], "q4": trimestri["q4"],
+            "latest_period": trimestri["latest_period"],
             "entity": data.get("entityName"),
             "years": all_years, "n_items": len(out_items),
             "items": out_items, "derived": derived,
             "tags_used": tags_used, "units": unit_used,
-            "_source": "SEC XBRL companyfacts (10-K/20-F/40-F, fp=FY)",
+            "_source": "SEC XBRL companyfacts (10-K/20-F/40-F fp=FY; trimestri dai 10-Q fp=Q1-Q3)",
             "_timestamp": datetime.now().isoformat(timespec="seconds"),
             # REV_G2a R-4: eta' del dato (cache fino a 7 giorni) e cache nota come superata
             "da_cache": lettura.get("da_cache"), "companyfacts_letto_il": lettura.get("letto_il"),

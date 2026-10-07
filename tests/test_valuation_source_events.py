@@ -27,7 +27,7 @@ def _track_and_migrate(manager):
 
 def _filing(manager, raw=b"Synthetic annual filing A", *, filed_date="2026-02-10",
             latest_unverified=False, ambiguous=False, broken_path=False, unverified_newer=False,
-            run_status="parziale"):
+            run_status="parziale", da_confermare=None):
     archive = manager.runtime.archive_root
     archive.mkdir(parents=True, exist_ok=True)
     path = archive / (sha256(raw).hexdigest() + ".txt")
@@ -46,6 +46,8 @@ def _filing(manager, raw=b"Synthetic annual filing A", *, filed_date="2026-02-10
         result["candidati"].append({"stato": "versione_ambigua", "report_date": "2025-12-31"})
     if unverified_newer:
         result["candidati"].append({"stato": "non_verificato", "report_date": "2026-06-30"})
+    if da_confermare:
+        result["candidati"].append({"stato": "periodo_da_confermare", "report_date": da_confermare})
     profile = {key: candidate["metadati"][key] for key in
                ("emittente_id", "lingua", "tipo", "perimetro")}
     with manager.versions.db._conn() as conn:
@@ -241,3 +243,19 @@ def test_expired_active_guidance_blocks_refresh(automation):
     assert guidance["status"] == "blocked" and "stale" in guidance["reason"]
     assert result["status"] == "partial"
     assert not observed["acquire"] and not observed["collect"] and not observed["paid"]
+
+
+def test_unconfirmed_period_is_a_known_state_and_blocks_only_when_newer(automation):
+    """Un 6-K col periodo da confermare non e' uno stato malformato: piu' vecchio dell'ultimo
+    verificato non blocca; piu' recente blocca come un non verificato, con la ragione vera."""
+    from bellomberg.valuation.valuation_source_events import IneligibleSource, _filing_documents
+
+    manager, _, _, _ = automation
+    _track_and_migrate(manager)
+    older = _filing(manager, da_confermare="2025-06-30")
+    ticker, identities, accepted = _filing_documents(older)
+    assert ticker == TICKER and len(accepted) == 1 and identities
+    newer = _filing(manager, da_confermare="2026-06-30")
+    with pytest.raises(IneligibleSource) as exc:
+        _filing_documents(newer)
+    assert "unverified" in str(exc.value) and "malformed" not in str(exc.value)

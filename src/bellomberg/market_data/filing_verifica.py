@@ -145,7 +145,9 @@ def _periodo_testuale(match, tipo, fine_libera=False):
               "tre": 3, "sei": 6, "nove": 9, "dodici": 12,
               "drei": 3, "sechs": 6, "neun": 9, "zwölf": 12,
               # durata dichiarata dal titolo della relazione («Half-Year … as of», «semestrale al»)
-              "half": 6, "semestrale": 6}
+              "half": 6, "semestrale": 6,
+              # APERTO-TI 06/10: regola standard 6-K FPI («second quarter ended June 30, 2026»)
+              "quarter": 3}
     mesi = counts.get(_norm(groups["mesi"]).lower())
     expected = {"annuale": 12, "semestrale": 6, "trimestrale": 3, "nove_mesi": 9}[tipo]
     if mesi != expected:
@@ -342,6 +344,25 @@ def _verifica_documento(path, *, url, profilo, catalogo=None):
     """
     out = {"stato": "non_verificato", "motivi": []}
     ocr = None
+    esterni = profilo.get("documenti_esterni") if isinstance(profilo, dict) else None
+    riscontro = None
+    if isinstance(esterni, dict) and url in esterni:
+        # impianto 07/10 (main): un documento da fonte esterna (CDN generico, sito di gruppo, redirect fuori
+        # dominio) non diventa MAI verificato, qualunque cosa dica il testo: contesto etichettato, mai numeri.
+        # Eccezione (main 07/10): i BYTE riscontrati all'attivazione (sha256 salvato in «documenti_riscontrati»)
+        # restano verificabili con l'etichetta salvata; se il file cambia, torna «fonte esterna».
+        riscontrati = profilo.get("documenti_riscontrati")
+        salvato = riscontrati.get(url) if isinstance(riscontrati, dict) else None
+        salvato = salvato if isinstance(salvato, dict) and salvato.get("sha256") else None
+        try:
+            attuale = hashlib.sha256(Path(path).read_bytes()).hexdigest() if salvato else None
+        except OSError:
+            attuale = None
+        if not (attuale and salvato["sha256"] == attuale):
+            out["motivi"].append(f"fonte esterna ({esterni[url]}), identita' non provabile: documento mai verificato"
+                                 + (" (byte diversi da quelli riscontrati all'attivazione)" if salvato else ""))
+            return out
+        riscontro = {"host": esterni[url], "sha256": attuale, "etichetta": salvato.get("etichetta")}
     try:
         catalogo = catalogo or {}
         meta = {k: profilo[k] for k in ("emittente_id", "lingua", "tipo", "perimetro")}
@@ -471,7 +492,325 @@ def _verifica_documento(path, *, url, profilo, catalogo=None):
                 'metadata': deepcopy(meta), 'proofs': deepcopy(prove),
                 'rules': {k: regole[k] for k in ('emittente', 'lingua', 'tipo', 'perimetro', 'periodo')},
                 'identity_basis': 'curated_filing_profile', 'security_identity_verified': False}
+        if riscontro:
+            if riscontro["sha256"] != digest:
+                raise ValueError("documento cambiato dopo il riscontro dei byte: hash differente")
+            doc["riscontro_esterno"] = riscontro
+            return {"stato": "ok", "motivi": [], "documento": doc, "etichetta": riscontro["etichetta"],
+                    "riscontro_esterno": riscontro}
         return {"stato": "ok", "motivi": [], "documento": doc}
     except (OSError, ValueError, TypeError, KeyError, IndexError, UnicodeError, re.error) as exc:
         out["motivi"].append((f"{ocr}; " if ocr else "") + f"{type(exc).__name__}: {exc}")
         return out
+
+
+# APERTO-TI (PM 06/10, «piu' aperti»): regola standard per gli allegati 6-K delle societa' estere
+# quotate in USA. I profili 6-K automatici chiedevano «three months ended», ma molti emittenti
+# scrivono «second quarter ended June 30, 2026» o «period ended ...»: il trimestrale restava fuori.
+# Vale per OGNI profilo con variante 6-K (anche quelli gia' salvati), SOLO dopo che la verifica col
+# profilo e' fallita su tipo o periodo; identita', lingua e perimetro restano quelli del profilo.
+_DATA_STD = r"(?P<fine>[A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]+\s+\d{4})"
+TIPO_6K_STANDARD = r"(?:months?|quarter|half[-\s]year|half|periods?)\s+ended|half[-\s]year"
+PERIODO_6K_STANDARD = {
+    "trimestrale": (r"(?:(?:first|second|third|fourth|1st|2nd|3rd|4th)\s+)?(?P<mesi>three|3|quarter)"
+                    r"(?:(?:\s+and\s+(?:six|nine))?[\s-]+months?(?:\s+periods?)?)?\s+ended(?:\s+on)?\s+" + _DATA_STD),
+    "semestrale": (r"(?:first\s+)?(?P<mesi>six|6|half)(?:[\s-]+(?:months?|year)(?:\s+periods?)?)?\s+ended(?:\s+on)?\s+"
+                   + _DATA_STD)}
+REGOLA_6K_STANDARD = "standard_6k_fpi (regola del codice, non del profilo)"
+_DATE_VISTE = re.compile(r"(?:ended(?:\s+on)?|as\s+of)\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]+\s+\d{4})", re.I)
+_REGISTRANTE_COPERTINA = re.compile(r"([^\n]{2,160})\n[\s\xa0]*\(Exact name of registrant", re.I)
+
+
+# Revisione R-FASE M1: sotto il CIK del titolo la COPERTINA del 6-K porta sempre il registrante; il
+# comunicato allegato puo' essere di un partner o di una controllata. L'identita' si prova nel CORPO.
+_FINE_COPERTINA_6K = re.compile(r"\(Exact name of registrant[^\n]*\)|Indicate by check mark[^\n]*|Form\s+40-F[^\n]*"
+                                r"|Commission File Number[^\n]*", re.I)
+
+
+def _corpo_6k(testo):
+    """Testo dopo il blocco di copertina del 6-K (registrante, «Indicate by check mark», Form 20-F/40-F);
+    tutto il testo se la copertina non c'e' (allegato EX-99 a se')."""
+    fine = 0
+    for m in _FINE_COPERTINA_6K.finditer(testo[:8000]):
+        fine = m.end()
+    return testo[fine:]
+
+
+_PERIODO_FRASE = re.compile(r"\b(?:quarter|months?|half[-\s]?year|six[-\s]month|period|semester)s?\s+ended\b", re.I)
+_ABBREVIAZIONI = {"ltd", "inc", "corp", "co", "no", "s.a", "n.v", "plc", "mr", "ms", "dr", "st", "s.p.a", "a.g", "n.a"}
+_DATELINE = re.compile(r"^\s*[A-ZÀ-Þ][A-ZÀ-Þa-zà-ÿ .,'’-]{0,60}?,?\s+(?:[A-Z][a-z]+\.?\s+\d{1,2},?\s+\d{4}"
+                       r"|\d{1,2}\s+[A-Z][a-z]+\s+\d{4})\s*(?:\([^)]{0,40}\)\s*)?[-–—/]+\s*")
+
+
+_TESTA_CORPO_6K = 6000  # battute del corpo in cui contano le frasi sul periodo (oltre: note al bilancio)
+
+
+def _fine_frase(dopo):
+    """Fine della frase in «dopo» (dal periodo in poi): punto/!/? seguito da maiuscola o fine riga, saltando le
+    abbreviazioni («Corp.», «Ltd.») e le date («June 30, 2025.» chiude)."""
+    for b in re.finditer(r"[.!?](?=\s+[A-ZÀ-Þ“\"(]|\s*$)", dopo):
+        parola = re.findall(r"[\w.]+$", dopo[:b.start()])
+        if b.group(0) == "." and parola and parola[0].lower().rstrip(".") in _ABBREVIAZIONI:
+            continue
+        return b.end()
+    return len(dopo)
+
+
+def _frasi_del_periodo(corpo, limite=_TESTA_CORPO_6K):
+    """Frasi INTERE che contengono il periodo («… quarter ended …», anche la parte dopo la data), senza
+    dateline e «(Business Wire)», nelle prime ``limite`` battute del corpo (la testa del comunicato)."""
+    out, fine_prec = [], 0
+    for m in _PERIODO_FRASE.finditer(corpo[:limite]):
+        if m.start() < fine_prec:
+            continue  # stessa frase di un periodo gia' letto
+        riga = corpo[max(0, m.start() - 600):m.start()].split("\n")[-1]
+        inizio = 0
+        for b in re.finditer(r"\.\s+(?=[A-Z])", riga):
+            parola = re.findall(r"[\w.]+$", riga[:b.start()])
+            if parola and parola[0].lower().rstrip(".") in _ABBREVIAZIONI:
+                continue
+            inizio = b.end()
+        dopo = corpo[m.start():m.start() + 600].split("\n")[0]
+        fine = _fine_frase(dopo)
+        frase = _DATELINE.sub("", riga[inizio:]) + dopo[:fine]
+        out.append(re.sub(r"^\s*(?:\([^)]{0,40}\)\s*[-–—]*\s*)?(?:the\s+)?", "", frase, flags=re.I))
+        fine_prec = m.start() + fine
+    return out
+
+
+def _frase_del_periodo(corpo):
+    """La PRIMA frase sul periodo (vedi ``_frasi_del_periodo``); None se il corpo non ne ha."""
+    frasi = _frasi_del_periodo(corpo, len(corpo))
+    return frasi[0] if frasi else None
+
+
+# Parole che possono aprire una frase sul periodo senza essere un'entita' («In the second quarter ended …»,
+# «As of and for the three months ended …», titoli dei prospetti): ogni altra parola maiuscola e' un nome proprio
+_PAROLE_COMUNI_6K = frozenset((
+    "in as of and for the during on at our its this these a an q1 q2 q3 q4 h1 h2 fy ytd first second third fourth "
+    "quarter quarterly half year years month months three six nine twelve fiscal results result financial statements "
+    "statement consolidated condensed interim unaudited audited report reports announces announced period periods "
+    "ended highlights revenue revenues net income total today released operating key figures earnings "
+    "january february march april may june july august september october november december "
+    # impianto 6K 07/10: pronomi, nomi generici del registrante, parole dei titoli dei prospetti
+    "we it company group groups bank management board directors shareholders stockholders operations profit loss "
+    "losses cash flows flow changes equity comprehensive position notes selected unaudited summary").split())
+# Il registrante senza nome: «we», «the Company», «the Group»; i possessivi aprono un sintagma da leggere
+_PRONOME_6K = re.compile(r"(?:we|it|management|(?:the\s+)?(?:company|group|bank)(?!['’]))\b|(?P<poss>our|its|"
+                         r"(?:the\s+)?(?:company|group|bank)['’]s?)(?=\s)", re.I)
+# Apertura avverbiale o sul periodo chiusa da una virgola («In the second quarter ended June 30, 2025, …»,
+# «Today, …»): la virgola dentro una data («June 30, 2025») non la chiude
+_APERTURA_6K = re.compile(r"(?:(?:in|for|during|as\s+(?:of|at)|over|through(?:out)?|at|on|since|compared\s+(?:to|with)"
+                          r"|following|after|today|yesterday|earlier\s+today|separately|additionally|also|meanwhile"
+                          r"|recently|in\s+addition)\b(?:[^,]|,\s*\d{4}\b){0,160}?,(?!\s*\d{4}\b)\s*)+", re.I)
+_FORME_DOPO_6K = re.compile(r"(?:[\s,]*(?:ltd|limited|inc|incorporated|corp|corporation|plc|s\.?a|n\.?v|ag|se|"
+                            r"s\.?p\.?a|llc|co|group|holdings?)\b\.?)*(?:\s*\([^)]{0,60}\))?", re.I)
+# Parole che chiudono il sintagma del soggetto (preposizioni e verbi tipici del comunicato)
+_FINE_SINTAGMA_6K = frozenset((
+    "in for at during from on to by with today was were is are has have had rose grew increased decreased "
+    "reached totaled totalled released reports reported announced announces said recorded delivered posted").split())
+_PASSIVO_6K = re.compile(r"\b(?:released|reported|announced|published|issued|presented|disclosed|furnished)\s+"
+                         r"(?:today\s+)?by\s+(?:the\s+)?", re.I)
+_MAIUSCOLA_6K = r"[A-ZÀ-Þ][\w&'’.-]*"
+
+
+def _comune_6k(parola):
+    parti = [p for p in re.split(r"[-'’.]", parola.lower()) if p]
+    return not parti or all(p in _PAROLE_COMUNI_6K or p.isdigit() for p in parti)
+
+
+def _alias_in_testa(testo, rxs):
+    """Fine del PIU' LUNGO alias del registrante all'inizio di ``testo`` (None se non comincia con un alias)."""
+    fini = [m.end() for m in (re.match(rx, testo, re.I) for rx in rxs) if m]
+    return max(fini) if fini else None
+
+
+def _nome_proprio(testo, rxs):
+    """Il nome proprio (parole maiuscole consecutive) con cui comincia ``testo`` se NON e' il registrante ne'
+    una parola comune, altrimenti None."""
+    t = re.match(_MAIUSCOLA_6K, testo)
+    if not t or _comune_6k(t[0]) or _alias_in_testa(testo, rxs) is not None:
+        return None
+    return re.match(rf"{_MAIUSCOLA_6K}(?:\s+{_MAIUSCOLA_6K})*", testo)[0].rstrip(".,;:")
+
+
+def _nome_nel_sintagma(resto, rxs, solo_specificazione=False):
+    """Altra entita' nominata nel sintagma del soggetto (fino a preposizione/verbo, max 8 parole): «payments
+    partner Zzpartner» -> Zzpartner. Con ``solo_specificazione`` conta solo «… of <Nome>»."""
+    for i, w in enumerate(re.finditer(r"\S+", resto)):
+        parola = w[0].strip("\"“”,;:")
+        if i >= 8:
+            break
+        if parola.lower() == "of":
+            nome = re.match(r"\s*of\s+(?:the\s+)?", resto[w.start():], re.I)
+            return _nome_proprio(resto[w.start() + nome.end():], rxs) if nome else None
+        if parola.lower() in _FINE_SINTAGMA_6K:
+            break
+        if not solo_specificazione:
+            nome = _nome_proprio(resto[w.start():], rxs)
+            if nome:
+                return nome
+    return None
+
+
+# Citazioni/attribuzioni (main 07/10): «John Smith, CEO, said …» ha per soggetto una PERSONA, non un'entita'
+# societaria. Persona = 2-3 parole maiuscole senza parole societarie, in una frase con verbo di dichiarazione e
+# (carica nella frase o verbo subito dopo il nome). Un nome di una parola («Zzpartner») resta un'entita'.
+_DICHIARA_6K = re.compile(r"\b(?:said|says|commented|comments|stated|states|added|adds|noted|notes|explained|"
+                          r"ha\s+dichiarato|ha\s+commentato|erkl(?:ä|ae)rte|sagte|a\s+d(?:é|e)clar(?:é|e))\b", re.I)
+_CARICA_6K = re.compile(r"\b(?:CEO|CFO|COO|chief\s+\w+\s+officer|president|chairman|chairwoman|chair|director|"
+                        r"head\s+of|founder|amministratore\s+delegato|vorstand\w*|directeur)\b", re.I)
+_PAROLE_SOCIETARIE_6K = frozenset((
+    "ltd limited inc incorporated corp corporation plc sa nv ag se spa llc co company group holding holdings bank "
+    "capital finance partner partners payments services international trust fund gmbh bv ab asa oyj").split())
+
+
+def _persona_che_dichiara(frase, nome):
+    parole = str(nome).replace(",", " ").split()
+    if not 2 <= len(parole) <= 3 or any(p.lower().strip(".") in _PAROLE_SOCIETARIE_6K for p in parole):
+        return False
+    if not _DICHIARA_6K.search(frase):
+        return False
+    dopo = frase[frase.find(nome) + len(nome):] if nome in frase else ""
+    return bool(_CARICA_6K.search(frase) or _DICHIARA_6K.match(dopo.lstrip(" ,")))
+
+
+def _altro_soggetto(frase, alias):
+    """Nome dell'altra entita' SOGGETTO della frase sul periodo; None se il soggetto e' il registrante (un suo
+    alias, «we», «the Company», «the Group») o se la frase non nomina un'altra entita' come soggetto: allora
+    nel 6-K del registrante vale per il registrante (impianto 07/10, R-SITI2 F1). Altro soggetto (R-SITI2 E8):
+    - nome proprio in testa che non e' un alias («Zzpartner today released …», «Zztest Pagamentos, a subsidiary
+      of …»), anche dopo un'apertura con virgola («In the second quarter ended June 30, 2025, Zzpartner …»);
+    - alias esteso da un altro nome («Zztest Payments» col marchio «Zztest»), soggetto composto
+      («Zztest Holdings and Zzpartner …»), possessivo («Zztest Holdings' payments partner Zzpartner …»,
+      «Our payments partner Zzpartner …»), specificazione («The financial statements of Zzpartner …»);
+    - passivo con un altro agente («… were released today by Zzpartner»)."""
+    from bellomberg.market_data.filing_attivazione import regex_alias
+    rxs = [rx for rx in (regex_alias(a["nome"]) for a in alias) if rx]
+    testo = re.sub(r"^[\s\"“‘'(]*(?:the\s+)?", "", frase, flags=re.I)
+    testo = re.sub(r"^[\s\"“‘'(]*(?:the\s+)?", "", _APERTURA_6K.sub("", testo, count=1), flags=re.I)
+    altro = None
+    fine = _alias_in_testa(testo, rxs)
+    pronome = _PRONOME_6K.match(testo) if fine is None else None
+    if fine is not None:
+        dopo = testo[fine:]
+        dopo = dopo[_FORME_DOPO_6K.match(dopo).end():]
+        if re.match(r"\s*(?:'s|’s|'|’)(?=\s)", dopo):
+            altro = _nome_nel_sintagma(re.sub(r"^\s*(?:'s|’s|'|’)", "", dopo), rxs)
+        elif m := re.match(r"\s*,?\s*(?:and|&|together\s+with|jointly\s+with)\s+(?:the\s+)?", dopo, re.I):
+            altro = _nome_proprio(dopo[m.end():], rxs)
+        elif m := re.match(r"\s+(?=[A-ZÀ-Þ])", dopo):
+            nome = _nome_proprio(dopo[m.end():], rxs)
+            altro = " ".join((testo[:fine] + " " + nome).split()) if nome else None
+    elif pronome:
+        if pronome.group("poss"):
+            altro = _nome_nel_sintagma(testo[pronome.end():], rxs)
+    else:
+        altro = _nome_proprio(testo, rxs) or _nome_nel_sintagma(testo, rxs, solo_specificazione=True)
+    if altro and not _persona_che_dichiara(frase, altro):
+        return altro
+    passivo = _PASSIVO_6K.search(frase)
+    if passivo and not _PRONOME_6K.match(frase[passivo.end():]):
+        return _nome_proprio(frase[passivo.end():], rxs)
+    return None
+
+
+def _identita_nel_corpo(path, profilo, registrante=None):
+    """None se nel CORPO del 6-K l'emittente e' il soggetto (stessa regola delle relazioni dal sito:
+    nessuna altra entita' con forma giuridica prima del nome), altrimenti il motivo."""
+    from bellomberg.market_data.filing_attivazione import _soggetto_in_copertina
+    try:
+        testo = estrai_testo(str(path), contenuto=Path(path).read_bytes()).get("testo", "")
+    except OSError as exc:
+        return f"corpo del 6-K non leggibile ({type(exc).__name__})"
+    alias = [{"nome": n, "fonte": "profilo"} for n in (profilo.get("nome"), registrante) if n]
+    if registrante:  # identita' dal CIK: vale anche il marchio (prima parola del registrante, 4+ lettere)
+        marchio = re.sub(r"[^\w]", "", str(registrante).split()[0]) if str(registrante).split() else ""
+        if len(marchio) >= 4:
+            alias.append({"nome": marchio, "fonte": "marchio del registrante"})
+    if not alias:
+        return "corpo del 6-K: nome dell'emittente non noto"
+    corpo = _corpo_6k(testo)
+    perche = _soggetto_in_copertina(corpo, alias)
+    if perche:
+        return f"identita' nel corpo del 6-K non provata: {perche}"
+    # revisione R-SITI2 D8: l'emittente deve essere il SOGGETTO della frase sul periodo, non solo citato
+    # («Zzpartner, the payments partner of Zztest Holdings, today released … quarter ended …»: no)
+    # impianto 6K 07/10: OGNI frase sul periodo nella testa del corpo; regola prudente, basta UNA frase con
+    # un'altra entita' soggetto (comunicato congiunto o del partner dopo quello del registrante): non verificato
+    altro = next((a for a in (_altro_soggetto(f, alias) for f in _frasi_del_periodo(corpo)) if a), None)
+    if altro:
+        return ("identita' nel corpo del 6-K non provata: la frase del periodo ha un altro soggetto "
+                f"(«{' '.join(str(altro).split())[:60]}»)")
+    return None
+
+
+def _cik_del_percorso(url):
+    m = re.search(r"/Archives/edgar/data/(\d{1,10})/", str(url or ""))
+    return str(int(m[1])).zfill(10) if m else None
+
+
+def verifica_6k_standard(path, *, url, profilo, catalogo=None):
+    """Seconda verifica di un allegato 6-K con la regola standard (dichiarata nel risultato).
+
+    Esiti: «ok» (periodo certo, regola dichiarata in ``regola_verifica``); «periodo_da_confermare»
+    (identita', lingua, perimetro e natura di relazione provati, periodo non certo: il documento
+    resta leggibile e si dichiara); altrimenti «non_verificato» col motivo. Identita' MAI rilassata:
+    vale la prova del profilo; se il nome del profilo non compare, vale solo il CIK del percorso
+    EDGAR uguale a quello del profilo E il registrante di copertina compatibile col nome del titolo.
+    """
+    tipo = profilo.get("tipo")
+    if tipo not in PERIODO_6K_STANDARD:
+        return {"stato": "non_verificato", "motivi": [f"regola standard 6-K non applicabile al tipo {tipo}"]}
+    regole = {**(profilo.get("verifica") or {}), "tipo": TIPO_6K_STANDARD, "periodo": PERIODO_6K_STANDARD[tipo]}
+    # Periodo dal testo dell'allegato: la data di catalogo di un 6-K e' spesso il mese del deposito.
+    cat = {k: v for k, v in (catalogo or {}).items() if k not in ("report_date", "period_end")}
+    prova = {**profilo, "verifica": regole, "periodo_regola": "piu_recente"}
+    esito = verifica_documento(path, url=url, profilo=prova, catalogo=cat)
+    identita, registrante = None, None
+    if esito.get("stato") != "ok" and any("emittente: prova testuale assente" in m for m in esito.get("motivi", [])):
+        cik = profilo.get("cik") or str(profilo.get("emittente_id", "")).removeprefix("CIK:")
+        try:
+            testo = estrai_testo(str(path), contenuto=Path(path).read_bytes()).get("testo", "")
+        except OSError:
+            testo = ""
+        copertina = _REGISTRANTE_COPERTINA.search(testo[:20_000])
+        registrante = _norm(copertina[1]).strip() if copertina else None
+        from bellomberg.market_data.filing_identita import nomi_compatibili
+        if (cik and cik.isdigit() and _cik_del_percorso(url) == str(int(cik)).zfill(10) and registrante
+                and profilo.get("nome") and nomi_compatibili(profilo["nome"], registrante)):
+            identita = "CIK del filing EDGAR uguale al profilo e registrante di copertina «%s»" % registrante[:80]
+            esito = verifica_documento(path, url=url, profilo={**prova, "verifica": {
+                **regole, "emittente": re.escape(registrante)}}, catalogo=cat)
+        else:
+            return {"stato": "non_verificato", "motivi": esito.get("motivi", []) + [
+                "identita' non provata: nome del titolo assente e CIK/registrante di copertina non concordanti"]}
+    if esito.get("stato") == "ok" or esito.get("motivi") and all(
+            ("periodo" in m or "durata" in m) and "futuro" not in m for m in esito.get("motivi", [])):
+        # R-FASE M1: la regola standard e' piu' larga su tipo e periodo, quindi l'identita' va provata nel
+        # CORPO (fuori dalla copertina del registrante), non dove il nome sta comunque
+        corpo = _identita_nel_corpo(path, profilo, registrante if identita else None)
+        if corpo:
+            return {"stato": "non_verificato", "motivi": list(esito.get("motivi", [])) + [corpo]}
+    if esito.get("stato") == "ok":
+        return {**esito, "regola_verifica": REGOLA_6K_STANDARD,
+                **({"identita_verifica": identita} if identita else {})}
+    motivi = list(esito.get("motivi", []))
+    if motivi and all(("periodo" in m or "durata" in m) and "futuro" not in m for m in motivi):
+        # Natura di relazione, identita', lingua e perimetro superati; manca solo un periodo certo.
+        try:
+            testo = estrai_testo(str(path), contenuto=Path(path).read_bytes()).get("testo", "")
+        except OSError:
+            testo = ""
+        viste = []
+        for m in _DATE_VISTE.finditer(testo):
+            try:
+                giorno = _data(m[1]).isoformat()
+            except ValueError:
+                continue
+            if giorno not in viste:
+                viste.append(giorno)
+        return {"stato": "periodo_da_confermare", "periodo_stato": "da_confermare",
+                "periodi_visti": sorted(viste, reverse=True)[:10], "regola_verifica": REGOLA_6K_STANDARD,
+                "motivi": ["periodo da confermare: " + "; ".join(motivi)[:300]]}
+    return {"stato": "non_verificato", "motivi": motivi}

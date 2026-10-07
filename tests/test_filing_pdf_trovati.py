@@ -20,10 +20,11 @@ def test_scelta_ultimo_e_omologo_dell_anno_prima():
     scelta = esef_sito.scegli_pdf(_link(
         ("acme-annual-report-2025.pdf", "Annual Report 2025"), ("acme-annual-report-2024.pdf", "Annual Report 2024"),
         ("acme-half-year-report-2025.pdf", "Half-year report 2025"),
-        ("acme-q1-2026-presentation.pdf", "Q1 2026 results presentation"),  # presentazione: esclusa
+        ("acme-q1-2026-presentation.pdf", "Q1 2026 results presentation"),  # presentazione: ammessa con etichetta (PM 06/10)
         ("remuneration-report-2025.pdf", "Remuneration report"), ("brochure.pdf", "Our products")), oggi=OGGI)
     assert scelta["tipo"] == "annuale" and scelta["ultimo"]["url"].endswith("annual-report-2025.pdf")
-    assert scelta["precedente"]["url"].endswith("annual-report-2024.pdf") and scelta["candidati"] == 3
+    assert scelta["precedente"]["url"].endswith("annual-report-2024.pdf") and scelta["candidati"] == 4
+    assert scelta["ammessi_per_tipo"] == {"relazione": 3, "presentazione": 1}
 
 
 def test_md_and_a_trimestrali_con_data_nel_nome():
@@ -105,8 +106,9 @@ def test_search_pdf_su_richiesta_e_409_con_il_consigliere(env, monkeypatch):
 
 def test_su_richiesta_al_massimo_un_esplorazione_l_ora(tmp_path, monkeypatch):
     visite = []
-    monkeypatch.setattr(esef_sito, "esplora", lambda sito, navigatore=None: visite.append(sito)
-                        or {"pagine": [], "link": [], "motivi": []})
+    # conta le esplorazioni del sito della societa' (la scoperta del sito IR, seguito 06/10, ne aggiunge altre)
+    monkeypatch.setattr(esef_sito, "esplora", lambda sito, navigatore=None, oggi=None: (
+        visite.append(sito) if sito == "https://www.acme.example/" else None) or {"pagine": [], "link": [], "motivi": []})
     kw = dict(oggi=OGGI, cache_dir=tmp_path, sito_fn=lambda t: "https://www.acme.example/",
               navigatore_fn=lambda d: None)
     esef_sito.scopri("ACME.PA", **kw)
@@ -128,9 +130,12 @@ def test_prova_reale_date_e_nomi_dei_documenti():
     assert doc("Relazione_semestrale_30062025.pdf")["periodo"] == "2025-06-30"
     assert (doc("ACME-Q226-MDA-Final.pdf", "Management Discussion and Analysis")["periodo"]) == "2026-06-30"
     assert doc("Resoconto_intermedio_31032026.pdf")["tipo"] == "trimestrale"
-    for escluso in ("ACME-Q2-2026-Earnings-Transcipt.pdf", "2024.03.14-ACME-Annual-Information-Form.pdf",
-                    "2026-08-05-q3-fy26-acme-at-a-glance-v01-00-en.pdf", "Avviso_Relazione_Semestrale_30062026.pdf",
-                    "ACME_2025_Climate_Report.pdf", "Nuova_Sintesi_1H26_ita.pdf"):
+    # decisione PM 06/10 sera: la trascrizione della call dei risultati entra, etichettata «presentazione»
+    assert doc("ACME-Q2-2026-Earnings-Transcipt.pdf")["tipo_documento"] == "presentazione"
+    # seguito main 06/10: gli estratti (at a glance, sintesi) entrano come «estratto»
+    assert doc("2026-08-05-q3-fy26-acme-at-a-glance-v01-00-en.pdf")["tipo_documento"] == "estratto"
+    for escluso in ("2024.03.14-ACME-Annual-Information-Form.pdf",
+                    "Avviso_Relazione_Semestrale_30062026.pdf", "ACME_2025_Climate_Report.pdf"):
         assert doc(escluso) is None, escluso
 
 

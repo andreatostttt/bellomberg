@@ -46,8 +46,9 @@ MODELLI_SEC = {
 }
 _VERIFICA_COMUNE = {"lingua": r"\b(?:the|and|of)\b", "perimetro": r"consolidated"}
 _DATA = r"(?P<fine>[A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]+\s+\d{4})"
-_PERIODO_6K = {"trimestrale": rf"(?P<mesi>three|3)(?:\s+and\s+(?:six|nine))?\s+months\s+ended\s+{_DATA}",
-               "semestrale": rf"(?P<mesi>six|6)\s+months\s+ended\s+{_DATA}"}
+# APERTO-TI 06/10: stesse regex della regola standard 6-K FPI («second quarter ended ...»,
+# «three and six-month periods ended ...»), cosi' i profili nuovi riconoscono il trimestrale da soli.
+from bellomberg.market_data.filing_verifica import PERIODO_6K_STANDARD as _PERIODO_6K, TIPO_6K_STANDARD
 
 
 def forme_presenti(catalogo):
@@ -58,7 +59,8 @@ def forme_presenti(catalogo):
 def sonda_tipo_6k(testo):
     """trimestrale / semestrale dal testo di una relazione 6-K, None se non e' un bilancio."""
     t = (testo or "").lower()
-    if re.search(r"\bthree(?:\s+and\s+(?:six|nine))?\s+months\s+ended\b", t):
+    if re.search(r"\bthree(?:\s+and\s+(?:six|nine))?[\s-]+months?(?:\s+periods?)?\s+ended\b"
+                 r"|\bquarter\s+ended\b", t):
         return "trimestrale"
     if re.search(r"\bsix\s+months\s+ended\b|\bhalf[-\s]year\b", t):
         return "semestrale"
@@ -89,7 +91,7 @@ def _variante(forma, tipo_6k=None, nome="", regex_emittente=None):
          for k, v in MODELLI_SEC[forma].items()}
     if forma == "6-K":
         m["tipo"] = tipo_6k
-        m["verifica"] = {"tipo": r"months\s+ended|half[-\s]year",
+        m["verifica"] = {"tipo": TIPO_6K_STANDARD,
                          "emittente": regex_emittente or _regex_nome(nome), "periodo": _PERIODO_6K[tipo_6k]}
     return m
 

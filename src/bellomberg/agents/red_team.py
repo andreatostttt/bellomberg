@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 from copy import deepcopy
 
 from bellomberg.core.trade_idea_policy import role_thinking
+from bellomberg.market_data.freschezza_trimestrale import as_of_freschezza as _as_of_freschezza  # cutoff della run (R-CASCATA 07/10)
 
 TRADE_IDEA_RED_MAX_TOKENS = 128000
 WEEKLY_RED_MAX_TOKENS = 128000
@@ -718,7 +719,8 @@ def _run_red_team_loop(blackboard, trade_idea, MODEL_SYNTHESIZER, user_msg,
                             from bellomberg.agents import chat_tools; import json as _j
                             # V6 Lotto 3 (review B4): attribuzione del chiamante
                             r = chat_tools.dispatch(block.name, block.input or {},
-                                                    caller="red-team")
+                                                    caller="red-team",
+                                                    **_as_of_freschezza(block.name, blackboard))
                             r_str = _j.dumps(r, default=str, ensure_ascii=False)
                             # Voce 11 §9-quattuortrigies (01/08): unico dei tre punti
                             # di taglio che troncava MUTO — ora stesso idioma

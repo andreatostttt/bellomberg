@@ -21,7 +21,9 @@ _TICKER = re.compile(r"[A-Z0-9][A-Z0-9.^=_:/-]{0,31}\Z")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 _META = ("emittente_id", "lingua", "tipo", "perimetro", "periodo_inizio", "periodo_fine")
 _SOURCES = frozenset(("SEC EDGAR", "ESEF", "IR"))
-_STATES = frozenset(("verificato", "duplicato", "versione_ambigua", "non_verificato", "non_applicabile"))
+# «periodo_da_confermare» (6-K con periodo incerto, 06/10): non attesta nulla, conta come non verificato.
+_STATES = frozenset(("verificato", "duplicato", "versione_ambigua", "non_verificato", "non_applicabile",
+                     "periodo_da_confermare"))
 
 
 class IneligibleSource(ValueError):
@@ -66,7 +68,7 @@ def _filing_documents(result):
         state = candidate["stato"]
         if state == "versione_ambigua":
             raise IneligibleSource("ambiguous document version; no automatic refresh")
-        if state == "non_verificato":
+        if state in ("non_verificato", "periodo_da_confermare"):
             unverified.append(candidate)
         if state not in ("verificato", "duplicato"):
             continue

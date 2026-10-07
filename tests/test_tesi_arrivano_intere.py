@@ -54,11 +54,7 @@ def db_finto(tmp_path, monkeypatch):
     # legge memory_db.SQLITE_PATH, la fonte unica; si reindirizza QUELLA
     from bellomberg.storage import memory_db
     monkeypatch.setattr(memory_db, "SQLITE_PATH", path)
-    current_facts._TESI_CACHE["text"] = None      # la cache non deve mascherare il test
-    current_facts._TESI_CACHE["ts"] = 0
     yield path
-    current_facts._TESI_CACHE["text"] = None
-    current_facts._TESI_CACHE["ts"] = 0
 
 
 def test_la_tesi_lunga_arriva_INTERA(db_finto):
@@ -76,8 +72,6 @@ def test_se_taglia_lo_DICHIARA_coi_numeri(db_finto, monkeypatch):
     """Un limite puo' esistere, ma dev'essere una misura dichiarata: tre puntini
     non dicono quanto manca ne' dove trovarlo."""
     monkeypatch.setattr(current_facts, "MAX_CHAR_TESI", 120)
-    current_facts._TESI_CACHE["text"] = None
-    current_facts._TESI_CACHE["ts"] = 0
     b = current_facts.pm_theses_block()
     assert "TRONCATA" in b or "troncata" in b
     assert str(len(TESI_LUNGA)) in b, (
@@ -91,3 +85,110 @@ def test_il_limite_e_una_costante_esplicita():
     assert current_facts.MAX_CHAR_TESI >= 900, (
         "sotto i 900 caratteri una tesi con addendum (tesi iniziale del PM piu' "
         "l'aggiornamento della trimestrale in coda) torna mozza")
+
+
+def test_una_tesi_appena_salvata_arriva_alla_chiamata_dopo(db_finto):
+    """Niente cache fra una chiamata e l'altra (PM 06/10): la tesi salvata dall'app
+    o dal Diario deve arrivare alla run lanciata subito dopo, non 10 minuti piu' tardi."""
+    assert "[addendum 03/03/2030" in current_facts.pm_theses_block()
+    con = sqlite3.connect(db_finto)
+    con.execute("UPDATE positions SET tesi=? WHERE ticker='IOTA.L'", ("Tesi riscritta dal Diario.",))
+    con.commit()
+    con.close()
+    b = current_facts.pm_theses_block()
+    assert "Tesi riscritta dal Diario." in b
+    assert "[addendum 03/03/2030" not in b, "il blocco e' ancora quello di prima del salvataggio"
+
+
+def test_una_tesi_da_diario_di_4000_caratteri_arriva_intera(db_finto):
+    """Il limite e' 4000 (PM 06/10): una nota del Diario lunga quanto il limite non si taglia."""
+    lunga = ("Ipotesi, prove, rischi e cosa mi farebbe cambiare idea. " * 80)[:4000]
+    con = sqlite3.connect(db_finto)
+    con.execute("UPDATE positions SET tesi=? WHERE ticker='IOTA.L'", (lunga,))
+    con.commit()
+    con.close()
+    b = current_facts.pm_theses_block()
+    assert lunga.strip() in b and "TRONCATA" not in b
+
+
+# --- review PR #36 (07/10, Opus 5.5): ramo d'errore, limite verso l'alto, specchio nell'app ---
+
+def _punta_il_db(monkeypatch, path):
+    from bellomberg.storage import memory_db
+    monkeypatch.setattr(memory_db, "SQLITE_PATH", str(path))
+
+
+def _asserisci_buco_dichiarato(b):
+    assert "TESI PM: n.d." in b, "l'errore di lettura deve DICHIARARE il buco, non tacere"
+    assert "NON dedurre" in b, "manca l'avviso che il PM puo' avere tesi non arrivate"
+
+
+def test_db_assente_dichiara_il_buco_e_non_crea_il_file(tmp_path, monkeypatch):
+    """Percorso sbagliato = buco dichiarato nel prompt, e il lettore NON crea un DB
+    vuoto (lezione «0 posizioni = path sbagliato»)."""
+    assente = tmp_path / "zztest_assente" / "consigliere.db"
+    _punta_il_db(monkeypatch, assente)
+    b = current_facts.pm_theses_block()
+    _asserisci_buco_dichiarato(b)
+    assert not assente.exists(), "il lettore in sola lettura ha creato un DB vuoto"
+
+
+def test_db_senza_colonna_tesi_dichiara_il_buco(tmp_path, monkeypatch):
+    path = tmp_path / "consigliere.db"
+    con = sqlite3.connect(str(path))
+    con.execute("CREATE TABLE positions (ticker TEXT, is_active INT, "
+                "quantita REAL, prezzo_medio REAL)")
+    con.execute("CREATE TABLE trade_history (id INTEGER PRIMARY KEY, ticker TEXT, "
+                "data TEXT, action TEXT, pm_rationale TEXT)")
+    con.execute("INSERT INTO positions VALUES ('ZZTST1', 1, 3, 7)")
+    con.commit()
+    con.close()
+    _punta_il_db(monkeypatch, path)
+    _asserisci_buco_dichiarato(current_facts.pm_theses_block())
+
+
+def test_una_tesi_oltre_il_limite_arriva_tagliata_e_dichiarata(db_finto):
+    """Il limite tiene anche verso l'alto: MAX_CHAR_TESI+1 si taglia e il taglio
+    porta le lunghezze VERE."""
+    n = current_facts.MAX_CHAR_TESI
+    lunga = ("Zztest ipotesi e smentite. " * 400)[:n] + "Z"
+    assert len(lunga) == n + 1
+    con = sqlite3.connect(db_finto)
+    con.execute("UPDATE positions SET tesi=? WHERE ticker='IOTA.L'", (lunga,))
+    con.commit()
+    con.close()
+    b = current_facts.pm_theses_block()
+    assert "TRONCATA" in b
+    assert "mostrati %d dei %d caratteri" % (n, n + 1) in b
+    assert lunga not in b, "la tesi oltre il limite e' arrivata intera"
+
+
+def test_un_commento_sul_trade_oltre_il_limite_arriva_tagliato_e_dichiarato(db_finto):
+    n = current_facts.MAX_CHAR_TESI
+    commento = ("Zztest commento sul trade. " * 400)[:n + 7]
+    con = sqlite3.connect(db_finto)
+    con.execute("INSERT INTO trade_history (ticker, data, action, pm_rationale) "
+                "VALUES ('IOTA.L', '2030-03-03', 'BUY', ?)", (commento,))
+    con.commit()
+    con.close()
+    b = current_facts.pm_theses_block()
+    assert "ultimo commento del PM (BUY 2030-03-03)" in b
+    assert "mostrati %d dei %d caratteri" % (n, n + 7) in b
+    assert commento not in b, "il commento oltre il limite e' arrivato intero"
+
+
+@pytest.mark.parametrize("rel, nome", [
+    ("app/src/components/nuova/DettaglioTitolo.tsx", "LIMITE_TESI"),
+    ("app/src/pages/JournalPage.tsx", "THESIS_LIMIT"),
+])
+def test_lo_specchio_nell_app_vale_MAX_CHAR_TESI(rel, nome):
+    """L'app mostra al PM quanto di una tesi arriva al consigliere: la sua copia
+    del limite deve coincidere con quella del backend."""
+    import re
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / rel).read_text(encoding="utf-8")
+    m = re.findall(r"\bconst\s+%s\s*=\s*(\d+)\s*;" % nome, src)
+    assert len(m) == 1, "costante %s non trovata (o duplicata) in %s" % (nome, rel)
+    assert int(m[0]) == current_facts.MAX_CHAR_TESI, (
+        "%s in %s vale %s, current_facts.MAX_CHAR_TESI vale %d"
+        % (nome, rel, m[0], current_facts.MAX_CHAR_TESI))

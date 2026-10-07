@@ -839,3 +839,24 @@ def acquisizione_fund_fuori_dalla_suite(monkeypatch):
                 "notices": []}
 
     monkeypatch.setattr(fund_market_worker, "refresh_followed_market_data", _giro_dichiarato)
+
+
+@pytest.fixture(autouse=True)
+def niente_rete_freschezza(monkeypatch, tmp_path):
+    """TRIPWIRE di rete (FRESCHEZZA, 06/10/2026): la cascata dell'ultimo periodo (SEC, EDGAR, yfinance) nei
+    test risponde ConnectionError dichiarato; chi la prova passa `fonti=` finte esplicite. R-CASCATA: la
+    cache su disco e il budget sono del SINGOLO test (prima la cache attraversava i test)."""
+    from bellomberg.market_data import freschezza_trimestrale as _ft
+    monkeypatch.setattr(_ft, "_cartella", lambda: str(tmp_path / "freschezza_cache"))
+    monkeypatch.setattr(_ft, "_BUDGET", {"lock": __import__("threading").Lock(), "per_titolo": {}, "spesa": []})
+    monkeypatch.setattr(_ft, "_SCADUTI", set())
+
+    class _FontiGiu:
+        def __getattr__(self, nome):
+            def _giu(*a, **k):
+                raise ConnectionError("rete nei test: cascata di freschezza senza fonti finte (%s)" % nome)
+            return _giu
+    monkeypatch.setattr(_ft, "FontiVive", _FontiGiu)
+    yield
+    # R-CASCATA N4: nessun preriscaldamento sopravvive al test (dopo il teardown FontiVive e' quello vero)
+    _ft.ferma_preriscaldamenti(attesa_s=5)

@@ -51,8 +51,11 @@ def test_esplora_segue_solo_pagine_ir_dello_stesso_dominio_con_pausa(tmp_path):
     esito = esef_sito.scopri("NOVA.MI", lei=LEI_NOVA, oggi=OGGI, cache_dir=tmp_path, sito_fn=lambda t: SITO,
                              navigatore_fn=_navigatore(pagine, chiamate, pause))
     pagine_html = [c for c in chiamate if not c.endswith("robots.txt")]
-    assert pagine_html == [SITO, IR, REPORTS]  # niente «Products» ne' «Sustainability», niente altro dominio
-    assert all(p == esef_sito.PAUSA_S for p in pause) and len(pause) == len(chiamate) - 1
+    assert pagine_html[:3] == [SITO, IR, REPORTS]  # niente «Products» ne' «Sustainability»
+    # seguito main 06/10: il link «Investors» della home verso un ALTRO dominio si prova come sito IR,
+    # col robots.txt e il ritmo di quel dominio (un navigatore per dominio: la sua prima richiesta senza pausa)
+    assert pagine_html[3:] == ["https://altro.example/investors"] and "https://altro.example/robots.txt" in chiamate
+    assert all(p == esef_sito.PAUSA_S for p in pause) and len(pause) == len(chiamate) - 2
     assert [(p["lei"], p["period_end"], p["lingua"]) for p in esito["pacchetti"]] == [
         (LEI_NOVA, "2025-12-31", "en"), (LEI_NOVA, "2024-12-31", "en")]
     assert esito["pdf"][0]["url"].endswith("annual-report-2025.pdf") and esito["pdf"][0]["testo"] == "Annual report 2025"
