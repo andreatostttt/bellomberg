@@ -290,18 +290,33 @@ def test_fcf_is_derived_only_where_tool_lacks_it_and_both_inputs_exist():
 
 
 def test_consensus_in_other_currency_is_not_used():
+    """Contratto D: la valuta diversa vieta il confronto target, non le stime archiviate."""
     receipts = [r for r in full_receipts() if r["tool"] != "get_consensus_estimates"]
     receipts.append(receipt("get_consensus_estimates", consensus_data(currency="USD")))
     facts = extract_facts(checkpoint(receipts))
-    assert facts["consensus"] is None
-    assert has_gap(facts, "Consensus degli analisti non usato", "USD", "EUR")
+    assert facts["consensus"]["target_mean"] is None
+    assert has_gap(facts, "prezzi obiettivo non usati", "USD", "EUR")
+
+
+def test_consensus_in_other_currency_keeps_estimates_but_not_target_comparison():
+    """Le osservazioni originali restano leggibili con metadati valuta non inventati."""
+    receipts = [r for r in full_receipts() if r["tool"] != "get_consensus_estimates"]
+    receipts.append(receipt("get_consensus_estimates", consensus_data(currency="USD")))
+    facts = extract_facts(checkpoint(receipts))
+    assert facts["consensus"]["target_values"]["mean"] == 15.5
+    assert facts["consensus"]["eps"][0]["value"] == 1.45
+    assert facts["consensus"]["eps"][0]["currency"] is None
 
 
 def test_consensus_details():
     facts = extract_facts(checkpoint(full_receipts()))
     cons = facts["consensus"]
     assert cons["analysts"] == 9 and cons["status"] == "partial" and cons["as_of"] is None
-    assert cons["eps"] == [{"period": "0y", "value": 1.45, "analysts": 8}]
+    assert len(cons["eps"]) == 1
+    assert {key: cons["eps"][0][key] for key in ("period", "value", "analysts")} == {
+        "period": "0y", "value": 1.45, "analysts": 8}
+    assert cons["eps"][0]["currency"] is None and cons["eps"][0]["period_end"] is None
+    assert cons["eps"][0]["yearAgoEps"] == 1.3
     assert cons["revenue"][0]["analysts"] == 7
     assert cons["eps_revisions"] == [{"period": "0y", "current": 1.45,
                                       "change_30d_pct": -1.25, "change_90d_pct": 2.5}]
@@ -457,14 +472,21 @@ def test_fiscal_year_of_estimates_only_when_revenue_matches_history():
     facts = extract_facts(checkpoint(full_receipts()))
     cons = facts["consensus"]
     assert cons["year_ago_revenue"] == 1234.5 and cons["year_ago_eps"] == 1.3
-    assert cons["current_fiscal_year"] == 2029                 # 1234.5 = ricavi 2028 dello storico
+    assert cons["current_fiscal_year"] is None  # metadata valuta assenti: match numerico non basta
+    assert has_gap(facts, "ricavi non confrontabili")
     assert not has_gap(facts, "manca almeno un esercizio")
     receipts = [r for r in full_receipts() if r["tool"] != "get_consensus_estimates"]
-    receipts.append(receipt("get_consensus_estimates", consensus_data(year_ago_revenue=1500.0)))
-    facts = extract_facts(checkpoint(receipts))
+    comparable = consensus_data()
+    comparable["revenue_estimates"][0]["currency"] = "EUR"
+    inferred = extract_facts(checkpoint(receipts + [receipt("get_consensus_estimates", comparable)]))
+    assert inferred["consensus"]["current_fiscal_year"] == 2029
+    assert inferred["consensus"]["fiscal_year_basis"] == "revenue_match_inference"
+    comparable["revenue_estimates"][0]["yearAgoRevenue"] = 1500.0
+    facts = extract_facts(checkpoint(receipts + [receipt("get_consensus_estimates", comparable)]))
     assert facts["consensus"]["current_fiscal_year"] is None   # non si indovina
-    assert has_gap(facts, "Storico di bilancio fermo al 2028", "1.500,00 EUR", "1.234,50 EUR",
-                   "manca almeno un esercizio")
+    assert facts["consensus"]["year_ago_revenue"] == 1500.0
+    assert has_gap(facts, "non riconciliato")
+    assert not has_gap(facts, "manca almeno un esercizio")
 
 
 def test_book_montecarlo_is_the_run_closest_to_the_pro_forma():
@@ -491,8 +513,12 @@ def test_fundamentals_currency_when_declared():
     data["financialCurrency"] = "EUR"
     receipts = [r for r in full_receipts() if r["tool"] != "get_fundamentals"]
     facts = extract_facts(checkpoint(receipts + [receipt("get_fundamentals", data)]))
-    assert facts["fundamentals"]["currency"] == "EUR"
-    assert not has_gap(facts, "né la valuta degli importi")
+    assert facts["fundamentals"]["currency"] is None  # financialCurrency non qualifica market cap
+    assert facts["fundamentals"]["cashflow_metadata"]["free_cashflow"]["provider_financial_currency"] == "EUR"
+    assert has_gap(facts, "periodo, definizione o valuta", "non attestati")
+    data["market_cap_currency"] = "GBP"
+    facts = extract_facts(checkpoint(receipts + [receipt("get_fundamentals", data)]))
+    assert facts["fundamentals"]["currency"] == "GBP"
 
 
 def test_non_dict_params_do_not_break_risk_or_benchmark():

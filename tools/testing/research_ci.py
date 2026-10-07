@@ -54,6 +54,26 @@ SUITE = (
     "tests/test_fund_market_independent.py",
     "tests/test_fund_market_worker.py",
     "tests/test_fundamentals_research_view.py",
+    # Memo audit regressions: native research contracts and offline providers.
+    "tests/test_accounting_memo15.py",
+    "tests/test_current_facts_memo15.py",
+    "tests/test_gate_research_memo15.py",
+    "tests/test_research_gate_policy_memo15.py",
+    "tests/test_macro_yoy_memo15.py",
+    "tests/test_fiscal_metadata_memo15.py",
+    "tests/test_options_quality_memo15.py",
+    "tests/test_polymarket_coverage_memo15.py",
+    "tests/test_quant_snapshot_memo15.py",
+    "tests/test_own_round_memo15.py",
+    "tests/test_weekly_memory_memo15.py",
+    "tests/test_reflection36_policy.py",
+    "tests/test_weekly_semantic_memory_memo15.py",
+    "tests/test_sizing_labels_policy_memo15.py",
+    "tests/test_evidence_prompt_policy_memo15.py",
+    "tests/test_weekly_diagnostic_policy_memo15.py",
+    "tests/test_fonti_p1_memo15.py",
+    "tests/test_source_health_memo15.py",
+    "tests/test_capo_mandate_binding_memo15.py",
 )
 # Legacy paths also prepare or write workbook fixtures. Keep them out of CI.
 SELECTION = (

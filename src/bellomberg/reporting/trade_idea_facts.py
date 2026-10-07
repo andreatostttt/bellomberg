@@ -511,8 +511,19 @@ def _fundamentals(picker, ticker, gaps):
     if receipt is None:
         return None
     parsed, data = got
-    own_currency = next((data.get(k) for k in ("financial_currency", "financialCurrency", "currency")
-                         if isinstance(data.get(k), str) and data.get(k).strip()), None)
+    own_currency = data.get("market_cap_currency")
+    cashflow_metadata = {}
+    raw_metadata = data.get("cashflow_metadata") or {}
+    for metric, field in (("free_cashflow", "freeCashflow"), ("operating_cashflow", "operatingCashflow")):
+        supplied = raw_metadata.get(metric) if isinstance(raw_metadata, dict) else None
+        cashflow_metadata[metric] = dict(supplied) if isinstance(supplied, dict) else {
+            "provider_field": field, "source": _source(receipt, parsed),
+            "acquired_at": _iso_or_none(receipt.get("timestamp")),
+            "currency": None, "period_start": None, "period_end": None, "definition": None,
+            "provider_financial_currency": data.get("financial_currency") or data.get("financialCurrency")}
+        if any(cashflow_metadata[metric].get(key) is None for key in ("period_end", "definition", "currency")):
+            gaps.append(label + ": " + metric + " snapshot del provider; periodo, definizione o valuta "
+                        "non attestati (n.d.); non equivale al FCF storico documentale.")
     block = {
         "market_cap": _num(data.get("market_cap")),
         "ev_to_ebitda": _num(data.get("ev_to_ebitda")),
@@ -528,6 +539,7 @@ def _fundamentals(picker, ticker, gaps):
         "operating_margin": _pct_from_fraction(data.get("operating_margin")),  # frazione -> punti
         "roe": _pct_from_fraction(data.get("roe")),                            # frazione -> punti
         "currency": own_currency,
+        "cashflow_metadata": cashflow_metadata,
         "source": _source(receipt, parsed), "tool": "get_fundamentals", "as_of": None,
     }
     sentence = _mancano(label, [n for n, v in block.items()
@@ -540,6 +552,7 @@ def _fundamentals(picker, ticker, gaps):
 
 
 def _consensus(picker, ticker, currency, gaps):
+    from bellomberg.market_data.consensus_estimates import estimate_metadata
     label = "Consensus degli analisti"
     receipt, got = picker.pick("get_consensus_estimates", label, _ticker_accept(ticker))
     if receipt is None:
@@ -549,10 +562,10 @@ def _consensus(picker, ticker, currency, gaps):
     if not own_currency:
         gaps.append(label + ": il fornitore non indica la valuta dei prezzi obiettivo.")
     elif currency and own_currency != currency:
-        gaps.append(label + " non usato: i prezzi obiettivo sono in " + str(own_currency)
+        gaps.append(label + ": prezzi obiettivo non usati nel confronto: sono in " + str(own_currency)
                     + ", il titolo quota in " + currency + ".")
-        return None
     targets = data.get("price_targets") if isinstance(data.get("price_targets"), dict) else {}
+    comparable_targets = bool(own_currency and currency and own_currency == currency)
     year_ago = {}
 
     def rows(key, what, ago_key):
@@ -564,8 +577,16 @@ def _consensus(picker, ticker, currency, gaps):
         for row in raw:
             if isinstance(row, dict):
                 period = str(row.get("period")) if row.get("period") is not None else None
+                metadata = estimate_metadata(row)
                 out.append({"period": period, "value": _num(row.get("avg")),
-                            "analysts": _int_if_whole(row.get("numberOfAnalysts"))})
+                            "analysts": _int_if_whole(row.get("numberOfAnalysts")),
+                            "low": _num(row.get("low")), "high": _num(row.get("high")),
+                            "growth": _num(row.get("growth")), ago_key: _num(row.get(ago_key)),
+                            **metadata})
+                missing = [key for key in ("currency", "period_end") if metadata[key] is None]
+                if missing:
+                    gaps.append(label + ": " + what + " " + str(period) + ", "
+                                + ", ".join(missing) + " n.d.; codice relativo conservato, nessun FY certo.")
                 if period == "0y":
                     year_ago[ago_key] = _num(row.get(ago_key))
         return out
@@ -610,12 +631,14 @@ def _consensus(picker, ticker, currency, gaps):
 
     as_of = _iso_or_none(data.get("data_as_of"))
     block = {
-        "target_mean": _num(targets.get("mean")),
-        "target_median": _num(targets.get("median")),
-        "target_high": _num(targets.get("high")),
-        "target_low": _num(targets.get("low")),
+        "target_mean": _num(targets.get("mean")) if comparable_targets else None,
+        "target_median": _num(targets.get("median")) if comparable_targets else None,
+        "target_high": _num(targets.get("high")) if comparable_targets else None,
+        "target_low": _num(targets.get("low")) if comparable_targets else None,
+        "target_currency": own_currency,
+        "target_values": {key: _num(targets.get(key)) for key in ("mean", "median", "high", "low")},
         "analysts": _int_if_whole(targets.get("number_of_analysts")),
-        "upside_pct": _num(targets.get("implied_upside_pct")),   # gia' in punti
+        "upside_pct": _num(targets.get("implied_upside_pct")) if comparable_targets else None,
         "eps": rows("eps_estimates", "utile per azione", "yearAgoEps"),
         "revenue": rows("revenue_estimates", "ricavi", "yearAgoRevenue"),
         # valori dell'esercizio precedente a «0y» dichiarati dal fornitore
@@ -623,6 +646,9 @@ def _consensus(picker, ticker, currency, gaps):
         "year_ago_revenue": year_ago.get("yearAgoRevenue"),
         # anno fiscale di «0y»: lo fissa extract_facts SOLO se i ricavi coincidono con lo storico
         "current_fiscal_year": None,
+        "fiscal_year_basis": None, "fiscal_year_candidates": [],
+        "details_acquired_at": _iso_or_none(data.get("details_acquired_at")),
+        "estimates_as_of": None,  # acquisizione e data dei target non datano EPS/ricavi
         "eps_revisions": eps_revisions,
         "recommendations": recommendations,
         "recommendations_prev": recommendations_prev,
@@ -637,6 +663,8 @@ def _consensus(picker, ticker, currency, gaps):
         gaps.append(sentence)
     if as_of is None:
         gaps.append(label + ": il fornitore non indica a che data risalgono prezzi obiettivo e stime.")
+    gaps.append(label + ": data economica/revisione delle stime EPS e ricavi n.d.; "
+                "la data di acquisizione non certifica il periodo o la revisione.")
     reason = str(data.get("consensus_reason") or "")
     if block["status"] == "not_applicable":
         gaps.append(label + ": non applicabile a questo tipo di strumento.")
@@ -1452,25 +1480,42 @@ def _montecarlo(picker, ticker, gaps):
 
 
 def _fiscal_year_check(history, consensus, gaps):
-    """Anno fiscale di «0y» SOLO se i ricavi «anno scorso» coincidono con un anno dello storico."""
+    """Match unico comparabile = inferenza dichiarata, mai calendario fiscale attestato."""
     if not history or not consensus:
         return
     revenue = history["series"].get("revenue") or {}
     last = max(revenue) if revenue else None
     year_ago = consensus.get("year_ago_revenue")
+    current_rows = [r for r in consensus.get("revenue", []) if r.get("period") == "0y"]
+    if (len(current_rows) != 1 or not history.get("unit")
+            or current_rows[0].get("currency") != history["unit"]):
+        gaps.append("Anno fiscale delle stime non determinabile: ricavi non confrontabili "
+                    "per valuta assente/diversa o periodo annuale ambiguo.")
+        return
     if last is None or year_ago is None:
         gaps.append("Anno fiscale delle stime degli analisti non determinabile: manca il confronto "
                     "fra i ricavi dell'anno scorso indicati dagli analisti e lo storico di bilancio.")
         return
     matches = [y for y, v in revenue.items() if v and abs(year_ago - v) / abs(v) <= _FY_MATCH_TOLERANCE]
-    if matches:
-        consensus["current_fiscal_year"] = max(matches) + 1
+    consensus["fiscal_year_candidates"] = sorted(y + 1 for y in matches)
+    if len(matches) > 1:
+        gaps.append("Anno fiscale delle stime non determinabile: ricavi compatibili con piu esercizi.")
         return
-    unit = history.get("unit")
-    gaps.append("Storico di bilancio fermo al " + str(last) + ": i ricavi dell'anno scorso indicati dagli "
-                "analisti (" + _importo(year_ago, unit) + ") non coincidono con quelli del " + str(last)
-                + " (" + _importo(revenue[last], unit) + "), quindi fra lo storico e le stime dell'anno "
-                "in corso manca almeno un esercizio.")
+    if len(matches) == 1:
+        candidate = matches[0] + 1
+        label = current_rows[0].get("fiscal_year_label")
+        explicit = re.fullmatch(r"(?:FY\s*)?(\d{4})", str(label or ""), re.I)
+        if label and (not explicit or int(explicit.group(1)) != candidate):
+            gaps.append("Anno fiscale delle stime: conflitto fra etichetta del provider e inferenza "
+                        "numerica; anno non determinabile.")
+            return
+        consensus["current_fiscal_year"] = candidate
+        consensus["fiscal_year_basis"] = "revenue_match_inference"
+        gaps.append("Anno fiscale delle stime " + str(candidate) + ": INFERENZA da ricavi annuali "
+                    "compatibili, non attestazione documentale del calendario fiscale.")
+        return
+    gaps.append("Anno fiscale delle stime non riconciliato: i ricavi dell'anno scorso degli analisti "
+                "non coincidono con lo storico disponibile; periodo/base contabile da verificare.")
 
 
 # ---------------------------------------------------------------- ingresso

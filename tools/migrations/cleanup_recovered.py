@@ -1,11 +1,13 @@
 """
-cleanup_recovered.py — Cancella l'ULTIMO memo (quello di recupero parziale di oggi) +
-le sue decisioni, i suoi specialist_reports e i file PDF collegati, cosi' domani si
-riparte puliti. NON tocca i memo/decisioni piu' vecchi.
+cleanup_recovered.py — Entry point legacy DISABILITATO.
+
+La selezione automatica dell'ultimo memo e la rimozione globale RECOVERED non
+rispettano stato/consegna, riferimenti e registri immutabili del runtime attuale.
 
 USO:
-  python cleanup_recovered.py            # DRY-RUN: mostra solo cosa cancellerebbe
-  python cleanup_recovered.py --apply    # esegue la cancellazione
+  Le invocazioni senza argomenti e con --apply sono entrambe rifiutate, senza
+  selezionare memo o aprire il DB. Non esiste un nuovo workflow di cancellazione.
+  Gli strumenti nativi di recovery senza cancellazione restano invariati.
 """
 import os, sys, sqlite3
 
@@ -15,6 +17,10 @@ DB = str(SQLITE_PATH)
 
 
 def main(apply=False):
+    raise SystemExit("cleanup_recovered disabilitato: selezione implicita dell'ultimo memo e "
+                     "cancellazione legacy non sicure. Nessun memo selezionato; DB non aperto. "
+                     "Nessuna nuova procedura di cancellazione autorizzata.")
+    # Corpo storico irraggiungibile: nessun flag puo' riattivarlo.
     if not os.path.exists(DB):
         print("DB non trovato:", DB); return
     conn = sqlite3.connect(DB); conn.row_factory = sqlite3.Row
@@ -40,7 +46,7 @@ def main(apply=False):
     print("=" * 60)
 
     if not apply:
-        print("\nDRY-RUN. Niente cancellato. Rilancia con --apply per eseguire.")
+        print("\nPercorso legacy disabilitato.")
         conn.close(); return
 
     with conn:

@@ -200,11 +200,12 @@ def _digest(value):
 
 
 def _native_checkpoint_contract(row, accepted):
-    return {"version": 1, "ticker": row["ticker"], "language": row["language"],
+    return _with_mandate_text_policy({"version": 1, "ticker": row["ticker"], "language": row["language"],
         "view_text": row["view_text"], "models": json.loads(row["models_json"]),
         "source_fingerprint": (accepted.get("source_qualification") or {}).get("fingerprint"),
         **({"analysis_mode": RESEARCH_ANALYSIS_MODE} if is_research_mode(accepted) else {}),
-        **({"execution_policy": execution_policy(accepted)} if execution_policy(accepted) else {})}
+        **({"execution_policy": execution_policy(accepted)} if execution_policy(accepted) else {})},
+        json.loads(row["context_json"]))
 
 
 def _capo_request_bindings(row):
@@ -247,6 +248,15 @@ def _capo_request_bindings(row):
         "report_times": _digest({desk: times.get(desk) for desk in (*desks, "_red_team")}),
         "research": {key: _digest(data.get(key)) for key in fields}}
     return progress["checkpoint_sha256"], bindings
+
+
+def _with_mandate_text_policy(current, accepted):
+    """Re-attest exactly the accepted server policy, never upgrade historical rows."""
+    from bellomberg.core.mandato_pm import MANDATE_TEXT_POLICY_KEY, text_policy_from_context
+    policy = text_policy_from_context(accepted)
+    if MANDATE_TEXT_POLICY_KEY in accepted:
+        current[MANDATE_TEXT_POLICY_KEY] = policy
+    return current
 
 
 def _same_non_price_context(accepted, current):
@@ -768,7 +778,9 @@ class TradeIdeaStore:
                 if not re.fullmatch(r"[0-9a-f]{64}", mandate_hash):
                     raise ValueError("mandate fingerprint invalid")
                 book, feedback = self._context(conn, ticker)
-                context = {"book": book, "feedback": feedback, "mandate_sha256": mandate_hash}
+                from bellomberg.core.mandato_pm import MANDATE_TEXT_POLICY, MANDATE_TEXT_POLICY_KEY
+                context = {"book": book, "feedback": feedback, "mandate_sha256": mandate_hash,
+                           MANDATE_TEXT_POLICY_KEY: MANDATE_TEXT_POLICY}
                 run_id = str(uuid.uuid4())
                 try:
                     conn.execute("""INSERT INTO trade_idea_runs(
@@ -916,8 +928,10 @@ class TradeIdeaStore:
         chain = self._ancestry(conn, row["id"])
         book, feedback = self._context(conn, row["ticker"], exclude_research_ids=[
             item["destination_decision_id"] for item in chain])
-        return {"book": book, "feedback": feedback,
-                "mandate_sha256": self._mandate_loader() if mandate_hash is None else mandate_hash}
+        return _with_mandate_text_policy(
+            {"book": book, "feedback": feedback,
+             "mandate_sha256": self._mandate_loader() if mandate_hash is None else mandate_hash},
+            json.loads(row["context_json"]))
 
     def price_refresh_context(self, run_id):
         """Read one consistent fingerprint; never replace the accepted research context."""
@@ -1513,7 +1527,8 @@ class TradeIdeaStore:
                 context = json.loads(parent["context_json"])
                 book, feedback = self._context(conn, parent["ticker"],
                     exclude_research_ids=[row["destination_decision_id"] for row in chain])
-                current = {"book": book, "feedback": feedback, "mandate_sha256": self._mandate_loader()}
+                current = _with_mandate_text_policy(
+                    {"book": book, "feedback": feedback, "mandate_sha256": self._mandate_loader()}, context)
                 price_grant = _price_refresh_grant(request, context)
                 if not _same_non_price_context(context, current):
                     raise RunConflict("book, feedback or mandate changed: targeted review required before continuation")
@@ -2370,7 +2385,8 @@ class TradeIdeaStore:
                 context = json.loads(row["context_json"])
                 book, feedback = self._context(conn, row["ticker"], exclude_research_ids=[
                     item["destination_decision_id"] for item in self._ancestry(conn, run_id)[:-1]])
-                current_context = {"book": book, "feedback": feedback, "mandate_sha256": mandate_hash}
+                current_context = _with_mandate_text_policy(
+                    {"book": book, "feedback": feedback, "mandate_sha256": mandate_hash}, context)
                 price_grant = _price_refresh_grant(json.loads(row["request_json"]), context)
                 reasons = []
                 proposal = result.get("proposal")
@@ -2844,7 +2860,8 @@ class TradeIdeaStore:
 
     @staticmethod
     def _public_run(row):
-        return {"id": row["id"], "ticker": row["ticker"],
+        return {**_with_mandate_text_policy({}, json.loads(row["context_json"])),
+                 "id": row["id"], "ticker": row["ticker"],
                  "company_name": row["company_name"], "exchange": row["exchange"],
                  "currency": row["currency"], "language": row["language"],
                  "view_text": row["view_text"],

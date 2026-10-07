@@ -31,6 +31,10 @@ def case(path, *, public=None, stop_reason='end_turn', settled=True, record_publ
     contract = {key: deepcopy(payload[key]) for key in
         ('ticker', 'language', 'view_text', 'models', 'analysis_mode', 'execution_policy')}
     contract.update(version=1, source_fingerprint=payload['source_qualification']['fingerprint'])
+    from bellomberg.core.mandato_pm import MANDATE_TEXT_POLICY_KEY
+    persisted = current.get_run(ident)['run']
+    if MANDATE_TEXT_POLICY_KEY in persisted:
+        contract[MANDATE_TEXT_POLICY_KEY] = persisted[MANDATE_TEXT_POLICY_KEY]
     data = {desk: {str(n): desk + ' original report ' + str(n) for n in (0, 1, 2)} for desk in DESKS}
     data.update(_research_thesis={'research_ref': 'sealed-research', 'dossiers': {'TEST': {'source': 'frozen'}}},
         _research_review={'objections': [], 'research_ref': 'sealed-research'},

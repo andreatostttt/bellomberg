@@ -712,6 +712,26 @@ def _numeri(numeri_fn, cik, coppia):
         numeri = numeri_fn(cik, coppia)
     except Exception as exc:
         return {"stato": "errore", "motivo": f"{type(exc).__name__}: {exc}", "voci": []}
+    if isinstance(numeri, dict):
+        # P0-8: questa e' la coppia PASSATA al calcolo, non quella del contenitore
+        # primario (che puo' essere infrannuale mentre i numeri sono annuali).
+        from bellomberg.market_data.filing_numeri import VOCI
+        modi = {voce: modo for voce, _, modo in VOCI}
+        documenti = {lato: {k: (coppia.get(lato) or {}).get(k) for k in ("url", "sha256")}
+                     for lato in ("prima", "dopo")}
+        voci = []
+        for voce in numeri.get("voci") or []:
+            modo = modi.get(voce.get("voce"))
+            periodi = None
+            if modo:
+                periodi = {}
+                for lato in ("prima", "dopo"):
+                    meta = (coppia.get(lato) or {}).get("metadati") or {}
+                    periodi[lato] = {"fine": meta.get("periodo_fine")}
+                    if modo == "durata":
+                        periodi[lato]["inizio"] = meta.get("periodo_inizio")
+            voci.append({**voce, "tipo_periodo": modo, "periodi": periodi})
+        numeri = {**numeri, "voci": voci, "documenti": documenti}
     if isinstance(numeri, dict) and (coppia or {}).get("regola") == "sequenziale":
         # Stessi periodi della coppia: il confronto e' col trimestre precedente, mai l'anno prima.
         numeri = {**numeri, "confronto": "trimestre_precedente"}

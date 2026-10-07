@@ -14,6 +14,7 @@ Risolve anche il bug #162: la chain si puo' chiedere per QUALSIASI expiry,
 non solo la nearest come yfinance.
 """
 from bellomberg.core.paths import PROJECT_ROOT
+from bellomberg.core.errori_sicuri import senza_segreti
 import os
 from typing import List, Dict, Any, Optional
 from datetime import datetime
@@ -42,7 +43,7 @@ def _senza_chiave(testo: str) -> str:
     """La chiave API non entra ne' nel log ne' nel dict di errore. Review 27/08:
     `str(e)` di un ConnectTimeout di requests porta l'URL intero con
     `apiKey=` (misurato); un corpo di errore del WAF potrebbe riecheggiarla."""
-    return testo.replace(POLYGON_KEY, "***") if POLYGON_KEY else testo
+    return senza_segreti(testo, POLYGON_KEY)
 
 
 def _path_log(url: str) -> str:
@@ -51,7 +52,7 @@ def _path_log(url: str) -> str:
     path = url.split("?", 1)[0]
     if path.startswith(BASE):
         path = path[len(BASE):]
-    return path
+    return _senza_chiave(path)
 
 
 def _log_riga(testo: str) -> None:
@@ -75,7 +76,7 @@ def _log_http(status: int, url: str, body: str) -> None:
     Quiver, non Finnhub). Corpo su una riga sola (chi conta i 429 fa grep di
     riga), 120 char, senza chiave.
     """
-    corpo = _senza_chiave(" ".join((body or "")[:120].split()))
+    corpo = " ".join(_senza_chiave(body or "")[:120].split())
     _log_riga(f"HTTP {status} on {_path_log(url)}: {corpo}")
 
 
@@ -96,7 +97,7 @@ def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[st
         r = requests.get(url, params=p, timeout=15)
         if r.status_code != 200:
             _log_http(r.status_code, url, r.text)
-            return {"error": f"HTTP {r.status_code}", "_body": r.text[:200]}
+            return {"error": f"HTTP {r.status_code}", "_body": _senza_chiave(r.text)[:200]}
         return r.json()
     except Exception as e:
         _log_eccezione(e, url)
@@ -135,9 +136,16 @@ def get_option_expirations(underlying: str, limit: int = 60) -> Dict[str, Any]:
         return fuori
     exps: set = set()
     last = None
+    errors = []
+    issues = []
+    requests_count = 0
+    pages_received = 0
+    stopped = False
 
     def _scan(extra_params: Dict[str, Any], pages: int) -> None:
-        nonlocal last
+        nonlocal last, requests_count, pages_received, stopped
+        if stopped:
+            return
         url: Optional[str] = "/v3/reference/options/contracts"
         params: Optional[Dict[str, Any]] = {
             "underlying_ticker": underlying.upper(),
@@ -146,10 +154,15 @@ def get_option_expirations(underlying: str, limit: int = 60) -> Dict[str, Any]:
             **extra_params,
         }
         for _ in range(pages):
+            requests_count += 1
             data = _get(url, params)
             last = data
             if not data or data.get("error"):
+                error = (data or {}).get("error", "no data")
+                errors.append(error)
+                stopped = error in {"HTTP 401", "HTTP 403", "HTTP 429"}
                 return
+            pages_received += 1
             for c in data.get("results", []):
                 if c.get("expiration_date"):
                     exps.add(c["expiration_date"])
@@ -157,6 +170,8 @@ def get_option_expirations(underlying: str, limit: int = 60) -> Dict[str, Any]:
             params = None
             if not url:
                 return
+        if url:
+            issues.append("page_limit")
 
     # Scansione base (scadenze vicine) + finestre future: i sottostanti liquidi
     # hanno decine di migliaia di contratti e la sola paginazione copre poche
@@ -166,11 +181,19 @@ def get_option_expirations(underlying: str, limit: int = 60) -> Dict[str, Any]:
     for shift in (35, 70, 105):
         _scan({"expiration_date.gte": str(today + timedelta(days=shift))}, 1)
 
+    returned = sorted(exps)[:limit]
+    if len(returned) < len(exps):
+        issues.append("output_limit")
+    coverage = {"status": "UNAVAILABLE" if not exps else "PARTIAL" if errors or issues else "COMPLETE",
+                "scope": "requested_scan_windows_only",
+                "requests": requests_count, "pages_received": pages_received,
+                "expirations_observed": len(exps), "expirations_returned": len(returned),
+                "errors": errors, "issues": issues, "requests_stopped": stopped}
     if not exps:
-        return {"error": (last or {}).get("error", "no data"),
-                "_body": (last or {}).get("_body", ""),
+        return {"error": errors[0] if errors else "no data",
+                "_body": (last or {}).get("_body", ""), "coverage": coverage,
                 "_source": "polygon /v3/reference/options/contracts"}
-    return {"underlying": underlying.upper(), "expirations": sorted(exps)[:limit],
+    return {"underlying": underlying.upper(), "expirations": returned, "coverage": coverage,
             "_source": "polygon /v3/reference/options/contracts (paginated)",
             "_timestamp": datetime.now().isoformat()}
 
@@ -191,17 +214,31 @@ def get_options_chain(underlying: str, expiry: Optional[str] = None,
     results: List[Dict[str, Any]] = []
     url: Optional[str] = f"/v3/snapshot/options/{underlying.upper()}"
     pages = 0
+    requests_count = 0
+    errors = []
     data = None
     while url and pages < max(1, max_contracts // 250 + 2):
+        requests_count += 1
         data = _get(url, params if pages == 0 else None)
         if not data or data.get("error"):
+            errors.append((data or {}).get("error", "no data"))
             break
         results.extend(data.get("results", []))
         url = data.get("next_url")
         pages += 1
+    issues = []
+    if url and not errors:
+        issues.append("page_limit")
+    if len(results) > max_contracts:
+        issues.append("output_limit")
+    coverage = {"status": "UNAVAILABLE" if not results else "PARTIAL" if errors or issues else "COMPLETE",
+                "scope": "requested_snapshot_pages_only",
+                "requests": requests_count, "pages_received": pages, "rows_observed": len(results),
+                "rows_returned": min(len(results), max_contracts), "errors": errors, "issues": issues,
+                "requests_stopped": any(e in {"HTTP 401", "HTTP 403", "HTTP 429"} for e in errors)}
     if not results:
         return {"error": (data or {}).get("error", "no data"),
-                "_body": (data or {}).get("_body", ""),
+                "_body": (data or {}).get("_body", ""), "coverage": coverage,
                 "_source": "polygon /v3/snapshot/options"}
     rows = []
     for c in results:
@@ -225,7 +262,7 @@ def get_options_chain(underlying: str, expiry: Optional[str] = None,
     rows.sort(key=lambda x: (x.get("expiry") or "", x.get("strike") or 0))
     rows = rows[:max_contracts]
     return {"underlying": underlying.upper(), "expiry_filter": expiry,
-            "n_contracts": len(rows), "n_pages": pages, "chain": rows,
+            "n_contracts": len(rows), "n_pages": pages, "chain": rows, "coverage": coverage,
             "_source": "polygon /v3/snapshot/options (paginated)",
             "_timestamp": datetime.now().isoformat()}
 
@@ -241,31 +278,59 @@ def get_options_summary_polygon(ticker: str, expiry: Optional[str] = None) -> Di
     try:
         if not polygon_available():
             return {"error": "POLYGON_API_KEY mancante", "_source": src}
-        if not expiry:
+        from bellomberg.core.options_expiry import normalize_expiry, valid_expiry, select_expiry
+        try:
+            expiry = normalize_expiry(expiry)
+            if expiry is not None:
+                expiry = valid_expiry(expiry)
+        except ValueError as exc:
+            return {"error": str(exc), "_source": src}
+        expiry_coverage = None
+        if expiry is None:
             exp = get_option_expirations(ticker)
-            if exp.get("error"):
-                return {"error": exp["error"], "_source": src}
-            today = datetime.now().date()
-            expiry = None
-            for e in exp.get("expirations", []):
-                try:
-                    d = (datetime.strptime(e, "%Y-%m-%d").date() - today).days
-                except Exception:
-                    continue
-                if d >= 2:
-                    expiry = e
-                    break
-            if not expiry:
-                return {"error": "nessuna expiry >= 2 giorni", "_source": src}
+            expiry_coverage = exp.get("coverage")
+            if exp.get("error") or (expiry_coverage or {}).get("requests_stopped"):
+                return {"error": exp.get("error") or expiry_coverage["errors"][-1],
+                        "coverage": expiry_coverage, "_source": src}
+            try:
+                expiry = select_expiry(exp.get("expirations", []), min_days=2)
+            except ValueError as exc:
+                if str(exc) == "expiry_no_valid_available":
+                    return {"error": "Nessuna opzione disponibile: nessuna scadenza valida per la richiesta",
+                            "error_code": "expiry_no_valid_available",
+                            "coverage": expiry_coverage, "_source": src}
+                return {"error": str(exc), "coverage": expiry_coverage, "_source": src}
 
         ch = get_options_chain(ticker, expiry, max_contracts=1200)
         if ch.get("error"):
-            return {"error": ch["error"], "_source": src}
-        chain = ch.get("chain", [])
+            return {"error": ch["error"], "coverage": ch.get("coverage"),
+                    "expiry_coverage": expiry_coverage, "_source": src}
+        raw_chain = ch.get("chain", [])
+        chain = []
+        rejected = {}
+        for contract in raw_chain:
+            try:
+                row_expiry = valid_expiry(contract.get("expiry"))
+                if row_expiry != expiry:
+                    raise ValueError("expiry_mismatch")
+            except ValueError as exc:
+                reason = str(exc)
+                rejected[reason] = rejected.get(reason, 0) + 1
+                continue
+            chain.append(contract)
+        # Annotate the summary projection only; preserve the raw chain response.
+        coverage = dict(ch.get("coverage") or {"status": "UNKNOWN"})
+        coverage.update(rows_used=len(chain), rows_rejected_expiry=sum(rejected.values()),
+                        expiry_rejections=[{"reason": reason, "count": count}
+                                           for reason, count in sorted(rejected.items())])
+        if rejected:
+            coverage["status"] = "PARTIAL"
+            coverage["issues"] = list(coverage.get("issues") or []) + ["row_expiry_rejected"]
         calls = [c for c in chain if c.get("type") == "call" and c.get("strike")]
         puts = [c for c in chain if c.get("type") == "put" and c.get("strike")]
         if not calls or not puts:
-            return {"error": "chain incompleta", "_source": src}
+            return {"error": "chain incompleta per expiry richiesta", "coverage": coverage,
+                    "expiry_coverage": expiry_coverage, "_source": src}
 
         # Spot: call con delta ~0.5
         spot = None
@@ -306,6 +371,10 @@ def get_options_summary_polygon(ticker: str, expiry: Optional[str] = None) -> Di
         return {
             "ticker": ticker.upper(),
             "expiry_used": expiry,
+            "coverage": coverage,
+            "expiry_coverage": expiry_coverage,
+            "partial": any((c or {}).get("status") != "COMPLETE" for c in
+                           [coverage] + ([expiry_coverage] if expiry_coverage else [])),
             "spot": spot,
             "atm_strike": atm_c.get("strike"),
             "iv_atm_call": round(atm_c["iv"], 4) if atm_c.get("iv") else None,

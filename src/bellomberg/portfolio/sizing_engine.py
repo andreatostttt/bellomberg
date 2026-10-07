@@ -238,8 +238,19 @@ def _corr_multiplier(avg_corr: float) -> float:
     return 1.10
 
 
+def _corr_value_valid(value):
+    from math import isfinite
+    from numbers import Real
+    try:
+        return isinstance(value, Real) and not isinstance(value, bool) and isfinite(value)
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
 def _build_corr_lookup(risk_data):
     corr = {}
+    c = {}
+    tks = []
     try:
         c = (risk_data or {}).get("correlation") or {}
         tks = c.get("tickers") or []
@@ -250,6 +261,8 @@ def _build_corr_lookup(risk_data):
                     corr.setdefault(ti, {})[tj] = M[i][j]
     except Exception:
         corr = {}
+        c = {}
+        tks = []
 
     def avg_corr(ticker, others):
         row = corr.get(ticker)
@@ -260,7 +273,48 @@ def _build_corr_lookup(risk_data):
             return None
         return sum(vals) / len(vals)
 
+    def coverage(ticker, counterparties):
+        # Contiamo le posizioni del book, non tutti i simboli nella matrice top-8.
+        # Il conteggio documenta le celle disponibili: non cambia la media sopra.
+        row = corr.get(ticker) or {}
+        observed = [t for t in counterparties
+                    if t and t != ticker and t in row and row[t] is not None]
+        missing = [t for t in counterparties if t not in observed]
+        invalid = [t for t in observed if not _corr_value_valid(row[t])]
+        expected = len(counterparties)
+        status = ("NOT_APPLICABLE" if not expected else
+                  "COMPLETE" if len(observed) == expected else
+                  "PARTIAL" if observed else "UNAVAILABLE")
+        return {"scope": "current_book", "status": status,
+                "expected_counterparties": expected,
+                "observed_counterparties": len(observed),
+                "missing_tickers": [t for t in missing if t],
+                "unmapped_counterparties": sum(not t for t in missing),
+                "value_quality": ("INVALID" if invalid else "VALID" if observed else
+                                  "NOT_APPLICABLE" if not expected else "UNAVAILABLE"),
+                "invalid_tickers": invalid,
+                "matrix_tickers": list(tks),
+                "matrix_meta": dict(c.get("meta") or {}) if isinstance(c.get("meta"), dict) else {},
+                # Numero di celle != certificazione della base valutaria dei rendimenti.
+                "basis_status": "UNVERIFIED"}
+
+    avg_corr.coverage = coverage
     return avg_corr
+
+
+def _corr_coverage_text(coverage):
+    """Suffisso compatibile anche con payload storici senza metadati."""
+    c = coverage or {}
+    status = c.get("status")
+    quality = (" | valori correlazione NON VALIDI: " +
+               ", ".join(str(t) for t in c.get("invalid_tickers", []))) if c.get("value_quality") == "INVALID" else ""
+    if status == "NOT_APPLICABLE":
+        return " | corr copertura NON APPLICABILE (nessuna controparte)" + quality
+    labels = {"COMPLETE": "COMPLETA", "PARTIAL": "PARZIALE", "UNAVAILABLE": "n.d."}
+    if status in labels:
+        return " | corr copertura {}/{} {}".format(
+            c["observed_counterparties"], c["expected_counterparties"], labels[status]) + quality
+    return " | corr copertura NON VERIFICATA" + quality
 
 
 def _vol_of(ticker, risk_data):
@@ -324,7 +378,7 @@ def compute_sizing(portfolio_data, risk_data=None, candidates=None, stress_data=
     total_trim = 0.0
     over_limit = []
 
-    for p in positions:
+    for position_index, p in enumerate(positions):
         tk = p.get("ticker")
         cur_eur = float(p.get("valore_mercato_eur") or p.get("valore_mercato") or 0.0)
         cur_pct = cur_eur / invested * 100.0  # % dell'INVESTITO (come dashboard)
@@ -373,6 +427,9 @@ def compute_sizing(portfolio_data, risk_data=None, candidates=None, stress_data=
             "vol_estimated": vol is None,
             "avg_corr_book": round(ac_used, 2),
             "corr_estimated": ac is None,
+            "corr_coverage": avg_corr_fn.coverage(
+                tk, [other.get("ticker") for index, other in enumerate(positions)
+                     if index != position_index]),
             "vol_multiplier": round(vmul, 2),
             "corr_multiplier": round(cmul, 2),
             "max_position_pct": round(L * 100, 2),
@@ -454,6 +511,14 @@ def compute_sizing(portfolio_data, risk_data=None, candidates=None, stress_data=
             "vol_annual_pct": round(vol_used * 100, 1),
             "vol_estimated": vol is None,
             "avg_corr_assumed": round(ac_used, 2),
+            "corr_coverage": {"scope": "current_book", "status": "UNVERIFIED",
+                              "expected_counterparties": sum(p.get("ticker") != tk for p in positions),
+                              "observed_counterparties": None,
+                              "value_quality": "INVALID" if ac is not None and not _corr_value_valid(ac) else "UNVERIFIED",
+                              "invalid_tickers": [tk] if ac is not None and not _corr_value_valid(ac) else [],
+                              "reason": "scalar_average_without_counterparty_observations"
+                              if ac is not None else "estimated_coefficient_without_observations",
+                              "basis_status": "UNVERIFIED"},
             "max_position_pct": round(L * 100, 2),
             "max_add_eur": round(max_add, 0),
             "suggested_starter_eur": round(starter, 0),
@@ -621,6 +686,7 @@ def format_for_capo(sizing: dict) -> str:
         # A del prima/dopo ammette solo righe nuove o suffissi appesi — la maggior parte delle
         # righe del book ha la correlazione stimata, in mezzo alla riga sarebbero righe cambiate)
         coda = ((" (corr stim.)" if p.get("corr_estimated") else "")
+                + _corr_coverage_text(p.get("corr_coverage"))
                 + (" | classe n.d. (ripiego)" if p.get("class_fallback") else ""))
         L.append("  {:<10} ora {:>5.1f}% | vol {:>4.1f}%{} | max {:>4.1f}% | {}{}".format(
             p["ticker"], p["current_pct"], p["vol_annual_pct"], est, p["max_position_pct"], tag, coda))
@@ -629,7 +695,8 @@ def format_for_capo(sizing: dict) -> str:
         for c in sizing["candidates"]:
             L.append("  {:<10} max {:.1f}% dell'investito | max aggiunta {:,.0f}€ | starter ~{:,.0f}€{}".format(
                 c["ticker"], c["max_position_pct"], c["max_add_eur"], c["suggested_starter_eur"],
-                " | classe n.d. (ripiego)" if c.get("class_fallback") else ""))
+                (" | classe n.d. (ripiego)" if c.get("class_fallback") else "")
+                + _corr_coverage_text(c.get("corr_coverage"))))
     L.append("POLICY D'USO (15/07, scelta PM): di default dispiega il cash entro queste size "
              "massime (% dell'investito), preferendo vol/correlazione basse. Le DEROGHE sono "
              "consentite SOLO dichiarate nella riga dell'ACTION TABLE ('SOPRA POLICY: +X pt' + "

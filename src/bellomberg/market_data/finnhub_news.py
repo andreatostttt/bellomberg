@@ -238,7 +238,8 @@ def fetch_earnings_calendar(days_ahead: int = 14,
                               symbols: Optional[List[str]] = None,
                               motivo: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """Earnings calendar globale per i prossimi N giorni.
-    Se symbols=None, ritorna tutti (limit 100). Altrimenti filtra. `motivo`: v. `_muto`.
+    Se symbols=None, lista globale con completezza remota non attestata.
+    Altrimenti interroga ogni simbolo. `motivo`: v. `_muto`.
     """
     today = datetime.now().date()
     frm = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
@@ -262,10 +263,13 @@ def fetch_earnings_calendar(days_ahead: int = 14,
     else:
         data = _api_get("/calendar/earnings", {"from": frm, "to": to}, motivo=motivo)
         if not isinstance(data, dict):
-            if data is not None:
+            if data is not None or not motivo:
                 _muto(motivo, f"/calendar/earnings: risposta inattesa ({type(data).__name__})")
             return []
-        events = data.get("earningsCalendar", [])
+        events = data.get("earningsCalendar")
+        if not isinstance(events, list) or any(not isinstance(event, dict) for event in events):
+            _muto(motivo, "/calendar/earnings: earningsCalendar assente o malformato; calendario non disponibile")
+            return []
     out = []
     for e in events:
         out.append({

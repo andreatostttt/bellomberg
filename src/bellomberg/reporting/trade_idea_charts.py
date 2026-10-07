@@ -94,7 +94,7 @@ _T = {
         "mar_sub": "In % dei ricavi, stessa unità per le tre linee",
         "op_m": "Margine operativo", "net_m": "Margine netto", "fcf_m": "Margine FCF",
         "eps_title": "Utile per azione: storico e stime",
-        "eps_sub": "EPS diluito in {cur} per azione; stime del consensus tratteggiate",
+        "eps_sub": "EPS in {cur}: storico diluito; stime tratteggiate, base non attestata",
         "estimate": "stima",
         "rp_title": "Ricavi: storico e stime",
         "rp_sub": "{scale} {cur}; stime del consensus tratteggiate",
@@ -159,7 +159,7 @@ _T = {
         "mar_sub": "As % of revenue, same unit for all three lines",
         "op_m": "Operating margin", "net_m": "Net margin", "fcf_m": "FCF margin",
         "eps_title": "Earnings per share: history and estimates",
-        "eps_sub": "Diluted EPS in {cur} per share; consensus estimates hatched",
+        "eps_sub": "EPS in {cur}: diluted history; hatched estimates, basis not attested",
         "estimate": "estimate",
         "rp_title": "Revenue: history and estimates",
         "rp_sub": "{cur} {scale}; consensus estimates hatched",
@@ -1140,6 +1140,16 @@ def _hist_and_cons(facts, key, title, t, series_field, cons_field, language):
     if not hist:
         return None, None, None, _missing(key, title, t["miss_series_absent"].format(fields=_names([series_field], language)))
     cons, quarterly = _estimates(facts.get("consensus") if isinstance(facts.get("consensus"), dict) else None, cons_field)
+    annual_rows = [row for row in (facts.get("consensus") or {}).get(cons_field, [])
+                   if isinstance(row, dict) and _ok(row.get("value")) and not is_quarterly(row.get("period"))]
+    if annual_rows and any(not history.get("unit") or row.get("currency") != history["unit"] for row in annual_rows):
+        units = ", ".join(sorted({str(row.get("currency") or "n.d.") for row in annual_rows}))
+        reason = ("Stime non confrontabili con lo storico: valuta assente/diversa; valori originali "
+                  "nella tabella consensus." if language == "it" else
+                  "Estimates not comparable with history: missing/different currency; original values "
+                  "remain in the consensus table.")
+        reason += " (" + str(history.get("unit") or "n.d.") + " / " + units + ")"
+        return None, None, None, _missing(key, title, reason)
     if not cons:
         label = "revenue_est" if cons_field == "revenue" else cons_field
         reason = t["miss_cons_q" if quarterly else "miss_cons"].format(field=_names([label], language))
@@ -1164,6 +1174,11 @@ def _eps_path(facts, out_dir, language, ticker_label):
     cur = facts["currency"]
     path = _path_chart(hist, cons, 2, t["per_share"].format(cur=cur), language, t["estimate"], out_dir, key)
     notes = _path_notes(f, f.tr("L'EPS diluito", "Diluted EPS"), hist, cons, 2, f" {cur}", *miss)
+    if notes:
+        notes[-1] += f.tr(" Base EPS del consensus (basic/diluita/rettificata) non attestata: "
+                         "le variazioni sono aritmetiche, la comparabilita economica non e' garantita.",
+                         " Consensus EPS basis (basic/diluted/adjusted) is not attested: changes are "
+                         "arithmetic; economic comparability is not attested.")
     return _done(key, title, t["eps_sub"].format(cur=cur), path,
                  _source(language, (t["src_fin"], history), (t["src_cons"], facts.get("consensus"))), H_MID, notes)
 

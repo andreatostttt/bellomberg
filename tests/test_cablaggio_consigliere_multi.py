@@ -151,6 +151,21 @@ def run_offline(monkeypatch, tmp_path):
                   compute_portfolio_risk=lambda: {"error": "finto"})
     _modulo_finto(monkeypatch, "bellomberg.portfolio.portfolio_montecarlo",
                   run_monte_carlo=lambda **k: {"error": "finto"})
+    # Quant snapshot moves these existing appendix acquisitions before the mocked renderer.
+    # Fake only producer boundaries; keep the dispatcher/checkpoints/replay logic real.
+    quant_acquisitions = []
+    def _quant_input(name):
+        def acquire():
+            quant_acquisitions.append(name)
+            return {"error": "finto", "status": "error"}
+        return acquire
+    _modulo_finto(monkeypatch, "bellomberg.portfolio.portfolio_garch",
+                  compute_portfolio_garch=_quant_input("garch"))
+    _modulo_finto(monkeypatch, "bellomberg.portfolio.portfolio_factors",
+                  compute_portfolio_factors=_quant_input("factors"))
+    _modulo_finto(monkeypatch, "bellomberg.market_data.macro_rates",
+                  get_us_curve=_quant_input("rates_us"), get_bund_curve=_quant_input("rates_de"),
+                  get_jgb_curve=_quant_input("rates_jp"), get_eu_hy_credit=_quant_input("rates_credit"))
     _modulo_finto(monkeypatch, "bellomberg.portfolio.sizing_engine",
                   compute_sizing=lambda *a, **k: {"error": "finto"}, format_for_capo=lambda s: "")
     _modulo_finto(monkeypatch, "bellomberg.agents.specialist_scores",
@@ -204,7 +219,8 @@ def run_offline(monkeypatch, tmp_path):
     monkeypatch.setattr(es.smtplib, "SMTP_SSL", _SMTP)
     _SMTP.inviati.clear()
     return SimpleNamespace(catturato=catturato, sondati=sondati, inviati=_SMTP.inviati,
-                           respinto=_RESPINTO, native_weekly_contract=native_weekly_contract)
+                           respinto=_RESPINTO, native_weekly_contract=native_weekly_contract,
+                           quant_acquisitions=quant_acquisitions)
 
 
 def _html(msg):

@@ -836,7 +836,14 @@ def run_monte_carlo(
     # in piu' (e a 500x33 punti siamo gia' a ~130 KB di JSON)
     sample_paths_n = max(1, min(int(sample_paths_n), SAMPLE_PATHS_POOL))
 
-    # Voce 7g: `new_alloc` fuori da (0, 1) o senza add_tickers e' un errore DICHIARATO,
+    # Baseline pura: zero numerico equivale a quota omessa, anche nella cache.
+    # Bool, modifiche al book e override restano nel contratto what-if esistente.
+    if (not isinstance(new_alloc, bool) and new_alloc == 0
+            and not add_tickers and not remove_tickers
+            and _override_weights is None and _override_nav is None):
+        new_alloc = None
+
+    # Voce 7g: negli altri casi fuori da (0, 1) o senza add_tickers e' errore DICHIARATO,
     # mai un clamp zitto (un 2.5 passato per "2,5%" diventerebbe il 100% del book).
     if new_alloc is not None:
         try:

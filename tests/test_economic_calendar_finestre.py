@@ -6,8 +6,9 @@ le release ricavate da una FINESTRA di giorni (CPI 10-15, PPI 11-16, retail
 OGNI giorno della finestra — CPI il 13, 14 e 15/10, PIL Q3 il 27, 28 e 29/10,
 HICP il 28, 29 e 30/10. La deduplica su (data, titolo) non le vedeva.
 
-Ora: al massimo un'occorrenza per release per mese (il primo giorno della
-finestra) con `date_estimated: True`; le date esatte (banche centrali, OPEC,
+Ora: al massimo un'occorrenza per release per mese; CPI usa le date ufficiali
+quando disponibili, altrimenti il primo giorno della finestra con
+`date_estimated: True`; le date esatte (banche centrali, OPEC,
 NFP primo venerdi', claims settimanali, PMI Cina il 1) restano senza flag.
 """
 from collections import Counter
@@ -39,11 +40,15 @@ def test_release_a_finestra_una_volta_per_mese_e_dichiarate_stimate():
     per_mese = Counter((e["title"], e["date"][:7]) for e in stimati)
     doppi = {k: n for k, n in per_mese.items() if n > 1}
     assert not doppi, doppi
-    assert all(e.get("date_estimated") is True for e in stimati), stimati
+    cpi = [e for e in stimati if e["title"].startswith("US CPI")]
+    assert len(cpi) == 1
+    assert cpi[0]["date_estimated"] is False
+    assert cpi[0]["source"] == "https://www.bls.gov/schedule/news_release/cpi.htm"
+    assert all(e.get("date_estimated") is True for e in stimati if e not in cpi), stimati
 
     date_per_titolo = {e["title"]: e["date"] for e in stimati}
-    assert date_per_titolo["US CPI / Core CPI Release"] == "2026-10-13"
-    assert date_per_titolo["US PPI Release"] == "2026-10-14"  # giorno dopo il CPI
+    assert date_per_titolo["US CPI / Core CPI Release"] == "2026-10-14"
+    assert date_per_titolo["US PPI Release"] == "2026-10-14"  # stima indipendente dal CPI ufficiale
     assert date_per_titolo["ISM Services PMI"] == "2026-10-05"  # 3o lavorativo
     assert date_per_titolo["US Retail Sales MoM"] == "2026-10-14"
     assert date_per_titolo["US GDP Q3 Advance Estimate"] == "2026-10-27"
@@ -58,8 +63,12 @@ def test_release_a_finestra_una_volta_per_mese_e_dichiarate_stimate():
 
 
 def test_finestra_gia_iniziata_non_slitta_la_release_a_oggi():
-    """Il 14/10 il CPI stimato (13/10) e' passato: non va riemesso il 14 o il 15."""
+    """CPI ufficiale il 14/10: presente quel giorno, non riemesso dal 15."""
     eventi = _calendario(date(2026, 10, 14), 10)
+    cpi = [e for e in eventi if e["title"].startswith("US CPI")]
+    assert len(cpi) == 1
+    assert cpi[0]["date"] == "2026-10-14"
+    eventi = _calendario(date(2026, 10, 15), 10)
     cpi = [e for e in eventi if e["title"].startswith("US CPI")]
     assert cpi == [], cpi
 

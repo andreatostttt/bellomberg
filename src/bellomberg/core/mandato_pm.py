@@ -613,12 +613,13 @@ def stato_per_api(path: Optional[str] = None) -> Tuple[Dict[str, Any], Optional[
 
 @scoped_language
 def anteprima(grezzo: Any) -> Dict[str, Any]:
-    """Valida un mandato e rende il testo esatto dei modelli, senza scrivere su disco."""
+    """Vista delle nuove run weekly/TI; le riprese e la chat mantengono la loro versione.
+    Valida il mandato senza scrivere su disco e senza cambiare l'impronta dei valori."""
     m, errori = valida(grezzo)
     if errori:
         raise ValueError(join_messages("\n", errori))
     m["origine"] = _origine(m)
-    return {"testo": blocco_prompt(m), "impronta": impronta(m), "origine": m["origine"], "output_language": current_language()}
+    return {"testo": blocco_prompt(m, text_policy=MANDATE_TEXT_POLICY), "impronta": impronta(m), "origine": m["origine"], "output_language": current_language()}
 
 
 def dichiarato(path: Optional[str] = None) -> bool:
@@ -756,7 +757,37 @@ def _piazze(m: Dict[str, Any]) -> str:
     return ", ".join("%s (%s)" % (_city(c), c) for c in m["profilo"]["mercati_accessibili"])
 
 
-def _sez_profilo_rischio(m: Dict[str, Any]) -> str:
+MANDATE_TEXT_POLICY = "mandate-sizing-labels/1"
+MANDATE_TEXT_POLICY_KEY = "mandate_text_policy"
+
+
+def text_policy_from_context(context):
+    """Missing is historical; a present unknown policy must never become legacy."""
+    if MANDATE_TEXT_POLICY_KEY not in context:
+        return None
+    value = context[MANDATE_TEXT_POLICY_KEY]
+    if type(value) is not str or value != MANDATE_TEXT_POLICY:
+        raise ValueError("Unsupported mandate text policy; original run preserved")
+    return value
+
+
+def text_policy_for_board(blackboard):
+    if getattr(blackboard, "run_scope", "weekly") == "trade_idea":
+        context = ({MANDATE_TEXT_POLICY_KEY: getattr(blackboard, MANDATE_TEXT_POLICY_KEY)}
+                   if hasattr(blackboard, MANDATE_TEXT_POLICY_KEY) else {})
+    else:
+        store = getattr(blackboard, "weekly_store", None)
+        context = (getattr(store, "context", None) or {}).get("contract", {})
+    return text_policy_from_context(context)
+
+
+def _validate_text_policy(text_policy):
+    if text_policy is not None:
+        text_policy_from_context({MANDATE_TEXT_POLICY_KEY: text_policy})
+
+
+def _sez_profilo_rischio(m: Dict[str, Any], *, text_policy=None) -> str:
+    _validate_text_policy(text_policy)
     p, r, s = m["profilo"], m["rischio"], m["sizing"]
     stile = _ui_text('CONCENTRATO sulle conviction', 'CONCENTRATED convictions') if p["stile"] == "concentrato" else _ui_text('DIVERSIFICATO', 'DIVERSIFIED')
     righe = [
@@ -777,6 +808,18 @@ def _sez_profilo_rischio(m: Dict[str, Any]) -> str:
            str(s["max_posizioni"]) if s["max_posizioni"] is not None else _ui_text("n.d.", "n/a"),
            (_fmt(s["top3_max_pct"]) + "%") if s["top3_max_pct"] is not None else _ui_text("n.d.", "n/a")),
     ]
+    if text_policy == MANDATE_TEXT_POLICY:
+        righe[2] = righe[2].replace(
+            "pavimento " + _fmt(s["limite_minimo_pct"]) + "%",
+            "pavimento del limite di sizing " + _fmt(s["limite_minimo_pct"]) + "% dell'investito"
+        ).replace("posizione minima " + _fmt(s["posizione_minima_pct"]) + "% del NAV",
+                  "soglia minima d'azione " + _fmt(s["posizione_minima_pct"])
+                  + "% del NAV (non un peso minimo obbligatorio della posizione)"
+        ).replace("floor " + _fmt(s["limite_minimo_pct"]) + "%",
+                  "sizing-limit floor " + _fmt(s["limite_minimo_pct"]) + "% of invested assets"
+        ).replace("minimum position " + _fmt(s["posizione_minima_pct"]) + "% of NAV",
+                  "minimum action amount " + _fmt(s["posizione_minima_pct"])
+                  + "% of NAV (not a mandatory minimum holding weight)")
     n = m["note"]
     extra = []
     if n["aree_gradite"]:
@@ -1021,12 +1064,12 @@ def _sez_profilo_tesi(m: Dict[str, Any]) -> str:
 
 
 @scoped_language
-def sezioni(m: Dict[str, Any]) -> Dict[str, str]:
+def sezioni(m: Dict[str, Any], *, text_policy=None) -> Dict[str, str]:
     """Il testo di ogni pezzo del mandato, deterministico dai campi. Le chiavi sono i segnaposto
     `{MANDATO:<chiave>}` che i prompt portano al posto delle frasi cablate di ieri."""
     return {
         "intestazione": intestazione(m),
-        "profilo_rischio": _sez_profilo_rischio(m),
+        "profilo_rischio": _sez_profilo_rischio(m, text_policy=text_policy),
         "cassa": _sez_cassa(m),
         "trim": _sez_trim(m),
         "pair": _sez_pair(m),
@@ -1054,10 +1097,10 @@ def _condizione_tesi(m: Dict[str, Any]) -> str:
 
 
 @scoped_language
-def blocco_prompt(m: Dict[str, Any]) -> str:
+def blocco_prompt(m: Dict[str, Any], *, text_policy=None) -> str:
     """Il mandato INTERO per i desk, il red team, la chat e l'anteprima della pagina: quello che
     vedi e' quello che l'AI riceve."""
-    s = sezioni(m)
+    s = sezioni(m, text_policy=text_policy)
     return "\n".join([
         s["intestazione"], s["profilo_rischio"], "", s["cassa"], "",
         _ui_text("## DISCIPLINA DEGLI ALLEGGERIMENTI (TRIM)", '## REDUCTION DISCIPLINE (TRIM)'), s["trim"], "",
@@ -1068,10 +1111,10 @@ def blocco_prompt(m: Dict[str, Any]) -> str:
     ])
 
 
-def compila(template: str, m: Dict[str, Any]) -> str:
+def compila(template: str, m: Dict[str, Any], *, text_policy=None) -> str:
     """Sostituisce ogni `{MANDATO:chiave}` del template con la sezione resa dai valori di `m`.
     Una chiave sconosciuta e' un errore di programmazione, non un buco zitto."""
-    s = sezioni(m)
+    s = sezioni(m, text_policy=text_policy)
 
     def _sost(match):
         chiave = match.group(1)
@@ -1084,11 +1127,12 @@ def compila(template: str, m: Dict[str, Any]) -> str:
     return out
 
 
-def compila_o_dichiara(template: str, m: Optional[Dict[str, Any]]) -> str:
+def compila_o_dichiara(template: str, m: Optional[Dict[str, Any]], *, text_policy=None) -> str:
     """Come `compila`; con `m` None (mandato non dichiarato) ogni segnaposto diventa la
     DICHIARAZIONE, mai una regola di ripiego. Per chi risponde comunque (la chat)."""
+    _validate_text_policy(text_policy)
     if m is not None:
-        return compila(template, m)
+        return compila(template, m, text_policy=text_policy)
 
     def _sost(match):
         if match.group(1) == "intestazione":
@@ -1227,7 +1271,7 @@ if __name__ == "__main__":  # pragma: no cover
     else:
         try:
             _m = carica()
-            print(blocco_prompt(_m))
+            print(blocco_prompt(_m, text_policy=MANDATE_TEXT_POLICY))
         except MandatoMancante as _e:
             print(str(_e))
             sys.exit(2)

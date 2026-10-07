@@ -9,20 +9,22 @@ era un dato FRED di 11 giorni prima presentato come corrente e "in risalita".
 Meccanica: a ogni run i valori chiave dei dati esterni vengono confrontati con lo
 snapshot della run precedente (data/freshness_snapshot.json — file JSON, NIENTE
 tabelle nuove nel DB):
-  - valore IDENTICO da piu' di IDENTICAL_DAYS giorni  -> STALE (fonte ferma/cachata)
+  - valore IDENTICO: non dimostra da solo che la fonte sia ferma
   - osservazione piu' vecchia del limite per la serie -> STALE (dato non corrente)
+  - data assente, invalida o futura / valore assente o invalido -> freschezza n.d.
 I limiti di osservazione sono per FREQUENZA della serie (una CPI mensile di 30
 giorni e' normale, un VIX di 6 giorni no).
 Lo snapshot si aggiorna SEMPRE (anche per i dati sani), cosi' il confronto e'
 sempre con l'ultima run reale.
 """
 import json
+import math
 import os
 from datetime import date
 from bellomberg.core.paths import DATA_DIR
 
 SNAP_PATH = str(DATA_DIR / "freshness_snapshot.json")
-IDENTICAL_DAYS = 7          # valore identico da > N giorni = fonte ferma
+IDENTICAL_DAYS = 7          # compatibilita': identicita' da sola non prova STALE
 _OBS_LIMITS = (             # (keyword nel nome serie, giorni max di osservazione)
     ("gdp", 130),                       # trimestrale
     ("cpi", 45), ("unemployment", 45), ("retail", 45), ("industrial", 45),
@@ -65,48 +67,61 @@ def _save(snap: dict) -> None:
 
 def check_and_update(current: dict, today: date = None) -> dict:
     """current: {chiave: {"value": num/str, "obs_date": "YYYY-MM-DD"|None}}.
-    Ritorna {"stale": [testo...], "fresh": n, "checked": n} e aggiorna lo snapshot."""
+    Ritorna stale/unknown (liste), fresh e checked; ogni serie conta una volta.
+    La freschezza e' misurata dalla data osservata, non dal cambiamento del valore."""
     today = today or date.today()
     snap = _load()
     stale = []
+    unknown = []
     fresh = 0
     for key, cur in sorted(current.items()):
         val = cur.get("value")
         if val is None:
+            unknown.append(key + ": n.d. - valore assente")
+            continue
+        try:
+            valid_value = not isinstance(val, bool) and math.isfinite(float(val))
+        except (TypeError, ValueError, OverflowError):
+            valid_value = False
+        if not valid_value:
+            unknown.append(key + ": n.d. - valore non numerico o non finito")
             continue
         sval = repr(val)
         prev = snap.get(key) or {}
         first_seen = today.isoformat()
         if prev.get("value") == sval and prev.get("first_seen"):
             first_seen = prev["first_seen"]
-        reasons = []
-        try:
-            same_days = (today - date.fromisoformat(first_seen)).days
-        except Exception:
-            same_days = 0
-        # soglia "identico" per FREQUENZA: una CPI mensile identica da 10 giorni e'
-        # normale (nuova stampa una volta al mese), un funding live fermo da 10 no.
-        _ident_lim = max(IDENTICAL_DAYS, _obs_limit(key))
-        if prev.get("value") == sval and same_days > _ident_lim:
-            reasons.append(f"valore IDENTICO da {same_days} giorni ({val}): fonte ferma o cachata")
         od = cur.get("obs_date")
-        if od:
+        unknown_reason = None
+        stale_reason = None
+        if not od:
+            unknown_reason = "data osservazione assente"
+        else:
             try:
-                obs_age = (today - date.fromisoformat(str(od)[:10])).days
+                # Contratto: YYYY-MM-DD completo. Non troncare un valore invalido.
+                od_text = str(od)
+                parsed = date.fromisoformat(od_text)
+                if parsed.isoformat() != od_text:
+                    raise ValueError("data non ISO YYYY-MM-DD")
+                obs_age = (today - parsed).days
                 lim = _obs_limit(key)
-                if obs_age > lim:
-                    reasons.append(f"osservazione del {str(od)[:10]} = {obs_age} giorni fa "
-                                   f"(limite {lim} per questa serie)")
-            except Exception:
-                pass
-        if reasons:
-            stale.append(key + ": " + "; ".join(reasons))
+                if obs_age < 0:
+                    unknown_reason = "data osservazione futura: " + od_text
+                elif obs_age > lim:
+                    stale_reason = (f"osservazione del {od_text} = {obs_age} giorni fa "
+                                    f"(limite {lim} per questa serie)")
+            except (ValueError, TypeError):
+                unknown_reason = "data osservazione invalida: " + str(od)
+        if unknown_reason:
+            unknown.append(key + ": n.d. - " + unknown_reason)
+        elif stale_reason:
+            stale.append(key + ": " + stale_reason)
         else:
             fresh += 1
-        snap[key] = {"value": sval, "obs_date": (str(od)[:10] if od else None),
+        snap[key] = {"value": sval, "obs_date": (str(od) if od else None),
                      "first_seen": first_seen, "last_run": today.isoformat()}
     _save(snap)
-    return {"stale": stale, "fresh": fresh, "checked": len(current)}
+    return {"stale": stale, "unknown": unknown, "fresh": fresh, "checked": len(current)}
 
 
 def format_for_memo(report: dict):
@@ -117,24 +132,29 @@ def format_for_memo(report: dict):
     if not report:
         return ""
     stale = report.get("stale") or []
-    if not stale:
+    unknown = report.get("unknown") or []
+    if not stale and not unknown:
         return ""
     head = "## QUALITA' DATI (freshness check — blocco automatico, appeso dal codice)"
-    lines = ["- " + s for s in stale]
-    foot = ("*({} serie esterne controllate: {} fresche, {} STALE. Le cifre del memo "
+    lines = ["- " + s for s in stale + unknown]
+    quality = f", {len(unknown)} n.d." if unknown else ""
+    foot = ("*({} serie esterne controllate: {} fresche, {} STALE{}. Le cifre del memo "
             "basate sui dati sopra valgono alla data di osservazione indicata, non a "
-            "oggi.)*".format(report.get("checked", "?"), report.get("fresh", "?"),
-                             len(stale)))
+            "oggi; se n.d., la freschezza non e' verificabile.)*".format(
+                report.get("checked", "?"), report.get("fresh", "?"), len(stale), quality))
     return "\n".join([head] + lines + [foot])
 
 
 def format_for_capo(report: dict):
-    """Blocco per il prompt del Capo. None se non c'e' nulla di stantio."""
-    if not report or not report.get("stale"):
+    """Blocco qualita' per il Capo. None se tutte le date sono fresche."""
+    if not report:
         return None
-    return ("\n\n=== FRESHNESS CHECK: DATI STANTII RILEVATI ===\n- "
-            + "\n- ".join(report["stale"])
-            + "\nREGOLA (PM): questi dati NON sono correnti. Nel memo si usano SOLO "
-              "dichiarando la data/eta' di osservazione; VIETATO presentarli come "
+    problems = (report.get("stale") or []) + (report.get("unknown") or [])
+    if not problems:
+        return None
+    return ("\n\n=== FRESHNESS CHECK: DATI STALE O FRESCHEZZA N.D. ===\n- "
+            + "\n- ".join(problems)
+            + "\nREGOLA (PM): questi dati non sono verificati come correnti. Nel memo si usano SOLO "
+              "dichiarando la data/eta' di osservazione o la freschezza n.d.; VIETATO presentarli come "
               "ricerca corrente o descriverne la 'direzione' (es. 'in risalita') "
               "sulla base di un valore fermo.")

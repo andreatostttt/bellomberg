@@ -556,6 +556,19 @@ def options_score(proxy_ticker=None, portfolio_data=None, options_data=None):
             return None
     if not isinstance(options_data, dict) or options_data.get("error"):
         return None
+    from bellomberg.core.options_expiry import valid_expiry
+    try:
+        declared = [options_data[key] for key in ("expiry_used", "nearest_expiry") if key in options_data]
+        if not declared:
+            raise ValueError("expiry_missing")
+        expiries = {valid_expiry(value) for value in declared}
+        if len(expiries) != 1:
+            raise ValueError("expiry_conflicting")
+    except ValueError as exc:
+        reason = str(exc)
+        return {"domain": "options ({})".format(proxy_ticker or "?"),
+                "score": None, "max_score": None, "verdict": "n.d. - " + reason,
+                "unavailable_reason": reason, "lines": [("Expiry", reason, None)], "metrics": {}}
     civ = _finite_number(options_data.get("atm_iv_call_pct"))
     piv = _finite_number(options_data.get("atm_iv_put_pct"))
     pcr = _finite_number(options_data.get("put_call_oi_ratio"))
@@ -815,7 +828,7 @@ def _poli_data_futura(end_date, adesso):
     except ValueError:
         return False
     if d.tzinfo is None:
-        d = d.replace(tzinfo=_tz.utc)
+        return False  # timezone assente: non inventare UTC per dichiarare il mercato aperto
     return d > adesso
 
 
@@ -828,12 +841,22 @@ def _poli_scegli_mercato(risultati, alternative, adesso, esclusi=()):
     scelto = None
     n_scartati = 0
     esclusi = {str(x).strip().lower() for x in (esclusi or ())}
+    def activity_unavailable(row):
+        status = row.get("activity_status")
+        if status is not None and status != "active":
+            return True
+        state = row.get("provider_state")
+        state = state if isinstance(state, dict) else row
+        return state.get("active") is False or state.get("closed") is True or state.get("archived") is True
     for ev in risultati or []:
         if not isinstance(ev, dict):
             continue
         mkts = ev.get("markets") if ev.get("markets") else [ev]
         for m in (mkts or []):
             if not isinstance(m, dict):
+                continue
+            if activity_unavailable(ev) or activity_unavailable(m):
+                n_scartati += 1
                 continue
             outs = m.get("outcomes")
             prs = m.get("prices") or m.get("outcomePrices")
@@ -858,7 +881,7 @@ def _poli_scegli_mercato(risultati, alternative, adesso, esclusi=()):
                 n_scartati += 1
                 continue
             question = m.get("question") or ev.get("title")
-            end_date = m.get("end_date") or ev.get("end_date")
+            end_date = m.get("end_date")  # la data dell'evento non attesta la scadenza del figlio
             if (not (0.0 < yes < 1.0) or not _poli_data_futura(end_date, adesso)
                     or not _poli_termini_ok(question, alternative)
                     or str(question or "").strip().lower() in esclusi):
@@ -870,7 +893,10 @@ def _poli_scegli_mercato(risultati, alternative, adesso, esclusi=()):
             chiave = (vol if vol is not None else -1.0, yes)
             if scelto is None or chiave > scelto[0]:
                 scelto = (chiave, yes, {"question": str(question)[:160], "end_date": end_date,
-                                        "volume_24h": vol})
+                                        "volume_24h": vol,
+                                        "activity_verification": ("explicit_active" if
+                                            m.get("activity_status") == ev.get("activity_status") == "active"
+                                            else "legacy_date_and_unresolved_price_only")})
     if scelto is None:
         return None, None, n_scartati
     return scelto[1], scelto[2], n_scartati
@@ -1001,6 +1027,9 @@ def format_score_block(score: dict) -> str:
         return ""
     L = []
     L.append(_t("=== SCORE DETERMINISTICO ({}) — calcolato in codice, parti da QUESTO ===").format(score["domain"].upper()))
+    if score.get("score") is None:
+        from bellomberg.core.presentation import message
+        return "\n".join(L + [message("Verdetto: {verdict}.", "Verdict: {verdict}.", verdict=score["verdict"])])
     L.append(_t("Verdetto: {} ({}/{} punti rischio; piu' alto = piu' rischio).").format(
         score["verdict"], score["score"], score["max_score"]))
     from bellomberg.core.presentation import message as _message

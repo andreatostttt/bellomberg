@@ -17,6 +17,7 @@ dispatcher; su errore {"error": "..."} e MAI eccezioni verso il chiamante. Cache
 ticker, nel dispatcher (un esito con errore non si cachea).
 """
 import json
+import math
 import re
 import time
 
@@ -202,32 +203,82 @@ _NOTA_HYPE = ("Formula UFFICIALE (hypestrat.xyz, computeDashboard/Excel: input P
               "+ (HYPE live x hypeHeld) + dtlChange, con dtlChange = reportedDTL - taxRate x (HYPE value - taxBasis); "
               "FD shares = basicShares + warrant ITM a TREASURY METHOD ((px-strike)x amount/px); "
               "mNAV = prezzo dell'azione / (Adjusted NAV / FD shares); mnav_dtl_addback riaggiunge la DTL (riga C24 del sito). "
-              "NB: e' l'AZIONE della tesoreria quotata al Nasdaq, NON il token omonimo sul DEX.")
+              "NB: il ticker richiesto indica l'AZIONE, NON il token omonimo sul DEX; "
+              "identita' emittente/ISIN non verificata da fast_info, venue e valuta solo se dichiarate dal provider.")
 
 
-def _prezzi_live_hype(ticker):
+def _prezzo_positivo_dat(raw):
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+        return value if math.isfinite(value) and value > 0 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _prezzi_live_hype(ticker, *, metadata=None):
     """(purr_px, purr_fonte, hype_px, hype_fonte) — fonti DICHIARATE, mai zitte.
     Azione: yfinance sul ticker chiesto. HYPE: Hyperliquid allMids (venue nativa, stessa fonte
     live del sito), fallback yfinance HYPE32196-USD dichiarato."""
     purr_px, purr_src = None, None
+    purr_raw, currency, exchange = None, None, None
+    metadata_errors = {}
     try:
         import yfinance as yf
-        purr_px = float(yf.Ticker(ticker).fast_info.last_price)
-        purr_src = "yfinance %s (Nasdaq)" % ticker
+        fast = yf.Ticker(ticker).fast_info
+        purr_raw = fast.last_price
+        for key in ('currency', 'exchange'):
+            try:
+                value = getattr(fast, key)
+                if key == 'currency':
+                    currency = value
+                else:
+                    exchange = value
+            except Exception as exc:
+                metadata_errors[key] = type(exc).__name__
+        purr_px = _prezzo_positivo_dat(purr_raw)
+        purr_src = "yfinance %s (fast_info)" % ticker
     except Exception as e:
         purr_src = "yfinance ko: " + str(e)[:80]
+    price_valid = purr_px is not None
+    reason = ('invalid_price' if not price_valid else
+              'currency_missing' if currency is None or currency == '' else
+              'currency_not_usd' if currency != 'USD' else None)
+    if reason:
+        purr_px = None
+        purr_src += "; quotazione non comparabile: " + reason
     hype_px, hype_src = None, None
+    hype_raw = None
     try:
         r = requests.post("https://api.hyperliquid.xyz/info", json={"type": "allMids"}, timeout=10)
-        hype_px = float(r.json().get("HYPE"))
+        hype_raw = r.json().get("HYPE")
+        hype_px = float(hype_raw)
         hype_src = "hyperliquid allMids"
     except Exception:
         try:
             import yfinance as yf
-            hype_px = float(yf.Ticker("HYPE32196-USD").fast_info.last_price)
+            hype_raw = yf.Ticker("HYPE32196-USD").fast_info.last_price
+            hype_px = float(hype_raw)
             hype_src = "yfinance HYPE32196-USD (fallback: hyperliquid allMids ko, dichiarato)"
         except Exception as e:
             hype_src = "hyperliquid E yfinance ko: " + str(e)[:80]
+    hype_px = _prezzo_positivo_dat(hype_raw) if hype_px is not None else None
+    if hype_px is None:
+        hype_src += "; prezzo non valido o assente"
+    if metadata is not None:
+        # Nonfinite raw values are preserved as text, never as JSON NaN/Infinity.
+        raw_quote = lambda v: repr(v) if isinstance(v, float) and not math.isfinite(v) else v
+        metadata.update({
+            'purr_quote': {'requested_ticker': ticker, 'raw_last': raw_quote(purr_raw),
+                          'currency': currency, 'exchange': exchange,
+                          'metadata_errors': metadata_errors, 'identity_status': 'UNVERIFIED',
+                          'identity_note': 'fast_info non attesta emittente/ISIN',
+                          'price_quality': 'VALID' if price_valid else 'INVALID',
+                          'comparability': 'USD' if reason is None else 'UNAVAILABLE', 'reason': reason},
+            'hype_quote': {'raw_last': raw_quote(hype_raw), 'unit_status': 'UNVERIFIED',
+                          'unit_note': 'convenzione fonte esistente, non verificata indipendentemente',
+                          'price_quality': 'VALID' if hype_px is not None else 'INVALID'}})
     return purr_px, purr_src, hype_px, hype_src
 
 
@@ -247,7 +298,8 @@ def _fetch_dat_dashboard_inputs(ticker):
         "dat_di": "HYPE",
         "fonte": "hypestrat.xyz/api/dashboard-inputs (sito IR ufficiale, JSON)",
         "nota_mnav": _NOTA_HYPE,
-        "unita": "valori in milioni ($M / M azioni / M token); quote in $ per unita'",
+        "unita": "input sito in milioni ($M / M azioni / M token); azione utilizzabile solo con valuta USD; "
+                 "raw_last nella valuta dichiarata; unita' HYPE secondo convenzione fonte non verificata indipendentemente",
         "dat_fundamentals_musd": {k: v for k, v in inp.items()
                                   if isinstance(v, (int, float))},
         "warrants": inp.get("warrants") or [],
@@ -256,9 +308,10 @@ def _fetch_dat_dashboard_inputs(ticker):
                     "lag_note": (inp.get("noteText") or "")[:300] or None},
     }
 
-    purr_px, purr_src, hype_px, hype_src = _prezzi_live_hype(ticker)
-    out["purr_quote"] = {"last": purr_px, "fonte": purr_src}
-    out["hype_quote"] = {"last": hype_px, "fonte": hype_src}
+    quote_metadata = {}
+    purr_px, purr_src, hype_px, hype_src = _prezzi_live_hype(ticker, metadata=quote_metadata)
+    out["purr_quote"] = {"last": purr_px, "fonte": purr_src, **quote_metadata['purr_quote']}
+    out["hype_quote"] = {"last": hype_px, "fonte": hype_src, **quote_metadata['hype_quote']}
 
     # Mirror ESATTO di computeDashboard(inp, liveHype, livePurr) del sito
     # (commenti C7..C39 = celle dell'Excel di riferimento citate nel JS).

@@ -26,6 +26,10 @@ def parent_case(path, fault=None, v2=False):
     contract = {key: payload[key] for key in ('ticker', 'language', 'view_text', 'models', 'analysis_mode')
                 + (('execution_policy',) if v2 else ())}
     contract.update(version=1, source_fingerprint=payload['source_qualification']['fingerprint'])
+    from bellomberg.core.mandato_pm import MANDATE_TEXT_POLICY_KEY
+    persisted = current.get_run(parent)['run']
+    if MANDATE_TEXT_POLICY_KEY in persisted:
+        contract[MANDATE_TEXT_POLICY_KEY] = persisted[MANDATE_TEXT_POLICY_KEY]
     checkpoint = {'version': 1, 'contract': contract, 'data': {'macro': {'2': 'Original report'}},
                   'specialist_checkpoints': {}}
     if fault == 'checkpoint_contract': checkpoint['contract']['ticker'] = 'ALTERED'

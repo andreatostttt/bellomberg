@@ -171,7 +171,7 @@ def test_scorers_do_not_turn_invalid_metric_into_risk_points(value):
     import bellomberg.agents.specialist_scores as ss
     assert ss.quant_score(risk_data={"portfolio": {"vol_annual_pct": value}}) is None
     assert ss.macro_score({"indicators": {"vix_close": {"value": value}}}) is None
-    assert ss.options_score(options_data={"atm_iv_call_pct": value}) is None
+    assert ss.options_score(options_data={"atm_iv_call_pct": value, "nearest_expiry": __import__("datetime").date.today().isoformat()}) is None
     assert ss.crypto_score({"highest_funding_long_pressure": [{"funding_annualized_pct": value}]}) is None
     assert ss.politics_score({"synthetic topic": value}) is None
 
@@ -302,9 +302,9 @@ def test_politics_reads_the_actual_polymarket_tool_contract(monkeypatch):
     # audit 11/09: il contratto letto comprende anche endDate (un mercato senza data di
     # chiusura futura e' risolto o non datato: politics_score lo scarta, dichiarandolo)
     monkeypatch.setattr(at, "_poly_fetch", lambda url, params, **kw: {
-        "events": [{"title": "synthetic event", "slug": "synthetic-event",
+        "events": [{"title": "synthetic event", "slug": "synthetic-event", "active": True, "closed": False,
                     "endDate": "2099-01-01T00:00:00Z", "markets": [{
-            "question": "synthetic tail?", "outcomes": '["Yes","No"]',
+            "question": "synthetic tail?", "outcomes": '["Yes","No"]', "active": True, "closed": False,
             "outcomePrices": '["0.8","0.2"]', "endDate": "2099-01-01T00:00:00Z"}]}]}
         if url.endswith("public-search") else [])
     monkeypatch.setattr(ss, "_POLI_TOPICS", {"Synthetic": "synthetic"})

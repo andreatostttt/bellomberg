@@ -1397,6 +1397,8 @@ def run_trade_idea_capo(blackboard, *, portfolio, mandate, decision_context=None
         CAPO_RESEARCH_INSTRUCTIONS_V4, trade_idea_result_schema, validate_result)
     from bellomberg.valuation.sector_analysis import valuation_results_block
     from bellomberg.core.language import output_language_instruction
+    from bellomberg.core import mandato_pm
+    text_policy = mandato_pm.text_policy_for_board(blackboard)
     verified_valuations = _require_final_desk_models(blackboard)
 
     chosen = scegli_report_specialisti(
@@ -1473,12 +1475,15 @@ def run_trade_idea_capo(blackboard, *, portfolio, mandate, decision_context=None
                       "devono comparire nel tool citato. Per una derivazione ipotetica "
                       "usa [assumption] o [ipotesi], formula esplicita e input citati; "
                       "non presentarla come dato osservato."))
+    from bellomberg.core.language import text as language_text
+    minimum_action_label = ("posizione minima" if text_policy is None else language_text(
+        "soglia minima d'azione del mandato (su NAV)", "minimum action amount under the mandate (on NAV)"))
     system = ((research_prompt if research else CAPO_TRADE_IDEA_INSTRUCTIONS)
               + "\n\n" + output_language_instruction(blackboard.language)
               + evidence_rule + citation_rule
-              + "\n\n" + mandato_pm.blocco_prompt(mandate)
+              + "\n\n" + mandato_pm.blocco_prompt(mandate, **({"text_policy": text_policy} if text_policy is not None else {}))
               + ("\n\nTAGLIA DELLA PROPOSTA: la SIZING BAND del server applica le regole di questo "
-                 "mandato (size di una nuova posizione, peso massimo per posizione, posizione minima, "
+                 "mandato (size di una nuova posizione, peso massimo per posizione, " + minimum_action_label + ", "
                  "cassa minima), limitate dai limiti misurati del motore di sizing; azione e importo si "
                  "scelgono solo dentro la fascia di quell'azione." if policy_v4 else ""))
     red_notes = _red_inadmissible_gaps(blackboard) if research else []
@@ -1619,7 +1624,7 @@ def run_trade_idea_capo(blackboard, *, portfolio, mandate, decision_context=None
     if policy_v4:
         # Inserted after every positional rewrite of parts (indices 7, 10-13 above):
         # the /2-/3 bodies stay byte-identical. Placed right after the sizing block.
-        parts.insert(len(parts) - 3, _sizing_band_block(sizing, portfolio, blackboard.target_ticker, mandate))
+        parts.insert(len(parts) - 3, _sizing_band_block(sizing, portfolio, blackboard.target_ticker, mandate, text_policy=text_policy))
     gate = getattr(blackboard, "budget_gate", None)
     if gate is None:
         raise ValueError("Trade Idea Capo senza budget gate")
@@ -1859,7 +1864,10 @@ def _progress(blackboard, phase, *, events=()):
 
 def _checkpoint_contract(blackboard):
     run = blackboard.budget_gate.store.get_run(blackboard.run_id)["run"]
+    from bellomberg.core.mandato_pm import MANDATE_TEXT_POLICY_KEY, text_policy_from_context
+    text_policy = text_policy_from_context(run)
     return {"version": 1, "ticker": run["ticker"], "language": run["language"],
+        **({MANDATE_TEXT_POLICY_KEY: text_policy} if MANDATE_TEXT_POLICY_KEY in run else {}),
         **({'analysis_mode': RESEARCH_ANALYSIS_MODE} if is_research_mode(run) else {}),
         **({'execution_policy': execution_policy(run)} if execution_policy(run) is not None else {}),
         "view_text": run["view_text"], "models": run["models"],
@@ -3508,9 +3516,10 @@ def _pm_binding_reader(db_path):
     return _SolaLettura(db_path)
 
 
-def _pm_constraints_snapshot(db_path, mandate, *, origin):
+def _pm_constraints_snapshot(db_path, mandate, *, origin, text_policy=None):
     from bellomberg.agents.specialists.base import blocco_vincoli_pm, stato_vincoli_pm
     from bellomberg.core import mandato_pm
+    mandato_pm._validate_text_policy(text_policy)
     try:
         text = blocco_vincoli_pm(_pm_binding_reader(db_path))
         reason = None
@@ -3531,7 +3540,7 @@ def _pm_constraints_snapshot(db_path, mandate, *, origin):
     try:
         if not isinstance(mandate, dict):
             raise ValueError("mandato non caricato")
-        mandate_row = {"status": "available", "text": mandato_pm.blocco_prompt(mandate),
+        mandate_row = {"status": "available", "text": mandato_pm.blocco_prompt(mandate, **({"text_policy": text_policy} if text_policy is not None else {})),
                        "fingerprint": mandato_pm.impronta(mandate), "reason": None}
     except Exception as exc:
         reason = type(exc).__name__ + ": " + str(exc)[:300]
@@ -3544,11 +3553,13 @@ def _pm_constraints_snapshot(db_path, mandate, *, origin):
 def _bind_pm_constraints(blackboard, db_path, mandate, *, resumed=False):
     """Fotografia unica per run. Alla ripresa vale quella del checkpoint; un checkpoint
     precedente alla cura (chiave assente) riceve una lettura NUOVA, dichiarata come tale."""
+    from bellomberg.core import mandato_pm
+    text_policy = mandato_pm.text_policy_for_board(blackboard)
     saved = blackboard.data.get(PM_CONSTRAINTS_KEY)
     if isinstance(saved, dict) and saved.get("version") == 1:
         return saved
     origin = "letti alla ripresa: il checkpoint precedente non li conteneva" if resumed else "run_start"
-    snapshot = _pm_constraints_snapshot(db_path, mandate, origin=origin)
+    snapshot = _pm_constraints_snapshot(db_path, mandate, origin=origin, text_policy=text_policy)
     blackboard.data[PM_CONSTRAINTS_KEY] = snapshot
     print("[TRADE_IDEA] vincoli PM: " + snapshot["binding"]["state"]
           + " | mandato: " + snapshot["mandate"]["status"] + " | origine: " + origin)
@@ -4862,14 +4873,21 @@ def _band_actions(sizing, ticker):
     return ("ADD", "TRIM", "SELL") if held else ("BUY",)
 
 
-def _sizing_band_block(sizing, portfolio, ticker, mandate):
+def _sizing_band_block(sizing, portfolio, ticker, mandate, *, text_policy=None):
     """The /4 Capo message block: the band of each admissible action, or its absence."""
+    from bellomberg.core import mandato_pm
+    mandato_pm._validate_text_policy(text_policy)
+    from bellomberg.core.language import text as language_text
+    action_label = language_text("soglia minima d'azione del mandato (su NAV)",
+                                 "minimum action amount under the mandate (on NAV)")
     bands, missing = {}, {}
     for action in _band_actions(sizing, ticker):
         reasons = []
         band = _sizing_band(sizing, portfolio, ticker, reasons, mandate=mandate, action=action)
         if band is None:
             missing[action] = "; ".join(reasons)
+            if text_policy is not None:
+                missing[action] = missing[action].replace("posizione minima del mandato", action_label)
         else:
             bands[action] = band
     if not bands:
@@ -4899,6 +4917,8 @@ def _sizing_band_block(sizing, portfolio, ticker, mandate):
                      "fascia e' vuota)" + ("; richiede TUTTE le condizioni del mandato " + ", ".join(
                          bands["SELL"]["conditions_required"]) + ", che il server non verifica: una SELL va "
                          "in ricerca, dichiarale nel basis" if bands["SELL"].get("conditions_required") else ""))
+    if text_policy is not None:
+        notes = [note.replace("posizione minima del mandato", action_label) for note in notes]
     not_applicable = sorted({rule for band in bands.values()
                              for rule in band["components"].get("rules_not_applicable", ())})
     if not_applicable:
@@ -5046,7 +5066,7 @@ def _bound_evidence_details(result, blackboard, ticker, cutoff):
                           "period_end", "reported_at", "filing_date", "observed_at"}
 
     def economic_dates(output, tool=None):
-        """{data economica: testi in cui cercare i numeri dell'Evidence}."""
+        """{data economica: frammenti JSON in cui cercare i numeri dell'Evidence}."""
         try:
             parsed = json.loads(output)
         except (TypeError, ValueError):
@@ -5078,7 +5098,7 @@ def _bound_evidence_details(result, blackboard, ticker, cutoff):
                         gruppo(value, nome, depth + 1)
 
             gruppo(payload, None, 0)
-            return {day: "\n".join(testi) for day, testi in gruppi.items()}
+            return gruppi
         dates = set()
 
         def visit(node, depth):
@@ -5095,7 +5115,7 @@ def _bound_evidence_details(result, blackboard, ticker, cutoff):
                     visit(value, depth + 1)
 
         visit(payload, 0)
-        return {day: output for day in dates}
+        return {day: [output] for day in dates}
 
     used = {ident for section in result.get("dossier", [])
             for ident in section.get("evidence_ids", [])}
@@ -5148,10 +5168,16 @@ def _bound_evidence_details(result, blackboard, ticker, cutoff):
             # R-CASCATA 2a verifica: un anno (1900-2100) non e' una misura (sta in ogni period_end) e un
             # numero si confronta INTERO, non come sottostringa («23.45» non e' dentro «123.45»).
             numbers = [n for n in numbers if not _ANNO.fullmatch(n)]
-            measured = bool(numbers and any(_numero_intero(n).search(scopes[observed]) for n in numbers)
+            measured = bool(numbers and any(_numero_intero(n).search(fragment)
+                            for n in numbers for fragment in scopes[observed])
                             and re.search(r"(?:%|€|\$|\b(?:EUR|USD|GBP|GBX|bps|pp|azioni|shares)\b)",
                                           evidence["summary"], re.I))
             bound[evidence["id"]] = {"tool": tool, "output": output,
+                                     # Keep the raw receipt for historical contracts; /4
+                                     # must not re-admit numbers from excluded periods.
+                                     # JSON preserves field scales across multiple groups.
+                                     "economic_output": json.dumps([json.loads(fragment)
+                                         for fragment in scopes[observed]], ensure_ascii=False),
                                      "summary": evidence.get("summary") or ""}
             if measured:
                 numeric.add(evidence["id"])
@@ -5174,8 +5200,7 @@ def _bound_evidence(result, blackboard, ticker, cutoff):
 _QUANTITY = re.compile(
     r"(?<![\w])[-+]?\d+(?:[.,]\d+)?(?:\s?(?:%|bps|pp|€|\$|EUR|USD|GBP|GBX|bn|billion|million|m|k))?(?![\w])",
     re.I)
-_MONTHS = ("jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|gen|feb|mar|apr|mag|giu|"
-           "lug|ago|set|ott|nov|dic")
+
 
 
 def _is_v4_memo(result, blackboard):
@@ -5195,165 +5220,19 @@ def _v4_field_evidence_ids(result):
 # /4 prose follows the output-language convention (Italian: 1.234,5 and 12,5%), so the
 # token keeps every group separator and its sign instead of splitting "1.234,5" into
 # two numbers; a multiple ("12,9x") or a scale word is part of the token.
-_QUANTITY_LOCAL = re.compile(
-    r"(?<![\w.,])[-+−]?(?:\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?)(?![.,]?\d)"
-    r"(?:\s?(?:%|bps|pp|€|\$|EUR|USD|GBP|GBX|bn|billion|billions|million|millions|mld|mln|"
-    r"miliardi|miliardo|milioni|milione|mila|migliaia|mrd|bilioni|bilione|trilioni|trilione|m|k|x))?(?![\w])",
-    re.I)
-_UNIT_SCALE = {"bn": 9, "billion": 9, "billions": 9, "mld": 9, "miliardi": 9, "miliardo": 9,
-               "million": 6, "millions": 6, "mln": 6, "milioni": 6, "milione": 6, "m": 6,
-               "mila": 3, "migliaia": 3, "k": 3, "mrd": 9,
-               # Italian long scale: bilione = 10^12, trilione = 10^18.
-               "bilioni": 12, "bilione": 12, "trilioni": 18, "trilione": 18}
-# Tool field names that declare their own scale (revenue_eur_m = millions of euro).
-_FIELD_SCALE = ((re.compile(r"(?:^|_)(?:bn|b|mld|billions?)$", re.I), 9),
-                (re.compile(r"(?:^|_)(?:m|mn|mm|mln|millions?)$", re.I), 6),
-                (re.compile(r"(?:^|_)(?:k|thousands?)$", re.I), 3))
-# Text numbers inside receipts: English thousands groups ("1,234.5") stay one number.
-_OUTPUT_TEXT_NUMBER = re.compile(
-    r"(-?\d{1,3}(?:,\d{3})+(?:\.\d+)?(?![\d,])|-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
-    r"(?:\s?(billions?|bn|mld|miliardi|millions?|mln|milioni|thousands?|mila|k)\b)?", re.I)
-_TEXT_SCALE = {"billion": 9, "billions": 9, "bn": 9, "mld": 9, "miliardi": 9, "million": 6, "millions": 6,
-               "mln": 6, "milioni": 6, "thousand": 3, "thousands": 3, "mila": 3, "k": 3}
-
-
-def _local_number_values(token, language):
-    """Every reading of a localized numeric token as (signed value, decimals).
-
-    it (default): '.' groups thousands, ',' is the decimal mark; en: the reverse.
-    The convention of the output language decides ('1.250' is 1250 in Italian); a lone
-    separator that is not a thousands group is a decimal mark ('12.5'); a leading zero
-    group ('0.125') is always decimal.
-    """
-    from decimal import Decimal
-    stripped = token.strip()
-    negative = stripped[:1] in ("-", "−")
-    body = re.match(r"[-+−]?([\d.,]+)", stripped).group(1).rstrip(".,")
-    group, decimal = (",", ".") if language == "en" else (".", ",")
-    readings = set()
-
-    def read(group_mark, decimal_mark):
-        if not re.fullmatch(r"\d{1,3}(?:" + re.escape(group_mark) + r"\d{3})*(?:"
-                            + re.escape(decimal_mark) + r"\d+)?|\d+(?:"
-                            + re.escape(decimal_mark) + r"\d+)?", body):
-            return
-        text = body.replace(group_mark, "").replace(decimal_mark, ".")
-        value = Decimal(text)
-        readings.add((-value if negative else value, len(text.split(".")[1]) if "." in text else 0))
-
-    if re.fullmatch(r"0[.,]\d+", body):
-        read("", body[1])            # '0.125' / '0,125': always a decimal
-        return readings
-    read(group, decimal)
-    separators = body.count(".") + body.count(",")
-    if separators == 1 and not readings:
-        read(decimal, group)        # a lone mark that is not a valid thousands group
-    return readings
-
-
-def _field_scale(key):
-    for pattern, exponent in _FIELD_SCALE:
-        if pattern.search(str(key or "")):
-            return exponent
-    return 0
-
-
-def _output_numbers(text):
-    """Signed numbers of a receipt as (value, scale exponent declared by its field name)."""
-    from decimal import Decimal
-    found = []
-
-    def text_numbers(value, exponent):
-        for raw, word in _OUTPUT_TEXT_NUMBER.findall(str(value)):
-            try:
-                # A scale word written after the number in the receipt text wins.
-                found.append((Decimal(raw.replace(",", "")), _TEXT_SCALE.get(word.lower(), exponent)
-                              if word else exponent))
-            except InvalidOperation:
-                continue
-
-    def visit(node, exponent, depth):
-        if depth > 12:
-            return
-        if isinstance(node, dict):
-            for key, value in node.items():
-                visit(value, _field_scale(key), depth + 1)
-        elif isinstance(node, list):
-            for value in node:
-                visit(value, exponent, depth + 1)
-        elif isinstance(node, bool) or node is None:
-            return
-        elif isinstance(node, (int, float)):
-            number = Decimal(str(node))
-            if number.is_finite():
-                found.append((number, exponent))
-        else:
-            text_numbers(node, exponent)
-    try:
-        visit(json.loads(text), 0, 0)
-    except (TypeError, ValueError):
-        text_numbers(text or "", 0)
-    return found
-
-
-def _number_attested(token, language, numbers):
-    """Rounded, SIGNED comparison of a prose token with receipt numbers.
-
-    A scale word ('1,2 miliardi') is compared only at that scale, with the receipt
-    value brought to units through its field name (revenue_eur_m); a bare token is
-    compared with the receipt value as written; '12,5%' also matches a 0.125 ratio.
-    """
-    from decimal import Decimal, ROUND_HALF_UP
-    unit = re.sub(r"^[-+−]?[\d.,]+\s?", "", token.strip()).lower()
-    group = "," if language == "en" else "."
-    if unit == "%" and group in token:
-        return False                # '41.025%': a grouped percentage is ambiguous, never x100
-    for value, places in _local_number_values(token, language):
-        quantum = Decimal(1).scaleb(-places)
-        for number, exponent in numbers:
-            if unit in _UNIT_SCALE:
-                candidates = [number.scaleb(exponent - _UNIT_SCALE[unit])]
-            else:
-                candidates = [number] + ([number.scaleb(2)] if unit == "%" else [])
-            for candidate in candidates:
-                try:
-                    if candidate.quantize(quantum, rounding=ROUND_HALF_UP) == value:
-                        return True
-                except InvalidOperation:
-                    continue    # beyond decimal precision: not this reading
-    return False
-
-
-_YEAR_UNITS_V4 = (r"\s*%|\s*(?:bps|pp|USD|EUR|GBP|GBX|million|millions|billion|billions|bn|milioni|milione|"
-                  r"mln|miliardi|miliardo|mld|mila)\b|\s*€")
-
-
-def _quantity_spans_v4(text):
-    """/4 numeric tokens with their positions in the ORIGINAL text.
-
-    Same exclusions as _quantities (URLs, dates, FY/CY/Q labels, years, a list number
-    at the start), blanked with spaces of the same length so the spans stay valid; a
-    year-shaped number followed by an Italian or English unit (2050 milioni, 1980 mln,
-    2045 €) is an amount, not a year. Known limits: numbers written in words, a number
-    right after a Q/FY label ("Q 470") and a list number at the start are not read.
-    """
-    source = str(text or "")
-    blank = lambda match: " " * len(match.group())
-    scrubbed = re.sub(r"https?://\S+", blank, source)
-    scrubbed = re.sub(r"\b(?:19|20)\d{2}[-/]\d{1,2}(?:[-/]\d{1,2})?\b", blank, scrubbed)
-    scrubbed = re.sub(r"\b\d{1,2}\s+(?:" + _MONTHS + r")[a-z]*\s+(?:19|20)\d{2}\b", blank, scrubbed, flags=re.I)
-    scrubbed = re.sub(r"\b(?:FY|CY|Q)[ -]?\d{1,4}\b", blank, scrubbed, flags=re.I)
-
-    def year_or_amount(match):
-        before = scrubbed[max(0, match.start() - 8):match.start()]
-        after = scrubbed[match.end():match.end() + 12]
-        if (re.search(r"(?:[$€]|\b(?:USD|EUR|GBP|GBX))\s*$", before, re.I)
-                or re.match(_YEAR_UNITS_V4, after, re.I)):
-            return match.group()
-        return " " * len(match.group())
-    scrubbed = re.sub(r"\b(?:19|20)\d{2}\b", year_or_amount, scrubbed)
-    scrubbed = re.sub(r"^\s*\d+(?:\.\d+)*[.)]\s+", blank, scrubbed)
-    return [(match.group().strip(), match.start(), match.end()) for match in _QUANTITY_LOCAL.finditer(scrubbed)]
+from bellomberg.core.memo_numbers import (
+    _MONTHS,
+    _QUANTITY_LOCAL,
+    _UNIT_SCALE,
+    _FIELD_SCALE,
+    _OUTPUT_TEXT_NUMBER,
+    _TEXT_SCALE,
+    _local_number_values,
+    _field_scale,
+    _output_numbers,
+    _number_attested,
+    _YEAR_UNITS_V4,
+    _quantity_spans_v4)
 
 
 _CLAUSE_START = re.compile(r"[;:!?\n]|\.\s")
@@ -5492,7 +5371,7 @@ def _numeric_claim_gaps_v4(result, bound, sizing, language, band_numbers=()):
     structured committee choice, not a claim.
     """
     sections = {section.get("key"): section for section in result.get("dossier") or []}
-    numbers_by_id = {ident: _output_numbers(row["output"]) for ident, row in bound.items()}
+    numbers_by_id = {ident: _output_numbers(row["economic_output"]) for ident, row in bound.items()}
 
     def own(*values):
         return [(Decimal(str(value)), 0) for value in values
@@ -6441,6 +6320,9 @@ def execute_trade_idea(run_id, *, db_path=None, store=None, lock_path=None,
                     pm_view=run["view_text"], candidate_history=json.dumps(history, ensure_ascii=False),
                     budget_gate=gate)
                 blackboard.r2_specialists = set(TRADE_IDEA_DESKS)
+                text_policy = mandato_pm.text_policy_from_context(run)
+                if mandato_pm.MANDATE_TEXT_POLICY_KEY in run:
+                    blackboard.mandate_text_policy = text_policy
                 blackboard.analysis_mode = run.get('analysis_mode')
                 blackboard.execution_policy = execution_policy(run)
                 blackboard.independent_round = 1

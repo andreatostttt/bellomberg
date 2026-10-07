@@ -157,8 +157,14 @@ def test_gex_labels_and_spot_proxy_declared_without_changing_gamma_math(monkeypa
 
 
 def test_cot_original_contract_and_hand_calculated_nets_unchanged_by_language(monkeypatch):
+    from datetime import date
     from types import SimpleNamespace
     from bellomberg.portfolio import positioning_tools as pt
+    class ObservedDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2001, 1, 12)
+    monkeypatch.setattr(pt, "date", ObservedDate)
     rows = [{"contract_market_name": "SYNTH FUTURE", "report_date_as_yyyy_mm_dd": f"2001-01-{i:02d}",
              "lev_money_long": i + 10, "lev_money_short": 10} for i in range(12, 0, -1)]
     calls = []
@@ -175,8 +181,42 @@ def test_cot_original_contract_and_hand_calculated_nets_unchanged_by_language(mo
     assert english["net_positions"]["leveraged_funds"] == 12
     assert english["wow_change"]["leveraged_funds"] == 1
     assert english["leveraged_funds_net_percentile_1y"] == 100
+    assert english["freshness"] == {"status": "FRESH", "age_days": 0}
     assert "EXTREME LONG" in english["reading"]
     for key in italian.keys() - {"reading", "_timestamp"}:
+        assert english[key] == italian[key], key
+
+
+def test_cot_stale_keeps_nets_but_has_no_percentile_or_reading_in_both_languages(monkeypatch):
+    from datetime import date
+    from types import SimpleNamespace
+    from bellomberg.portfolio import positioning_tools as pt
+    class ObservedDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2001, 2, 1)
+    monkeypatch.setattr(pt, "date", ObservedDate)
+    rows = [{"contract_market_name": "SYNTH FUTURE", "report_date_as_yyyy_mm_dd": f"2001-01-{i:02d}",
+             "lev_money_long": i + 10, "lev_money_short": 10} for i in range(12, 0, -1)]
+    calls = []
+    def response(*args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(status_code=200, json=lambda: deepcopy(rows))
+    monkeypatch.setattr(pt.requests, "get", response)
+    with language_context("it"):
+        italian = pt.get_cot_positioning("SYNTH FUTURE")
+    with language_context("en"):
+        english = pt.get_cot_positioning("SYNTH FUTURE")
+    assert len(calls) == 2 and calls[0] == calls[1]
+    for payload in (italian, english):
+        assert payload["contract_market_name"] == "SYNTH FUTURE"
+        assert payload["report_date"] == "2001-01-12"
+        assert payload["net_positions"]["leveraged_funds"] == 12
+        assert payload["wow_change"]["leveraged_funds"] == 1
+        assert payload["freshness"] == {"status": "STALE", "age_days": 20}
+        assert payload["leveraged_funds_net_percentile_1y"] is None
+        assert payload["reading"] is None
+    for key in italian.keys() - {"_timestamp"}:
         assert english[key] == italian[key], key
 
 

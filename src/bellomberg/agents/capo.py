@@ -550,6 +550,8 @@ def scegli_report_specialisti(data, orari=None):
 
 @scoped_language
 def run_capo(blackboard, portfolio_data=None, memory_db=None, sizing_context=None, scoring_context=None):
+    from bellomberg.core.reflection_policy import board_enabled, memory_projection, scorecard_for
+    _reflection36 = board_enabled(blackboard)
     CAPO_MODEL = _modello_llm("capo")   # 05/09: dal .env; assente = ConfigurazioneLLMMancante
     # 05/09 (criterio 5, audit/26): il MANDATO del PM si legge dal disco a OGNI run e compila i
     # segnaposto {MANDATO:...} del system prompt (cassa, tagli, pair trade, opzioni, caccia
@@ -557,7 +559,9 @@ def run_capo(blackboard, portfolio_data=None, memory_db=None, sizing_context=Non
     # qualunque chiamata: mai la dottrina di ieri come ripiego (regola 14/07).
     import bellomberg.core.mandato_pm as _mandato_pm
     _mandato = _mandato_pm.carica()
-    _system = _mandato_pm.compila(prompt_for_language(CAPO_SYSTEM_PROMPT), _mandato)
+    _text_policy = _mandato_pm.text_policy_for_board(blackboard)
+    _system = _mandato_pm.compila(prompt_for_language(CAPO_SYSTEM_PROMPT), _mandato,
+                                **({"text_policy": _text_policy} if _text_policy is not None else {}))
     from bellomberg.core.research_analysis import is_research_mode, research_context
     if is_research_mode(blackboard):
         _system += ('\nCOMPANY RESEARCH MODE: the shared dossier and R1 thesis are identified by '
@@ -616,6 +620,10 @@ def run_capo(blackboard, portfolio_data=None, memory_db=None, sizing_context=Non
     if filing_context:
         user_msg_parts.extend([filing_context, ""])
 
+    # Validate/read checkpoints outside the best-effort memory catch. Saved requests returned above.
+    _memory_kwargs = ({'reflection_block': memory_projection(blackboard.weekly_store),
+                       'track_record_snapshot': scorecard_for(blackboard.weekly_store)}
+                      if _reflection36 and memory_db else {})
     # MEMORIA PERSISTENTE (Phase 1)
     if memory_db:
         try:
@@ -628,7 +636,7 @@ def run_capo(blackboard, portfolio_data=None, memory_db=None, sizing_context=Non
             # "PAROLE DIRETTE DEL PM (VINCOLANTI)" erano ancora tagliate a 120 char,
             # con la virgoletta di chiusura rimessa dopo il taglio. Vero dal 21/08:
             # memory_db.MAX_CHAR_FEEDBACK_PM = 2000, e il taglio si dichiara.
-            memory_block = memory_db.build_capo_memory_context(max_chars=MAX_CHAR_MEMORIA_CAPO)  # +1800 TRACK RECORD #190/#211; +1700 (21/07) blocco PAROLE DIRETTE DEL PM — misurato 8031 char pieni: a 6800 il taglio mangiava i trade eseguiti e la lezione #210. 8500 -> 8800 il 26/07 sera-5: la memoria era arrivata a 8365 char (135 di margine) e la riga nuova del quadro-confidence sforava tagliando la frase FINALE, quella che dice al Capo cosa fare coi commenti del PM. Il taglio E' dichiarato (memory_db:2283) — e' cosi' che l'ho visto
+            memory_block = memory_db.build_capo_memory_context(max_chars=MAX_CHAR_MEMORIA_CAPO, **_memory_kwargs)  # +1800 TRACK RECORD #190/#211; +1700 (21/07) blocco PAROLE DIRETTE DEL PM — misurato 8031 char pieni: a 6800 il taglio mangiava i trade eseguiti e la lezione #210. 8500 -> 8800 il 26/07 sera-5: la memoria era arrivata a 8365 char (135 di margine) e la riga nuova del quadro-confidence sforava tagliando la frase FINALE, quella che dice al Capo cosa fare coi commenti del PM. Il taglio E' dichiarato (memory_db:2283) — e' cosi' che l'ho visto
             user_msg_parts.append("=== LA TUA MEMORIA (dalle run settimanali precedenti) ===")
             user_msg_parts.append(memory_block)
             user_msg_parts.append("")

@@ -45,6 +45,18 @@ DAYS = {"it": ("lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sab
         "en": ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")}
 
 LABELS = {
+    "quant.beta_divergent": ("Motivo: i motori divergono secondo il guardrail congelato.", "Reason: the engines diverge according to the frozen guardrail."),
+    "quant.beta_insufficient": ("Motivo: fonti con osservazioni sufficienti non disponibili per la riconciliazione.", "Reason: insufficient sources with adequate observations for reconciliation."),
+    "quant.beta_missing": ("Motivo: guardrail assente, in errore o senza autorizzazione decisionale attestata.", "Reason: guardrail missing, failed or without attested decision eligibility."),
+    "quant.run_date": ("RUN {value}", "RUN {value}"),
+    "quant.snapshot_beta": ("Guardrail beta: {verdict}; calcolato il {timestamp} (priming congelato).", "Beta guardrail: {verdict}; calculated at {timestamp} (frozen priming)."),
+    "quant.beta_reconciled": ("Beta riconciliato secondo il guardrail della run.", "Beta reconciled according to the run guardrail."),
+    "quant.beta_unavailable": ("Beta non valido per decisioni o coperture finche non riconciliato.", "Beta is not valid for decisions or hedging until reconciled."),
+    "quant.risk_rf": ("Sharpe portfolio_risk: rf={value} (frazione annua). {note}", "portfolio_risk Sharpe: rf={value} (annual fraction). {note}"),
+    "quant.advanced_rf": ("Sharpe advanced_metrics: rf={value} (frazione annua); {status}; {source}. {note}", "advanced_metrics Sharpe: rf={value} (annual fraction); {status}; {source}. {note}"),
+    "quant.snapshot_gap": ("Input quant congelato {slot}: n.d. ({cause}); nessuna nuova acquisizione nel rendering.", "Frozen quant input {slot}: unavailable ({cause}); no new acquisition during rendering."),
+
+    "quant.kurtosis_reference": ("Curtosi {} (riferimento normale: 3,0) · coda oltre VaR95 in rosso", "Kurtosis {} (normal reference: 3.0) · tail beyond VaR95 in red"),
     '%s (copertura PARZIALE: %s - il volume NON misura il flusso reale)': ('%s (copertura PARZIALE: %s - il volume NON misura il flusso reale)', '%s (PARTIAL coverage: %s - volume does NOT measure actual news flow)'),
     'Giorni': ('Giorni', 'Days'), "Densita'": ('Densità', 'Density'),
     'Scadenza': ('Scadenza', 'Maturity'), 'Forecast {}': ('Previsione {}', 'Forecast {}'),
@@ -379,6 +391,6 @@ LABELS = {
     "AGGREGATO": ("AGGREGATO", "AGGREGATE"),
     "Rendimento/Rischio": ("Rendimento/Rischio", "Return/Risk"),
     "Skewness": ("Asimmetria", "Skewness"),
-    "quant.risk_interpretation": ("Il profilo corretto per il rischio è {quality} (Sharpe {sharpe}, Sortino {sortino}). Il Sortino sopra lo Sharpe indica che la volatilità è prevalentemente al rialzo; l'indice Ulcer e il fattore di recupero misurano profondità e velocità di recupero delle perdite dal picco. Le metriche relative al benchmark isolano alpha e beta.", "The risk-adjusted profile is {quality} (Sharpe {sharpe}, Sortino {sortino}). Sortino above Sharpe indicates that volatility is predominantly on the upside; the Ulcer Index and Recovery Factor measure drawdown depth and recovery speed. Benchmark-relative metrics isolate alpha and beta."),
+    "quant.risk_interpretation": ("Il profilo corretto per il rischio è {quality} (Sharpe {sharpe}, Sortino {sortino}). Leggere le misure con campione e convenzioni dichiarati.", "The risk-adjusted profile is {quality} (Sharpe {sharpe}, Sortino {sortino}). Read the measures with the stated sample and stated conventions."),
     "quant.factor_interpretation": ("Copertura {coverage} del NAV su fattori regionali. Solo {significant} alpha su {count} sono statisticamente significativi (t>1,96): gli altri sono rumore, non vera capacità di sovraperformare. L'alpha aggregato va letto con prudenza: il portafoglio è in larga parte spiegato dai fattori di mercato.", "Regional factors cover {coverage} of NAV. Only {significant} alphas out of {count} are statistically significant (t>1.96): the others are noise, not demonstrated outperformance. Interpret aggregate alpha cautiously: market factors explain much of the portfolio."),
 }

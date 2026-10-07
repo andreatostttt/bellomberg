@@ -389,7 +389,7 @@ def _fmt_line(label, a):
             f"edge medio {a['avg_edge_pct']:+.1f}%{tail}")
 
 
-def format_track_record_for_capo(sc: Dict[str, Any], max_chars: int = 2000) -> str:
+def format_track_record_for_capo(sc: Dict[str, Any], max_chars: int = 2000, *, descriptive_only=False) -> str:
     """Blocco TRACK RECORD per la memoria del Capo (#190 + #211).
 
     `max_chars` 1700 -> 2000 il 26/07 sera-5 (Opus 5): la riga nuova di quadro
@@ -422,7 +422,8 @@ def format_track_record_for_capo(sc: Dict[str, Any], max_chars: int = 2000) -> s
         if line:
             L.append(line)
     if sc.get("by_confidence"):
-        L.append("PER CONFIDENCE (la calibrazione promessa: ALTA deve battere MEDIA/BASSA):")
+        L.append("PER CONFIDENCE (statistiche descrittive):" if descriptive_only else
+                 "PER CONFIDENCE (la calibrazione promessa: ALTA deve battere MEDIA/BASSA):")
         for cfd, agg in sc["by_confidence"].items():
             line = _fmt_line("  " + cfd, agg)
             if line:
@@ -450,11 +451,13 @@ def format_track_record_for_capo(sc: Dict[str, Any], max_chars: int = 2000) -> s
         _p = fisher_bilaterale(_a.get("hits"), _a.get("n"), _m.get("hits"), _m.get("n"))
         if _p is not None:
             _diff = (_a.get("hit_rate_pct") or 0) - (_m.get("hit_rate_pct") or 0)
-            _verdetto = ("differenza REALE al 95%" if _p < 0.05 else
+            _verdetto = ("test descrittivo; nessuna regola operativa" if descriptive_only else
+                         "differenza REALE al 95%" if _p < 0.05 else
                          "RUMORE con questi n, NON dedurne la promessa mantenuta")
             L.append(f"  [ALTA vs MEDIA: {_diff:+.1f} pt, Fisher p={_p:.2f} -> {_verdetto}]")
     if sc.get("by_specialist"):
-        L.append("PER SPECIALISTA (firma = ticker citato nei suoi report; pesa le voci su questo, non a sensazione):")
+        L.append("PER SPECIALISTA (firma euristica; confronto solo descrittivo):" if descriptive_only else
+                 "PER SPECIALISTA (firma = ticker citato nei suoi report; pesa le voci su questo, non a sensazione):")
         for sp, agg in sorted(sc["by_specialist"].items(),
                               key=lambda kv: -(kv[1].get("hit_rate_pct") or 0)):
             line = _fmt_line("  " + sp, agg)
@@ -462,7 +465,8 @@ def format_track_record_for_capo(sc: Dict[str, Any], max_chars: int = 2000) -> s
                 L.append(line)
     wc = sc.get("worst_calls") or []
     if wc:
-        L.append("PEGGIORI call recenti per edge direzionale (impara da queste): " + "; ".join(
+        L.append(("Call recenti con edge direzionale minore (descrittivo): " if descriptive_only else
+                  "PEGGIORI call recenti per edge direzionale (impara da queste): ") + "; ".join(
             f"#{c['id']} {c['action']} {c['ticker']} edge {c['edge_pct']:+.1f}% ({c['horizon_used']})"
             for c in wc))
     # degrado PARZIALE dichiarato (review 26/07): con n>0 il blocco e' sano ma
@@ -475,7 +479,7 @@ def format_track_record_for_capo(sc: Dict[str, Any], max_chars: int = 2000) -> s
 
 
 def format_track_record_for_specialist(sc: Dict[str, Any], specialist: str,
-                                        max_chars: int = 600) -> str:
+                                        max_chars: int = 600, *, descriptive_only=False) -> str:
     """Blocco breve per la memoria di UNO specialista (#211)."""
     if not sc:
         return ""
@@ -505,7 +509,8 @@ def format_track_record_for_specialist(sc: Dict[str, Any], specialist: str,
     ovl = _fmt_line("Comitato nel complesso", ov)
     if ovl:
         L.append(ovl)
-    L.append("Usa questo dato: se il tuo hit-rate e' sotto il comitato, alza la soglia di evidenza prima di firmare una call.")
+    L.append("Statistiche descrittive: nessuna istruzione operativa da questo confronto." if descriptive_only else
+             "Usa questo dato: se il tuo hit-rate e' sotto il comitato, alza la soglia di evidenza prima di firmare una call.")
     # misurato 26/07: 329 char (488 per eventdesk, che eredita news+politics) su 600
     return _tronca_dichiarando("\n".join(L), max_chars, "YOUR TRACK RECORD")
 

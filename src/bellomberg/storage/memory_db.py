@@ -29,6 +29,8 @@ from bellomberg.core.paths import (CHROMA_PATH as _CHROMA_PATH, DATA_DIR as _DAT
                                    PROJECT_ROOT, REPORT_DIR as _REPORT_DIR,
                                    RESEARCH_NOTES_DIR as _RESEARCH_NOTES_DIR,
                                    SQLITE_PATH as _SQLITE_PATH)
+from bellomberg.core.reflection_policy import UNSET as _REFLECTION_UNSET
+
 import os
 import sqlite3
 import json
@@ -2787,6 +2789,51 @@ class MemoryDB:
                                 "ORDER BY id DESC LIMIT ?", (n,)).fetchall()
             return [dict(r) for r in rows]
 
+    def get_completed_weekly_memos(self, n=3):
+        """Memoria operativa verificata; getter raw e archivio restano completi."""
+        from .weekly_memory import WeeklyMemoryReader
+        return WeeklyMemoryReader(self).memos(n)
+
+    def get_completed_specialist_reports(self, specialist, n=3):
+        """R2 di run utilizzabili, legato al checkpoint nativo quando disponibile."""
+        from .weekly_memory import WeeklyMemoryReader
+        reader = WeeklyMemoryReader(self)
+        names = (specialist,) + self._LEGACY_SPECIALIST_ALIASES.get(specialist, ())
+        with self._conn() as conn:
+            rows = conn.execute("SELECT sr.*, m.full_markdown AS memo_full_markdown "
+                                "FROM specialist_reports sr JOIN memos m ON m.id=sr.memo_id "
+                                "WHERE sr.specialist IN (" + ",".join("?" * len(names)) + ") "
+                                "AND sr.round_n=2 ORDER BY sr.id DESC", names).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            if reader.report_eligible(item):
+                out.append({**item, "memory_completion": reader.completion(item["memo_id"])})
+                if len(out) >= n:
+                    break
+        return out if n > 0 else []
+
+    def get_operational_memory_decisions(self, n=20):
+        """Esclude proposte di run incomplete; fatti e parole esplicite del PM restano."""
+        from .weekly_memory import WeeklyMemoryReader
+        reader = WeeklyMemoryReader(self)
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM decisions ORDER BY id DESC").fetchall()
+        out = []
+        for row in rows:
+            item = self._decision_read_model(dict(row))
+            if e_duplicato(item):
+                continue
+            explicit_pm = (bool(item.get("pm_feedback") or item.get("veto"))
+                           or item.get("status") in ("EXECUTED", "PARTIAL"))
+            if item.get("memo_id") is None or reader.completion(item["memo_id"]) or explicit_pm:
+                if item.get("memo_id") is not None and not reader.completion(item["memo_id"]):
+                    item["memory_origin"] = "explicit_pm_from_unavailable_run"
+                out.append(item)
+                if len(out) >= n:
+                    break
+        return out if n > 0 else []
+
     def get_archive_memos(self, limit=20, offset=0, include_trade_ideas=True):
         """Memo per l'ARCHIVIO (decisione PM 04/10): Consigliere + Trade Idea insieme,
         ciascuno etichettato. NON sostituisce get_recent_memos, che resta il solo
@@ -3375,8 +3422,10 @@ class MemoryDB:
                      valid_until=None, valid_until_source=None, entered_by=None,
                      note=None, today=None):
         """Registra una guidance SOCIETARIA (D1: fonte OBBLIGATORIA — source_doc +
-        source_date; senza, rifiuto spiegato). Supersede automatico della riga attiva
-        stesso ticker+metric+period (storico conservato). valid_until: la passa il
+        source_date; senza, rifiuto spiegato). Supersede della stessa grandezza
+        ticker+metric+period+unit SOLO con fonte successiva. Fonte vecchia/futura
+        o conflitto pari data: rifiuto; duplicato identico: no-op senza rinnovo.
+        Storico conservato. valid_until: la passa il
         chiamante (prossima trimestrale dal calendar); assente = effective+120g
         DICHIARATO (D4). Ritorna dict con esito, mai eccezioni verso il chiamante."""
         import re as _re
@@ -3443,6 +3492,9 @@ class MemoryDB:
                 return {"error": ("source_date '%s' non ISO (atteso YYYY-MM-DD): la fonte "
                                   "D1 richiede una data parsabile" % source_date)}
             _today = today or date.today()
+            if sd > _today:
+                return {"error": "source_date futura rispetto alla registrazione",
+                        "reason_code": "source_date_in_future", "source_date": sd.isoformat()}
             eff = _today.isoformat()
             if valid_until:
                 try:
@@ -3456,13 +3508,61 @@ class MemoryDB:
                 vu = (_today + timedelta(days=self.GUIDANCE_FALLBACK_DAYS)).isoformat()
                 vus = "fallback effective+%dg (calendar n.d., D4)" % self.GUIDANCE_FALLBACK_DAYS
             with self._conn() as conn:
+                # Il confronto e la scrittura condividono il lock: due writer non
+                # possono decidere entrambi su una fotografia precedente all'INSERT.
+                conn.execute("BEGIN IMMEDIATE")
+                _chiave = self._chiave_unit(u)
+                gemelle, accanto = [], []
+                for _r in conn.execute(
+                        "SELECT * FROM company_guidance WHERE ticker=? "
+                        "AND metric=? AND period=? AND status='active'",
+                        (t, m, p)).fetchall():
+                    (gemelle if self._chiave_unit(_r["unit"]) == _chiave
+                     else accanto).append(_r)
+                riferimenti = [{"id": r["id"], "source_date": r["source_date"],
+                                "source_doc": r["source_doc"]} for r in gemelle]
+                date_attive = []
+                for r in gemelle:
+                    try:
+                        data_attiva = date.fromisoformat(str(r["source_date"])[:10])
+                    except (TypeError, ValueError):
+                        return {"error": "registro attivo con data fonte non confrontabile",
+                                "reason_code": "active_chronology_ambiguous", "active": riferimenti}
+                    if data_attiva > _today:
+                        return {"error": "registro attivo con data fonte futura",
+                                "reason_code": "active_chronology_ambiguous", "active": riferimenti}
+                    date_attive.append(data_attiva)
+                if any(sd < d for d in date_attive):
+                    return {"error": "fonte precedente alla guidance attiva: registrazione rifiutata",
+                            "reason_code": "source_older_than_active", "active": riferimenti}
+                if sd in date_attive:
+                    if len(gemelle) != 1:
+                        return {"error": "piu righe attive omologhe: pari data ambiguo",
+                                "reason_code": "active_chronology_ambiguous", "active": riferimenti}
+                    r = gemelle[0]
+                    if (r["value_low"], r["value_mid"], r["value_high"], r["source_doc"]) != (
+                            lo_, mid_, hi_, str(source_doc).strip()):
+                        return {"error": "guidance con pari data ma valori o fonte differenti",
+                                "reason_code": "same_date_conflict", "active": riferimenti}
+                    out = {"ok": True, "id": r["id"], "ticker": t, "metric": m, "period": p,
+                           "valid_until": r["valid_until"],
+                           "valid_until_source": r["valid_until_source"], "superseded": 0,
+                           "status": "already_registered", "reason_code": "already_registered",
+                           "nota": "guidance gia registrata: nessuna modifica o rinnovo della scadenza"}
+                    if vu != r["valid_until"] or vus != r["valid_until_source"]:
+                        out["requested_valid_until"] = vu
+                        out["requested_valid_until_source"] = vus
+                    if accanto:
+                        out["convivono"] = [{"id": x["id"], "unit": x["unit"],
+                                             "value_mid": x["value_mid"]} for x in accanto]
+                    return out
                 cur = conn.execute(
                     "INSERT INTO company_guidance (ticker, metric, period, value_low, "
                     "value_mid, value_high, unit, source_doc, source_date, effective_date, "
                     "valid_until, valid_until_source, status, entered_by, note, created_at) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'active', ?, ?, ?)",
                     (t, m, p, lo_, mid_, hi_, u, str(source_doc).strip(),
-                     str(source_date)[:10], eff, vu, vus, entered_by, note,
+                     sd.isoformat(), eff, vu, vus, entered_by, note,
                      datetime.now().isoformat(timespec="seconds")))
                 new_id = cur.lastrowid
                 # 20/08 (gate trimestrali arretrate, Opus 5): il supersede sostituisce
@@ -3480,14 +3580,6 @@ class MemoryDB:
                 # Per le metriche a unit fissa (pct/musd/eps) il comportamento e'
                 # identico a prima, perche' l'unit e' imposta da GUIDANCE_UNITS e non
                 # puo' variare (override rifiutato sopra).
-                _chiave = self._chiave_unit(u)
-                gemelle, accanto = [], []
-                for _r in conn.execute(
-                        "SELECT id, unit, value_mid FROM company_guidance WHERE ticker=? "
-                        "AND metric=? AND period=? AND status='active' AND id != ?",
-                        (t, m, p, new_id)).fetchall():
-                    (gemelle if self._chiave_unit(_r["unit"]) == _chiave
-                     else accanto).append(_r)
                 n_sup = 0
                 for _r in gemelle:
                     n_sup += conn.execute(
@@ -4440,7 +4532,8 @@ class MemoryDB:
         parts, _ = self._pm_binding_parts()
         return "\n".join(parts)
 
-    def build_specialist_memory_context(self, specialist_name, max_chars=3000):
+    def build_specialist_memory_context(self, specialist_name, max_chars=3000, *,
+                                        track_record_snapshot=_REFLECTION_UNSET):
         """Costruisce blocco di memoria da iniettare nel prompt del specialista."""
         parts = ["=== YOUR MEMORY (from previous runs) ==="]
 
@@ -4448,7 +4541,7 @@ class MemoryDB:
         parts.extend(_vincoli)
 
         # Ultimi 3 tuoi report
-        reports = self.get_recent_specialist_reports(specialist_name, n=3)
+        reports = self.get_completed_specialist_reports(specialist_name, n=3)
         if reports:
             fingerprint_corrente = _fingerprint_mandato_corrente()
             parts.append("\n--- Your last 3 reports (round 2 final, most recent first) ---")
@@ -4459,7 +4552,7 @@ class MemoryDB:
                 parts.append("[" + r.get("timestamp", "")[:10] + "] "
                              + etichetta + "\n" + snippet)
         else:
-            parts.append("(No previous reports - this is your first run)")
+            parts.append("(No completed compatible reports available; incomplete runs excluded)")
 
         # Ultimi 5 feedback PM
         feedbacks = self.get_recent_pm_feedback(n=5, specialist=specialist_name)
@@ -4471,11 +4564,13 @@ class MemoryDB:
                                            fonte="pm_feedback.feedback_text"))
 
         # Decisioni recenti correlate al tuo dominio
-        decisions = self.get_recent_decisions(n=10)
+        decisions = self.get_operational_memory_decisions(n=10)
         if decisions:
             parts.append("\n--- Recent recommendations and their status ---")
             for d in decisions[:7]:
                 line = "[" + (d.get("status") or "?") + "] " + (d.get("action") or "?") + " " + (d.get("ticker") or "?")
+                if d.get("memory_origin"):
+                    line += " [run non utilizzabile: si conserva il fatto/commento esplicito del PM]"
                 if d.get("eur_amount"):
                     line += " (EUR " + "{:+,.0f}".format(d["eur_amount"]) + ")"
                 if d.get("outcome_pct") is not None:
@@ -4498,7 +4593,13 @@ class MemoryDB:
         # specialista, calcolato in codice dallo scorekeeper (guarded).
         try:
             from bellomberg.agents.scorekeeper import get_track_record_for_specialist
-            _tr = get_track_record_for_specialist(specialist_name)
+            if track_record_snapshot is _REFLECTION_UNSET:
+                _tr = get_track_record_for_specialist(specialist_name)
+            else:
+                from bellomberg.agents.scorekeeper import format_track_record_for_specialist
+                _tr = (format_track_record_for_specialist(track_record_snapshot, specialist_name,
+                                                         descriptive_only=True)
+                       if track_record_snapshot else 'TRACK RECORD n.d.: snapshot priming non disponibile.')
             if _tr:
                 parts.append("\n" + _tr)
         except Exception:
@@ -4733,18 +4834,19 @@ class MemoryDB:
 
 
 
-    def build_capo_memory_context(self, max_chars=5000):
+    def build_capo_memory_context(self, max_chars=5000, *, reflection_block=_REFLECTION_UNSET,
+                                  track_record_snapshot=_REFLECTION_UNSET):
         """Memoria per il Capo: tutte le decisioni recenti + feedback + memo precedente sintetizzato."""
         parts = ["=== CAPO MEMORY (from previous weekly runs) ==="]
 
         # Last memo summary (per continuity)
-        # audit 11/09: il memo precedente e' l'ultimo NON marcato DUPLICATO (memos[0] e' il
-        # segnaposto della run in corso); senza duplicati il comportamento e' quello di sempre
-        memos = self.get_recent_memos(n=6)
+        # Il precedente e' selezionato per completamento, mai per posizione del placeholder.
+        memos = self.get_completed_weekly_memos(n=1)
         if memos:
             fingerprint_corrente = _fingerprint_mandato_corrente()
-            _precedenti = [m for m in memos[1:] if not e_duplicato(m)]
-            last = _precedenti[0] if _precedenti else memos[0]
+            last = memos[0]  # query dedicata: questo e' il precedente utilizzabile
+            if last.get("memory_completion") == "legacy_untracked":
+                parts.append("[Archivio legacy: completamento nativo non disponibile; testo storico conservato]")
             title = last.get("title", "")
             ts = last.get("timestamp", "")
             parts.append(f"[{ts}] {title}")
@@ -4752,12 +4854,14 @@ class MemoryDB:
                 last.get("full_markdown"), fingerprint_corrente))
             full_md = (last.get("full_markdown") or "")[:1500]
             parts.append(full_md)
+        else:
+            parts.append("[Nessun memo settimanale completato e compatibile disponibile; run incomplete escluse]")
 
         # Decisioni recenti CON STATUS (questa e' la "pagina Decisioni" che il PM aggiorna:
         # EXECUTED = ha eseguito la tua raccomandazione; SKIPPED = NON eseguita QUESTA volta
         # (timing/liquidita'/priorita'), NON un rifiuto definitivo; PENDING = ancora aperta).
         try:
-            decisions = self.get_recent_decisions(n=20)
+            decisions = self.get_operational_memory_decisions(n=20)
             # audit 11/09: le decisioni di una run marcata DUPLICATO non sono pendenti ne'
             # decadute — il PM non le ha mai valutate — e non entrano nella memoria
             decisions = [d for d in decisions if not e_duplicato(d)]
@@ -4772,7 +4876,8 @@ class MemoryDB:
                 sk = [d for d in decisions if (d.get("status") or "").upper() == "SKIPPED"]
                 # REV2 N1: le chiusure del gate di pubblicazione NON sono un «no» del PM e non
                 # contano per l'anti-insistenza: riga a parte, dichiarata
-                gate_sk = [d for d in sk if MARCA_CHIUSA_DAL_GATE in str(d.get("outcome_notes") or "")]
+                gate_sk = [d for d in sk if MARCA_CHIUSA_DAL_GATE in str(d.get("outcome_notes") or "")
+                           or "AUTO-ESCLUSA" in str(d.get("outcome_notes") or "").upper()]
                 sk = [d for d in sk if d not in gate_sk]
                 pe = [d for d in decisions if (d.get("status") or "").upper() == "PENDING"]
                 # review 16/07: con l'auto-archivio (>7g -> EXPIRED) le decadute sparivano
@@ -4797,7 +4902,8 @@ class MemoryDB:
                     return ("#" + str(d.get("id")) + " " + str(d.get("action")) + " " +
                             str(d.get("ticker")) + " " + amt_s + _es +
                             (" | outcome=" + str(out) if out is not None else "") +
-                            ((" | " + note[:100]) if note else ""))
+                            ((" | " + note[:100]) if note else "")
+                            + (" [run non utilizzabile: fatto/commento esplicito del PM]" if d.get("memory_origin") else ""))
                 if ex:
                     parts.append("ESEGUITE dal PM: " + "; ".join(_fmt(d) for d in ex[:10]))
                 # audit 11/09: lo status PARTIAL non aveva un bucket (8 righe invisibili al Capo)
@@ -4871,7 +4977,12 @@ class MemoryDB:
         # avevo ragione". Guarded: un guasto dello scorekeeper non tocca la memoria.
         try:
             from bellomberg.agents.scorekeeper import get_track_record_for_capo
-            _tr = get_track_record_for_capo()
+            if track_record_snapshot is _REFLECTION_UNSET:
+                _tr = get_track_record_for_capo()
+            else:
+                from bellomberg.agents.scorekeeper import format_track_record_for_capo
+                _tr = (format_track_record_for_capo(track_record_snapshot, descriptive_only=True)
+                       if track_record_snapshot else 'TRACK RECORD n.d.: snapshot priming non disponibile.')
             if _tr:
                 parts.append("\n" + _tr)
         except Exception:
@@ -4881,7 +4992,9 @@ class MemoryDB:
         # run precedente, ancorata allo scorekeeper. Guarded come sopra.
         try:
             from bellomberg.agents.reflection import get_latest_lesson_block
-            _ls = get_latest_lesson_block()
+            _lesson_memo_ids = {m["id"] for m in self.get_completed_weekly_memos(n=None)}
+            _ls = (get_latest_lesson_block(eligible_memo_ids=_lesson_memo_ids)
+                   if reflection_block is _REFLECTION_UNSET else reflection_block)
             if _ls:
                 parts.append("\n" + _ls)
         except Exception:

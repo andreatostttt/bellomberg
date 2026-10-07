@@ -1,4 +1,4 @@
-"""Anteprima del mandato: stesso testo dei modelli, nessuna scrittura."""
+"""Anteprima delle nuove run: policy esplicita, renderer legacy e file preservati."""
 import copy
 import json
 
@@ -51,14 +51,20 @@ def test_get_mandato_incompleto_http_conserva_il_corpo_compilato(client):
 
 
 def test_get_anteprima_restituisce_esattamente_il_blocco_prompt(client):
-    c, _ = client
+    c, p = client
+    prima = p.read_bytes()
     import bellomberg.api.bellomberg_api as api
     api.app.dependency_overrides[api.require_session] = lambda: None
     r = c.get("/mandato/anteprima")
     m = mp.carica()
     assert r.status_code == 200
-    assert r.json() == {"testo": mp.blocco_prompt(m), "impronta": mp.impronta(m),
+    assert r.json() == {"testo": mp.blocco_prompt(m, text_policy=mp.MANDATE_TEXT_POLICY), "impronta": mp.impronta(m),
                         "origine": m["origine"], "output_language": "it"}
+    legacy = mp.blocco_prompt(m)
+    assert "posizione minima" in legacy and "soglia minima d'azione" not in legacy
+    assert "soglia minima d'azione" in r.json()["testo"]
+    assert r.json()["testo"] != legacy
+    assert p.read_bytes() == prima
 
 
 def test_post_anteprima_valida_non_scrive_e_calcola_origine(client):

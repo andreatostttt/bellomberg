@@ -69,6 +69,10 @@ def truncated_parent(path, *, explicit_cap=False, terminal_cost="0.02"):
         "data": {"_primary_failure": failure, "quant": {"0": "Completed earlier report kept verbatim"}},
         "tool_receipts": [{"tool": "read_frozen", "output": "Frozen measured evidence"}],
         "specialist_checkpoints": {"quant:R1": state}}
+    from bellomberg.core.mandato_pm import MANDATE_TEXT_POLICY_KEY
+    persisted = current.get_run(parent)['run']
+    if MANDATE_TEXT_POLICY_KEY in persisted:
+        checkpoint['contract'][MANDATE_TEXT_POLICY_KEY] = persisted[MANDATE_TEXT_POLICY_KEY]
     current.update_progress(parent, token, "checkpoint", {"checkpoint": checkpoint,
         "checkpoint_sha256": _digest(checkpoint), "primary_failure": failure})
     current.finish_run(parent, token, None, "incomplete", reason=failure["message"])

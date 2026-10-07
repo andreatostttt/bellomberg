@@ -154,6 +154,7 @@ def get_filing_changes(ticker, *, db_path=None, max_changes=5, da=1, variante=No
     current = result.get("confronto_corrente")
     historical = result.get("confronto_storico")
     diff = current or historical or {}
+    coppia_selezionata = result.get("coppia")
     if variante and variante != result.get("variante"):
         altra = next((v for v in result.get("varianti") or []
                       if isinstance(v, dict) and v.get("tipo") == variante and v.get("confronto")), None)
@@ -161,6 +162,7 @@ def get_filing_changes(ticker, *, db_path=None, max_changes=5, da=1, variante=No
             return {"ticker": ticker, "status": "non_disponibile", "reason": "variante assente",
                     "run_id": last["id"], "_source": "filing_archive"}
         current, historical, diff = altra["confronto"], None, altra["confronto"]
+        coppia_selezionata = altra.get("coppia")
     changes = diff.get("cambiamenti") or []
     shown = []
     sequenza = [(n, c, None) for n, c in enumerate(changes, 1)]
@@ -203,10 +205,11 @@ def get_filing_changes(ticker, *, db_path=None, max_changes=5, da=1, variante=No
             "latest_unverified": bool(result.get("ultimo_non_verificato")),
             "freshness": result.get("freschezza") or {"stato": "n.d."},
             "coverage": result.get("copertura") or {"stato": "n.d."},
-            "pair": {k: {"url": (result.get("coppia") or {}).get(k, {}).get("url"),
-                         "sha256": (result.get("coppia") or {}).get(k, {}).get("sha256"),
-                         "metadati": (result.get("coppia") or {}).get(k, {}).get("metadati")}
-                     for k in ("prima", "dopo")} if result.get("coppia") else None,
+            "pair": {k: {"url": (coppia_selezionata.get(k) or {}).get("url"),
+                         "sha256": (coppia_selezionata.get(k) or {}).get("sha256"),
+                         "metadati": (coppia_selezionata.get(k) or {}).get("metadati")}
+                     for k in ("prima", "dopo")} if coppia_selezionata else None,
+            "pair_status": "disponibile" if coppia_selezionata else "non_disponibile",
             "diff_status": diff.get("stato") or "non_disponibile",
             "sections": diff.get("sezioni_confrontate") or [],
             "similarity": dict(list(similarities.items())[:8]),
@@ -411,13 +414,27 @@ def _riga_numeri(numeri):
     if numeri.get("stato") != "ok":
         motivo = _una(numeri.get("motivo") or numeri.get("stato"), 120)
         return text("numeri non disponibili: ", "figures not available: ") + motivo
-    voci = " · ".join(f"{_una(str(v.get('voce')).replace('_', ' '), 40)} {_pct(v['delta_pct'])}"
-                      for v in numeri.get("voci") or [] if v.get("delta_pct") is not None)
+    def periodo(v, lato):
+        p = (v.get("periodi") or {}).get(lato) or {}
+        modo = v.get("tipo_periodo")
+        if modo == "durata" and p.get("inizio") and p.get("fine"):
+            return _una(f"{p['inizio']}/{p['fine']}", 50)
+        if modo == "istante" and p.get("fine"):
+            return text("istante ", "instant ") + _una(p["fine"], 25)
+        return text("periodo non dichiarato", "period not stated")
+
+    voci = " · ".join(
+        f"{_una(str(v.get('voce')).replace('_', ' '), 40)} {_pct(v['delta_pct'])}"
+        + f" [{periodo(v, 'dopo')} vs {periodo(v, 'prima')}; "
+        + (_una(v.get("valuta"), 20) or text("unita non dichiarata", "unit not stated")) + "]"
+        for v in numeri.get("voci") or [] if v.get("delta_pct") is not None)
     if not voci:
         return text("numeri non disponibili: nessuna voce confrontabile",
                     "figures not available: no comparable item")
     coda = text(f" (variante {_una(numeri['variante'], 20)})", f" ({_una(numeri['variante'], 20)} variant)") \
         if numeri.get("variante") else ""
+    coda += text(" · fonte numeri: ", " · figures source: ") + (
+        _una(numeri.get("fonte"), 120) or text("non dichiarata", "not stated"))
     # Fase F: emittente nuovo, numeri sul trimestre precedente e non sull'anno prima.
     testa = text("numeri vs trimestre precedente: ", "figures vs previous quarter: ") \
         if numeri.get("confronto") == "trimestre_precedente" else text("numeri ", "figures ")

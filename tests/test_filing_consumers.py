@@ -86,6 +86,9 @@ def test_filing_priming_reaches_each_specialist_round_without_fake_report():
         data = {"_filing_context": "ARCHIVIO FILING TEST, storico e stale"}
         valuation_results = {}
 
+        def read(self, desk, round_n):
+            return None
+
         def summary_for_specialist(self, _):
             return {}
 

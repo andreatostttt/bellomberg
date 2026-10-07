@@ -1412,19 +1412,24 @@ def _annual(period):
 def _consensus_rows(facts, language, *, annual_only=False):
     it = language == "it"
     cons = facts.get("consensus") or {}
-    cur = facts.get("currency") or ""
-    rows = [("Target price " + cur, _fmt(cons.get("target_mean"), 2, language) + (" medio · " if it else " mean · ")
-             + _fmt(cons.get("target_median"), 2, language) + (" mediano" if it else " median"))]
+    cur = cons.get("target_currency") or ("valuta n.d." if it else "currency n/a")
+    targets = cons.get("target_values") or {}
+    rows = [("Target price " + cur, _fmt(targets.get("mean", cons.get("target_mean")), 2, language) + (" medio · " if it else " mean · ")
+             + _fmt(targets.get("median", cons.get("target_median")), 2, language) + (" mediano" if it else " median"))]
+    def metadata(item):
+        return ((item.get("currency") or ("valuta n.d." if it else "currency n/a"))
+                + ("; fine periodo " if it else "; period end ") + (item.get("period_end") or "n.d.")
+                + ("; " + str(item["fiscal_year_label"]) if item.get("fiscal_year_label") else ""))
     for item in cons.get("eps") or []:
         if annual_only and not _annual(item.get("period")):
             continue
-        rows.append((f"EPS {_period(item.get('period'), language)}", _fmt(item.get("value"), 2, language)
+        rows.append((f"EPS {_period(item.get('period'), language)} — " + metadata(item), _fmt(item.get("value"), 2, language)
                      + (f" ({item['analysts']} {'analisti' if it else 'analysts'})" if item.get("analysts") else "")))
     for item in cons.get("revenue") or []:
         if annual_only and not _annual(item.get("period")):
             continue
         rows.append(((f"Ricavi {_period(item.get('period'), language)} (mld)" if it else
-                      f"Revenue {_period(item.get('period'), language)} (bn)"),
+                      f"Revenue {_period(item.get('period'), language)} (bn)") + " — " + metadata(item),
                      _fmt(item.get("value"), 2, language, scale=1e9)
                      + (f" ({item['analysts']} {'analisti' if it else 'analysts'})" if item.get("analysts") else "")))
     return rows
@@ -1717,8 +1722,19 @@ def _history_table(facts, language, st, width):
     # A year with no revenue (e.g. equity only, as an opening balance) is not a fiscal column.
     years = [y for y in (history.get("years") or []) if revenue.get(y, revenue.get(str(y))) is not None]
     cons = facts.get("consensus") or {}
-    est_rev = {str(i.get("period")): i.get("value") for i in cons.get("revenue") or [] if _annual(i.get("period"))}
-    est_eps = {str(i.get("period")): i.get("value") for i in cons.get("eps") or [] if _annual(i.get("period"))}
+    history_currency = history.get("unit")
+    noncomparable = False
+    def estimates(field):
+        nonlocal noncomparable
+        result = {}
+        for item in cons.get(field) or []:
+            if not _annual(item.get("period")):
+                continue
+            comparable = bool(history_currency and item.get("currency") == history_currency)
+            noncomparable = noncomparable or not comparable
+            result[str(item.get("period"))] = item.get("value") if comparable else None
+        return result
+    est_rev, est_eps = estimates("revenue"), estimates("eps")
     periods = [p for p in dict.fromkeys([*est_rev, *est_eps])]
     if not years and not periods:
         return None, None
@@ -1727,8 +1743,8 @@ def _history_table(facts, language, st, width):
                 ("capex", "Investimenti (capex)", "Capex", 1e6, 0), ("fcf", "Flusso di cassa libero", "Free cash flow", 1e6, 0),
                 ("cash", "Cassa", "Cash", 1e6, 0), ("long_term_debt", "Debito a lungo termine", "Long-term debt", 1e6, 0),
                 ("goodwill", "Avviamento", "Goodwill", 1e6, 0), ("equity", "Patrimonio netto", "Equity", 1e6, 0),
-                ("eps_diluted", "Utile per azione diluito", "Diluted EPS", 1, 2)]
-    head = [Paragraph(("Milioni di " if it else "Millions of ") + (facts.get("currency") or "n.d."), st["head"])]
+                ("eps_diluted", "EPS", "EPS", 1, 2)]
+    head = [Paragraph(("Milioni di " if it else "Millions of ") + (history_currency or "n.d."), st["head"])]
     head += [Paragraph(str(y), st["headr"]) for y in years]
     head += [Paragraph(_text(_period(p, language) + (" (stima)" if it else " (est.)")), st["headr"]) for p in periods]
     rows = [head]
@@ -1763,6 +1779,16 @@ def _history_table(facts, language, st, width):
              "periodo come dichiarato dal fornitore" if periods else "") + ".") if it else
             (f"Sources: history {history.get('source') or 'n.d.'}" + (f"; estimates {cons.get('source') or 'n.d.'}"
              if periods else "") + "."))
+    if noncomparable:
+        note += (" Stime non confrontabili per valuta assente/diversa: n.d. in questa tabella; "
+                 "valori originali nella tabella consensus." if it else
+                 " Estimates not comparable due to missing/different currency: n.d. in this table; "
+                 "original values remain in the consensus table.")
+    if series.get("eps_diluted") or est_eps:
+        note += (" EPS storico diluito; per il consensus la base EPS (basic/diluita/rettificata) "
+                 "non e' attestata. La stessa valuta non garantisce comparabilita economica." if it else
+                 " Historical diluted EPS; consensus EPS basis is not attested (basic/diluted/adjusted). "
+                 "The same currency does not establish economic comparability.")
     return table, note
 
 

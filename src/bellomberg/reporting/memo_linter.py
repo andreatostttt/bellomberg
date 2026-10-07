@@ -199,15 +199,20 @@ def build_linter_block(memo_markdown, portfolio=None):
         cash = portfolio.get("cash_disponibile_eur")
 
     warnings = []
-    for check in (lambda: _check_nav_percentages(memo_markdown, nav),
-                  lambda: _check_scenario_sum(memo_markdown),
-                  lambda: _check_cash_quadrature(memo_markdown, cash),
-                  lambda: _check_src_coverage(memo_markdown),
-                  lambda: _check_drawdown_duplicati(memo_markdown)):
+    for label, check in (
+            (_lt("percentuali del NAV", "NAV percentages"), lambda: _check_nav_percentages(memo_markdown, nav)),
+            (_lt("somma scenari", "scenario totals"), lambda: _check_scenario_sum(memo_markdown)),
+            (_lt("quadratura liquidita'", "cash reconciliation"), lambda: _check_cash_quadrature(memo_markdown, cash)),
+            (_lt("copertura fonti", "source coverage"), lambda: _check_src_coverage(memo_markdown)),
+            (_lt("drawdown doppi", "conflicting drawdowns"), lambda: _check_drawdown_duplicati(memo_markdown))):
         try:
             warnings.extend(check())
-        except Exception:
-            pass
+        except Exception as exc:
+            # Flag-only: keep running the other checks, but never confuse a
+            # failed check with a clean result. Do not expose the raw payload.
+            warnings.append("**CHECK_UNAVAILABLE — " + label + "**: " + _lt(
+                "controllo automatico non eseguito", "automatic check not performed")
+                + " (" + type(exc).__name__ + ").")
 
     if not warnings:
         return ""

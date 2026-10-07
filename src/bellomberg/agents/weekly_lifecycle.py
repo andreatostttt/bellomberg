@@ -36,7 +36,7 @@ def create_run(db, portfolio, mandate, contract, language):
             isinstance(portfolio.get("n_positions"), bool) or
             portfolio.get("n_positions") != len(portfolio["positions"])):
         raise WeeklyRunBlocked("Fonte portfolio non verificata: nessuna richiesta AI consentita")
-    memo_id = db.save_memo("[IN PROGRESS]", portfolio_nav_eur=portfolio.get("totale_valore_mercato_eur"),
+    memo_id = db.save_memo("[IN PROGRESS]", portfolio_nav_eur=portfolio.get("nav_total_eur"),
                            title="Bellomberg Weekly - " + datetime.now().strftime("%d/%m/%Y"),
                            output_language=language)
     if not memo_id:

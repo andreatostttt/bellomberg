@@ -261,6 +261,46 @@ def _save_observation(payload):
         return payload
 
 
+def estimate_metadata(row):
+    """Solo metadata della riga Yahoo; valuta target/acquisizione non sono un periodo."""
+    fields = {"currency": ("currency",), "period_end": ("period_end", "endDate"),
+              "period_start": ("period_start", "startDate"),
+              "fiscal_year_label": ("fiscal_year_label", "fiscalYear")}
+    original, result, status = {}, {}, {}
+    for target, aliases in fields.items():
+        value = None
+        for key in aliases:
+            raw = row.get(key)
+            if raw is None or str(raw) in ("nan", "NaT", "<NA>"):
+                continue
+            raw = raw.isoformat() if hasattr(raw, "isoformat") else raw
+            original[key] = raw if isinstance(raw, (str, int, float, bool)) else str(raw)
+            value = original[key]
+            break
+        normalized = None
+        if target == "currency":
+            if (isinstance(value, str) and len(value.strip()) == 3 and value.strip().isascii()
+                    and value.strip().isalpha() and value.strip().isupper()):
+                normalized = value.strip()  # GBp non diventa GBP: nessuna conversione di scala implicita
+        elif target.startswith("period_"):
+            if isinstance(value, str):
+                try:
+                    normalized = datetime.fromisoformat(value.replace("Z", "+00:00")).date().isoformat()
+                except ValueError:
+                    pass
+        elif isinstance(value, str) and value.strip():
+            normalized = value.strip()
+        result[target] = normalized
+        status[target] = "PRESENT" if normalized is not None else "MISSING" if value is None else "INVALID"
+        supplied_status = row.get("metadata_status")
+        if normalized is None and isinstance(supplied_status, dict) and supplied_status.get(target) == "INVALID":
+            status[target] = "INVALID"
+    prior = row.get("provider_metadata")
+    result["provider_metadata"] = deepcopy(prior) if isinstance(prior, dict) else original
+    result["metadata_status"] = status
+    return result
+
+
 def _df_rows(df, cols):
     """DataFrame yfinance -> lista di dict {period, <cols>} (period e' l'indice)."""
     out = []
@@ -273,6 +313,8 @@ def _df_rows(df, cols):
                 d[c] = None if number is None else round(number, 4)
             except Exception:
                 d[c] = v
+        if "yearAgoRevenue" in cols or "yearAgoEps" in cols:
+            d.update(estimate_metadata(row))
         out.append(d)
     return out
 

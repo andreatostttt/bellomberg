@@ -12,7 +12,9 @@ MANUALE (cambia di rado): FACTS_STATIC e CONTEXT_SNAPSHOT. Quando li rivedi aggi
 Fonti calendari: federalreserve.gov, ecb.europa.eu, bls.gov (giugno 2026).
 """
 import time
+import math
 from datetime import date, datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 LAST_VERIFIED = "2026-06-10"
 STALE_AFTER_DAYS = 14
@@ -43,7 +45,10 @@ CONTEXT_SNAPSHOT = [
 ]
 
 NOTES = [
-    "Se un fatto qui sopra confligge con la tua memoria di training, PREVALE questo elenco.",
+    "La memoria di training non e' una fonte corrente. Questo blocco NON prevale automaticamente "
+    "su altre fonti documentate: confronta definizione, periodo e vintage; dichiara il conflitto. "
+    "Preferisci la fonte primaria pertinente e piu' recente solo dopo aver verificato la "
+    "confrontabilita'; nessuna scelta silenziosa o media fra dati diversi.",
     "Per qualsiasi altro fatto che potrebbe essere cambiato dopo la tua data di addestramento, "
     "verifica con tavily_search prima di affermarlo, e non dare per scontate cariche o nomine.",
 ]
@@ -55,7 +60,33 @@ FOMC_2026 = [(date(2026, 1, 27), date(2026, 1, 28)), (date(2026, 3, 17), date(20
              (date(2026, 10, 27), date(2026, 10, 28)), (date(2026, 12, 8), date(2026, 12, 9))]
 ECB_2026 = [date(2026, 3, 19), date(2026, 4, 30), date(2026, 6, 11), date(2026, 7, 23),
             date(2026, 9, 10), date(2026, 10, 29), date(2026, 12, 17)]
-CPI_US_2026 = [date(2026, 6, 10), date(2026, 7, 14), date(2026, 8, 12)]  # confermate BLS; estendere quando pubblicano le successive
+# Verifica 07/10/2026: https://www.bls.gov/schedule/news_release/cpi.htm
+# Ore 08:30 Eastern; mesi di riferimento da maggio a novembre (non mese di uscita).
+CPI_US_2026 = [date(2026, 6, 10), date(2026, 7, 14), date(2026, 8, 12),
+               date(2026, 9, 11), date(2026, 10, 14), date(2026, 11, 10), date(2026, 12, 10)]
+
+
+def _rome_time(day, hour, minute=0):
+    """Orario New York convertito alla data dell'evento, inclusi disallineamenti DST."""
+    # Fed: monetary20130313a.htm (14:00 ET / 14:30 ET); BLS: cpi.htm (08:30 ET).
+    try:
+        event = datetime(day.year, day.month, day.day, hour, minute,
+                         tzinfo=ZoneInfo("America/New_York"))
+        return event.astimezone(ZoneInfo("Europe/Rome")).strftime("%H:%M %Z")
+    except ZoneInfoNotFoundError:
+        return "%02d:%02d America/New_York (ora Roma n.d.: dati zoneinfo assenti)" % (hour, minute)
+
+
+def _cpi_year_pair(observations):
+    """CPI mensile: nessuna distanza per posizione, nessun mese duplicato o invalido."""
+    from bellomberg.core.macro_observations import annual_comparison
+    result = annual_comparison(observations, 'monthly')
+    # Compatibilita' rigorosa: questa tupla non puo' trasportare quality al prompt.
+    if result['quality']['invalid_observations'] or result['quality']['duplicate_periods']:
+        raise ValueError('osservazioni CPI non valide o mesi duplicati: vintage ambiguo')
+    if result['yoy_pct'] is None:
+        raise ValueError(result['comparison']['reason'])
+    return result['yoy_pct'], result['latest_date'], result['year_ago_date']
 
 
 def _days_label(d, today=None):
@@ -89,7 +120,8 @@ def _live_numbers():
     try:
         from bellomberg.agents.agent_tools import _fred_fetch_series
     except Exception:
-        return ["(numeri live FRED non disponibili: usa get_macro_dashboard per i livelli correnti)"]
+        return ["(numeri live FRED non disponibili: usa get_macro_dashboard per i livelli correnti)",
+                "- CPI USA: n.d. (CPIAUCSL; import FRED non disponibile)."]
 
     def last(series, n=3):
         try:
@@ -106,12 +138,34 @@ def _live_numbers():
         lines.append("- Tasso deposito BCE: %.2f%% (al %s) [src: FRED]" % (depo["value"], depo["date"]))
     try:
         from bellomberg.agents.agent_tools import _fred_fetch_series as _f
-        obs = (_f("CPIAUCSL", last_n=14) or {}).get("observations") or []
-        if len(obs) >= 13:
-            yoy = (obs[-1]["value"] / obs[-13]["value"] - 1.0) * 100.0
-            lines.append("- CPI USA: %+.1f%% a/a (indice al %s) [src: FRED]" % (yoy, obs[-1]["date"]))
-    except Exception:
-        pass
+        data = _f("CPIAUCSL", last_n=14) or {}
+        obs = data.get("observations") or []
+        rejected = data.get("rejected_observations")
+        vintage = ("realtime FRED %s / %s (intervallo della risposta, non data di pubblicazione)"
+                   % (data["realtime_start"], data["realtime_end"])
+                   if data.get("realtime_start") and data.get("realtime_end")
+                   else "vintage n.d.: non fornito dal tool")
+        if rejected is None:
+            lines.append("- CPIAUCSL: metadati scarti n.d.; completezza del payload non verificabile. [src: FRED]")
+        elif rejected:
+            dates = ", ".join(o.get("date") or "data n.d." for o in rejected)
+            latest_available = max((o["date"] for o in obs), default="n.d.")
+            lines.append("- CPIAUCSL: osservazioni scartate: %s; ultima osservazione disponibile %s; %s. [src: FRED]"
+                         % (dates, latest_available, vintage))
+            if any(not o.get("date") or o["date"] >= latest_available for o in rejected) or not obs:
+                raise ValueError("latest observation rejected")
+        yoy, current_date, base_date = _cpi_year_pair(obs)
+        lines.append("- CPI USA: %+.1f%% a/a (CPIAUCSL, CPI-U all items destagionalizzato; "
+                     "indice %s / %s; %s, soggetto a revisione). "
+                     "Non equiparare automaticamente al CPI non destagionalizzato del comunicato. "
+                     "[src: FRED]" % (yoy, current_date, base_date, vintage))
+    except ValueError as exc:
+        # Solo diagnostica locale: gli errori provider possono contenere URL/credenziali.
+        lines.append("- CPI USA: n.d. (CPIAUCSL; dati non validi o stesso mese di confronto "
+                     "non disponibile; %s). [src: FRED]" % type(exc).__name__)
+    except Exception as exc:
+        lines.append("- CPI USA: n.d. (CPIAUCSL; acquisizione/calcolo KO: %s). [src: FRED]"
+                     % type(exc).__name__)
     t10 = last("DGS10")
     if t10:
         lines.append("- Treasury 10Y: %.2f%% (al %s) [src: FRED]" % (t10["value"], t10["date"]))
@@ -132,8 +186,9 @@ def current_facts_block() -> str:
     if _BLOCK_CACHE["text"] and (time.time() - _BLOCK_CACHE["ts"]) < _BLOCK_TTL_S:
         return _BLOCK_CACHE["text"]
     today = date.today()
-    lines = ["=== FATTI CORRENTI VERIFICATI (ground truth, " + datetime.now().strftime("%d/%m/%Y") + ") ===",
-             "Usa SEMPRE questi fatti; ignora la tua memoria di training dove confligge.", ""]
+    lines = ["=== FONTI E CONTESTO CORRENTE (" + datetime.now().strftime("%d/%m/%Y") + ") ===",
+             "Distingui dati osservati, calendario e contesto manuale; applica le regole sulle fonti in fondo.",
+             "CARICHE E CONTESTO MANUALE (verifica: " + LAST_VERIFIED + "):"]
     for k, v in FACTS_STATIC.items():
         lines.append("- " + k + ": " + v)
 
@@ -148,7 +203,8 @@ def current_facts_block() -> str:
         # 28/07 la riga diceva "OGGI... statement ore 20:00" con statement il 29).
         lines.append("- Prossima riunione FOMC: " + s.strftime("%d/%m") + "-" + e.strftime("%d/%m/%Y")
                      + "; la decisione esce a fine riunione: statement " + _days_label(e, today)
-                     + " (" + e.strftime("%d/%m") + ") ore 20:00 CET, conferenza 20:30.")
+                     + " (" + e.strftime("%d/%m") + ") ore " + _rome_time(e, 14)
+                     + ", conferenza " + _rome_time(e, 14, 30) + ".")
         if 0 <= (e - today).days <= 8:
             near.append("FOMC " + e.strftime("%d/%m"))
     ne = _next(ECB_2026, today)
@@ -159,7 +215,8 @@ def current_facts_block() -> str:
             near.append("BCE " + ne.strftime("%d/%m"))
     nc = _next(CPI_US_2026, today)
     if nc:
-        lines.append("- Prossimo CPI USA: " + nc.strftime("%d/%m/%Y") + " (" + _days_label(nc, today) + "), ore 14:30 CET.")
+        lines.append("- Prossimo CPI USA: " + nc.strftime("%d/%m/%Y") + " (" + _days_label(nc, today)
+                     + "), ore " + _rome_time(nc, 8, 30) + ". [src: BLS calendario, verifica 07/10/2026]")
         if 0 <= (nc - today).days <= 8:
             near.append("CPI USA " + nc.strftime("%d/%m"))
     elif CPI_US_2026 and max(CPI_US_2026) < today:
@@ -168,7 +225,7 @@ def current_facts_block() -> str:
         lines.append("! FINESTRA EVENTO: " + " + ".join(near) + " ravvicinati. Ogni proposta con timing/expiry DEVE tenerne conto.")
 
     lines.append("")
-    lines.append("NUMERI LIVE (FRED, al momento della run):")
+    lines.append("DATI OSSERVATI (FRED; cache blocco fino a 1h, data osservazione distinta dal vintage):")
     lines.extend(_live_numbers())
 
     lines.append("")

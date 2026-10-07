@@ -13,11 +13,15 @@ from bellomberg.storage.weekly_run_store import WeeklyRunBlocked
 
 
 MODE = 'fundamentals_research_v1'
+_REAL_EXTRACT = cm.MemoryDB.extract_and_save_decisions
 
 
 @pytest.fixture
 def research_weekly(run_offline, monkeypatch):
     from bellomberg.valuation import preparation_runtime, dcf_engine, preparation_service
+    # Exercise the real publication gate, not the generic wiring fixture's stub.
+    monkeypatch.delitem(sys.modules, 'bellomberg.agents.action_validator')
+    import_module('bellomberg.agents.action_validator')
     monkeypatch.setattr(cm, '_weekly_contract', run_offline.native_weekly_contract)
     calls = {'prepare_binding': 0, 'compiler': 0, 'coverage': 0, 'reports': []}
 
@@ -66,6 +70,8 @@ def test_new_weekly_reaches_real_pdf_and_simulated_smtp_without_any_workbook(res
     result = cm.run_multi_agent(send_email=True)
     store = _store()
     assert store.context['contract']['analysis_mode'] == MODE
+    assert store.context['contract']['publication_gate_policy'] == 'research-evidence-v1'
+    assert 'instrument_natures' in store.context['contract']
     assert result['status'] == 'completed'
     assert result['analytical_status'] == 'complete'
     assert result['delivery_status'] == 'sent'
@@ -110,6 +116,26 @@ def test_research_crash_then_two_resumes_keep_reports_and_do_not_send_twice(rese
     assert store.get('decisions_finalized') == decisions and second['request_costs'] == costs
     assert len(observed.inviati) == 1
     assert all(calls[key] == 0 for key in ('prepare_binding', 'compiler', 'coverage'))
+
+
+def test_research_publication_never_reads_val_and_explains_withdrawal(research_weekly, monkeypatch):
+    monkeypatch.setattr(cm.MemoryDB, 'extract_and_save_decisions', _REAL_EXTRACT)
+    validator = import_module('bellomberg.agents.action_validator')
+    monkeypatch.setattr(validator, '_sanity_payload', lambda *a, **k: pytest.fail('Research read archived VAL'))
+    memo = ('# Memo\n\n## BLUF\nSynthetic proposed purchase.\n\n## ACTION TABLE\n'
+            '| Action | Ticker | EUR | Timing | Confidence | Rationale |\n'
+            '|---|---|---|---|---|---|\n'
+            '| BUY | SYNTH-A | 1234 | now | HIGH | Synthetic thesis |\n')
+    monkeypatch.setattr(cm, 'run_capo', lambda *a, **k: (memo, {'complete': True, 'stop_reason': 'end_turn',
+        'model': 'synthetic/offline', 'api_calls': 1, 'in': 10, 'out': 10,
+        'input_tokens': 10, 'output_tokens': 10}))
+    cm.run_multi_agent(send_email=False)
+    store = _store()
+    published = store.get('memo_validated')['publication']
+    assert store.get('capo')['memo'] == memo
+    assert published['assessments'][0]['status'] == 'CHECK_UNAVAILABLE'
+    assert 'evidenze' in published['assessments'][0]['reason']
+    assert 'GATE DI PUBBLICAZIONE' in published['memo_markdown']
 
 
 def test_research_smtp_failure_preserves_analysis_and_pdf(research_weekly, monkeypatch):

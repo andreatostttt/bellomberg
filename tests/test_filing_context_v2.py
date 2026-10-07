@@ -39,7 +39,9 @@ def test_riga_di_stato_date_non_trimestri_e_novita():
                          novita_dopo=datetime(2026, 10, 1, tzinfo=timezone.utc))
     assert s["stato"].startswith("NOVA.DE · SEC 10-Q CIK 0009990001 · trimestre al 27/09/2026 vs 28/09/2025")
     assert "aggiornato" in s["stato"] and "NOVITÀ" in s["stato"] and "Q3" not in s["stato"]
-    assert s["numeri"] == "numeri ricavi +15,0% · utile netto −3,2%"
+    assert s["numeri"] == ("numeri ricavi +15,0% [periodo non dichiarato vs periodo non dichiarato; unita non dichiarata]"
+                           " · utile netto −3,2% [periodo non dichiarato vs periodo non dichiarato; unita non dichiarata]"
+                           " · fonte numeri: non dichiarata")
     assert s["gruppo"] == 2  # nessun cambiamento: invariato anche se nuovo
 
 
@@ -218,7 +220,8 @@ def test_numeri_non_ok_e_variante_dei_numeri():
     run["result"]["numeri"] = {"stato": "ok", "variante": "annuale",
                                "voci": [{"voce": "utile_operativo", "delta_pct": 17.06}]}
     s = fc.scheda_da_run("NOVA.DE", profilo=PROFILO_SEC, run=run, ultimo=None, freschezza=None, novita_dopo=None)
-    assert s["numeri"] == "numeri utile operativo +17,1% (variante annuale)"
+    assert s["numeri"] == ("numeri utile operativo +17,1% [periodo non dichiarato vs periodo non dichiarato; unita non dichiarata]"
+                           " (variante annuale) · fonte numeri: non dichiarata")
 
 
 def test_inglese_parole_fisse():

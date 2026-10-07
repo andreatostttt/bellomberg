@@ -129,10 +129,10 @@ def test_contesto_dichiara_trimestre_su_trimestre():
               novita_dopo=datetime(2026, 10, 1, tzinfo=timezone.utc))
     s = fc.scheda_da_run("NOVA.DE", run=_run(), **kw)
     assert "trimestre al 31/03/2026 vs 31/12/2025 · trimestre su trimestre (manca l'anno prima)" in s["stato"]
-    assert s["numeri"] == "numeri vs trimestre precedente: ricavi +4,0%"
+    assert s["numeri"] == "numeri vs trimestre precedente: ricavi +4,0% [periodo non dichiarato vs periodo non dichiarato; unita non dichiarata] · fonte numeri: non dichiarata"
     with language_context("en"):
         s = fc.scheda_da_run("NOVA.DE", run=_run(), **kw)
     assert "quarter to 31/03/2026 vs 31/12/2025 · quarter on quarter (no prior year)" in s["stato"]
-    assert s["numeri"] == "figures vs previous quarter: ricavi +4.0%"
+    assert s["numeri"] == "figures vs previous quarter: ricavi +4.0% [period not stated vs period not stated; unit not stated] · figures source: not stated"
     s = fc.scheda_da_run("NOVA.DE", run=_run(regola=False), **kw)
-    assert "trimestre su trimestre" not in s["stato"] and s["numeri"] == "numeri ricavi +4,0%"
+    assert "trimestre su trimestre" not in s["stato"] and s["numeri"] == "numeri ricavi +4,0% [periodo non dichiarato vs periodo non dichiarato; unita non dichiarata] · fonte numeri: non dichiarata"

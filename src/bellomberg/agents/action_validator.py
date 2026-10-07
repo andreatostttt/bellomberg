@@ -156,7 +156,22 @@ def _sanity_reason(record):
     return "; ".join(parts) or "sidecar di sanity con severity BLOCK"
 
 
-def assess_action_table(memo_markdown, sizing=None, *, sanity_exclusions=None):
+RESEARCH_GATE_POLICY = 'research-evidence-v1'
+
+
+def research_gate_enabled(contract):
+    """Explicit opt-in from the sealed run contract; old runs stay unchanged."""
+    from bellomberg.core.research_analysis import is_research_mode
+    if not isinstance(contract, dict) or 'publication_gate_policy' not in contract:
+        return False
+    policy = contract['publication_gate_policy']
+    if type(policy) is not str or policy != RESEARCH_GATE_POLICY:
+        raise ValueError('Unsupported publication gate policy; original run preserved')
+    return is_research_mode(contract)
+
+
+def assess_action_table(memo_markdown, sizing=None, *, sanity_exclusions=None,
+                        publication_contract=None, research_checks=None):
     """Esito di pubblicazione di ogni riga della ACTION TABLE (funzione pura).
 
     04/10 (G6, decisioni PM A): il gate blocca SOLO cio' che non si puo' eseguire
@@ -176,6 +191,12 @@ def assess_action_table(memo_markdown, sizing=None, *, sanity_exclusions=None):
 
     `sanity_exclusions`: un record per ticker BUY/ADD (`collect_sanity_exclusions`);
     None = controllo non fornito, fail-closed sulle BUY/ADD.
+
+    Contratto research-evidence-v1: VAL non applicabile. Il binding congelato
+    prova provenienza (run, memo/riga, dossier e ricevute), NON verita economica.
+    BUY/ADD con binding disponibile e controlli run disponibili sono proposte
+    operative al PM; dati mancanti/corrotti restano CHECK_UNAVAILABLE. Le eccezioni
+    di natura restano etichettate SENZA VALUTAZIONE; sizing sempre flag-only.
     """
     rows = _parse_action_rows(memo_markdown or "")
     sanity_by_ticker = _sanity_map(sanity_exclusions)
@@ -206,6 +227,45 @@ def assess_action_table(memo_markdown, sizing=None, *, sanity_exclusions=None):
             continue
         if action not in ("BUY", "ADD"):
             continue
+        if research_gate_enabled(publication_contract):
+            # A sealed provenance binding is not semantic approval of the thesis.
+            assessment.update(status="CHECK_UNAVAILABLE",
+                reason="DCF non applicabile alla ricerca; legame della riga con tesi ed evidenze "
+                       "correnti non verificabile",
+                research_checks=research_checks)
+            if amount is None or amount <= 0:
+                assessment['reason'] = "importo BUY/ADD illeggibile o non positivo: '" + str(row.get('size_raw') or '') + "'"
+                continue
+            unavailable = [name for name in ('research_seal', 'mandate', 'risk', 'sizing')
+                           if not isinstance(research_checks, dict)
+                           or (research_checks.get(name) or {}).get('status') != 'AVAILABLE']
+            if unavailable:
+                assessment['reason'] += '; controlli della run non disponibili: ' + ', '.join(unavailable)
+                continue
+            nature = (publication_contract.get('instrument_natures') or {}).get(_normal_ticker(ticker)) or {}
+            if (nature.get('valore') in NATURE_SENZA_VALUTAZIONE
+                    and nature.get('fonte') in {'registro_pm', 'quote_type'}):
+                # Preserve the existing PM exception; do not call it research approval.
+                assessment.update(status='OPERATIVE', senza_valutazione=True,
+                    reason='SENZA VALUTAZIONE: strumento ' + nature['valore'].upper()
+                           + ' da natura sigillata della run; DCF non applicabile. '
+                           'Eccezione di natura vigente, non certificazione della tesi; sizing: vedi avvisi ACTION VALIDATOR')
+                continue
+            try:
+                from bellomberg.core.research_analysis import research_binding_for_row
+                bound = research_binding_for_row(research_checks.get('row_thesis_evidence_binding'),
+                    memo_markdown=memo_markdown, row=row,
+                    run_identity=research_checks.get('run_identity') or {},
+                    reference=research_checks['research_seal']['source'])
+                assessment['research_binding'] = bound
+                if bound.get('status') == 'AVAILABLE':
+                    assessment.update(status='OPERATIVE', reason='DCF non applicabile; ' + bound['reason']
+                                      + '; sizing: vedi avvisi ACTION VALIDATOR')
+                else:
+                    assessment['reason'] += ': ' + str(bound.get('reason') or 'provenienza non disponibile')
+            except (ValueError, TypeError, KeyError) as exc:
+                assessment['reason'] += ': ' + str(exc)
+            continue
         # The sanity block is a hard gate and must precede the amount check.
         sanity_record = (sanity_by_ticker or {}).get(_normal_ticker(ticker))
         severity = str((sanity_record or {}).get("severity") or "").upper()
@@ -235,7 +295,7 @@ def assess_action_table(memo_markdown, sizing=None, *, sanity_exclusions=None):
     return results
 
 
-def collect_sanity_exclusions(memo_markdown, report_dir=None, negozio=None):
+def collect_sanity_exclusions(memo_markdown, report_dir=None, negozio=None, *, publication_contract=None):
     """Read local sanity sidecars and return one evidence record per BUY/ADD ticker.
 
     The collector never contacts a provider. It returns severity=None for a
@@ -244,6 +304,8 @@ def collect_sanity_exclusions(memo_markdown, report_dir=None, negozio=None):
     vehicle store (`negozio`, loaded when omitted). When `report_dir` is
     omitted it uses the runtime `core.paths.REPORT_DIR`.
     """
+    if research_gate_enabled(publication_contract):
+        return []  # Not applicable, not an OK sanity result; assessor records the reason.
     candidates = []
     try:
         for row in _parse_action_rows(memo_markdown or ""):
@@ -348,7 +410,7 @@ def _ddmm(iso):
 
 @scoped_language
 def build_validator_block(memo_markdown, sizing, db, exclude_memo_id=None, *, sanity_exclusions=None,
-                          mandato=None):
+                          mandato=None, publication_contract=None, research_checks=None):
     """Ritorna il blocco markdown '## ACTION VALIDATOR' (o stringa vuota se pulito).
     Non solleva mai: ogni check e' guarded, un guasto del validator non deve
     toccare la run (il chiamante ha comunque il suo try/except).
@@ -368,10 +430,11 @@ def build_validator_block(memo_markdown, sizing, db, exclude_memo_id=None, *, sa
     # blocks, pending overrides, and unavailable checks explicit in the memo.
     risk_assessments_ok = False
     try:
-        resolved_sanity = (collect_sanity_exclusions(memo_markdown)
+        resolved_sanity = (collect_sanity_exclusions(memo_markdown, publication_contract=publication_contract)
                            if sanity_exclusions is None else sanity_exclusions)
         risk_assessments = assess_action_table(
-            memo_markdown, sizing, sanity_exclusions=resolved_sanity)
+            memo_markdown, sizing, sanity_exclusions=resolved_sanity,
+            publication_contract=publication_contract, research_checks=research_checks)
         for assessment in risk_assessments:
             status = assessment["status"]
             if status == "OPERATIVE" and assessment.get("senza_valutazione"):
@@ -764,7 +827,7 @@ def _canonical_sanity(ticker, report_dir=None):
 
 
 @scoped_language
-def detect_sanity_exclusions(memo_markdown, report_dir=None):
+def detect_sanity_exclusions(memo_markdown, report_dir=None, *, publication_contract=None):
     """#204b residuo — ESCLUSIONE HARD, fase DETECT (pacchetto verita' dei
     numeri Lotto C, ok PM 23/07; riprogettata dopo review: detect/apply separati
     perche' il memo si finalizza PRIMA che le decisioni siano salvate).
@@ -774,6 +837,8 @@ def detect_sanity_exclusions(memo_markdown, report_dir=None):
     DICE (review F4 — mai bypass muto). Solo BUY/ADD chiudono: un TRIM/SELL su
     modello rotto resta decisione del PM.
     Ritorna (block_markdown, pairs) — ('' , []) se nulla. Non solleva mai."""
+    if research_gate_enabled(publication_contract):
+        return "", []
     try:
         rows = _parse_action_rows(memo_markdown)
     except Exception:

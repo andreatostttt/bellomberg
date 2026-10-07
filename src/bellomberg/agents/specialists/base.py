@@ -1538,6 +1538,35 @@ SPECIALIST_STYLE_RULES = """
 """.strip()
 
 
+def _blocco_round_precedente(board, desk, round_n, others):
+    """Round proprio esatto e colleghi condividono il budget gia' esistente.
+
+    Priorita' al proprio lavoro, senza cercare un latest o un'altra run.
+    Il budget conta i caratteri dei report, come _blocco_blackboard; le
+    intestazioni diagnostiche sono extra, non una garanzia sui token LLM.
+    """
+    previous = round_n - 1
+    report = board.read(desk, previous)
+    heading = "OWN PREVIOUS ROUND (same run, %s, R%d):\n" % (desk, previous)
+    if not isinstance(report, str) or not report.strip():
+        own = heading + "unavailable: exact previous report absent or invalid. Do not reconstruct it."
+        used = 0
+    else:
+        used = min(len(report), MAX_CHAR_BLACKBOARD)
+        if used == len(report):
+            own = heading + "report INTERO, %d caratteri\n" % len(report) + report
+        else:
+            # Equivalente a RECUPERO_NESSUNO, ma per il ROUND ESATTO:
+            # ask_specialist legge latest e non garantisce quel contenuto.
+            own = heading + (
+                "NE LEGGI %d SU %d CARATTERI: il resto NON e' qui; "
+                "nessun tool garantisce questo round esatto; latest non e' un sostituto. "
+                "Dichiara il limite, non dedurre l'assenza di tesi o proposte "
+                "dalla parte non visibile.\n" % (used, len(report))) + report[:used]
+    return own + "\n\nBLACKBOARD:\n" + _blocco_blackboard(
+        others, budget=MAX_CHAR_BLACKBOARD - used)
+
+
 class Specialist:
     """Base class. Subclass deve definire: name, system_prompt, tools_used."""
     name = "BASE"
@@ -1751,6 +1780,25 @@ class Specialist:
         return self._execute_meta_tool_unlocked(name, input_)
 
     def _execute_meta_tool_unlocked(self, name, input_):
+        if (name == "search_past_memos" and getattr(self.blackboard, "run_scope", None) == "weekly"
+                and "semantic_memory_policy" in (getattr(getattr(self.blackboard, "weekly_store", None),
+                                                        "context", {}).get("contract") or {})):
+            policy = self.blackboard.weekly_store.context["contract"]["semantic_memory_policy"]
+            if policy != "weekly-published-chunks/1":
+                return {"status": "unavailable", "reason": "unsupported_policy",
+                        "memory_scope": "weekly_operational", "count": 0, "memos": []}
+            # Internal run policy, never a model-supplied flag. Keep tinput/journal
+            # untouched; pending paid tool outputs replay before reaching this node.
+            try:
+                from bellomberg.agents.agent_tools import tool_search_past_memos
+                from bellomberg.agents.chat_tools import _stamp
+                result = tool_search_past_memos(query=input_["query"],
+                    n_results=input_.get("n_results", 5), operational_only=True)
+                return _stamp(result, "published weekly memo chunks: exact SQLite provenance")
+            except Exception:
+                # Do not fall through to the unfiltered archive dispatcher.
+                return {"status": "unavailable", "reason": "operational_search_unavailable",
+                        "memory_scope": "weekly_operational", "count": 0, "memos": []}
         from bellomberg.agents.company_research_tools import TOOL_NAMES, dispatch_company_source
         if name in TOOL_NAMES:
             return dispatch_company_source(self.blackboard, name, input_, max_chars=_tetto_tool_result(),
@@ -1927,8 +1975,12 @@ class Specialist:
     def _build_memory_block(self):
         """Costruisce blocco YOUR MEMORY da iniettare nel prompt round 0.
         Include ultimi 3 report tuoi, feedback PM specifici, decisioni recenti."""
+        from bellomberg.core.reflection_policy import board_enabled, scorecard_for
+        _reflection36 = board_enabled(self.blackboard)
         if not self.blackboard.memory_db:
             return ""
+        _memory_kwargs = ({'track_record_snapshot': scorecard_for(self.blackboard.weekly_store)}
+                          if _reflection36 else {})
         try:
             # 4100 -> 8000 il 20/08 (ok PM "aumentiamo i tetti"): la memoria vera
             # misurava 3.874 char, cioe' il 94% del cap — un margine di 226 char su
@@ -1943,7 +1995,7 @@ class Specialist:
             # giusto lasciando acceso il taglio vero, e ho scritto la frase come se
             # valesse per entrambi. Curato il 21/08: memory_db.MAX_CHAR_FEEDBACK_PM.
             return "\n\n" + self.blackboard.memory_db.build_specialist_memory_context(
-                self.name, max_chars=MAX_CHAR_MEMORIA_SPECIALISTA)
+                self.name, max_chars=MAX_CHAR_MEMORIA_SPECIALISTA, **_memory_kwargs)
         except Exception as e:
             return "\n\n[MEMORY ERROR: " + str(e) + "]"
 
@@ -2006,7 +2058,9 @@ class Specialist:
             history = self.blackboard.candidate_history or "(storico candidato non disponibile: dichiarare il limite)"
             decision_context = self.blackboard.data.get("_decision_context")
             book_context = self.blackboard.data.get("_portfolio_context")
-            other = _blocco_blackboard(self.blackboard.summary_for_specialist(self.name)) if round_n else ""
+            peers = self.blackboard.summary_for_specialist(self.name) if round_n else {}
+            other = (_blocco_round_precedente(self.blackboard, self.name, round_n, peers)
+                     if round_n == 2 else _blocco_blackboard(peers) if round_n else "")
             red = self.blackboard.get_latest("red_team") if round_n == 2 else None
             from bellomberg.valuation.sector_analysis import valuation_results_block
             from bellomberg.agents.trade_idea import candidate_model_context
@@ -2137,8 +2191,7 @@ class Specialist:
                 "specialists earlier in the pipeline may already show Round 1 drafts - use them).\n"
                 "Produce your full analytical report (800-1500 words).\n"
                 "Cross-reference others where relevant. Use ask_specialist for targeted questions.\n\n"
-                "BLACKBOARD:\n"
-                + _blocco_blackboard(others)
+                + _blocco_round_precedente(self.blackboard, self.name, round_n, others)
             )
         elif round_n == 2:
             others = self.blackboard.summary_for_specialist(self.name)
@@ -2177,8 +2230,8 @@ class Specialist:
                 "add cross-pollination insights, sharpen views.\n"
                 + rt_line
                 + vincoli +
-                "\nBLACKBOARD:\n"
-                + _blocco_blackboard(others)
+                ("\nBLACKBOARD:\n" + _blocco_blackboard(others) if is_research_mode(self.blackboard) else
+                 _blocco_round_precedente(self.blackboard, self.name, round_n, others))
             )
         else:
             preamble = "Round " + str(round_n)
@@ -2663,24 +2716,28 @@ class Specialist:
         max_tokens = self._max_tokens_for_round(round_n, task_context)
         print("\n[" + self.name.upper() + "] Round " + str(round_n) + " start")
         # Una fotografia per round; la prossima chiamata vede eventuali modifiche.
+        from bellomberg.core.evidence_prompt_policy import select_template, diagnostic_block
+        evidence_template = select_template(self.blackboard, self.name, self.system_prompt)
         mandato = None
+        from bellomberg.core import mandato_pm
+        text_policy = mandato_pm.text_policy_for_board(self.blackboard)
         try:
-            from bellomberg.core import mandato_pm
             try:
                 mandato = mandato_pm.carica()
                 errore_mandato = ""
             except mandato_pm.MandatoMancante as e:
                 mandato, errore_mandato = None, str(e)
-            system_round = mandato_pm.compila_o_dichiara(self.system_prompt, mandato)
-            if "{MANDATO:" not in self.system_prompt:
-                system_round += "\n\n" + (mandato_pm.blocco_prompt(mandato) if mandato is not None
+            system_round = mandato_pm.compila_o_dichiara(evidence_template, mandato,
+                **({"text_policy": text_policy} if text_policy is not None else {}))
+            if "{MANDATO:" not in evidence_template:
+                system_round += "\n\n" + (mandato_pm.blocco_prompt(mandato, **({"text_policy": text_policy} if text_policy is not None else {})) if mandato is not None
                                             else mandato_pm.riga_senza_mandato())
             if errore_mandato:
                 system_round += "\n[MANDATO n.d.] " + errore_mandato
         except Exception as e:
             import re
             causa = _dichiara_fallback("mandato[" + self.name + "]", e)
-            system_round = re.sub(r"\{MANDATO:[^}]+\}", "(mandato n.d.)", self.system_prompt)
+            system_round = re.sub(r"\{MANDATO:[^}]+\}", "(mandato n.d.)", evidence_template)
             system_round += "\n[MANDATO n.d.] " + causa
         if getattr(self.blackboard, "run_scope", "weekly") == "trade_idea":
             from bellomberg.core.trade_idea_contract import trade_idea_specialist_instructions
@@ -2688,7 +2745,7 @@ class Specialist:
                 analysis_mode=self.blackboard.analysis_mode) if is_research_mode(self.blackboard)
                 else trade_idea_specialist_instructions(self.name))
             system_round += "\nSELECTED CANDIDATE: " + str(self.blackboard.target_ticker)
-            system_round += "\n" + (mandato_pm.blocco_prompt(mandato) if mandato is not None else mandato_pm.riga_senza_mandato())
+            system_round += "\n" + (mandato_pm.blocco_prompt(mandato, **({"text_policy": text_policy} if text_policy is not None else {})) if mandato is not None else mandato_pm.riga_senza_mandato())
         system_round += ("\nBefore acquiring company data again, use read_company_dossier to reuse "
                          "the verified company evidence shared by this run. Preserve its source references; "
                          "declare partial or unavailable facts explicitly and never replace them silently.")
@@ -2725,6 +2782,8 @@ class Specialist:
                               + ". Dichiara il buco nel report.")
         if saved_checkpoint is None:
             _ctx = "".join(blocchi) + "\n\n" + _ctx
+        if saved_checkpoint is None and self.name == 'quant' and round_n == 2:
+            _ctx += diagnostic_block(self.blackboard)
         if task_context is not None and saved_checkpoint is None:
             task_heading = (
                 "\n\nTARGETED TASK: answer the explicit question below using the supplied draft and "
@@ -3239,6 +3298,10 @@ class Specialist:
                             _out_s = json.dumps(result, default=str, ensure_ascii=False)
                         except Exception:
                             _out_s = str(result)
+                        # Diagnostica passiva separata: stessi byte al modello/receipt/journal.
+                        from bellomberg.core.source_health import capture_health
+                        capture_health(self.blackboard, checkpoint_key + ":" + tool_key, tname, result,
+                                       desk=self.name, round_n=round_n, output_json=_out_s, input_values=tinput)
                         if not replayed_tool and (getattr(self.blackboard, "run_scope", "weekly") == "trade_idea"
                                                   or is_research_mode(self.blackboard)):
                             _receipt_truncated = len(_out_s) > 200000

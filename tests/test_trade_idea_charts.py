@@ -43,8 +43,8 @@ def _facts():
                   "source": "Prezzi sintetici"},
         "consensus": {"target_mean": 58.0, "target_median": 59.0, "target_high": 70.0,
                       "target_low": 45.0, "analysts": 9, "source": "Consensus sintetico",
-                      "eps": [{"period": "2024", "value": 2.50}, {"period": "2025", "value": 3.00}],
-                      "revenue": [{"period": "2024", "value": 1.5e9}, {"period": "2025", "value": 1.68e9}],
+                      "eps": [{"period": "2024", "value": 2.50, "currency": "EUR"}, {"period": "2025", "value": 3.00, "currency": "EUR"}],
+                      "revenue": [{"period": "2024", "value": 1.5e9, "currency": "EUR"}, {"period": "2025", "value": 1.68e9, "currency": "EUR"}],
                       "recommendations": {"strong_buy": 4, "buy": 9, "hold": 3, "sell": 1, "strong_sell": 0},
                       "recommendations_prev": {"strong_buy": 3, "buy": 8, "hold": 5, "sell": 1, "strong_sell": 0}},
         "returns": {"window": "1y", "source": "Rendimenti sintetici", "assets": [
@@ -245,7 +245,8 @@ def test_note_eps(charts_it):
     assert n[0] == "L'EPS diluito passa da 1,10 a 2,00 EUR tra il 2020 e il 2023 (+81,8%, media annua composta +22,1%)."
     assert "2022" in n[1]  # buco nello storico dichiarato
     assert n[2] == "2024 (stima): 2,50 EUR, +25,0% rispetto all'ultimo esercizio storico (2023)."
-    assert n[3] == "2025 (stima): 3,00 EUR, +20,0% rispetto alla stima precedente."
+    assert n[3].startswith("2025 (stima): 3,00 EUR, +20,0% rispetto alla stima precedente.")
+    assert "Base EPS del consensus" in n[3] and "comparabilita economica non e' garantita" in n[3]
 
 
 def test_note_ricavi_storico_e_stime(charts_it):
@@ -312,7 +313,7 @@ def test_colore_candidato_nel_png(charts_it):
 def test_stime_trimestrali_mai_mescolate_con_gli_anni(tmp_path):
     facts = _facts()
     facts["consensus"]["revenue"] = [{"period": "0q", "value": 0.4e9}, {"period": "+1q", "value": 0.42e9},
-                                     {"period": "0y", "value": 1.5e9}, {"period": "+1y", "value": 1.68e9}]
+                                     {"period": "0y", "value": 1.5e9, "currency": "EUR"}, {"period": "+1y", "value": 1.68e9, "currency": "EUR"}]
     out = {c["key"]: c for c in build_charts(facts, str(tmp_path))}
     n = out["revenue_path"]["notes"]
     assert n[1] == "Anno in corso (stima): 1,5 miliardi di EUR, +7,1% rispetto all'ultimo esercizio storico (2023)."

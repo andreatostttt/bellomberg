@@ -180,7 +180,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     },
     {
         "name": "add_guidance",
-        "description": "REGISTRA una GUIDANCE SOCIETARIA nel registro persistente (V6, decisione PM D1): usalo quando LEGGI una trimestrale/press release/presentazione con guidance NUMERICA. FONTE OBBLIGATORIA: source_doc (documento+riferimento, es. 'press release Q2 FY2026, sito IR') E source_date — senza, il registro RIFIUTA. Valori pct come FRAZIONE (0.18 = 18%). Se la societa' da' un RANGE passa value_low/value_high (alimentera' bear/base/bull, D3). La scadenza si calcola da sola (prossima trimestrale dal calendar, fallback 120g — D4); supersede automatico della guidance attiva precedente per la stessa GRANDEZZA, cioe' stesso ticker+metric+period E STESSA `unit` (storico conservato) — se resta attiva una riga con unit diversa la risposta te la DICHIARA nel campo 'convivono', leggilo: se e' la stessa grandezza scritta con un'altra etichetta, riscrivila con la `unit` identica per sostituirla. MAI registrare numeri a memoria, stime tue o consensus: SOLO cifre LETTE dal documento citato (il consensus ha il suo tool, e' un'altra cosa).",
+        "description": "REGISTRA una GUIDANCE SOCIETARIA nel registro persistente (V6, decisione PM D1): usalo quando LEGGI una trimestrale/press release/presentazione con guidance NUMERICA. FONTE OBBLIGATORIA: source_doc (documento+riferimento, es. 'press release Q2 FY2026, sito IR') E source_date — senza, il registro RIFIUTA. Valori pct come FRAZIONE (0.18 = 18%). Se la societa' da' un RANGE passa value_low/value_high (alimentera' bear/base/bull, D3). La scadenza si calcola da sola (prossima trimestrale dal calendar, fallback 120g — D4); supersede della guidance attiva SOLO con data fonte strettamente successiva, per la stessa GRANDEZZA, cioe' stesso ticker+metric+period E STESSA `unit` (storico conservato) — se resta attiva una riga con unit diversa la risposta te la DICHIARA nel campo 'convivono', leggilo: se e' la stessa grandezza scritta con un'altra etichetta, riscrivila con la `unit` identica per sostituirla. Fonte futura o precedente: rifiuto. Pari data con valori/range o documento diversi: conflitto rifiutato. Duplicato identico: gia registrato, nessuna scrittura o rinnovo scadenza. source_doc e' un riferimento dichiarato, non una verifica automatica del documento. MAI registrare numeri a memoria, stime tue o consensus: SOLO cifre LETTE dal documento citato (il consensus ha il suo tool, e' un'altra cosa).",
         "input_schema": {"type": "object", "properties": {
             "ticker": {"type": "string"},
             "metric": {"type": "string", "enum": ["revenue_growth", "revenue_abs", "eps", "ebitda_margin", "gross_margin", "capex_pct", "other"], "description": "revenue_growth = crescita ricavi (frazione); revenue_abs = ricavi assoluti in MILIONI valuta bilancio; margini come frazione; other = QUALSIASI altra grandezza (EBITA, FOCF, ordini, debito netto, dividendo...): la grandezza va NOMINATA dentro `unit`, non solo in note"},
@@ -498,7 +498,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     },
     {
         "name": "get_earnings_calendar",
-        "description": "Earnings calendar prossimi N giorni. Se ticker fornito, filtra per quello. Altrimenti ritorna tutti gli earnings del periodo (max 100). Per un titolo italiano (.MI) il calendario viene da Borsa Italiana (eventi societari: items nella finestra + prossimo), con stato dichiarato: KO / non_coperto = errore, NON 'nessun evento'; ISIN assente dalle tabelle = risolto in automatico su Borsa Italiana (dichiarato in 'risoluzione_isin'), se non risolvibile errore col motivo; STALE = dato vecchio con la data vera di lettura.",
+        "description": "Earnings calendar prossimi N giorni. Se ticker fornito, filtra per quello. Senza ticker: calendario globale esplorativo (max 100 righe locali), completezza remota e copertura dei ticker della run NON attestate; omissioni locali e guasti dichiarati. Per verificare un titolo, richiederlo per ticker. Le date Finnhub sono del provider, senza conferma emittente verificata. Per un titolo italiano (.MI) il calendario viene da Borsa Italiana (eventi societari: items nella finestra + prossimo), con stato dichiarato: KO / non_coperto = errore, NON 'nessun evento'; ISIN assente dalle tabelle = risolto in automatico su Borsa Italiana (dichiarato in 'risoluzione_isin'), se non risolvibile errore col motivo; STALE = dato vecchio con la data vera di lettura.",
         "input_schema": {"type": "object", "properties": {
             "days_ahead": {"type": "integer", "default": 14},
             "ticker": {"type": "string",
@@ -2372,12 +2372,28 @@ def dispatch(tool_name: str, tool_input: Dict[str, Any], caller: str = None, *,
                     if not items:
                         _out["error"] = "calendario Finnhub non ha risposto: " + _out["fonti_mute"]["finnhub"]
                 return _stamp(con_proxy(_out, g), "Finnhub earnings calendar")
-            if ticker:
-                items = fetch_earnings_for_portfolio([ticker], days_ahead=days)
-            else:
-                items = fetch_earnings_calendar(days_ahead=days)
-            return _stamp({"count": len(items), "items": items[:100]},
-                            "Finnhub earnings calendar")
+            _mot = []
+            items = fetch_earnings_calendar(days_ahead=days, motivo=_mot)
+            shown = items[:100]
+            omitted = len(items) - len(shown)
+            _out = {
+                "count": len(items), "days_ahead": days,
+                "returned_count": len(shown), "omitted_count": omitted,
+                "local_truncated": omitted > 0,
+                "scope": "global_exploratory", "coverage_complete": False,
+                "coverage_note": "Completezza remota non attestata; non certifica la copertura dei ticker della run.",
+                "next_step": "Richiedere il calendario per ciascun ticker da verificare.",
+                "date_confirmation": "issuer_not_verified",
+                "status": "unavailable" if _mot and not items else "partial" if _mot or omitted else "received",
+            }
+            if _mot:
+                from bellomberg.core.errori_sicuri import senza_segreti
+                _out["fonti_mute"] = {"finnhub": senza_segreti("; ".join(str(m) for m in _mot))}
+                if not items:
+                    _out["error"] = "calendario Finnhub non ha risposto: " + _out["fonti_mute"]["finnhub"]
+            # La chat puo conservare solo il prefisso: qualita e guasti prima delle righe.
+            _out["items"] = shown
+            return _stamp(_out, "Finnhub earnings calendar")
 
         if tool_name == "get_13f_holdings":
             from bellomberg.market_data.sec_edgar import get_13f_holdings

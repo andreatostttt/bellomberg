@@ -54,6 +54,13 @@ def test_red_completed_legacy_contract_is_exact_and_never_dispatched(tmp_path, m
     monkeypatch.setattr(Blackboard, "HEARTBEAT_PATH", str(tmp_path / "heartbeat.json"))
     monkeypatch.setattr("bellomberg.core.llm_pricing._fx_usd_to_eur",
                         lambda: (.9, "frozen synthetic FX fixture"))
+    # Weekly mismatches also check the historical provider-clipped cap.
+    # Freeze that external catalogue input; keep the real compatibility resolver.
+    catalog_calls = []
+    def local_catalog(model):
+        catalog_calls.append(model)
+        return {"id": model, "top_provider": {"max_completion_tokens": 65536}}
+    monkeypatch.setattr(llm_client, "_listino_fuori_run", local_catalog)
     board = Blackboard()
     system = prompt_for_language(TRADE_IDEA_RED_TEAM_INSTRUCTIONS if trade_idea else red_team.RED_TEAM_PROMPT)
     from bellomberg.agents import chat_tools
@@ -73,6 +80,7 @@ def test_red_completed_legacy_contract_is_exact_and_never_dispatched(tmp_path, m
             invoke()
     else:
         assert invoke() == saved["critique"]
+    assert catalog_calls == (["synthetic/model"] if mutation and not trade_idea else [])
 
 
 def preparer(path, cap, call, *, provider_cap=200000):

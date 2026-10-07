@@ -39,6 +39,7 @@ from bellomberg.agents.agent_tools import tool_get_macro_dashboard, tool_quant_c
 from bellomberg.core.paths import MODELS_DIR, REPORT_DIR
 from bellomberg.core.language import capture_language, language_context, scoped_language
 from bellomberg.storage.memory_db import MemoryDB, RESEARCH_NOTES_DIR
+from bellomberg.agents.action_validator import RESEARCH_GATE_POLICY, research_gate_enabled
 
 
 # Ripipeline 15/07 (dossier 03, ok PM esplicito): ORDINE DI PIPELINE — chi valida
@@ -171,7 +172,7 @@ def _action_ticker_symbol(value):
 
 
 def build_publication_snapshot(memo_markdown, assessments, *, finalization_error=None,
-                               source_markdown=None):
+                               source_markdown=None, withdrawal_warning=False):
     """Return a fail-closed Markdown projection and its matching action snapshot.
 
     The supplied memo is never mutated. A row stays in the published ACTION TABLE
@@ -365,6 +366,15 @@ def build_publication_snapshot(memo_markdown, assessments, *, finalization_error
         projected = projected[:action_pos] + advisory + "\n" + projected[action_pos:]
     else:
         projected = advisory + "\n" + projected
+    if withdrawal_warning and any(item.get('action') in ('BUY', 'ADD') for item in nonoperative):
+        warning = ('**GATE DI PUBBLICAZIONE: proposte BUY/ADD ritirate dalla tabella operativa. '
+                   'Le proposte BUY/ADD elencate in PROPOSTE NON OPERATIVE restano non eseguibili '
+                   'anche se richiamate nel testo; li sono dichiarati motivi e controlli mancanti.**')
+        bluf = re.search(r'(?im)^##+\s*BLUF[^\n]*\n', projected)
+        if bluf:
+            projected = projected[:bluf.end()] + warning + '\n\n' + projected[bluf.end():]
+        else:
+            projected = '## BLUF\n' + warning + '\n\n' + projected
     return {
         "source_markdown": str(source_markdown if source_markdown is not None else source),
         "memo_markdown": projected,
@@ -621,6 +631,37 @@ def _persistable(source_rows, db_assessments):
     return rows, [a for a in db_assessments or [] if a.get("row_index") in indices]
 
 
+def _research_publication_checks(bb, store, memo_markdown=None):
+    """Availability from this run only. Never equate a seal with economic approval."""
+    from bellomberg.core.research_analysis import (research_reference, _binding_seal_reference,
+                                                   build_research_action_bindings)
+    checks = {'row_thesis_evidence_binding': {'status': 'NOT_YET_ASSESSED',
+               'source': 'Provenance binding follows the exact Capo ACTION TABLE; not semantic approval'},
+              'run_identity': {'run_id': store.run_id, 'cutoff': store.context['research_started_at']}}
+    try:
+        saved = store.get('research_action_bindings')
+        # A recovery uses the hashed checkpoints; no new live source lookup/AI.
+        reference = (_binding_seal_reference(store.get('research_dossier')) if saved is not None
+                     else research_reference(bb))
+        checks['research_seal'] = {'status': 'AVAILABLE', 'source': reference}
+        if memo_markdown is not None:
+            if saved is None:
+                saved = build_research_action_bindings(bb.data['_research_thesis'],
+                    run_id=store.run_id, memo_markdown=memo_markdown,
+                    cutoff=store.context['research_started_at'])
+                store.complete('research_action_bindings', saved)
+            checks['row_thesis_evidence_binding'] = saved
+    except Exception as exc:
+        checks['research_seal'] = {'status': 'CHECK_UNAVAILABLE', 'source': type(exc).__name__}
+    synthesis = store.get('synthesis_context') or {}
+    for key, value in [('risk', synthesis.get('risk_data')), ('sizing', bb.data.get('_sizing'))]:
+        checks[key] = {'status': 'AVAILABLE' if isinstance(value, dict) and value and not value.get('error')
+                       else 'CHECK_UNAVAILABLE', 'source': 'synthesis_context of this run'}
+    checks['mandate'] = {'status': 'AVAILABLE' if store.context.get('mandate_sha256') else 'CHECK_UNAVAILABLE',
+                         'source': 'run context mandate_sha256 (identity, not row compliance)'}
+    return checks
+
+
 def _publication_gate(bb, db, store, memo_id, memo, capo_source_memo, raw_sidecar_error, sanity_pairs):
     """Publication gate: source decisions, assessments, and hard sanity closures are
     committed before either PDF renderer sees the memo; the returned projection IS
@@ -650,9 +691,14 @@ def _publication_gate(bb, db, store, memo_id, memo, capo_source_memo, raw_sideca
 
     try:
         from bellomberg.agents.action_validator import collect_sanity_exclusions, assess_action_table
-        sanity_records = collect_sanity_exclusions(capo_source_memo, report_dir=REPORT_DIR)
+        contract = (getattr(store, 'context', {}) or {}).get('contract') or {}
+        research = research_gate_enabled(contract)
+        checks = _research_publication_checks(bb, store, capo_source_memo) if research else None
+        sanity_records = collect_sanity_exclusions(capo_source_memo, report_dir=REPORT_DIR,
+                                                  publication_contract=contract)
         assessments = assess_action_table(
-            capo_source_memo, bb.data.get("_sizing"), sanity_exclusions=sanity_records)
+            capo_source_memo, bb.data.get("_sizing"), sanity_exclusions=sanity_records,
+            publication_contract=contract, research_checks=checks)
     except Exception as assessment_error:
         _log("[!] Action assessment unavailable: " + str(assessment_error))
         assessments = []
@@ -735,7 +781,8 @@ def _publication_gate(bb, db, store, memo_id, memo, capo_source_memo, raw_sideca
 
     publication = build_publication_snapshot(
         memo, assessments, finalization_error=publication_error,
-        source_markdown=capo_source_memo)
+        source_markdown=capo_source_memo, withdrawal_warning=research_gate_enabled(
+            (getattr(store, 'context', {}) or {}).get('contract')))
     if recorded:
         # REV R1: il registro non resta piu' permissivo del memo (es. errore di
         # pubblicazione su righe gia' registrate OPERATIVE)
@@ -747,7 +794,9 @@ def _publication_gate(bb, db, store, memo_id, memo, capo_source_memo, raw_sideca
                 final_rows = [dict(a) for a in publication["assessments"] if isinstance(a.get("row_index"), int)]
                 _annota_esiti(final_rows, withdrawn, _NOTA_RITIRO)
                 publication = dict(build_publication_snapshot(memo, final_rows, finalization_error=None,
-                                                              source_markdown=capo_source_memo),
+                                                              source_markdown=capo_source_memo,
+                                                              withdrawal_warning=research_gate_enabled(
+                                                                  (getattr(store, 'context', {}) or {}).get('contract'))),
                                    finalization_error=publication.get("finalization_error"))
         except Exception as reconcile_error:
             decisions_error = decisions_error or (
@@ -1241,10 +1290,51 @@ def _weekly_contract(*, analysis_mode='fundamentals_research_v1'):
     for cls in SPECIALIST_ORDER:
         for round_n in (0, 1, 2):
             models[cls.name + ":" + str(round_n)] = modello_o_buco("consigliere", cls.name, round_n)
-    contract = {"models": models, "roster": [cls.name for cls in SPECIALIST_ORDER],
-                "r1_stages": R1_STAGES, "r2_specialists": sorted(R2_SPECIALISTS)}
+    from bellomberg.core.mandato_pm import MANDATE_TEXT_POLICY, MANDATE_TEXT_POLICY_KEY
+    contract = {MANDATE_TEXT_POLICY_KEY: MANDATE_TEXT_POLICY, "models": models, "roster": [cls.name for cls in SPECIALIST_ORDER],
+                "r1_stages": R1_STAGES, "r2_specialists": sorted(R2_SPECIALISTS),
+                "reflection_policy": "weekly-reflection36/1",
+                "memo_facts_policy": "weekly-facts/1",
+                "semantic_memory_policy": "weekly-published-chunks/1",
+                "source_health_policy": "weekly-source-health/1",
+                "quant_render_policy": "weekly-quant-snapshot/1", "evidence_prompt_policy": "weekly-evidence-prompts/1"}
     if analysis_mode is not None:
         contract['analysis_mode'] = analysis_mode
+        contract['publication_gate_policy'] = RESEARCH_GATE_POLICY
+    return contract
+
+
+def _capture_publication_natures(contract):
+    """Freeze existing nature exceptions once, before creating a new research run."""
+    if not research_gate_enabled(contract):
+        return contract
+    from bellomberg.storage.classificazione import carica_veicoli, natura
+    contract = dict(contract)
+    try:
+        store = carica_veicoli()
+        contract['instrument_natures'] = {ticker: natura(ticker, store).as_dict()
+                                         for ticker in store['veicoli']}
+        contract['instrument_natures_source'] = {'origin': store['origine'], 'reason': store.get('motivo')}
+    except Exception as exc:
+        contract['instrument_natures'] = {}
+        contract['instrument_natures_source'] = {'status': 'CHECK_UNAVAILABLE', 'reason': type(exc).__name__}
+    return contract
+
+
+def _resume_publication_contract(contract, saved):
+    """Compare current models, while preserving historical gate policy and natures."""
+    from bellomberg.core.reflection_policy import enabled as _reflection_enabled
+    _reflection_enabled(saved)
+    research_gate_enabled(saved)
+    from bellomberg.core.mandato_pm import text_policy_from_context
+    text_policy_from_context(saved)
+    contract = dict(contract)
+    for key in ('publication_gate_policy', 'instrument_natures', 'instrument_natures_source',
+                'memo_facts_policy', 'semantic_memory_policy', 'source_health_policy', 'quant_render_policy', 'mandate_text_policy', 'evidence_prompt_policy', 'reflection_policy'):
+        if key in saved:
+            contract[key] = saved[key]
+        else:
+            contract.pop(key, None)
     return contract
 
 
@@ -1337,7 +1427,7 @@ def run_multi_agent(*, resume_memo_id=None, delivery_only=False,
     if resume_memo_id is None:
         mandate = mandato_o_esci()
         portfolio = db.get_portfolio_summary()
-        store = create_run(db, portfolio, mandate, _weekly_contract(), capture_language())
+        store = create_run(db, portfolio, mandate, _capture_publication_natures(_weekly_contract()), capture_language())
     else:
         store = WeeklyRunStore(db, resume_memo_id)
         if store.context['contract'].get('analysis_mode') is None:
@@ -1366,7 +1456,9 @@ def run_multi_agent(*, resume_memo_id=None, delivery_only=False,
                             if not authorize_new_ai:
                                 raise WeeklyRunBlocked("Ripresa analitica richiede autorizzazione esplicita per le fasi mancanti")
                             validate_resume(store, mandato_o_esci(),
-                                _weekly_contract(analysis_mode=store.context['contract'].get('analysis_mode')))
+                                _resume_publication_contract(
+                                    _weekly_contract(analysis_mode=store.context['contract'].get('analysis_mode')),
+                                    store.context['contract']))
                         journal_path = Path(db.db_path).with_name("weekly-" + store.run_id + "-requests.sqlite")
                         if store.status().get("request_journal_path") and not journal_path.is_file():
                             raise WeeklyRunBlocked("Registro richieste mancante: nessun nuovo invio autorizzabile")
@@ -1493,6 +1585,10 @@ def _run_multi_agent(store, db, *, send_email=True):
     from bellomberg.agents.company_research_tools import bind_weekly_company_research
     bind_weekly_company_research(bb, store)
     bb.request_journal = store.request_journal
+    from bellomberg.core.quant_render_snapshot import enabled as _quant_enabled, capture_once as _quant_capture, prepare_snapshot as _quant_prepare, entry as _quant_entry
+    _quant_render_enabled = _quant_enabled(store)
+    from bellomberg.core.reflection_policy import enabled as _reflection_enabled
+    _reflection_enabled(store.context.get('contract', {}))
     _priming = store.get("priming")
     if _priming is None:
         try:
@@ -1560,18 +1656,31 @@ def _run_multi_agent(store, db, *, send_email=True):
         # vengono pingati PRIMA dei round; i KO finiscono nel log E nel prompt del Capo
         # (stesso pattern del guardrail beta / guardie Polymarket).
         tool_health = {"ok": [], "ko": []}
+        from bellomberg.core.source_health import capture_health
+        from bellomberg.storage.weekly_run_store import WeeklyRunBlocked
+
+        def _observe_health(name, result):
+            return capture_health(bb, "preflight:" + name, name, result, phase="preflight")
 
         def _probe(name, fn):
             try:
                 r = fn()
-                if isinstance(r, dict) and r.get("error"):
+                observation = _observe_health(name, r)
+                if observation is not None and observation["observation"]["status"] == "UNVERIFIED":
+                    tool_health.setdefault("unverified", []).append(name)
+                elif observation is not None and observation["observation"]["status"] not in ("OK", "EMPTY"):
+                    tool_health["ko"].append(name + " -> " + observation["observation"]["status"])
+                elif isinstance(r, dict) and r.get("error"):
                     tool_health["ko"].append(name + " -> " + str(r["error"])[:160])
                 elif r is None or (hasattr(r, "__len__") and len(r) == 0):
                     tool_health["ko"].append(name + " -> risposta vuota")
                 else:
                     tool_health["ok"].append(name)
                 return r
+            except WeeklyRunBlocked:
+                raise
             except Exception as e:
+                _observe_health(name, {"error": "probe_failed"})
                 tool_health["ko"].append(name + " -> " + type(e).__name__ + ": " + str(e)[:160])
                 return None
 
@@ -1580,24 +1689,39 @@ def _run_multi_agent(store, db, *, send_email=True):
             tool_health["ok"].append("portfolio (" + str(portfolio["n_positions"]) + " posizioni)")
         else:
             tool_health["ko"].append("portfolio -> DB vuoto o illeggibile")
-        if macro and macro.get("indicators"):
+        _macro_health = _observe_health("macro_dashboard", macro)
+        if _macro_health is not None and _macro_health["observation"]["status"] not in ("OK", "EMPTY"):
+            tool_health["ko"].append("macro_dashboard -> " + _macro_health["observation"]["status"])
+        elif macro and macro.get("indicators"):
             tool_health["ok"].append("macro_dashboard (" + str(len(macro["indicators"])) + " indicatori)")
         else:
             tool_health["ko"].append("macro_dashboard -> vuoto/KO")
         try:
             from bellomberg.portfolio.portfolio_analytics import compute_var_contribution
             _probe("var_contribution", lambda: compute_var_contribution())
+        except WeeklyRunBlocked:
+            raise
         except Exception as e:
+            _observe_health("var_contribution", {"error": "probe_import_failed"})
             tool_health["ko"].append("var_contribution -> import: " + str(e)[:120])
+        _quant_advanced_metrics = None
         try:
             from bellomberg.portfolio.advanced_metrics import portfolio_metrics
-            _probe("portfolio_metrics", lambda: portfolio_metrics())
+            _quant_advanced_metrics = _probe("portfolio_metrics", lambda: portfolio_metrics())
+        except WeeklyRunBlocked:
+            raise
         except Exception as e:
+            _observe_health("portfolio_metrics", {"error": "probe_import_failed"})
             tool_health["ko"].append("portfolio_metrics -> import: " + str(e)[:120])
+        if _quant_render_enabled:
+            _quant_advanced_metrics = _quant_entry(_quant_advanced_metrics, 'preflight.portfolio_metrics')
         try:
             from bellomberg.market_data.news_aggregator import get_feed
             _probe("news_feed", lambda: get_feed(limit=5))
+        except WeeklyRunBlocked:
+            raise
         except Exception as e:
+            _observe_health("news_feed", {"error": "probe_import_failed"})
             tool_health["ko"].append("news_feed -> import: " + str(e)[:120])
         # Audit 11/09 (Fable 5.1, run 10/09 memo #53): Polymarket era irraggiungibile (TLS) per
         # tutta la run e `_tool_health.ko` restava vuoto — il tool rende un dict con count 0 e
@@ -1607,6 +1731,7 @@ def _run_multi_agent(store, db, *, send_email=True):
             from bellomberg.agents.agent_tools import tool_get_polymarket_events
             _pm = tool_get_polymarket_events("fed", max_results=1)
             _pm = _pm if isinstance(_pm, dict) else {}
+            _observe_health("polymarket", _pm)
             _fw = [str(w) for w in (_pm.get("fetch_warnings") or [])]
             if _pm.get("error"):
                 tool_health["ko"].append("polymarket -> " + str(_pm["error"])[:160])
@@ -1614,7 +1739,10 @@ def _run_multi_agent(store, db, *, send_email=True):
                 tool_health["ko"].append("polymarket -> " + "; ".join(_fw)[:200])
             else:
                 tool_health["ok"].append("polymarket (%d risultati)" % len(_pm.get("results") or []))
+        except WeeklyRunBlocked:
+            raise
         except Exception as e:
+            _observe_health("polymarket", {"error": "probe_failed"})
             tool_health["ko"].append("polymarket -> " + type(e).__name__ + ": " + str(e)[:120])
         # F5 (riallineamento 23/07, audit/20): riconciliazione NAV come allarme di
         # PRIMA CLASSE — una run che parte con NAV live lontano dallo snapshot
@@ -1757,7 +1885,8 @@ def _run_multi_agent(store, db, *, send_email=True):
         store.complete("priming", {"macro": macro, "correlation_matrix": correlation_matrix,
             "freshness_report": freshness_report, "tool_health": tool_health,
             "scorecard": _progress_scorecard, "score_error": _progress_score_error,
-            "beta_reconcile": bb.data["_beta_reconcile"]}, bb)
+            "beta_reconcile": bb.data["_beta_reconcile"],
+            **({"quant_advanced_metrics": _quant_advanced_metrics} if _quant_render_enabled else {})}, bb)
     else:
         # ripresa: il guardrail del priming si RIUSA; checkpoint di una run precedente alla
         # regola 06/10 (chiave assente) = ricalcolato una volta, dichiarato nel log
@@ -1933,6 +2062,11 @@ def _run_multi_agent(store, db, *, send_email=True):
         except Exception as e:
             _log("[!] Scoreboard skipped: " + str(e))
 
+        from bellomberg.core.source_health import context_block as _source_health_context
+        _source_health_block = _source_health_context(bb, store.context.get("language", "it"))
+        if _source_health_block:
+            sizing_context = (sizing_context or "") + "\n\n" + _source_health_block
+
         # HEALTH-CHECK -> prompt del Capo: i tool KO vanno DICHIARATI nel memo
         if tool_health["ko"]:
             _hline = ("\n\n=== HEALTH-CHECK PRE-RUN: TOOL NON DISPONIBILI ===\n- "
@@ -1941,6 +2075,9 @@ def _run_multi_agent(store, db, *, send_email=True):
                         "dichiarare esplicitamente il pezzo mancante; VIETATE affermazioni "
                         "che presuppongono quei tool (es. decomposizione VaR se "
                         "var_contribution e' KO).")
+            if _source_health_block:
+                _hline = _hline.replace("questi dati NON hanno alimentato la run",
+                    "questi controlli pre-run non attestavano disponibilita; gli esiti successivi sono separati in SOURCE HEALTH")
             sizing_context = (sizing_context or "") + _hline
             _log("Health-check: " + str(len(tool_health["ko"])) + " tool KO dichiarati al Capo")
 
@@ -1960,6 +2097,17 @@ def _run_multi_agent(store, db, *, send_email=True):
         risk_data = _synthesis["risk_data"]
         sizing_context = _synthesis["sizing_context"]
         scoring_context = _synthesis["scoring_context"]
+
+    if research_gate_enabled(store.context['contract']):
+        _research_gate_checks = _research_publication_checks(bb, store)
+        sizing_context = (sizing_context or '') + '\n\nRESEARCH PUBLICATION CHECKS:\n' + json.dumps(
+            _research_gate_checks, ensure_ascii=False) + (
+            '\nDCF is not applicable. The final gate binds each exact BUY/ADD row to this run, '
+            'its sealed issuer dossier, committee reports and eligible source receipts. This verifies '
+            'provenance and source availability, not semantic truth or economic approval. '
+            'Existing instrument-nature exceptions remain explicitly labelled SENZA VALUTAZIONE. '
+            'Judgments and assumptions belong to the committee; approval belongs to the PM. '
+            'State actual source gaps in the BLUF; do not present a withdrawn proposal as executable.')
 
     _capo_saved = store.get("capo")
     if _capo_saved is None:
@@ -2059,13 +2207,27 @@ def _run_multi_agent(store, db, *, send_email=True):
         except Exception as e:
             _log("[!] MEMO LINTER skipped: " + str(e))
 
+        # Controllo fatti flag-only: checkpoint prima della proiezione validata.
+        # Il validator e i binding continuano a ricevere il source canonico.
+        from bellomberg.core.memo_facts_context import checkpoint_memo_facts
+        _facts_block = checkpoint_memo_facts(store, capo_source_memo)
+        if _facts_block:
+            memo = memo + "\n\n" + _facts_block
+
+        from bellomberg.core.source_health import checkpoint_source_health
+        _source_health_block = checkpoint_source_health(store, capo_source_memo)
+        if _source_health_block:
+            memo = memo + "\n\n" + _source_health_block
+
         # ACTION VALIDATOR #191 (v1 SOLO FLAG, scelta PM 13/07): appende avvertimenti al
         # memo (sizing sforato, riproposte mai eseguite); i numeri del Capo restano
         # intoccati e un guasto del validator non tocca la run.
         try:
             from bellomberg.agents.action_validator import build_validator_block
-            _vblock = build_validator_block(memo, bb.data.get("_sizing"), db, exclude_memo_id=memo_id,
-                                            mandato=_mandato_run)
+            _vblock = build_validator_block(capo_source_memo, bb.data.get("_sizing"), db, exclude_memo_id=memo_id,
+                                            mandato=_mandato_run, publication_contract=store.context['contract'],
+                                            research_checks=_research_publication_checks(bb, store, capo_source_memo)
+                                            if research_gate_enabled(store.context['contract']) else None)
             if _vblock:
                 memo = memo + "\n\n" + _vblock
                 _log("ACTION VALIDATOR: " + str(_vblock.count("\n- ")) + " avvertimenti aggiunti al memo")
@@ -2076,7 +2238,7 @@ def _run_multi_agent(store, db, *, send_email=True):
             # al registro decisioni sta DOPO extract_and_save_decisions, piu' sotto
             # (le decisioni a questo punto NON esistono ancora in DB).
             from bellomberg.agents.action_validator import detect_sanity_exclusions
-            _xblock, _sanity_pairs = detect_sanity_exclusions(memo)
+            _xblock, _sanity_pairs = detect_sanity_exclusions(memo, publication_contract=store.context['contract'])
             if _xblock:
                 memo = memo + "\n\n" + _xblock
                 _log("ACTION VALIDATOR: " + str(_xblock.count("\n- ")) + " righe su modelli BLOCK dichiarate nel memo")
@@ -2163,12 +2325,23 @@ def _run_multi_agent(store, db, *, send_email=True):
     write_frozen_text(md_path, memo)
     _log("Markdown archive: " + md_path)
 
+    from bellomberg.storage.weekly_run_store import WeeklyRunBlocked
+    from bellomberg.core.reflection_policy import (enabled as _reflection_enabled, prepare_input as _reflection_input,
+        result_for as _reflection_result, verified_lesson as _verified_lesson)
+    def _reflection_request(groups):
+        from bellomberg.agents.reflection import policy_request
+        return policy_request(groups)
+    _reflection36 = _reflection_enabled(store.context.get('contract', {}))
     _reflection = store.get("reflection")
+    _reflection_evidence = (_reflection_input(store, request_factory=_reflection_request) if _reflection36 else None)
+    if _reflection36 and _reflection is not None:
+        _verified_lesson(store)
     if _reflection is None:
         # REFLECTION #210 (post-run, Sonnet): lezione sintetica ancorata agli esiti
         # dello scorekeeper, salvata per il priming della PROSSIMA run. Best-effort.
         _lesson = None
         _progress_reflection_status = "unavailable"
+        _refl_result = {}
         try:
             from bellomberg.agents.reflection import generate_lesson
             # #44/finding 4: questa chiamata Sonnet e' REALE e prima di oggi non entrava
@@ -2180,9 +2353,13 @@ def _run_multi_agent(store, db, *, send_email=True):
             # token sparivano dal conto — mentre _refl_usage, mutato in-place, li aveva gia'.
             # Spesa avvenuta e nota = spesa contata (principio contabile 1).
             _refl_usage = {}
+            _refl_result = {}
             try:
                 with request_scope(store.request_journal, phase="reflection", agent="_reflection"):
-                    _lesson = generate_lesson(_analysis_memo, memo_id=memo_id, usage_out=_refl_usage)
+                    _lesson = generate_lesson(publication_memo, memo_id=memo_id, usage_out=_refl_usage,
+                                              eligible_memo_ids={m["id"] for m in db.get_completed_weekly_memos(n=None)},
+                                              **({'policy_input': _reflection_evidence, 'result_out': _refl_result}
+                                                 if _reflection36 else {}))
             finally:
                 _record_side_usage(bb, "_reflection", _refl_usage)
             if _lesson:
@@ -2193,9 +2370,16 @@ def _run_multi_agent(store, db, *, send_email=True):
                 _progress_reflection_status = "not_generated"
                 _log("Reflection #210: nessuna lezione (dichiarato nel log del modulo)")
         except Exception as e:
+            if _reflection36 and isinstance(e, WeeklyRunBlocked):
+                raise
             _log("[!] reflection skipped: " + str(e))
 
-        store.complete("reflection", {"lesson": _lesson, "status": _progress_reflection_status}, bb)
+        if _reflection36:
+            _reflection_payload = (_refl_result if _refl_result else
+                _reflection_result(_reflection_evidence, cause='GENERATION_UNAVAILABLE'))
+            store.complete("reflection", _reflection_payload, bb)
+        else:
+            store.complete("reflection", {"lesson": _lesson, "status": _progress_reflection_status}, bb)
     else:
         _lesson, _progress_reflection_status = _reflection["lesson"], _reflection["status"]
 
@@ -2222,7 +2406,7 @@ def _run_multi_agent(store, db, *, send_email=True):
     nav_history = _render_saved.get("nav_history") if _render_saved is not None else None
     if _render_saved is not None:
         risk_data = _render_saved.get("risk_data")
-    if _render_saved is None and risk_data is None:
+    if _render_saved is None and risk_data is None and not _quant_render_enabled:
         try:
             from bellomberg.portfolio.portfolio_risk import compute_portfolio_risk
             risk_data = compute_portfolio_risk()
@@ -2232,14 +2416,19 @@ def _run_multi_agent(store, db, *, send_email=True):
         except Exception as e:
             _log("[!] risk metrics for PDF skipped: " + str(e))
     if _render_saved is None:
-        try:
-            from bellomberg.portfolio.portfolio_analytics import compute_nav_history
-            nav_history = compute_nav_history()
-            if isinstance(nav_history, dict) and nav_history.get("error"):
-                nav_history = None
-        except Exception as e:
-            _log("[!] nav history for PDF skipped: " + str(e))
+        if _quant_render_enabled:
+            _nav_entry = _quant_capture(store, 'nav_history')
+            nav_history = _nav_entry['payload']
+        else:
+            try:
+                from bellomberg.portfolio.portfolio_analytics import compute_nav_history
+                nav_history = compute_nav_history()
+                if isinstance(nav_history, dict) and nav_history.get("error"):
+                    nav_history = None
+            except Exception as e:
+                _log("[!] nav history for PDF skipped: " + str(e))
         store.complete("render_context", {"risk_data": risk_data, "nav_history": nav_history}, bb)
+    _quant_snapshot = _quant_prepare(store) if _quant_render_enabled and _artifact_bundle is None else None
     if pdf_memo_path is None:
         try:
             from bellomberg.reporting.pdf_institutional import build_institutional_memo
@@ -2282,7 +2471,8 @@ def _run_multi_agent(store, db, *, send_email=True):
             pdf_appendix_path = render_pdf_once(store, sys.modules[__name__], build_quant_appendix, role="appendix",
                 blackboard=bb, portfolio_data=portfolio,
                 macro_data=macro, options_data_dict={},
-                correlation_data=correlation_matrix)
+                correlation_data=correlation_matrix,
+                **({"quant_snapshot": _quant_snapshot} if _quant_render_enabled else {}))
             if pdf_appendix_path:
                 _log("PDF APPENDICE: " + pdf_appendix_path)
         except WeeklyRunBlocked:

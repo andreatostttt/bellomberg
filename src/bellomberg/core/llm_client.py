@@ -393,6 +393,7 @@ class Usage:
             "cache_read_input_tokens": self.cache_read_input_tokens,
             "cache_creation_input_tokens": self.cache_creation_input_tokens,
             "reasoning_tokens": self.reasoning_tokens, "cost_usd": self.cost_usd,
+            "prompt_tokens": self.prompt_tokens, "completion_tokens": self.completion_tokens,
             "reasoning_forzato": self.reasoning_forzato,
         }
         if getattr(self, "request_id", None):

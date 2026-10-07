@@ -498,12 +498,13 @@ def _hardcoded_economic_calendar(today, days_ahead: int):
     # FOMC/BCE: date di DECISIONE derivate dal calendario UNICO in current_facts
     # (voce 13 §9-quattuortrigies: qui viveva una copia divergente — 04/11 e
     # 16/12 non esistono sul calendario Fed, le decisioni sono 28/10 e 09/12).
-    from bellomberg.core.current_facts import FOMC_2026 as _FOMC_PAIRS, ECB_2026 as _ECB_DECISIONI
+    from bellomberg.core.current_facts import (
+        FOMC_2026 as _FOMC_PAIRS, ECB_2026 as _ECB_DECISIONI, CPI_US_2026, _rome_time)
     FOMC_2026 = [e.isoformat() for _s, e in _FOMC_PAIRS]
     for d in FOMC_2026:
         dt = _date.fromisoformat(d)
         if today <= dt <= end:
-            events.append({"date": d, "time": "20:00 CET", "type": "Central Bank",
+            events.append({"date": d, "time": _rome_time(dt, 14), "type": "Central Bank",
                            "title": _api_text('Decisione tassi FOMC + conferenza stampa', 'FOMC Rate Decision + Press Conference'),
                            "importance": 5, "country": "US"})
 
@@ -642,10 +643,21 @@ def _hardcoded_economic_calendar(today, days_ahead: int):
     while mese <= end:
         for data, ora, tipo, titolo, importanza, paese in finestre:
             giorno = data(mese)
+            confirmed_cpi = False
+            if data is _cpi:
+                official = [d for d in CPI_US_2026 if (d.year, d.month) == (mese.year, mese.month)]
+                if official:
+                    giorno = official[0]
+                    confirmed_cpi = True
+                if giorno is not None:
+                    ora = _rome_time(giorno, 8, 30)
             if giorno is not None and today <= giorno <= end:
-                events.append({"date": giorno.isoformat(), "time": ora, "type": tipo,
+                event = {"date": giorno.isoformat(), "time": ora, "type": tipo,
                                "title": titolo(giorno), "importance": importanza,
-                               "country": paese, "date_estimated": True})
+                               "country": paese, "date_estimated": not confirmed_cpi}
+                if confirmed_cpi:
+                    event["source"] = "https://www.bls.gov/schedule/news_release/cpi.htm"
+                events.append(event)
         mese = (mese + _td(days=32)).replace(day=1)
 
     # Deduplica e sort by date+time

@@ -17,6 +17,7 @@ from datetime import datetime
 from bellomberg.reporting.i18n import label as _t, number as _n, localized, date_label
 
 from bellomberg.core.paths import REPORT_DIR
+from bellomberg.core.quant_render_snapshot import UNSET, SLOTS, payload_for
 
 try:
     import numpy as np
@@ -327,7 +328,8 @@ def chart_var_distribution(nav_hist, risk):
         ax.grid(axis="y"); ax.tick_params(length=2)
         ax.legend(loc="upper right", fontsize=7.5, handlelength=1.4)
         st.titlebar(fig, _t("Distribuzione rendimenti giornalieri — VaR"),
-                    _t("Kurtosis {:.1f} (code grasse vs 3.0 normale) · coda oltre VaR95 in rosso").format(kurt),
+                    _t("quant.kurtosis_reference").format(
+                        _n(kurt, ".1f") if np.isfinite(kurt) else _t("quote.unavailable")),
                     "Bellomberg Quant Engine · portfolio_risk + nav history")
         fig.subplots_adjust(left=0.075, right=0.985, top=0.78, bottom=0.15)
         return _save(fig, "var_dist")
@@ -431,7 +433,7 @@ def _fmt(v, suffix="", dec=2):
         return str(v)
 
 
-def _numeric_tables(risk, mc, ff):
+def _numeric_tables(risk, mc, ff, *, advanced_metrics_snapshot=UNSET, beta_reconcile_snapshot=UNSET):
     """Costruisce le tabelle numeriche dell'appendice (reportlab flowables):
     metriche di rischio + decomposizione fattoriale + interpretazione.
     E' la parte che trasforma 'grafici' in 'analisi quantitativa'."""
@@ -439,6 +441,7 @@ def _numeric_tables(risk, mc, ff):
     from reportlab.lib import colors as C
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.platypus import Paragraph, Spacer, Table, TableStyle, HRFlowable
+    from xml.sax.saxutils import escape
 
     # Stessa identita' del memo (PM 15/07): intestazioni tabella obsidian+ambra,
     # titoli di sezione NERI con filetto ambra. Prima erano navy: nell'appendice le
@@ -479,6 +482,23 @@ def _numeric_tables(risk, mc, ff):
 
     flow = _sec(_t("PROFILO DI RISCHIO QUANTITATIVO"), h1)
 
+    if beta_reconcile_snapshot is not UNSET:
+        rb = beta_reconcile_snapshot if isinstance(beta_reconcile_snapshot, dict) else {}
+        verdict = rb.get('verdict') or 'UNAVAILABLE'
+        usable = verdict == 'RECONCILED' and rb.get('beta_per_decisioni') is True
+        flow.append(Paragraph(escape(_t('quant.snapshot_beta', verdict=verdict,
+            timestamp=rb.get('calcolato_il') or _t('quote.unavailable'))), body))
+        flow.append(Paragraph(escape(_t('quant.beta_reconciled' if usable else 'quant.beta_unavailable')), body))
+        if not usable:
+            reason = {'UNRELIABLE': 'quant.beta_divergent', 'INSUFFICIENT_SOURCES': 'quant.beta_insufficient'}.get(verdict, 'quant.beta_missing')
+            flow.append(Paragraph(escape(_t(reason)), body))
+
+    def _rf_text(value):
+        import math
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            return _n(value, '.15g')
+        return _t('quote.unavailable')
+
     # --- Tabella metriche di rischio ---
     p = (risk or {}).get("portfolio", {})
     mcd = mc or {}
@@ -491,7 +511,15 @@ def _numeric_tables(risk, mc, ff):
     if p.get("sharpe") is not None:
         add(_t("Sharpe ratio"), _fmt(p["sharpe"]),
             _t("rendimento per unita' di rischio; <0 distrugge valore"))
-    if p.get("beta_vs_spy") is not None:
+    beta_note = (risk or {}).get("beta_note") or p.get("beta_note")
+    beta_error = (risk or {}).get("beta_error") or p.get("beta_error")
+    if p.get("beta_vs_spy") is None:
+        add(_t("Beta vs S&P 500"), _t("quote.unavailable"),
+            Paragraph(escape(str(beta_error or _t("motivo n.d."))), body))
+    elif beta_note:
+        add(_t("Beta vs S&P 500"), _fmt(p["beta_vs_spy"]),
+            Paragraph(escape(str(beta_note)), body))
+    else:
         add(_t("Beta vs S&P 500"), _fmt(p["beta_vs_spy"]),
             _t("sensibilita' al mercato USA; >1 amplifica"))
     if p.get("var_95_1d_pct") is not None:
@@ -512,6 +540,11 @@ def _numeric_tables(risk, mc, ff):
     if len(rows) > 1:
         flow.append(styled(rows, [4.6 * cm, 4.8 * cm, 7.6 * cm], right_cols=(1,)))
 
+    if advanced_metrics_snapshot is not UNSET:
+        flow.append(Paragraph(escape(_t('quant.risk_rf',
+            value=_rf_text((risk or {}).get('risk_free_used')),
+            note=(risk or {}).get('sharpe_note') or _t('quote.unavailable'))), body))
+
     # interpretazione rischio
     notes = []
     if p.get("sharpe") is not None:
@@ -520,7 +553,7 @@ def _numeric_tables(risk, mc, ff):
                              _t("remunera bene il rischio assunto") if p["sharpe"] > 0.5 else
                              _t("rende poco rispetto al rischio") if p["sharpe"] >= 0 else
                              _t("sta distruggendo valore corretto per il rischio")))
-    if p.get("beta_vs_spy") is not None:
+    if p.get("beta_vs_spy") is not None and not beta_note:
         notes.append(_t("Con beta {} verso l'S&P 500, il book {} i movimenti del mercato USA.")
                      .format(_fmt(p["beta_vs_spy"]),
                              _t("amplifica") if p["beta_vs_spy"] > 1.1 else
@@ -532,11 +565,14 @@ def _numeric_tables(risk, mc, ff):
         flow.append(Paragraph(" ".join(notes), body))
 
     # --- Tabella metriche di performance ISTITUZIONALI (advanced_metrics) ---
-    try:
-        from bellomberg.portfolio.advanced_metrics import portfolio_metrics
-        am = portfolio_metrics()
-    except Exception:
-        am = {}
+    if advanced_metrics_snapshot is UNSET:
+        try:
+            from bellomberg.portfolio.advanced_metrics import portfolio_metrics
+            am = portfolio_metrics()
+        except Exception:
+            am = {}
+    else:
+        am = advanced_metrics_snapshot if isinstance(advanced_metrics_snapshot, dict) else {}
     if am and not am.get("error"):
         flow.extend(_sec(_t("Metriche di Performance Istituzionali (vs benchmark)"), h2, 0.8))
         def gv(k):
@@ -580,13 +616,21 @@ def _numeric_tables(risk, mc, ff):
         ]))
         flow.append(pt)
         flow.append(Spacer(1, 0.15 * cm))
+        if advanced_metrics_snapshot is not UNSET:
+            flow.append(Paragraph(escape(_t('quant.advanced_rf',
+                value=_rf_text(am.get('risk_free_used')),
+                status=am.get('risk_free_status') or _t('quote.unavailable'),
+                source=am.get('risk_free_source') or _t('quote.unavailable'),
+                note=am.get('risk_free_note') or _t('quote.unavailable'))), body))
+            flow.append(Paragraph(escape(str(am.get('_source') or _t('quote.unavailable'))
+                + ' | ' + str(am.get('benchmark_alignment') or _t('quote.unavailable'))), body))
         # lettura sintetica
         sh, so = am.get("sharpe"), am.get("sortino")
         if sh is not None:
             quality = (_t("eccellente") if sh > 1.5 else _t("buono") if sh > 0.8 else
                        _t("modesto") if sh > 0 else _t("negativo"))
             flow.append(Paragraph(
-                _t("quant.risk_interpretation", quality=quality, sharpe=sh, sortino=so), body))
+                _t("quant.risk_interpretation", quality=quality, sharpe=sh, sortino=so if so is not None else _t('quote.unavailable')), body))
 
     # --- Tabella decomposizione fattoriale ---
     ph = (ff or {}).get("per_holding", {})
@@ -629,7 +673,7 @@ def _numeric_tables(risk, mc, ff):
 @localized
 def build_quant_appendix_v2(blackboard=None, portfolio_data=None, macro_data=None,
                             options_data_dict=None, correlation_data=None,
-                            output_path=None):
+                            output_path=None, quant_snapshot=UNSET):
     """Appendice quant v2 (#178/#180). Tabelle numeriche + grafici desk-grade."""
     try:
         from reportlab.lib.pagesizes import A4
@@ -641,27 +685,33 @@ def build_quant_appendix_v2(blackboard=None, portfolio_data=None, macro_data=Non
     except ImportError:
         return None
 
-    # ---- raccolta dati (ogni modulo guarded) ----
-    try:
-        from bellomberg.portfolio.portfolio_analytics import compute_nav_history
-        nav = compute_nav_history()
-    except Exception:
-        nav = {}
-    try:
-        from bellomberg.portfolio.portfolio_risk import compute_portfolio_risk
-        risk = compute_portfolio_risk()
-    except Exception:
-        risk = {}
-    try:
-        from bellomberg.portfolio.portfolio_garch import compute_portfolio_garch
-        garch = compute_portfolio_garch()
-    except Exception:
-        garch = {}
-    try:
-        from bellomberg.portfolio.portfolio_montecarlo import run_monte_carlo
-        mc = run_monte_carlo()
-    except Exception:
-        mc = {}
+    frozen = quant_snapshot is not UNSET
+    if frozen:
+        frozen_payloads = {slot: payload_for(quant_snapshot, slot) for slot in SLOTS}
+        nav, risk = frozen_payloads['nav_history'], frozen_payloads['risk_data']
+        garch, mc = frozen_payloads['garch'], frozen_payloads['mc']
+    else:
+        # ---- raccolta dati (ogni modulo guarded) ----
+        try:
+            from bellomberg.portfolio.portfolio_analytics import compute_nav_history
+            nav = compute_nav_history()
+        except Exception:
+            nav = {}
+        try:
+            from bellomberg.portfolio.portfolio_risk import compute_portfolio_risk
+            risk = compute_portfolio_risk()
+        except Exception:
+            risk = {}
+        try:
+            from bellomberg.portfolio.portfolio_garch import compute_portfolio_garch
+            garch = compute_portfolio_garch()
+        except Exception:
+            garch = {}
+        try:
+            from bellomberg.portfolio.portfolio_montecarlo import run_monte_carlo
+            mc = run_monte_carlo()
+        except Exception:
+            mc = {}
 
     corr_src = correlation_data or (risk.get("correlation") if isinstance(risk, dict) else None)
 
@@ -690,11 +740,13 @@ def build_quant_appendix_v2(blackboard=None, portfolio_data=None, macro_data=Non
     try:
         from bellomberg.reporting import charts_rates
         try:
-            yieldc = charts_rates.yield_curves_chart()
+            yieldc = (charts_rates.yield_curves_chart(frozen_payloads['rates_us'], frozen_payloads['rates_de'], frozen_payloads['rates_jp'])
+                      if frozen else charts_rates.yield_curves_chart())
         except Exception as e:
             print("[appendix] yield curves skip: {}".format(e))
         try:
-            credit = charts_rates.credit_chart()
+            credit = (charts_rates.credit_chart(frozen_payloads['rates_credit'])
+                      if frozen else charts_rates.credit_chart())
         except Exception as e:
             print("[appendix] credit chart skip: {}".format(e))
     except Exception:
@@ -734,6 +786,14 @@ def build_quant_appendix_v2(blackboard=None, portfolio_data=None, macro_data=Non
     OBS_C = C.HexColor("#050608"); AMBER_C = C.HexColor("#FFA51E")
     GREY_C = C.HexColor("#5A6472"); RULE_C = C.HexColor("#D7DCE3")
 
+    frozen_date = None
+    if frozen:
+        try:
+            raw_date = quant_snapshot.get('research_started_at') if isinstance(quant_snapshot, dict) else None
+            frozen_date = date_label(datetime.fromisoformat(raw_date.replace('Z', '+00:00')))
+        except (AttributeError, TypeError, ValueError):
+            frozen_date = _t('quote.unavailable')
+
     def furniture(canvas, doc_):
         canvas.saveState()
         w, h = A4
@@ -746,7 +806,7 @@ def build_quant_appendix_v2(blackboard=None, portfolio_data=None, macro_data=Non
         canvas.setFillColor(GREY_C); canvas.setFont("Helvetica", 7.5)
         canvas.drawRightString(w - 2 * cm, h - 1.42 * cm,
                                _t("QUANTITATIVE APPENDIX  ·  ")
-                               + date_label().upper())
+                               + (_t('quant.run_date', value=frozen_date).upper() if frozen else date_label().upper()))
         canvas.setStrokeColor(NAVY_C); canvas.setLineWidth(0.8)
         canvas.line(2 * cm, h - 1.78 * cm, w - 2 * cm, h - 1.78 * cm)
         canvas.setStrokeColor(RULE_C); canvas.setLineWidth(0.5)
@@ -770,18 +830,36 @@ def build_quant_appendix_v2(blackboard=None, portfolio_data=None, macro_data=Non
                             author=_t("Bellomberg Quant Engine"))
     story = []
     # PRIMA le tabelle numeriche (le metriche contano piu' dei grafici), poi le figure
+    if frozen:
+        ff = frozen_payloads['factors']
+    else:
+        try:
+            from bellomberg.portfolio.portfolio_factors import compute_portfolio_factors
+            ff = compute_portfolio_factors()
+        except Exception:
+            ff = {}
     try:
-        from bellomberg.portfolio.portfolio_factors import compute_portfolio_factors
-        ff = compute_portfolio_factors()
-    except Exception:
-        ff = {}
-    try:
-        num_flow = _numeric_tables(risk, mc, ff)
+        num_flow = _numeric_tables(risk, mc, ff,
+            **({"advanced_metrics_snapshot": frozen_payloads["advanced_metrics"],
+                "beta_reconcile_snapshot": frozen_payloads["beta_reconcile"]} if frozen else {}))
         if num_flow:
             story.extend(num_flow)
             story.append(PageBreak())
     except Exception as e:
         print(f"[appendix] numeric tables skip: {e}")
+
+    if frozen:
+        from xml.sax.saxutils import escape
+        entries = quant_snapshot.get('entries', {}) if isinstance(quant_snapshot, dict) else {}
+        for slot in SLOTS:
+            item = entries.get(slot) or {}
+            if item.get('status') != 'AVAILABLE':
+                # Only closed acquisition causes; provider bodies/URLs never enter this note.
+                cause = item.get('cause')
+                allowed = ('MISSING_INPUT', 'EMPTY_INPUT', 'INVALID_INPUT', 'PRODUCER_ERROR',
+                           'PRODUCER_FAILED', 'ATTEMPT_OUTCOME_UNAVAILABLE')
+                cause = cause if cause in allowed else 'MISSING_INPUT'
+                story.append(Paragraph(escape(_t('quant.snapshot_gap', slot=slot, cause=cause)), S_cap))
 
     first = True
     for title, charts in sections:

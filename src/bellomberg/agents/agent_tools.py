@@ -677,17 +677,12 @@ def _get_ibkr_options(ticker, port=7496, expiry=None):
             return None
         chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
         expirations = sorted(chain.expirations)
-        if not expirations:
-            return None
-        if expiry:
-            from datetime import date
-            nearest = date.fromisoformat(expiry).strftime("%Y%m%d")
-            if nearest not in expirations:
-                return {"data_source": "IBKR_TWS_error", "error_ibkr":
-                        "Scadenza richiesta non disponibile: " + expiry,
-                        "available_expiries": expirations}
-        else:
-            nearest = expirations[0]
+        from bellomberg.core.options_expiry import select_expiry
+        try:
+            nearest = select_expiry(expirations, expiry, compact=True)
+        except ValueError as exc:
+            return {"data_source": "IBKR_TWS_error", "error_ibkr": str(exc),
+                    "available_expiries": expirations}
         # Strike vicini ad ATM (15% range)
         strikes = sorted([s for s in chain.strikes if 0.85 * spot <= s <= 1.15 * spot])
         if not strikes:
@@ -817,15 +812,11 @@ def _get_yfinance_oi_only(ticker, expiry=None):
     try:
         tk = yf.Ticker(ticker)
         expirations = tk.options
-        if not expirations:
-            return None
-        if expiry:
-            from datetime import date
-            nearest = date.fromisoformat(expiry).isoformat()
-            if nearest not in expirations:
-                return None
-        else:
-            nearest = expirations[0]
+        from bellomberg.core.options_expiry import select_expiry
+        try:
+            nearest = select_expiry(expirations, expiry)
+        except ValueError as exc:
+            return {"error": str(exc), "available_expiries": list(expirations or [])}
         chain = tk.option_chain(nearest)
         calls, puts = chain.calls, chain.puts
         if calls.empty or puts.empty:
@@ -1016,12 +1007,13 @@ def _options_data_usa(ticker, expiry=None, note_polygon=None):
       - yfinance per Open Interest, put/call ratio, max pain (IBKR delayed non manda OI)
     Se IBKR non raggiungibile, fallback puro yfinance.
     """
-    if expiry is not None:
-        try:
-            from datetime import date
-            expiry = date.fromisoformat(expiry).isoformat()
-        except (TypeError, ValueError):
-            return {"error": "expiry non valida: usare una data YYYY-MM-DD"}
+    from bellomberg.core.options_expiry import normalize_expiry, valid_expiry, select_expiry
+    try:
+        expiry = normalize_expiry(expiry)
+        if expiry is not None:
+            expiry = valid_expiry(expiry)
+    except ValueError as exc:
+        return {"error": str(exc)}
     # 0. POLYGON PRIMA (#163): fonte professionale, niente dipendenza da TWS.
     #    IBKR retrocesso a fallback d'emergenza (codice intatto sotto).
     try:
@@ -1046,7 +1038,7 @@ def _options_data_usa(ticker, expiry=None, note_polygon=None):
                 and YFINANCE_AVAILABLE):
             try:
                 yf_oi = _get_yfinance_oi_only(ticker, expiry=ibkr_result["nearest_expiry"])
-                if yf_oi:
+                if yf_oi and not yf_oi.get("error"):
                     # Merge: tieni Greeks IBKR, sovrascrivi i campi OI con yfinance
                     ibkr_result["data_source"] += " + yfinance_OI"
                     ibkr_result["put_call_oi_ratio"] = yf_oi.get("put_call_oi_ratio")
@@ -1069,16 +1061,14 @@ def _options_data_usa(ticker, expiry=None, note_polygon=None):
     try:
         tk = yf.Ticker(ticker)
         expirations = tk.options
-        if not expirations:
-            return {"error": "Nessuna opzione disponibile per " + ticker}
-        # Una scadenza diversa e' un contratto diverso: non sostituirla in silenzio.
-        if expiry and expiry in expirations:
-            nearest = expiry
-        elif expiry:
-            return {"error": "Scadenza richiesta non disponibile: " + expiry,
-                    "available_expiries": list(expirations)}
-        else:
-            nearest = expirations[0]
+        try:
+            nearest = select_expiry(expirations, expiry)
+        except ValueError as exc:
+            if str(exc) == "expiry_no_valid_available":
+                return {"error": "Nessuna opzione disponibile: nessuna scadenza valida per la richiesta",
+                        "error_code": "expiry_no_valid_available",
+                        "available_expiries": list(expirations or [])}
+            return {"error": str(exc), "available_expiries": list(expirations or [])}
         chain = tk.option_chain(nearest)
         calls = chain.calls
         puts = chain.puts
@@ -1307,6 +1297,153 @@ def tool_get_polymarket_events(query, max_results=10):
                 all_keywords.update(SYNONYMS[w])
 
         fetch_warnings = []
+        from datetime import datetime as _dt, timezone as _tz
+        now = _dt.now(_tz.utc)
+        coverage = {"observed_by_source": {}, "excluded_inactive": 0,
+                    "exclusion_reasons": {}, "limits_reached": []}
+        inactive_parent_markets = set()
+        unknown_parent_markets = set()
+        observed_events, observed_markets, candidates = [], [], []
+        event_evidence, market_evidence = {}, {}
+
+        def identities(row):
+            return {(key, str(row[key])) for key in ("id", "slug") if row.get(key)}
+
+        def activity(row):
+            negative, uncertain = [], []
+            for flag in ("closed", "archived"):
+                if row.get(flag) is True:
+                    negative.append(flag)
+            if row.get("active") is False:
+                negative.append("inactive")
+            if row.get("active") is not True:
+                uncertain.append("active_not_confirmed")
+            if row.get("closed") is not False:
+                uncertain.append("closed_not_confirmed")
+            if row.get("archived") is not None and not isinstance(row["archived"], bool):
+                uncertain.append("archived_not_confirmed")
+            raw_date = row.get("endDate")
+            if not raw_date:
+                uncertain.append("end_date_missing")
+            else:
+                try:
+                    end = _dt.fromisoformat(raw_date.replace("Z", "+00:00"))
+                    if end.tzinfo is None or end.utcoffset() is None:
+                        uncertain.append("end_date_timezone_unknown")
+                    elif end <= now:
+                        negative.append("expired")
+                except (ValueError, TypeError, AttributeError):
+                    uncertain.append("end_date_invalid")
+            return {"activity_status": "inactive" if negative else "unknown" if uncertain else "active",
+                    "activity_reasons": negative + uncertain,
+                    "provider_state": {key: row.get(key) for key in ("active", "closed", "archived")}}
+
+        def exclude(quality):
+            coverage["excluded_inactive"] += 1
+            for reason in quality["activity_reasons"]:
+                coverage["exclusion_reasons"][reason] = coverage["exclusion_reasons"].get(reason, 0) + 1
+
+        def remember(registry, row, status=None):
+            status = status or activity(row)["activity_status"]
+            rank = {"active": 0, "unknown": 1, "inactive": 2}
+            for identity in identities(row):
+                if rank[status] > rank.get(registry.get(identity), -1):
+                    registry[identity] = status
+
+        def observed_activity(row, registry):
+            quality = activity(row)
+            states = {registry.get(key) for key in identities(row)}
+            if quality["activity_status"] != "inactive" and "inactive" in states:
+                quality["activity_status"] = "inactive"
+                quality["activity_reasons"].append("observed_inactive_same_identity")
+            elif quality["activity_status"] == "active" and "unknown" in states:
+                quality["activity_status"] = "unknown"
+                quality["activity_reasons"].append("observed_unknown_same_identity")
+            return quality
+
+        def market_activity(row):
+            quality = observed_activity(row, market_evidence)
+            parents = row.get("events")
+            parent_quality = []
+            if parents is not None:
+                if isinstance(parents, list):
+                    parent_quality = [observed_activity(p, event_evidence)["activity_status"]
+                                      if isinstance(p, dict) else "unknown" for p in parents]
+                else:
+                    parent_quality = ["unknown"]
+            if identities(row) & inactive_parent_markets or "inactive" in parent_quality:
+                quality["activity_status"] = "inactive"
+                quality["activity_reasons"].append("parent_inactive")
+            elif quality["activity_status"] != "inactive" and (
+                    identities(row) & unknown_parent_markets or "unknown" in parent_quality):
+                quality["activity_status"] = "unknown"
+                quality["activity_reasons"].append("parent_activity_unknown")
+            return quality
+
+        def queue_event(ev, source, match=None):
+            candidates.append(("event", ev, source, match))
+            # Soltanto identita' per il dedup; nessuno stato e' proiettato prima
+            # di aver confrontato tutte le evidenze osservate nei tre endpoint.
+            return {"url": "https://polymarket.com/event/" + (ev.get("slug", "") or "")}
+
+        def market_projection(m, source, quality, question_limit=160):
+            outcomes_raw, prices_raw = m.get("outcomes", "[]"), m.get("outcomePrices", "[]")
+            try:
+                outcomes = _json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                prices = _json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+            except (ValueError, TypeError) as e:
+                outcomes, prices = None, None
+                fetch_warnings.append(f"{source}: outcomes/outcomePrices JSON non valido ({type(e).__name__}); probabilita' n.d.")
+            return {"question": (m.get("question", "") or "")[:question_limit], "outcomes": outcomes,
+                    "prices": prices, "volume_24h": m.get("volume24hr"),
+                    "end_date": m.get("endDate", ""), **quality}
+
+        def event_projection(ev, source, match=None):
+            quality = observed_activity(ev, event_evidence)
+            if quality["activity_status"] == "inactive":
+                exclude(quality)
+                return None
+            markets = ev.get("markets") or []
+            if not isinstance(markets, list):
+                fetch_warnings.append(source + ": markets non e' una lista; copertura n.d.")
+                markets = []
+            eligible, excluded, invalid, unknown, active = [], 0, 0, 0, 0
+            reasons = {}
+            for m in markets:
+                if not isinstance(m, dict):
+                    invalid += 1
+                    continue
+                mq = market_activity(m)
+                if mq["activity_status"] == "inactive":
+                    excluded += 1
+                    for reason in mq["activity_reasons"]:
+                        reasons[reason] = reasons.get(reason, 0) + 1
+                    continue
+                if quality["activity_status"] != "active":
+                    mq["activity_status"] = "unknown"
+                    mq["activity_reasons"].append("parent_activity_unknown")
+                unknown += int(mq["activity_status"] == "unknown")
+                active += int(mq["activity_status"] == "active")
+                eligible.append((m, mq))
+            limited = max(0, len(eligible) - 5)
+            market_coverage = {"observed": len(markets), "excluded_inactive": excluded,
+                               "eligible": len(eligible), "returned": min(5, len(eligible)),
+                               "omitted_limit": limited, "unknown_activity": unknown,
+                               "completeness": "partial" if excluded or invalid or limited else
+                                               "unknown" if unknown else "complete_observed"}
+            if invalid:
+                market_coverage["excluded_invalid"] = invalid
+                fetch_warnings.append(source + ": sottomercati non validi omessi: " + str(invalid))
+            result = {"type": "event_group", "title": (ev.get("title", "") or "")[:200],
+                      "volume_24h": ev.get("volume24hr"), "active_markets": active,
+                      "end_date": ev.get("endDate", ""), "category": ev.get("category"),
+                      "url": "https://polymarket.com/event/" + (ev.get("slug", "") or ""),
+                      "market_coverage": market_coverage, "market_exclusion_reasons": reasons,
+                      **quality,
+                      "markets": [market_projection(m, source, mq) for m, mq in eligible[:5]]}
+            if match:
+                result["match"] = match
+            return result
 
         # Strategy 0 (#163 fix definitivo): RICERCA SERVER-SIDE di Polymarket —
         # lo stesso endpoint del sito. Trova i mercati specifici anche quando
@@ -1315,35 +1452,14 @@ def tool_get_polymarket_events(query, max_results=10):
             sr = _poly_fetch("https://gamma-api.polymarket.com/public-search",
                              {"q": query, "limit_per_type": 12})
             if isinstance(sr, dict):
+                observed_events.extend(sr.get("events") or [])
+                coverage["observed_by_source"]["/public-search"] = len(sr.get("events") or [])
+                if len(sr.get("events") or []) >= 12 or (sr.get("pagination") or {}).get("hasMore") is True:
+                    coverage["limits_reached"].append("/public-search")
                 for ev in (sr.get("events") or []):
-                    markets = ev.get("markets", []) or []
-                    sub_markets = []
-                    for m in markets[:5]:
-                        outcomes_raw = m.get("outcomes", "[]")
-                        prices_raw = m.get("outcomePrices", "[]")
-                        try:
-                            outcomes = _json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-                            prices = _json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
-                        except (ValueError, TypeError) as e:
-                            outcomes, prices = None, None
-                            fetch_warnings.append(f"/public-search: outcomes/outcomePrices JSON non valido ({type(e).__name__}); probabilita' n.d.")
-                        sub_markets.append({
-                            "question": (m.get("question", "") or "")[:160],
-                            "outcomes": outcomes,
-                            "prices": prices,
-                            "volume_24h": m.get("volume24hr"),
-                            "end_date": m.get("endDate", ""),
-                        })
-                    all_results.append({
-                        "type": "event_group",
-                        "match": "server_search",
-                        "title": (ev.get("title", "") or "")[:200],
-                        "volume_24h": ev.get("volume24hr"),
-                        "active_markets": len(markets),
-                        "end_date": ev.get("endDate", ""),
-                        "url": "https://polymarket.com/event/" + (ev.get("slug", "") or ""),
-                        "markets": sub_markets,
-                    })
+                    item = queue_event(ev, "/public-search", "server_search")
+                    if item is not None:
+                        all_results.append(item)
             elif sr is None:
                 fetch_warnings.append("/public-search: "
                                       + str(_POLY_CACHE.get("__last_error", "irraggiungibile")))
@@ -1368,6 +1484,10 @@ def tool_get_polymarket_events(query, max_results=10):
                         f"/events offset={offset}: {_POLY_CACHE.get('__last_error', 'irraggiungibile')}")
                     break
                 events.extend(page)
+                observed_events.extend(page)
+                coverage["observed_by_source"]["/events"] = len(events)
+                if offset == 1000 and len(page) >= 500:
+                    coverage["limits_reached"].append("/events")
                 if len(page) < 500:
                     break
             if events:
@@ -1381,38 +1501,20 @@ def tool_get_polymarket_events(query, max_results=10):
                     # dei sub-market (evento "Brazil Presidential Election", question "Will Jair
                     # Bolsonaro win..."): senza questo blocco una query "Lula Bolsonaro" non
                     # matchava nulla se la server-search era giu' -> falso "mercato inesistente".
+                    matching_markets = ev.get("markets") or []
+                    if not isinstance(matching_markets, list):
+                        fetch_warnings.append("/events: markets non e' una lista; ricerca nei sottomercati n.d.")
+                        matching_markets = []
+                    if len(matching_markets) > 30 and "/events:submarket_keyword_scan" not in coverage["limits_reached"]:
+                        coverage["limits_reached"].append("/events:submarket_keyword_scan")
                     mkt_txt = " ".join(
                         ((m.get("question") or "") + " " + (m.get("groupItemTitle") or ""))
-                        for m in (ev.get("markets") or [])[:30]).lower()
+                        for m in matching_markets[:30] if isinstance(m, dict)).lower()
                     haystack = title + " " + slug + " " + description + " " + mkt_txt
                     if _poly_kw_match(haystack, all_keywords):
-                        markets = ev.get("markets", [])
-                        sub_markets = []
-                        for m in markets[:5]:
-                            outcomes_raw = m.get("outcomes", "[]")
-                            prices_raw = m.get("outcomePrices", "[]")
-                            try:
-                                outcomes = _json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-                                prices = _json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
-                            except (ValueError, TypeError) as e:
-                                outcomes, prices = None, None
-                                fetch_warnings.append(f"/events: outcomes/outcomePrices JSON non valido ({type(e).__name__}); probabilita' n.d.")
-                            sub_markets.append({
-                                "question": (m.get("question", "") or "")[:160],
-                                "outcomes": outcomes,
-                                "prices": prices,
-                                "volume_24h": m.get("volume24hr"),
-                                "end_date": m.get("endDate", ""),
-                            })
-                        all_results.append({
-                            "type": "event_group",
-                            "title": ev.get("title", "")[:200],
-                            "volume_24h": ev.get("volume24hr"),
-                            "active_markets": len(markets),
-                            "end_date": ev.get("endDate", ""),
-                            "url": "https://polymarket.com/event/" + (ev.get("slug", "")),
-                            "markets": sub_markets,
-                        })
+                        item = queue_event(ev, "/events")
+                        if item is not None:
+                            all_results.append(item)
         except Exception as e:
             fetch_warnings.append(f"/events: {type(e).__name__}: {e}")
 
@@ -1430,6 +1532,10 @@ def tool_get_polymarket_events(query, max_results=10):
                         f"/markets offset={offset}: {_POLY_CACHE.get('__last_error', 'irraggiungibile')}")
                     break
                 markets.extend(page)
+                observed_markets.extend(page)
+                coverage["observed_by_source"]["/markets"] = len(markets)
+                if offset == 500 and len(page) >= 500:
+                    coverage["limits_reached"].append("/markets")
                 if len(page) < 500:
                     break
             if markets:
@@ -1443,38 +1549,75 @@ def tool_get_polymarket_events(query, max_results=10):
                         continue
                     if slug in seen_slugs:
                         continue  # Already in event group
-                    outcomes_raw = m.get("outcomes", "[]")
-                    prices_raw = m.get("outcomePrices", "[]")
-                    try:
-                        outcomes = _json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-                        prices = _json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
-                    except (ValueError, TypeError) as e:
-                        outcomes, prices = None, None
-                        fetch_warnings.append(f"/markets: outcomes/outcomePrices JSON non valido ({type(e).__name__}); probabilita' n.d.")
-                    all_results.append({
-                        "type": "single_market",
-                        "question": (m.get("question", "") or "")[:200],
-                        "outcomes": outcomes,
-                        "prices": prices,
-                        "volume_24h": m.get("volume24hr"),
-                        "end_date": m.get("endDate", ""),
-                        "url": "https://polymarket.com/event/" + (m.get("slug", "")),
-                    })
+                    candidates.append(("market", m, "/markets", None))
         except Exception as e:
             fetch_warnings.append(f"/markets: {type(e).__name__}: {e}")
+
+        # Prima della proiezione: anche copie eliminate dal dedup e figli oltre
+        # il limite possono contenere una prova negativa sulla stessa identita'.
+        for m in list(observed_markets):
+            parents = m.get("events")
+            if isinstance(parents, list):
+                observed_events.extend(p for p in parents if isinstance(p, dict))
+        for ev in observed_events:
+            remember(event_evidence, ev)
+            children = ev.get("markets")
+            if isinstance(children, list):
+                observed_markets.extend(m for m in children if isinstance(m, dict))
+        for m in observed_markets:
+            remember(market_evidence, m)
+        for ev in observed_events:
+            state = observed_activity(ev, event_evidence)["activity_status"]
+            children = ev.get("markets")
+            if isinstance(children, list) and state != "active":
+                target = inactive_parent_markets if state == "inactive" else unknown_parent_markets
+                for child in children:
+                    if isinstance(child, dict):
+                        target.update(identities(child))
+        for m in observed_markets:
+            remember(market_evidence, m, market_activity(m)["activity_status"])
+        all_results = []
+        for kind, raw, source, match in candidates:
+            if kind == "event":
+                item = event_projection(raw, source, match)
+            else:
+                quality = market_activity(raw)
+                if quality["activity_status"] == "inactive":
+                    exclude(quality)
+                    continue
+                item = market_projection(raw, source, quality, question_limit=200)
+                item.update(type="single_market", category=raw.get("category"),
+                            url="https://polymarket.com/event/" + (raw.get("slug", "") or ""))
+            if item is not None:
+                all_results.append(item)
 
         # Sort: prima i match della server search (più pertinenti), poi per volume
         all_results.sort(key=lambda x: (0 if x.get("match") == "server_search" else 1,
                                         -(x.get("volume_24h", 0) or 0)))
+        coverage["eligible_candidates"] = len(all_results)
+        coverage["unknown_activity_candidates"] = sum(r.get("activity_status") == "unknown" for r in all_results)
+        coverage["candidate_count_basis"] = "matched records evaluated locally; observed_by_source also includes unmatched records"
+        nested_partial = any(r.get("market_coverage", {}).get("completeness") == "partial" for r in all_results)
         all_results = all_results[:max_results]
+        coverage["returned"] = len(all_results)
+        coverage["omitted_result_limit"] = coverage["eligible_candidates"] - len(all_results)
+        local_partial = bool(coverage["omitted_result_limit"] or nested_partial or fetch_warnings)
 
         result = {
             "query": query,
             "expanded_keywords": sorted(all_keywords),
             "count": len(all_results),
+            "coverage_verified": False,
+            "coverage": coverage,
+            "observed_response_completeness": "partial" if local_partial else "complete_observed",
+            "completeness": "partial" if local_partial or coverage["limits_reached"] else "unknown",
+            "activity_definition": "active=True, closed=False, no archived=True, future timezone-aware endDate; parent must also qualify for submarkets",
             "results": all_results,
             "note": "Prices are probabilities (0-1). Outcomes[0]=Yes, Outcomes[1]=No typically. "
-                    "type=event_group raccoglie più mercati su stesso tema; type=single_market e' singolo.",
+                    "type=event_group raccoglie più mercati su stesso tema; type=single_market e' singolo. "
+                    "Do not aggregate prices across markets: exclusivity and exhaustive coverage are not verified. "
+                    "Counts refer only to observed candidates; complete_observed never means the full market universe. "
+                    "Unknown activity is not evidence of a current tradable probability.",
         }
         if fetch_warnings:
             result["fetch_warnings"] = fetch_warnings
@@ -1518,6 +1661,18 @@ def tool_get_fundamentals(ticker):
             return {"error": "Fundamentals identity mismatch for " + ticker + ": provider returned "
                     + str(info.get("symbol")) + " instead of " + symbol}
 
+        from datetime import datetime, timezone
+        acquired_at = datetime.now(timezone.utc).isoformat()
+        cashflow_metadata = {metric: {
+            "provider_field": field, "source": "yfinance.info", "acquired_at": acquired_at,
+            "currency": None, "provider_financial_currency": info.get("financialCurrency"),
+            "period_start": None, "period_end": None, "definition": None,
+            "status": "METADATA_UNAVAILABLE",
+            "note": "Periodo, definizione e valuta specifica del flusso n.d.; financialCurrency "
+                    "e' la valuta degli aggregati dichiarata dal provider, non prova per campo. "
+                    "Il valore non e' attestato come annuale, TTM, FCFF o FCFE."}
+            for metric, field in (("free_cashflow", "freeCashflow"), ("operating_cashflow", "operatingCashflow"))}
+
         result = {
             "ticker": ticker,
             "provider_symbol": symbol,
@@ -1526,6 +1681,8 @@ def tool_get_fundamentals(ticker):
             "industry": info.get("industry", ""),
             # Valuation
             "market_cap": info.get("marketCap"),
+            "market_cap_currency": info.get("marketCapCurrency"),
+            "quote_currency": info.get("currency"),
             "pe_trailing": info.get("trailingPE"),
             "pe_forward": info.get("forwardPE"),
             "peg": info.get("pegRatio"),
@@ -1550,6 +1707,7 @@ def tool_get_fundamentals(ticker):
             # Cash Flow
             "operating_cashflow": info.get("operatingCashflow"),
             "free_cashflow": info.get("freeCashflow"),
+            "cashflow_metadata": cashflow_metadata,
             # Dividends
             "dividend_yield": info.get("dividendYield"),
             "payout_ratio": info.get("payoutRatio"),
@@ -1826,7 +1984,7 @@ _FRED_INDICATORS = {
     "fed_funds_rate": ("FEDFUNDS", "Fed Funds Effective Rate (%)", "level"),
     "10y_treasury": ("DGS10", "10Y Treasury Yield (%)", "level"),
     "2y_treasury": ("DGS2", "2Y Treasury Yield (%)", "level"),
-    "yield_curve_10y_2y": ("T10Y2Y", "10Y-2Y Spread (bps if negative = inversion)", "level"),
+    "yield_curve_10y_2y": ("T10Y2Y", "10Y-2Y Spread (percentage points; negative = inversion)", "level"),
     "vix_close": ("VIXCLS", "VIX close", "level"),
     "wti_oil": ("DCOILWTICO", "WTI Crude Oil ($/bbl)", "level"),
     "dollar_index_broad": ("DTWEXBGS", "Broad Dollar Index (FRED, scala ~120; NON e' il DXY ICE ~100)", "level"),
@@ -1844,7 +2002,7 @@ _FRED_INDICATORS = {
     # P1 14/07: ez_3m_euribor (IR3TIB01EZM156N) morto alla fonte (ultimo update 02/2026)
     # -> sostituito con ESTR overnight ECB, giornaliero, VERIFICATO con fetch reale (oss. 13/07/2026)
     "ez_estr": ("ECBESTRVOLWGTTRMDMNRT", "Euro Short-Term Rate ESTR overnight (%)", "level"),
-    "ez_cpi_yoy": ("CP0000EZ19M086NEST", "Eurozone HICP YoY (%)", "level"),
+    "ez_cpi_yoy": ("CP0000EZ19M086NEST", "Euro area 19 HICP NSA index; derived YoY (%)", "yoy"),
     "ez_10y_bund": ("IRLTLT01DEM156N", "Germany 10Y Bund Yield (%)", "level"),
     # === BOE (UK) ===
     "boe_bank_rate": ("IUDSOIA", "BOE Sterling Overnight Index (%)", "level"),
@@ -1862,7 +2020,7 @@ _FRED_INDICATORS = {
     "usd_cny": ("DEXCHUS", "USD/CNY FX rate", "level"),
     "china_export_yoy": ("XTEXVA01CNM659S", "China Export Value YoY (%)", "level"),  # 659S: serie GIA' YoY (audit/11: prima si faceva lo YoY dello YoY)
     # === Brazil (BCB) ===
-    "brazil_selic": ("INTDSRBRM193N", "Brazil SELIC Rate (%)", "level"),
+    "brazil_discount_rate": ("INTDSRBRM193N", "Brazil Discount Rate (% per annum, NSA)", "level"),
     "usd_brl": ("DEXBZUS", "USD/BRL FX rate", "level"),
     # === Currencies cross ===
     "eur_usd": ("DEXUSEU", "USD/EUR FX rate (USD per EUR)", "level"),
@@ -1877,6 +2035,7 @@ _FRED_INDICATORS = {
 # buco DICHIARATO in indicators_not_available — regola PM "buco dichiarato >
 # numero morto".
 _FRED_REMOVED_NOTE = {
+    "brazil_selic": "SELIC unavailable: INTDSRBRM193N is a discount rate, not verified SELIC. Available separately as brazil_discount_rate; no proxy substitution.",
     "china_unemployment": "ID FRED LMUNRRTTCNM156S INESISTENTE (HTTP 400), registered unemployment ferma al 2011; nessuna fonte libera affidabile (NBS richiede sessione)",
 }
 
@@ -2020,16 +2179,36 @@ def _fred_fetch_series(series_id, last_n=24):
         }
         r = _req.get(url, params=params, timeout=15)
         r.raise_for_status()
-        obs = r.json().get("observations", [])
-        # Reverse: piu vecchio -> piu recente, scarta valori "."
+        payload = r.json()
+        obs = payload.get("observations", [])
+        # Keep the historical clean shape; expose gaps/vintage separately.
+        import math
+        from datetime import date as _date, datetime as _datetime, timezone as _timezone
+        def _iso(value):
+            try:
+                return _date.fromisoformat(value).isoformat()
+            except (TypeError, ValueError):
+                return None
+        metadata = [{"date": _iso(o.get("date")),
+                     "realtime_start": _iso(o.get("realtime_start")),
+                     "realtime_end": _iso(o.get("realtime_end"))} for o in obs]
         clean = []
+        rejected = []
         for o in obs[::-1]:
             try:
                 v = float(o["value"])
+                if isinstance(o["value"], bool) or not math.isfinite(v):
+                    raise ValueError("non-finite/bool")
                 clean.append({"date": o["date"], "value": v})
-            except (ValueError, KeyError):
-                continue
-        _out = {"series_id": series_id, "observations": clean}
+            except (ValueError, KeyError, TypeError, OverflowError):
+                rejected.append({"date": _iso(o.get("date")), "reason": "non_numeric_or_non_finite"})
+        _out = {"series_id": series_id, "observations": clean,
+                "rejected_observations": rejected,
+                "latest_observation_date": max((m["date"] for m in metadata if m["date"]), default=None),
+                "observation_metadata": metadata,
+                "realtime_start": _iso(payload.get("realtime_start")),
+                "realtime_end": _iso(payload.get("realtime_end")),
+                "fetched_at": _datetime.now(_timezone.utc).isoformat()}
         _FRED_CACHE[_k] = (_t.time(), _out)
         return _out
     except Exception as e:
@@ -2037,6 +2216,17 @@ def _fred_fetch_series(series_id, last_n=24):
         # requests contiene l'URL con &api_key=<chiave>
         from bellomberg.core.errori_sicuri import descrivi_eccezione
         return {"error": "FRED fetch " + str(series_id) + ": " + descrivi_eccezione(e, FRED_API_KEY)}
+
+
+# Frequenza e definizione esplicite per ogni trasformazione annuale registrata.
+_FRED_YOY_PERIODS = {
+    'us_cpi_yoy': ('monthly', 'CPI-U all items, seasonally adjusted index'),
+    'us_core_cpi_yoy': ('monthly', 'CPI-U excluding food and energy, seasonally adjusted index'),
+    'us_industrial_prod': ('monthly', 'Industrial production, seasonally adjusted index'),
+    'us_retail_sales': ('monthly', 'Retail and food services, nominal seasonally adjusted sales'),
+    'us_gdp_real_yoy': ('quarterly', 'Real GDP, seasonally adjusted annualized level'),
+    'ez_cpi_yoy': ('monthly', 'HICP all items, euro area 19, not seasonally adjusted index'),
+}
 
 
 def tool_get_macro_indicator(indicator, last_n=12):
@@ -2055,6 +2245,10 @@ def tool_get_macro_indicator(indicator, last_n=12):
             out["yoy_pct"] = res["value"]  # il value E' gia' lo YoY in %
         return out
 
+    # Una chiave rimossa non deve diventare un ID FRED grezzo o un proxy silenzioso.
+    if indicator in _FRED_REMOVED_NOTE:
+        return {"indicator": indicator, "error": _FRED_REMOVED_NOTE[indicator]}
+
     # Mapping chiave -> series_id, mode
     mode = "level"
     desc = indicator
@@ -2067,46 +2261,31 @@ def tool_get_macro_indicator(indicator, last_n=12):
     if "error" in data:
         return data
 
-    obs = data["observations"]
-    if not obs:
-        return {"error": "Nessun dato FRED per " + series_id}
+    obs = data['observations']
+    result = {'indicator': indicator, 'series_id': series_id, 'description': desc, 'mode': mode}
+    if mode == 'yoy':
+        from bellomberg.core.macro_observations import annual_comparison
+        frequency, definition = _FRED_YOY_PERIODS[indicator]
+        pair = annual_comparison(obs, frequency, data.get('rejected_observations'))
+        obs = pair.pop('observations')
+        result.update(pair)
+        result['comparison']['definition'] = definition
+        for field in ('observation_metadata', 'latest_observation_date', 'realtime_start', 'realtime_end', 'fetched_at'):
+            result['quality'][field] = data.get(field)
+        result['quality']['realtime_note'] = 'FRED response interval, not publication date or historical as-of guarantee'
+        if pair['quality']['latest_status'] != 'available':
+            result['error'] = pair['comparison']['reason']
+            result['history_last_12'] = obs[-12:]
+            return result
+        if result['yoy_pct'] is not None:
+            result['yoy_pct'] = round(result['yoy_pct'], 2)
+    else:
+        if not obs:
+            return {'error': 'Nessun dato FRED per ' + series_id}
+        result.update(latest_date=obs[-1]['date'], latest_value=obs[-1]['value'])
 
-    result = {
-        "indicator": indicator,
-        "series_id": series_id,
-        "description": desc,
-        "latest_date": obs[-1]["date"],
-        "latest_value": obs[-1]["value"],
-        "mode": mode,
-    }
-
-    if mode == "yoy" and len(obs) >= 2:
-        # audit/11 §2: obs[-13] assumeva serie MENSILI — su GDPC1 (trimestrale) il "YoY"
-        # era in realta' la crescita a 3 ANNI. Ora si cerca l'osservazione per DATA
-        # (~365 giorni prima dell'ultima), robusto per qualunque frequenza.
-        from datetime import datetime as _dt, timedelta as _td
-        latest = obs[-1]["value"]
-        year_ago_obs = None
-        try:
-            d_last = _dt.strptime(obs[-1]["date"], "%Y-%m-%d")
-            target = d_last - _td(days=365)
-            year_ago_obs = min(
-                obs[:-1],
-                key=lambda o: abs((_dt.strptime(o["date"], "%Y-%m-%d") - target).days))
-            # se la piu' vicina dista >200gg dal target la serie non copre l'anno: niente YoY
-            if abs((_dt.strptime(year_ago_obs["date"], "%Y-%m-%d") - target).days) > 200:
-                year_ago_obs = None
-        except Exception:
-            year_ago_obs = None
-        if year_ago_obs and year_ago_obs["value"]:
-            year_ago = year_ago_obs["value"]
-            yoy = (latest - year_ago) / abs(year_ago) * 100
-            result["yoy_pct"] = round(yoy, 2)
-            result["year_ago_date"] = year_ago_obs["date"]
-            result["year_ago_value"] = year_ago
-
-    if len(obs) >= 2:
-        # Variazione vs precedente release
+    if len(obs) >= 2 and (mode != 'yoy' or result['quality']['previous_status'] == 'available'):
+        # Variazione vs precedente release: per YoY il periodo deve essere univoco.
         prev = obs[-2]["value"]
         result["prev_value"] = prev
         result["prev_date"] = obs[-2]["date"]
@@ -2138,6 +2317,10 @@ def tool_get_macro_dashboard():
                 # P1 14/07 (no-fallback): l'errore si DICHIARA, non si salta in
                 # silenzio (uk_cpi con ID inesistente e' sparito per mesi cosi')
                 dashboard["indicators"][key] = {"error": result["error"], "description": desc}
+            for field in ('quality', 'comparison', 'last_available_date', 'last_available_value',
+                          'year_ago_date', 'year_ago_value'):
+                if field in result:
+                    dashboard['indicators'][key][field] = result[field]
         except Exception as e:
             dashboard["indicators"][key] = {"error": _senza_chiavi(str(e)), "description": desc}
 
@@ -2786,14 +2969,20 @@ def tool_add_research_note(decision_id, note):
         return {"error": "add_research_note error: " + str(e)}
 
 
-def tool_search_past_memos(query, n_results=5):
+def tool_search_past_memos(query, n_results=5, *, operational_only=False):
     """Semantic search sui memo consigliere storici via ChromaDB."""
     try:
         from bellomberg.storage.memory_db import MemoryDB
         db = MemoryDB()
+        if operational_only:
+            from bellomberg.storage.semantic_memory import search_operational_memos
+            return search_operational_memos(db, query, n_results=n_results)
         results = db.search_memos_semantic(query, n_results=n_results)
         return {"query": query, "count": len(results), "memos": results}
     except Exception as e:
+        if operational_only:
+            return {"status": "unavailable", "reason": "operational_search_unavailable",
+                    "memory_scope": "weekly_operational", "count": 0, "memos": []}
         return {"error": "semantic memo search error: " + str(e)}
 
 

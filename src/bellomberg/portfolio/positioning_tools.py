@@ -281,21 +281,26 @@ def get_cot_positioning(market: str = "ES", weeks: int = 52) -> Dict[str, Any]:
         if not rows:
             return {"error": message("nessun contratto CFTC trovato per '{name}'", "no CFTC contract found for '{name}'", name=name), "_source": src}
 
-        # Commodity: codice CFTC esatto. TFF: conserva selezione storica #177.
+        # Commodity: codice CFTC esatto. TFF: nome esatto, mai prima riga del LIKE.
         if commodity:
             rows = [x for x in rows if x.get("cftc_contract_market_code") == code]
             if not rows:
                 return {"error": message("risposta CFTC senza contratto {code}",
                                          "CFTC response missing contract {code}", code=code), "_source": src}
         else:
-            exact = [x for x in rows if (x.get("contract_market_name") or "").upper() == name]
-            target = name if exact else (rows[0].get("contract_market_name") or "")
+            target = name
             rows = [x for x in rows
                     if (x.get("contract_market_name") or "").upper() == target.upper()]
+            codes = {x.get("cftc_contract_market_code") for x in rows
+                     if x.get("cftc_contract_market_code")}
+            if len(codes) > 1:
+                return {"error": message("identita' CFTC ambigua per '{name}': piu' codici contratto",
+                                         "ambiguous CFTC identity for '{name}': multiple contract codes", name=name),
+                        "_source": src}
         seen_dates = set()
         dedup = []
         for x in rows:
-            d = x.get("report_date_as_yyyy_mm_dd", "")[:10]
+            d = (x.get("report_date_as_yyyy_mm_dd") or "")[:10]
             if d in seen_dates:
                 continue
             seen_dates.add(d)
@@ -332,7 +337,7 @@ def get_cot_positioning(market: str = "ES", weeks: int = 52) -> Dict[str, Any]:
             freshness_status = "FRESH" if 0 <= age_days <= 14 else "STALE"
         except ValueError:
             age_days, freshness_status = None, "UNKNOWN"
-        if commodity and freshness_status != "FRESH":
+        if freshness_status != "FRESH":
             pctile = None  # non presentare una lettura contrarian come corrente
 
         return {

@@ -318,6 +318,8 @@ def run_red_team(blackboard, portfolio_data=None, memory_db=None, *, citation_co
     Best-effort: in caso di errore ritorna "" senza propagare."""
     import time as _time
     trade_idea = getattr(blackboard, "run_scope", "weekly") == "trade_idea"
+    from bellomberg.core.evidence_prompt_policy import enabled as evidence_prompts_enabled
+    evidence_prompts_enabled(blackboard)  # Validate before any best-effort import/config path.
     if citation_correction is not None:
         if not trade_idea:
             raise ValueError("Citation correction belongs only to Trade Idea")
@@ -523,6 +525,10 @@ def _run_red_team_loop(blackboard, trade_idea, MODEL_SYNTHESIZER, user_msg,
     _calls = 0
     _t0 = _time.perf_counter()
     _request_inflight = False
+    from bellomberg.core.evidence_prompt_policy import select_template, diagnostic_block
+    evidence_template = select_template(blackboard, 'red_team', RED_TEAM_PROMPT)
+    if saved_checkpoint is None and not trade_idea:
+        user_msg += diagnostic_block(blackboard)
     try:
         messages = [{"role": "user", "content": user_msg}]
         if trade_idea:
@@ -536,7 +542,7 @@ def _run_red_team_loop(blackboard, trade_idea, MODEL_SYNTHESIZER, user_msg,
             base_system = selected_system  # pre-E7: serve a riconoscere i checkpoint gia' pagati
             selected_system += "\n" + pm_constraints_text(blackboard)[1]
         else:
-            selected_system = prompt_for_language(RED_TEAM_PROMPT)
+            selected_system = prompt_for_language(evidence_template)
             if is_research_mode(blackboard):
                 selected_system += ('\nChallenge the exact sealed company research and R1 thesis: '
                     'observed statements, management guidance, analyst consensus and independent '

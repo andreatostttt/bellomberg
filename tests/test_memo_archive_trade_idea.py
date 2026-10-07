@@ -48,8 +48,9 @@ def test_metodo_vecchio_e_memoria_del_capo_restano_senza_trade_idea(db):
     w1, w2, ti, bad = _seed(db)
     assert [r["id"] for r in db.get_recent_memos(6)] == [w2, w1]
     ctx = db.build_capo_memory_context(max_chars=99999)
-    # memos[0] e' il segnaposto della run in corso: il precedente e' w1
-    assert "ZZWEEK uno" in ctx
+    # Entrambi hanno un BODY pubblicato: il precedente utilizzabile e' w2.
+    assert "ZZWEEK due" in ctx
+    assert "ZZWEEK uno" not in ctx
     assert "ZZTEST" not in ctx and "QQSYN.MI" not in ctx
 
 

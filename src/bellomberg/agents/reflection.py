@@ -76,7 +76,8 @@ def _extract_action_table(memo_markdown: str, max_chars: int = 1200) -> str:
 
 @scoped_language
 def generate_lesson(memo_markdown: str = "", memo_id: Optional[int] = None,
-                    usage_out: Optional[Dict[str, Any]] = None) -> str:
+                    usage_out: Optional[Dict[str, Any]] = None, *, eligible_memo_ids=None,
+                    policy_input=None, result_out=None) -> str:
     """Genera e salva la lezione post-run. Ritorna la lezione ('' su fallimento).
 
     usage_out (opzionale, #44/finding 4): dict MUTATO in-place col consumo della
@@ -91,47 +92,68 @@ def generate_lesson(memo_markdown: str = "", memo_id: Optional[int] = None,
       "usage_unknown" -> chiamata fatta ma la risposta non ha esposto usage (token IGNOTI)
       "api_error"     -> la chiamata e' fallita
     """
+    from bellomberg.core.reflection_policy import POLICY, result_for, parse_rows
+    from bellomberg.storage.weekly_run_store import WeeklyRunBlocked
+    if policy_input is not None and policy_input.get('version') != POLICY:
+        raise WeeklyRunBlocked('Policy Reflection input non compatibile')
+    if result_out is not None:
+        result_out.clear()
     _u_out = usage_out if isinstance(usage_out, dict) else None
     if _u_out is not None:
         _u_out.clear()
         _u_out.update({"in": 0, "out": 0, "cache_read": 0, "cache_write": 0,
                        "model": None, "api_calls": 0, "duration_s": None,
                        "status": "skipped"})
+    if policy_input is not None and policy_input.get('request') is None:
+        if result_out is not None:
+            result_out.update(result_for(policy_input, cause=policy_input.get('request_cause') or 'NO_ELIGIBLE_GROUPS'))
+        _log('Reflection non generata: ' + (policy_input.get('request_cause') or 'NO_ELIGIBLE_GROUPS'))
+        return ''
     try:
         from bellomberg.core.llm_client import OpenRouterClient, modello as _modello_llm, somma_usage, thinking_fase
         from bellomberg.agents.specialists.base import timeout_specialisti
         from bellomberg.agents.scorekeeper import compute_scorecard, format_track_record_for_capo
         # 05/09 (ordine PM): modello dal .env (REFLECTION_MODEL); assente = errore col nome
-        MODEL_SYNTHESIZER = _modello_llm("reflection")
+        MODEL_SYNTHESIZER = (policy_input["request"]["model"] if policy_input is not None
+                             else _modello_llm("reflection"))
     except Exception as e:
         _log("import skip: " + str(e))
         return ""
     if _u_out is not None:
         _u_out["model"] = MODEL_SYNTHESIZER
 
-    try:
-        sc = compute_scorecard()  # snapshot fresco dal pre-run
-        track = format_track_record_for_capo(sc, max_chars=2000)
-    except Exception as e:
-        _log("scorecard non disponibile (" + str(e)[:80] + "): niente lezione — "
-             "la reflection SENZA esiti misurati sarebbe opinione, non lezione")
-        return ""
-    # guardia sul DATO (overall.n), non sulla stringa: dal fix 26/07 il blocco
-    # "TRACK RECORD n.d. — MISURA FALLITA" e' NON-vuoto per dichiarare il buco
-    # al Capo, ma una lezione ancorata a una misura guasta sarebbe finzione.
-    if sc.get("overall", {}).get("n", 0) == 0 or not track:
-        _log("track record assente o misura fallita (n=0): niente lezione (dichiarato)")
-        return ""
+    if policy_input is not None:
+        request = policy_input['request']
+        user_msg = request['user']
+        selected_system = request['system']
+    else:
+        try:
+            sc = compute_scorecard()  # snapshot fresco dal pre-run
+            track = format_track_record_for_capo(sc, max_chars=2000)
+        except Exception as e:
+            _log("scorecard non disponibile (" + str(e)[:80] + "): niente lezione — "
+                 "la reflection SENZA esiti misurati sarebbe opinione, non lezione")
+            return ""
+        # guardia sul DATO (overall.n), non sulla stringa: dal fix 26/07 il blocco
+        # "TRACK RECORD n.d. — MISURA FALLITA" e' NON-vuoto per dichiarare il buco
+        # al Capo, ma una lezione ancorata a una misura guasta sarebbe finzione.
+        if sc.get("overall", {}).get("n", 0) == 0 or not track:
+            _log("track record assente o misura fallita (n=0): niente lezione (dichiarato)")
+            return ""
 
-    prev = _load_lessons()
-    prev_lesson = prev[-1]["lesson"] if prev else "(nessuna: prima reflection)"
+        prev = _load_lessons()
+        eligible = _eligible_lessons(prev, eligible_memo_ids)
+        prev_lesson = eligible[-1]["lesson"] if eligible else ("(nessuna: prima reflection)"
+            if eligible_memo_ids is None else "(nessuna lezione compatibile da run completata)")
 
-    user_msg = (
-        "=== TRACK RECORD MISURATO (scorekeeper #190) ===\n" + track
-        + "\n\n=== ACTION TABLE DEL MEMO APPENA PRODOTTO ===\n"
-        + _extract_action_table(memo_markdown)
-        + "\n\n=== LEZIONE DELLA RUN PRECEDENTE (falla evolvere, non ripeterla) ===\n"
-        + prev_lesson[:900])
+        user_msg = (
+            "=== TRACK RECORD MISURATO (scorekeeper #190) ===\n" + track
+            + "\n\n=== ACTION TABLE DEL MEMO APPENA PRODOTTO ===\n"
+            + _extract_action_table(memo_markdown)
+            + "\n\n=== LEZIONE DELLA RUN PRECEDENTE (falla evolvere, non ripeterla) ===\n"
+            + prev_lesson[:900])
+
+        selected_system = prompt_for_language(REFLECTION_PROMPT)
 
     _t0 = _time.perf_counter()
     try:
@@ -139,11 +161,11 @@ def generate_lesson(memo_markdown: str = "", memo_id: Optional[int] = None,
         resp = client.messages.create(
             model=MODEL_SYNTHESIZER,
             # PM 02/10: 8k; una lezione troncata non viene salvata nel priming.
-            max_tokens=REFLECTION_MAX_TOKENS,
+            max_tokens=(request["max_tokens"] if policy_input is not None else REFLECTION_MAX_TOKENS),
             # Lezione sintetica della run: effort dal .env (REFLECTION_EFFORT, default
             # low: limita costo e latenza).
-            thinking=thinking_fase("reflection"),
-            system=prompt_for_language(REFLECTION_PROMPT),
+            thinking=(request["thinking"] if policy_input is not None else thinking_fase("reflection")),
+            system=selected_system,
             messages=[{"role": "user", "content": user_msg}],
         )
         if _u_out is not None:
@@ -176,12 +198,23 @@ def generate_lesson(memo_markdown: str = "", memo_id: Optional[int] = None,
             _log("lezione TRONCATA al limite token: non salvata e non usata nel priming")
             return ""
     except Exception as e:
+        if policy_input is not None and isinstance(e, WeeklyRunBlocked):
+            raise
         if _u_out is not None:
             _u_out["api_calls"] = 1
             _u_out["duration_s"] = round(_time.perf_counter() - _t0, 2)
             _u_out["status"] = "api_error"
         _log("API error (nessuna lezione, run intatta): " + str(e)[:120])
         return ""
+    if policy_input is not None:
+        rows = parse_rows(lesson, policy_input)
+        result = result_for(policy_input, rows, cause=('INVALID_LESSON_OUTPUT' if rows is None else
+                            'NO_SUPPORTED_LESSON' if not rows else None))
+        if result_out is not None:
+            result_out.update(result)
+        if not result['lesson']:
+            _log('Reflection non operativa: ' + str(result['cause']))
+        return result['lesson']
     if not lesson:
         return ""
 
@@ -192,21 +225,23 @@ def generate_lesson(memo_markdown: str = "", memo_id: Optional[int] = None,
     return lesson
 
 
-def get_latest_lesson_block(max_chars: int = 900) -> str:
+def _eligible_lessons(lessons, eligible_memo_ids):
+    """Filtro read-time: la lista originale resta integra, incluse le run abortite."""
+    return [row for row in lessons if isinstance(row, dict) and not row.get("duplicato")
+            and isinstance(row.get("lesson"), str) and row["lesson"].strip()
+            and (eligible_memo_ids is None or type(row.get("memo_id")) is int
+                 and row["memo_id"] in eligible_memo_ids)]
+
+
+def get_latest_lesson_block(max_chars: int = 900, *, eligible_memo_ids=None) -> str:
     """Blocco per il priming della run SUCCESSIVA (memoria del Capo).
     Audit 11/09: una lezione marcata `duplicato` (run ripetuta archiviata, v.
     tools/maintenance/archivia_run_duplicata.py) non prima la run successiva; si risale
     all'ultima lezione non marcata. Nulla viene cancellato dal file."""
-    lessons = _load_lessons()
+    lessons = _eligible_lessons(_load_lessons(), eligible_memo_ids)
     if not lessons:
         return ""
-    last = None
-    for cand in reversed(lessons):
-        if isinstance(cand, dict) and not cand.get("duplicato"):
-            last = cand
-            break
-    if last is None:
-        return ""
+    last = lessons[-1]
     return ("--- LEZIONE DALL'ULTIMA RUN (#210 reflection, ancorata allo scorekeeper) ---\n"
             + "[" + str(last.get("date", ""))[:10] + "]\n"
             + str(last.get("lesson", "")))[:max_chars]
@@ -227,3 +262,12 @@ if __name__ == "__main__":
     print(lesson or "(nessuna lezione)")
     print()
     print(get_latest_lesson_block())
+
+
+def policy_request(groups):
+    """Resolve the existing configuration once, before sealing the weekly request."""
+    from bellomberg.core.reflection_policy import SYSTEM
+    from bellomberg.core.llm_client import modello, thinking_fase
+    return {"model": modello("reflection"), "thinking": thinking_fase("reflection"),
+            "max_tokens": REFLECTION_MAX_TOKENS, "system": prompt_for_language(SYSTEM),
+            "user": json.dumps({"eligible_groups": groups}, ensure_ascii=False, sort_keys=True)}

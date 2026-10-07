@@ -33,6 +33,14 @@ def _sidecar(report, ticker, severity):
 
 @pytest.fixture
 def vero(research_weekly, run_offline, monkeypatch, tmp_path):
+    # Historical research policy: this suite exercises persisted sanity closures.
+    # New research-evidence contracts have their separate no-VAL regression bank.
+    native_contract = cm._weekly_contract
+    def historical_contract(**kwargs):
+        contract = native_contract(**kwargs)
+        contract.pop('publication_gate_policy', None)
+        return contract
+    monkeypatch.setattr(cm, '_weekly_contract', historical_contract)
     import importlib
     nome = "bellomberg.agents.action_validator"
     sys.modules.pop(nome, None)
